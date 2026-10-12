@@ -74,7 +74,7 @@ char kbd_getchar(void) {
     for (;;) {
         int c = kbd_poll();
         if (c >= 0) return (char)c;
-        __asm hlt /* sleep until next interrupt */
+        cpu_hlt(); /* sleep until next interrupt */
     }
 }
 

@@ -1,22 +1,45 @@
 ; =============================================================================
-; MyOS v0.1 — 32-bit kernel entry stub (NASM -> COFF object for link.exe)
+; MyOS v0.1 — 32-bit kernel entry stub (NASM -> COFF for win32, ELF for linux)
 ;
-; Assembled with `nasm -f win32` and linked FIRST on the link.exe command
-; line, so the image starts here. link.exe /ENTRY:_entry jumps to this code
-; with flat segments; the C stack convention needs nothing else set up here
-; (the bootloader already loaded ESP). kernel_main never returns; if it did
-; we fall into hang.
+; Linked FIRST on the link command line so the image starts here.
+; On Windows MSVC prepends '_' to C symbols; NASM's bare `_entry` matches
+; that. On Linux GCC uses bare names; `entry` matches that.
+;
+; On Linux the flat binary is produced with `objcopy -O binary`, which
+; does NOT emit the .bss section (NOBITS). So we zero .bss ourselves here
+; before calling into C — otherwise every uninitialised static (IDT,
+; kbd ring buffer, ...) starts as garbage.
 ; =============================================================================
 
 [bits 32]
 
-global _entry
-extern _kernel_main
+%ifdef WIN32
+  %define ENTRY _entry
+  %define KMAIN _kernel_main
+%else
+  %define ENTRY entry
+  %define KMAIN kernel_main
+%endif
+
+global ENTRY
+extern KMAIN
 
 section .text
 
-_entry:
-    call _kernel_main
+ENTRY:
+%ifndef WIN32
+    ; ---- zero .bss (Linux only — objcopy drops NOBITS sections) ----
+    extern __bss_start
+    extern __bss_end
+    mov edi, __bss_start
+    mov ecx, __bss_end
+    sub ecx, edi
+    shr ecx, 2          ; dword count
+    xor eax, eax
+    rep stosd
+%endif
+
+    call KMAIN
 .hang:
     hlt
     jmp .hang
