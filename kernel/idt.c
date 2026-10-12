@@ -88,7 +88,7 @@ void irq_install(uint8_t irq, irq_fn_t fn) {
 static void halt(void) {
     cpu_cli();
     for (;;) {
-        __asm hlt
+        cpu_hlt();
     }
 }
 

@@ -1,5 +1,9 @@
-/* MyOS cpu helpers: port I/O and tiny libc substitutes. */
+/* MyOS cpu helpers: port I/O and tiny libc substitutes.
+ * Inline asm is compiler-specific (MSVC __asm vs GCC/Clang __asm__);
+ * everything else is plain freestanding C and identical on both. */
 #include "cpu.h"
+
+#ifdef _MSC_VER
 
 void outb(uint16_t port, uint8_t val) {
     __asm {
@@ -18,6 +22,26 @@ uint8_t inb(uint16_t port) {
     }
     return value;
 }
+
+void cpu_hlt(void) { __asm hlt }
+void cpu_int3(void) { __asm int 3 }
+
+#else /* GCC / Clang (AT&T syntax) */
+
+void outb(uint16_t port, uint8_t val) {
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+void cpu_hlt(void) { __asm__ volatile("hlt"); }
+void cpu_int3(void) { __asm__ volatile("int3"); }
+
+#endif
 
 void io_wait(void) {
     outb(0x80, 0);

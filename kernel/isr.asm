@@ -1,42 +1,49 @@
 ; =============================================================================
-; MyOS v0.1 — interrupt stubs (NASM -> COFF object for link.exe)
+; MyOS v0.1 — interrupt stubs (NASM -> COFF for win32, ELF for linux)
 ;
-; Each CPU exception gets a tiny stub that pushes a uniform frame:
-;   [dummy error code unless the CPU pushed a real one] + vector number,
-; then jumps to isr_common. IRQs (vectors 32..47) go to irq_common instead.
-; isr_common saves everything, calls the C dispatcher with a regs_t pointer,
-; restores state and irets. All IDT gates are interrupt gates, so IF is
-; already clear on entry — hence the leading cli is just belt and braces.
+; Uniform stack frame per vector: [dummy error code unless CPU pushed one]
+; + vector number. isr_common saves everything, calls the C dispatcher
+; with a regs_t*, restores and irets. All gates are interrupt gates,
+; so IF is already clear — the leading cli is belt and braces.
+;
+; Symbol naming: on Windows MSVC C functions are `_name`; on Linux they
+; are `name`. GSYM() picks the right prefix from the -DWIN32 define that
+; build.py passes to nasm on Windows.
 ; =============================================================================
 
 [bits 32]
 
-global _idt_load, _cpu_sti, _cpu_cli
-extern _isr_handler, _irq_handler
+%ifdef WIN32
+  %define GSYM(name) _ %+ name
+%else
+  %define GSYM(name) name
+%endif
 
-; NOTE: win32 output needs an EXPLICIT section for global labels to bind.
-; Without this, NASM emits the code but drops every definition from the
-; symbol table (verified by dumping the .obj: sect=0 on all globals).
+global GSYM(idt_load)
+global GSYM(cpu_sti)
+global GSYM(cpu_cli)
+extern GSYM(isr_handler)
+extern GSYM(irq_handler)
+
 section .text
 
-_idt_load:                       ; void idt_load(uint32_t idtr_addr)
+GSYM(idt_load):
     mov eax, [esp+4]
     lidt [eax]
     ret
 
-_cpu_sti:
+GSYM(cpu_sti):
     sti
     ret
 
-_cpu_cli:
+GSYM(cpu_cli):
     cli
     ret
 
-; ---- CPU exceptions: dummy error code except where the CPU pushes one -----
-; Error-code vectors (Intel SDM): 8, 10, 11, 12, 13, 14, 17.
+; ---- CPU exceptions ---------------------------------------------------------
 %macro ISR_NOERR 1
-global _isr%1
-_isr%1:
+global GSYM(isr%1)
+GSYM(isr%1):
     cli
     push 0
     push %1
@@ -44,8 +51,8 @@ _isr%1:
 %endmacro
 
 %macro ISR_ERR 1
-global _isr%1
-_isr%1:
+global GSYM(isr%1)
+GSYM(isr%1):
     cli
     push %1
     jmp isr_common
@@ -84,10 +91,10 @@ ISR_NOERR 29
 ISR_NOERR 30
 ISR_NOERR 31
 
-; ---- hardware IRQs: vectors 32..47 -----------------------------------------
+; ---- hardware IRQs: vectors 32..47 ------------------------------------------
 %macro IRQ 2
-global _irq%1
-_irq%1:
+global GSYM(irq%1)
+GSYM(irq%1):
     cli
     push 0
     push %2
@@ -101,30 +108,30 @@ IRQ i, i+32
 %endrep
 
 ; ---- catch-all for vectors 48..255 ------------------------------------------
-global _isr_default
-_isr_default:
+global GSYM(isr_default)
+GSYM(isr_default):
     cli
     push 0
     push 255
     jmp isr_common
 
-; ---- common entry ------------------------------------------------------------
+; ---- common entry -----------------------------------------------------------
 isr_common:
-    pusha                         ; eax,ecx,edx,ebx,esp,ebp,esi,edi
+    pusha
     mov ax, ds
-    push eax                      ; ds
-    mov ax, 0x10                  ; kernel data segment
+    push eax
+    mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
-    push esp                      ; regs_t* argument
-    call _isr_handler
-    add esp, 4                    ; drop argument
+    push esp
+    call GSYM(isr_handler)
+    add esp, 4
     pop eax
-    mov ds, ax                    ; restore ds (es/fs/gs never changed)
+    mov ds, ax
     popa
-    add esp, 8                    ; drop vector number + error code
+    add esp, 8
     iret
 
 irq_common:
@@ -137,7 +144,7 @@ irq_common:
     mov fs, ax
     mov gs, ax
     push esp
-    call _irq_handler
+    call GSYM(irq_handler)
     add esp, 4
     pop eax
     mov ds, ax

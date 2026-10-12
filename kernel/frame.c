@@ -44,7 +44,7 @@ void frame_init(void) {
             vga_write("E820 map missing, halting\n");
             serial_write("E820-FAIL\n");
             for (;;) {
-                __asm hlt
+                cpu_hlt();
             }
         }
         vga_write("E820 map: ");
@@ -59,7 +59,7 @@ void frame_init(void) {
         vga_write("FRAME FAILED: no heap for bitmap, halting\n");
         serial_write("FRAME-FAIL bitmap\n");
         for (;;) {
-            __asm hlt
+            cpu_hlt();
         }
     }
     /* kzalloc zeroes: every frame starts free. Mark the regions the
