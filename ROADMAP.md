@@ -59,6 +59,14 @@ compatibility is not a short-term goal.
   vector, Linux-shaped `set_thread_area`, and the `_llseek`/`readv`/`writev`/
   `set_tid_address` calls an outside libc expects. `python build.py probe`
   boots any externally built ELF as PID 1 and asserts its markers.
+- [x] An x86-64 (long mode) target built from the same tree — `python
+  build.py x64` produces `haku64.img` — with a long-mode entry, four-level
+  paging and a 2 MiB-page physmap of all RAM (so no 1020 MiB ceiling), an
+  E820 frame allocator, a kernel heap, a GDT/TSS with IST stacks, a 64-bit
+  IDT with ISR stubs, the 8259 remapped to `0x20`/`0x28`, and a 100 Hz PIT
+  (`HAKU64-TIMER-OK`). It has no scheduler, syscalls, or userland yet;
+  `haku.img` is still the default image and the only one that runs the
+  system.
 
 ## Proposed Milestones
 
@@ -481,10 +489,20 @@ the port is complete.
   them (`bootmem64.c`), and an 8 MiB free-list kernel heap. Self-tests cover
   the physmap alias, allocate/free, a 4 KiB mapping through the new
   `paging64_map_page`, and heap coalescing (`HAKU64-SELFTEST-OK`).
-- [ ] Interrupts: 64-bit IDT and TSS with an IST stack, rewritten ISR stubs,
-  and the PIC/PIT path. MSVC x64 dropped inline `__asm` entirely, so every
-  one of the 26 inline-assembly blocks in `kernel/` becomes a NASM routine or
-  an intrinsic first.
+- [x] Interrupts: 64-bit IDT and TSS with an IST stack, rewritten ISR stubs,
+  and the PIC/PIT path. `gdt64.c` builds a six-entry GDT (kernel and ring-3
+  segments plus a 64-bit TSS) and wires IST1 to `#DF` and IST2 to NMI, so a
+  double fault — normally the *result* of a bad kernel stack — can still be
+  reported. `isr64.asm` has one stub per vector, zero-fills the error-code
+  slot where the CPU does not supply one, and hands a `regs64_t` to
+  `isr64_dispatch`; `pic64.c` remaps the 8259 to `0x20`/`0x28` and `timer64.c`
+  drives the PIT at 100 Hz. MSVC x64 has no inline assembly, so `CLI`/`STI`/
+  `LIDT`/`LGDT`/`LTR`, port I/O, `CR2` and `PAUSE` are NASM routines, and the
+  `HAKU64-EXC-OK` self-test provokes `INT3`, `#PF` and `#DE` and resumes each
+  one by setting `RIP` to a label the assembler exported for the instruction
+  after the faulting one — no instruction decoder and no hardcoded lengths.
+  The IDT layout is asserted separately (`IST` indices, gate type, distinct
+  stubs per vector, one shared catch-all).
 - [ ] Processes: 64-bit context switch, per-process page tables, ring-3
   entry, and the syscall gate (`syscall`/`sysret`, or `int 0x80` with a
   64-bit frame).

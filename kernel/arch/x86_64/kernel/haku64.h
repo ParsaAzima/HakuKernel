@@ -49,11 +49,91 @@ typedef signed long long s64;
 #define K64_E820_MAX   24u
 #define K64_E820_RAM   1u
 
+/* ---------------------------------------------------------------- segments
+ * The GDT gdt64.c installs. The values match entry64.asm's boot table for
+ * the first three entries, so the far return in gdt64_load lands on an
+ * identical code descriptor; the user segments and the TSS are new. */
+#define K64_KERNEL_CS 0x08u
+#define K64_KERNEL_DS 0x10u
+#define K64_USER_CS   0x18u
+#define K64_USER_DS   0x20u
+#define K64_TSS_SEL   0x28u
+
+/* --------------------------------------------------------------- interrupts
+ * Vectors 0..31 are CPU exceptions, 32..47 the remapped 8259 IRQs, and
+ * everything else lands on isr64_default. Gates are 64-bit interrupt gates
+ * (type 0xE), so IF is cleared on entry and handlers never nest. */
+#define K64_IDT_ENTRIES 256u
+#define K64_GATE_INT    0x8Eu  /* present, DPL 0, 64-bit interrupt gate */
+#define K64_GATE_USER   0xEEu  /* present, DPL 3, 64-bit interrupt gate */
+#define K64_IRQ_BASE    0x20u
+#define K64_IRQ_COUNT   16u
+
+/* Stack frame isr64.asm builds; see the comment at the top of that file. */
+typedef struct {
+    u64 r15, r14, r13, r12, r11, r10, r9, r8;
+    u64 rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    u64 vector, error;
+    u64 rip, cs, rflags, rsp, ss;
+} regs64_t;
+
+#pragma pack(push, 1)
+typedef struct {
+    u16 offset_low;
+    u16 selector;
+    u8 ist;        /* bits 0..2: which IST stack to switch to (0 = none) */
+    u8 type_attr;  /* P, DPL, gate type */
+    u16 offset_mid;
+    u32 offset_high;
+    u32 reserved;
+} idt64_entry_t;
+
+typedef struct {
+    u16 limit;
+    u64 base;
+} table_desc64_t;
+#pragma pack(pop)
+
+/* 64-bit TSS. Only RSP0 and the IST pointers are used: there is no hardware
+ * task switching in long mode, so the descriptor exists for the stack
+ * switches a privilege change or a double fault needs. */
+#pragma pack(push, 1)
+typedef struct {
+    u32 reserved0;
+    u64 rsp0;
+    u64 rsp1;
+    u64 rsp2;
+    u64 reserved1;
+    u64 ist[7];
+    u64 reserved2;
+    u16 reserved3;
+    u16 iomap_base;
+} tss64_t;
+#pragma pack(pop)
+
 /* entry64.asm */
 void serial_write64(const char *text);
 void serial_putc64(char c);
 void invlpg64(u64 address);
 void cpu_halt64(void);
+
+/* isr64.asm */
+void isr64_load_idt(u64 idtr_addr);
+void gdt64_load(u64 gdtr_addr);
+void tss64_load(u16 selector);
+void sti64(void);
+void cli64(void);
+u64 read_cr2_64(void);
+void cpu_pause64(void);
+void outb64(u16 port, u8 value);
+u8 inb64(u16 port);
+void int3_probe64(void);
+u64 probe_load64(u64 address);
+u64 probe_div64(u64 a, u64 b);
+extern u8 probe_load64_fault[];
+extern u8 probe_load64_resume[];
+extern u8 probe_div64_fault[];
+extern u8 probe_div64_resume[];
 
 /* Freestanding string/memory primitives: the compiler is allowed to emit
  * calls to these even with /Zl, so they must exist. */
@@ -96,5 +176,32 @@ int heap64_init(void);
 void *kmalloc64(u64 bytes);
 void kfree64(void *ptr);
 u64 heap64_free_bytes(void);
+
+/* gdt64.c: GDT, TSS and the IST stacks */
+void gdt64_init(void);
+u64 gdt64_tss_base(void);
+u64 gdt64_ist_top(u32 index);
+
+/* idt64.c: gate table plus the C exception/IRQ dispatcher */
+void idt64_init(void);
+regs64_t *isr64_dispatch(regs64_t *r);
+u32 exc64_count(u32 vector);
+u64 exc64_last_cr2(void);
+u8 idt64_gate_ist(u32 vector);
+u8 idt64_gate_type(u32 vector);
+u64 idt64_gate_handler(u32 vector);
+
+/* pic64.c: 8259 remap, masks and EOIs */
+void pic64_remap(u8 master_base, u8 slave_base);
+void pic64_mask_all(void);
+void pic64_set_mask(u8 irq);
+void pic64_clear_mask(u8 irq);
+void pic64_send_eoi(u8 irq);
+
+/* timer64.c: PIT on IRQ0 */
+void timer64_init(u32 hz);
+void timer64_tick(void);
+u64 timer64_ticks(void);
+u32 timer64_hz(void);
 
 #endif

@@ -1,4 +1,5 @@
-/* Haku x86-64 bring-up: from long mode to a working memory subsystem.
+/* Haku x86-64 bring-up: from long mode to a working memory subsystem and
+ * an interrupt-driven clock.
  *
  * entry64.asm enters long mode, installs an identity map of the first 1 GiB
  * with 2 MiB pages, and calls kernel64_main. From here the 64-bit kernel
@@ -6,13 +7,15 @@
  *
  *   1. the E820 inventory stage2 left at 0x7000,
  *   2. a supervisor physmap of all RAM at K64_PHYS_MAP_BASE (2 MiB pages),
- *   3. a frame allocator over that map, and
- *   4. a kernel heap.
+ *   3. a frame allocator over that map,
+ *   4. a kernel heap,
+ *   5. the GDT/TSS with its IST stacks,
+ *   6. the IDT, the 8259 remap, and the 100 Hz PIT.
  *
  * Each step prints a marker the headless check asserts, so a regression
  * shows up as a missing line rather than a silent hang. There is no
- * scheduler, no interrupts and no userland on this path yet; when the
- * sequence finishes the CPU halts.
+ * scheduler and no userland on this path yet; when the sequence finishes
+ * the CPU halts with interrupts enabled.
  */
 #include "haku64.h"
 
@@ -184,6 +187,76 @@ static int test_heap(void) {
     return 1;
 }
 
+/* The table layout, as opposed to "an interrupt happened": every gate is a
+ * DPL-0 interrupt gate, #DF and NMI get their own IST stacks, the rest share
+ * the interrupted stack, each vector has its own stub, and the unused
+ * vectors all fall through to the catch-all. */
+static int test_idt_table(void) {
+    u32 v;
+
+    for (v = 0; v < K64_IDT_ENTRIES; v++)
+        if (idt64_gate_type(v) != K64_GATE_INT) return 0;
+    if (idt64_gate_ist(8) != 1) return 0;     /* #DF -> IST1 */
+    if (idt64_gate_ist(2) != 2) return 0;     /* NMI -> IST2 */
+    if (idt64_gate_ist(14) != 0) return 0;    /* #PF -> interrupted stack */
+    if (idt64_gate_ist(K64_IRQ_BASE) != 0) return 0;
+
+    /* Distinct stubs where the vector is part of the pushed frame... */
+    if (idt64_gate_handler(0) == idt64_gate_handler(1)) return 0;
+    if (idt64_gate_handler(K64_IRQ_BASE) ==
+        idt64_gate_handler(K64_IRQ_BASE + 1)) return 0;
+    if (idt64_gate_handler(0) == idt64_gate_handler(K64_IRQ_BASE)) return 0;
+    /* ...and one shared catch-all above the IRQ range. */
+    if (idt64_gate_handler(48) != idt64_gate_handler(255)) return 0;
+    if (idt64_gate_handler(255) == idt64_gate_handler(31)) return 0;
+    return 1;
+}
+
+/* An address in PML4 slot 384: canonical (bits 63..48 sign-extend bit 47)
+ * and, unlike the physmap's slot 256, never populated. */
+#define K64_UNMAPPED_PROBE 0xFFFFC00000000000ull
+
+static int test_exceptions(void) {
+    /* INT3 is a trap, not a fault: the handler reports it and returns, and
+     * the probe continues at the instruction after INT3. */
+    int3_probe64();
+    if (exc64_count(3) != 1) return 0;
+
+    /* The divide probe has to work before it is made to fault, otherwise a
+     * "recovered" #DE would not prove anything. */
+    if (probe_div64(10, 2) != 5) return 0;
+
+    /* A load from an unmapped kernel-half address. The handler resumes the
+     * probe at an exported label, so this returns with a stale RAX. */
+    probe_load64(K64_UNMAPPED_PROBE);
+    if (exc64_count(14) != 1) return 0;
+    if (exc64_last_cr2() != K64_UNMAPPED_PROBE) return 0;
+
+    /* Divide by zero, recovered the same way. */
+    probe_div64(1, 0);
+    if (exc64_count(0) != 1) return 0;
+    return 1;
+}
+
+static int test_timer(void) {
+    u64 start = timer64_ticks();
+    u64 spins = 0;
+
+    /* Wait for five ticks: 50 ms at 100 Hz. Bounded, so a timer that never
+     * fires fails the check instead of hanging the boot. */
+    while (timer64_ticks() < start + 5) {
+        if (++spins > 200000000ull) return 0;
+        cpu_pause64();
+    }
+
+    /* HLT must wake on an interrupt. With IRQ0 running this returns within
+     * 10 ms; with interrupts off or the PIC masked it would never return. */
+    start = timer64_ticks();
+    cpu_halt64();
+    if (timer64_ticks() == start) return 0;
+    return 1;
+}
+
 void kernel64_main(void) {
     u64 top;
     u64 highest;
@@ -227,7 +300,39 @@ void kernel64_main(void) {
     if (!test_paging()) k64_fail("4 KiB mapping self-test");
     if (!test_heap()) k64_fail("heap self-test");
 
-    k64_puts("HAKU64-SELFTEST-OK: physmap, frames, 4 KiB mapping, heap\r\n");
-    k64_puts("HAKU64-READY: memory online, 32-bit kernel still boots the system\r\n");
+    gdt64_init();
+    k64_puts("HAKU64-GDT-OK: tss=");
+    k64_hex(gdt64_tss_base());
+    k64_puts(" ist1=");
+    k64_hex(gdt64_ist_top(1));
+    k64_puts(" ist2=");
+    k64_hex(gdt64_ist_top(2));
+    k64_puts("\r\n");
+
+    idt64_init();
+    if (!test_idt_table()) k64_fail("IDT layout self-test");
+    pic64_remap(K64_IRQ_BASE, K64_IRQ_BASE + 8);
+    pic64_mask_all();
+    pic64_clear_mask(0);        /* only the timer is unmasked so far */
+    timer64_init(100);
+    k64_puts("HAKU64-IDT-OK: gates=256 ist=df/nmi irq0=");
+    k64_dec(K64_IRQ_BASE);
+    k64_puts(" hz=");
+    k64_dec(timer64_hz());
+    k64_puts("\r\n");
+    sti64();
+
+    if (!test_exceptions()) k64_fail("exception dispatch self-test");
+    k64_puts("HAKU64-EXC-OK: int3, page fault and divide error resumed\r\n");
+
+    if (!test_timer()) k64_fail("timer self-test");
+    k64_puts("HAKU64-TIMER-OK: ticks=");
+    k64_dec(timer64_ticks());
+    k64_puts("\r\n");
+
+    k64_puts("HAKU64-SELFTEST-OK: physmap, frames, 4 KiB mapping, heap, "
+             "exceptions, timer\r\n");
+    k64_puts("HAKU64-READY: interrupts online, 32-bit kernel still boots "
+             "the system\r\n");
     for (;;) cpu_halt64();
 }

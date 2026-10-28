@@ -190,7 +190,7 @@ Memory map:
 | `0xBFFFE000–0xC0000000` | two user stack pages |
 | `0xB8000` | VGA text buffer |
 
-### x86-64: boot path and memory (work in progress)
+### x86-64: boot path, memory and interrupts (work in progress)
 
 `python build.py x64` produces `haku64.img` from the same stage1/stage2
 floppy, with a 64-bit kernel entry instead of the 32-bit one. Stage 2 still
@@ -207,6 +207,10 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | paging | supervisor physmap of all RAM at `0xFFFF800000000000`, 2 MiB pages | `HAKU64-PAGING-OK` |
 | frames | E820-backed frame allocator, bitmaps sized from the detected limit | `HAKU64-FRAME-OK` |
 | heap | 8 MiB free-list `kmalloc64`/`kfree64` window | `HAKU64-HEAP-OK` |
+| GDT/TSS | kernel and user segments, a 64-bit TSS, IST1/IST2 stacks | `HAKU64-GDT-OK` |
+| IDT/PIC | 256 gates, 8259 remapped to `0x20`/`0x28`, IRQ0 unmasked | `HAKU64-IDT-OK` |
+| exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
+| timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
 
 The physmap is why the 64-bit build has no equivalent of the 32-bit
@@ -215,10 +219,33 @@ mapping 5 GiB costs five directories and no page tables. A 4 GiB guest
 reports `physmap=5120MiB` and a 5120 MiB frame limit; the 32-bit image on
 the same machine stops at 1020 MiB.
 
-The 64-bit path still has no interrupts, scheduler, syscalls, or userland,
-and `haku.img` remains the default image; ROADMAP.md (Milestone 8) lists the
-remaining stages. The 64-bit sources are excluded from the 32-bit link line,
-so both targets build from one tree.
+Interrupts follow the 32-bit model with 64-bit frames: `isr64.asm` has one
+stub per vector, pushes a zero in the error-code slot for the vectors the CPU
+does not supply one for, and hands a `regs64_t` to `isr64_dispatch`. Two
+things are new in long mode. Gates are 16 bytes and carry an IST index, so
+`#DF` runs on IST1 and NMI on IST2 — a double fault is usually the *result*
+of a bad kernel stack, and without a switch it could not be reported. And the
+TSS exists purely to describe `RSP0` and those stacks, since long mode has no
+hardware task switching.
+
+Because MSVC x64 has no inline assembly, `CLI`/`STI`/`LIDT`/`LGDT`/`LTR`,
+port I/O, `CR2` and `PAUSE` all live in `isr64.asm` as small callable
+functions. The same file holds three exception probes (`int3_probe64`,
+`probe_load64`, `probe_div64`). Recovering from a fault means skipping the
+faulting instruction, so instead of decoding it each probe exports a label
+for the instruction *after* the one that faults and the handler sets `RIP` to
+it — no hardcoded instruction lengths, and the test fails if the handler's
+frame is wrong.
+
+`gdt64_load` replaces the boot GDT with `LGDT` and reloads only the data
+segments. CS is deliberately not reloaded: the new table keeps the boot code
+descriptor byte-identical at selector `0x08`, so the cached descriptor stays
+valid. Index 1 must therefore remain the kernel code descriptor.
+
+The 64-bit path still has no scheduler, syscalls, or userland, and `haku.img`
+remains the default image; ROADMAP.md (Milestone 8) lists the remaining
+stages. The 64-bit sources are excluded from the 32-bit link line, so both
+targets build from one tree.
 
 Physical layout on the 64-bit path: `0–2 MiB` firmware, boot stages, kernel
 image and the boot page tables; `2–16 MiB` boot allocations (page tables,
@@ -1113,13 +1140,18 @@ Haku/
       boot/             entry64.asm: PAE + EFER.LME + PML4/PDPT/PD, far jump
                         into a 64-bit code segment, then call into C
       kernel/           boot64.c: bring-up sequence (E820 → physmap → frames
-                        → heap → self-test); haku64.h: shared types, layout,
-                        asm declarations; serial64.c: COM1 output + memset/
-                        memcpy; bootmem64.c: bump allocator for early tables
+                        → heap → GDT/TSS → IDT/PIC → timer → self-tests);
+                        haku64.h: shared types, layout, asm declarations;
+                        serial64.c: COM1 output + memset/memcpy;
+                        bootmem64.c: bump allocator for early tables;
+                        gdt64.c: GDT, TSS and the IST stacks;
+                        idt64.c: 256 gates + exception/IRQ dispatch;
+                        isr64.asm: stubs, CLI/STI/LIDT/LGDT/LTR, port I/O,
+                        CR2, exception probes; pic64.c: 8259 remap, masks,
+                        EOI; timer64.c: 100 Hz PIT tick counter
       mm/               paging64.c: four-level paging + physmap;
                         frame64.c: E820 frame allocator (no 1 GiB ceiling);
                         heap64.c: 8 MiB free-list kernel heap
-                        coverage)
     drivers/            ata.c/.h: primary/secondary ATA (master/slave) LBA28/LBA48
                         polling PIO with reset/retry recovery and cache flush
                         terminal.c/.h: text-I/O layer (output + input ring)

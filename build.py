@@ -22,10 +22,10 @@ Pipeline:
     QEMU boots haku.img and attaches haku_fs.img as primary-master ATA disk,
     plus a generated spare disk on the secondary channel for device scanning
 
-`python build.py x64` is a separate pipeline: entry64.asm + boot64.c are
-compiled for x86-64, linked as a PE32+ image, and booted from the same
-stage1/stage2 floppy as haku64.img. It shares nothing with the i386 link
-line, so neither target can break the other.
+`python build.py x64` is a separate pipeline: entry64.asm, isr64.asm and the
+kernel/arch/x86_64 C sources are compiled for x86-64, linked as a PE32+
+image, and booted from the same stage1/stage2 floppy as haku64.img. It shares
+nothing with the i386 link line, so neither target can break the other.
 
 The data image (build/haku_fs.img) is user data: an existing image is
 reused as-is so files from previous QEMU sessions survive the build, and
@@ -285,10 +285,12 @@ def build_x64(nasm, py, memory_mb):
     arch32 = os.path.join(ROOT, "kernel", "arch", "x86")
     arch64 = os.path.join(ROOT, "kernel", "arch", "x86_64")
     entry_asm = os.path.join(arch64, "boot", "entry64.asm")
+    isr_asm = os.path.join(arch64, "kernel", "isr64.asm")
     stage1_asm = os.path.join(arch32, "boot", "stage1.asm")
     stage2_asm = os.path.join(arch32, "boot", "stage2.asm")
 
     entry_obj = os.path.join(BUILD, "entry64.obj")
+    isr_obj = os.path.join(BUILD, "isr64.obj")
     kernel_pe = os.path.join(BUILD, "kernel64.pe")
     kernel_bin = os.path.join(BUILD, "kernel64.bin")
     stage1_bin = os.path.join(BUILD, "stage1.bin")
@@ -303,6 +305,7 @@ def build_x64(nasm, py, memory_mb):
     if not sources:
         sys.exit("no kernel/arch/x86_64/**/*.c files found")
     run([nasm, "-f", "win64", entry_asm, "-o", entry_obj])
+    run([nasm, "-f", "win64", isr_asm, "-o", isr_obj])
     objects = []
     for src in sources:
         obj = os.path.join(BUILD, "x64_" +
@@ -315,7 +318,7 @@ def build_x64(nasm, py, memory_mb):
     run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:NATIVE",
                   "/ENTRY:entry64", "/BASE:0x10000", "/ALIGN:16", "/FIXED",
                   "/NODEFAULTLIB", "/OUT:" + kernel_pe,
-                  entry_obj] + objects)
+                  entry_obj, isr_obj] + objects)
     pe = subprocess.run([py, os.path.join(ROOT, "tools", "pe2bin.py"),
                          kernel_pe, kernel_bin],
                         capture_output=True, text=True)
@@ -356,7 +359,9 @@ def build_x64(nasm, py, memory_mb):
     log("--- serial log (x64) ---")
     log(content)
     required = ["HAKU64-BOOT-OK", "HAKU64-E820-OK", "HAKU64-PAGING-OK",
-                "HAKU64-FRAME-OK", "HAKU64-HEAP-OK", "HAKU64-SELFTEST-OK"]
+                "HAKU64-FRAME-OK", "HAKU64-HEAP-OK", "HAKU64-GDT-OK",
+                "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
+                "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():
