@@ -35,6 +35,8 @@
 
 global entry64
 global serial_write64
+global serial_putc64
+global invlpg64
 global cpu_halt64
 extern kernel64_main
 
@@ -140,6 +142,25 @@ serial_write64:
 ; void cpu_halt64(void)
 cpu_halt64:
     hlt
+    ret
+
+; void serial_putc64(char c)   [Microsoft x64: character in CL]
+serial_putc64:
+.wait:
+    mov dx, 0x3FD                     ; line status register
+    in al, dx
+    test al, 0x20                     ; THR empty?
+    jz .wait
+    mov dx, 0x3F8
+    mov al, cl
+    out dx, al
+    ret
+
+; void invlpg64(u64 address)   [Microsoft x64: address in RCX]
+; MSVC x64 has no inline assembly, so the one TLB instruction the paging
+; code needs lives here.
+invlpg64:
+    invlpg [rcx]
     ret
 
 ; ---------------------------------------------------------------- GDT

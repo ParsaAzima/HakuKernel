@@ -473,9 +473,14 @@ the port is complete.
   calling convention across the asm/C boundary. `python build.py x64` reuses
   the existing stage1/stage2 floppy, and `tools/pe2bin.py` now converts PE32+
   images as well as PE32.
-- [ ] Memory: 4-level paging helpers, a frame allocator over 64-bit physical
-  addresses (no 1020 MiB direct-map ceiling), and the kernel heap rebuilt on
-  the new mapping primitives.
+- [x] Memory: four-level paging helpers, a supervisor physmap of all RAM at
+  `0xFFFF800000000000` built from 2 MiB pages (one page directory per GiB,
+  so no page tables and no 1020 MiB ceiling — a 4 GiB guest reports a
+  5120 MiB frame limit), an E820 frame allocator whose bitmaps are sized
+  from the detected limit, a bump allocator for the structures that precede
+  them (`bootmem64.c`), and an 8 MiB free-list kernel heap. Self-tests cover
+  the physmap alias, allocate/free, a 4 KiB mapping through the new
+  `paging64_map_page`, and heap coalescing (`HAKU64-SELFTEST-OK`).
 - [ ] Interrupts: 64-bit IDT and TSS with an IST stack, rewritten ISR stubs,
   and the PIC/PIT path. MSVC x64 dropped inline `__asm` entirely, so every
   one of the 26 inline-assembly blocks in `kernel/` becomes a NASM routine or

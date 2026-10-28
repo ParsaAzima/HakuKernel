@@ -190,23 +190,39 @@ Memory map:
 | `0xBFFFE000–0xC0000000` | two user stack pages |
 | `0xB8000` | VGA text buffer |
 
-### x86-64: boot path only (work in progress)
+### x86-64: boot path and memory (work in progress)
 
 `python build.py x64` produces `haku64.img` from the same stage1/stage2
 floppy, with a 64-bit kernel entry instead of the 32-bit one. Stage 2 still
 leaves the CPU in 32-bit protected mode; `kernel/arch/x86_64/boot/entry64.asm`
 takes over from there, enables PAE and `EFER.LME`, installs a PML4/PDPT/PD
 identity map of the first 1 GiB with 2 MiB pages, and far-jumps to a 64-bit
-code segment. `kernel/arch/x86_64/kernel/boot64.c` is then the first C code
-that runs in long mode, and it reports `HAKU64-BOOT-OK` on COM1.
+code segment.
 
-That is the whole of the 64-bit path today. It proves the long-mode
-transition, the 64-bit segment setup, the Microsoft x64 calling convention
-across the asm/C boundary, and PE32+ handling in `tools/pe2bin.py`. The heap,
-frame allocator, interrupts, scheduler, syscalls, and userland are still the
-32-bit implementation, and `haku.img` remains the default image; ROADMAP.md
-(Milestone 8) lists the remaining stages. The 64-bit sources are excluded
-from the 32-bit link line, so both targets build from one tree.
+From `kernel64_main` the 64-bit kernel brings up, in order:
+
+| Step | What it builds | Marker |
+|---|---|---|
+| E820 | physical inventory from the map stage2 left at `0x7000` | `HAKU64-E820-OK` |
+| paging | supervisor physmap of all RAM at `0xFFFF800000000000`, 2 MiB pages | `HAKU64-PAGING-OK` |
+| frames | E820-backed frame allocator, bitmaps sized from the detected limit | `HAKU64-FRAME-OK` |
+| heap | 8 MiB free-list `kmalloc64`/`kfree64` window | `HAKU64-HEAP-OK` |
+| self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
+
+The physmap is why the 64-bit build has no equivalent of the 32-bit
+1020 MiB ceiling: one page directory covers a GiB with 2 MiB pages, so
+mapping 5 GiB costs five directories and no page tables. A 4 GiB guest
+reports `physmap=5120MiB` and a 5120 MiB frame limit; the 32-bit image on
+the same machine stops at 1020 MiB.
+
+The 64-bit path still has no interrupts, scheduler, syscalls, or userland,
+and `haku.img` remains the default image; ROADMAP.md (Milestone 8) lists the
+remaining stages. The 64-bit sources are excluded from the 32-bit link line,
+so both targets build from one tree.
+
+Physical layout on the 64-bit path: `0–2 MiB` firmware, boot stages, kernel
+image and the boot page tables; `2–16 MiB` boot allocations (page tables,
+frame bitmaps); `16–24 MiB` kernel heap. A machine needs at least 32 MiB.
 
 ### Interrupts (IDT)
 
@@ -1096,7 +1112,13 @@ Haku/
     arch/x86_64/
       boot/             entry64.asm: PAE + EFER.LME + PML4/PDPT/PD, far jump
                         into a 64-bit code segment, then call into C
-      kernel/           boot64.c: the first 64-bit C code (HAKU64-BOOT-OK)
+      kernel/           boot64.c: bring-up sequence (E820 → physmap → frames
+                        → heap → self-test); haku64.h: shared types, layout,
+                        asm declarations; serial64.c: COM1 output + memset/
+                        memcpy; bootmem64.c: bump allocator for early tables
+      mm/               paging64.c: four-level paging + physmap;
+                        frame64.c: E820 frame allocator (no 1 GiB ceiling);
+                        heap64.c: 8 MiB free-list kernel heap
                         coverage)
     drivers/            ata.c/.h: primary/secondary ATA (master/slave) LBA28/LBA48
                         polling PIO with reset/retry recovery and cache flush
