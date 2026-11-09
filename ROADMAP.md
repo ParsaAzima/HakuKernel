@@ -403,7 +403,7 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   the console answers `TCGETS`/`TCSETS*`, `TIOCGWINSZ`, and `FIONREAD`.
   Permission and ownership calls succeed without changing anything because
   FAT12 has no mode or owner bits, and `getrlimit` reports the fixed table
-  sizes (8 descriptors, 4 tasks). `poll` blocks (zero scans once, negative
+  sizes (32 descriptors, 4 tasks). `poll` blocks (zero scans once, negative
   waits forever, positive is a millisecond deadline) by parking on a
   scheduler activity queue the timer wakes every tick, so the wait and its
   deadline are re-scanned at 100 Hz without per-descriptor wakeups; `select`

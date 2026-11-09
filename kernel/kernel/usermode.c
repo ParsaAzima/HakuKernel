@@ -2151,8 +2151,8 @@ static uint32_t sys_getrlimit(uint32_t resource, uint32_t user_rlim,
         return copy_from_user_error(HAKU_EINVAL);
     switch (resource) {
     case HAKU_RLIMIT_NOFILE:
-        limits.rlim_cur = 8u;
-        limits.rlim_max = 8u;
+        limits.rlim_cur = VFS_FD_LIMIT;
+        limits.rlim_max = VFS_FD_LIMIT;
         break;
     case HAKU_RLIMIT_NPROC:
         limits.rlim_cur = 4u;

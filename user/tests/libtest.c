@@ -254,6 +254,11 @@ static void test_filesystem_abi(void) {
         duplicate = fcntl(fd, F_DUPFD, 5);
         expect(duplicate >= 5, "fcntl F_DUPFD");
         if (duplicate >= 0) close(duplicate);
+        /* A job-control shell moves its terminal above fd 9 so that
+         * applet file descriptors never land on it. */
+        duplicate = fcntl(fd, F_DUPFD_CLOEXEC, 10);
+        expect(duplicate >= 10, "fcntl F_DUPFD_CLOEXEC above 9");
+        if (duplicate >= 0) close(duplicate);
         close(fd);
         unlink("ABI3.TXT");
     }
@@ -294,7 +299,7 @@ static void test_filesystem_abi(void) {
     expect(isatty(-1) == 0, "isatty(-1)");
 
     /* Limits, process name, persona, and randomness. */
-    expect(getrlimit(RLIMIT_NOFILE, &limits) == 0 && limits.rlim_cur == 8,
+    expect(getrlimit(RLIMIT_NOFILE, &limits) == 0 && limits.rlim_cur == 32,
            "getrlimit NOFILE");
     limits.rlim_cur = 4;
     expect(setrlimit(RLIMIT_NOFILE, &limits) == 0, "setrlimit");

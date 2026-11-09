@@ -69,6 +69,10 @@
 /* Longest path (including NUL) the VFS and its backends accept. */
 #define VFS_PATH_MAX 64u
 #define VFS_MAX_MOUNTS 6u
+/* Descriptors per process. A job-control shell dups its controlling
+ * terminal above fd 9 (busybox ash asks fcntl(F_DUPFD, 10)), so the table
+ * has to reach past that or the shell reports it cannot access a tty. */
+#define VFS_FD_LIMIT 32u
 
 /* Filesystem-independent metadata: the fields the Linux stat layouts
  * carry. Backends fill what their filesystem can answer; the syscall
@@ -203,7 +207,7 @@ int vfs_open_stdio(uint32_t pid);
  * file descriptions (each copy bumps the reference count). Called on
  * spawn before the child runs. Returns 1 or a negative -VFS_E* errno. */
 int32_t vfs_inherit(uint32_t parent_pid, uint32_t child_pid);
-/* Number of descriptors currently open for a process (0..VFS_FD_COUNT). */
+/* Number of descriptors currently open for a process (0..VFS_FD_LIMIT). */
 uint32_t vfs_open_count(uint32_t pid);
 /* Follow symbolic links in the last component across mounts, writing the
  * resolved path to `out` (which may alias `path`). Returns 1 or a negative
@@ -220,7 +224,7 @@ int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset, uint32_t whence);
  * sees the same offset/access mode and keeps the file alive until the last
  * of them closes. dup returns the lowest free fd, dup2 returns newfd (or
  * closes and reuses it if already open); both return 1 or -VFS_E*. Any fd
- * in 0..VFS_FD_COUNT-1 is valid, including the standard descriptors, so
+ * in 0..VFS_FD_LIMIT-1 is valid, including the standard descriptors, so
  * dup2 can redirect 0/1/2 onto a file or another handle. */
 int32_t vfs_dup(uint32_t pid, uint32_t fd);
 int32_t vfs_dup2(uint32_t pid, uint32_t oldfd, uint32_t newfd);

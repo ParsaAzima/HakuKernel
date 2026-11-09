@@ -695,7 +695,7 @@ name resolves and
 refuses `X_OK` because nothing is marked executable; `fchmod`, `fchown`,
 and their `*at` forms succeed without changing anything because FAT12 stores
 no mode or owner bits. `getrlimit`/`setrlimit`/`prlimit64` report the fixed
-table sizes (8 descriptors, 4 tasks, `RLIM_INFINITY` elsewhere) and accept a
+table sizes (32 descriptors, 4 tasks, `RLIM_INFINITY` elsewhere) and accept a
 new value without applying it. `getrandom` fills a buffer from a xorshift
 generator seeded by the tick counter and the pid, `sched_yield` hands the
 CPU to the next runnable task, `prctl` stores a 15-character process name
