@@ -152,6 +152,11 @@ typedef struct vfs_fs_ops {
      * lstat() can report a link instead of its target. NULL means the
      * backend has no link type and stat is the answer. */
     int32_t (*lstat)(const char *path, vfs_stat_t *out);
+    /* Optional: 1 when this open handle is a terminal. The console behind
+     * fds 0-2 is a VFS_OFD_DEVICE, but a /dev/tty opened by path is an
+     * ordinary backend file, and a shell asks ioctl about the descriptor
+     * it just opened. NULL means "never a terminal". */
+    int (*is_tty)(void *handle);
 } vfs_fs_ops_t;
 
 /* Character-device backend for the standard descriptors 0/1/2. These are

@@ -1982,6 +1982,26 @@ static uint32_t sys_ioctl(uint32_t fd, uint32_t request, uint32_t user_arg) {
             return copy_from_user_error(HAKU_EFAULT);
         return 0u;
     }
+    /* Foreground process group. There is exactly one group, the caller's,
+     * so the answers are the caller's pid and a write of that pid. ash
+     * checks both before turning job control on, and a mismatch would make
+     * it stop the shell with SIGTTIN. */
+    case HAKU_TIOCGPGRP: {
+        haku_i32 pgrp = (haku_i32)scheduler_current_pid();
+        if (!copy_to_user(user_arg, &pgrp, sizeof(pgrp)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    }
+    case HAKU_TIOCSPGRP: {
+        haku_i32 pgrp;
+        if (!copy_from_user(&pgrp, user_arg, sizeof(pgrp)))
+            return copy_from_user_error(HAKU_EFAULT);
+        if (pgrp != (haku_i32)scheduler_current_pid())
+            return copy_from_user_error(HAKU_EPERM);
+        return 0u;
+    }
+    case HAKU_TIOCNOTTY:
+        return 0u;
     case HAKU_TCSBRK:
     case HAKU_TCFLSH:
         return 0u;
@@ -2186,6 +2206,26 @@ static uint32_t sys_setrlimit(uint32_t resource, uint32_t user_rlim) {
         return copy_from_user_error(HAKU_EINVAL);
     if (!copy_from_user(&limits, user_rlim, sizeof(limits)))
         return copy_from_user_error(HAKU_EFAULT);
+    return 0u;
+}
+
+/* getpgid(132)/getsid(147). Haku has one process per group and one per
+ * session, so the group and session of a process are its pid. A caller
+ * names itself with 0; any other id has to be a task slot that exists. */
+static uint32_t sys_getpgid(uint32_t pid) {
+    uint32_t self = scheduler_current_pid();
+    if (pid == 0u) return self;
+    if (pid > SCHEDULER_MAX_PROCESSES) return copy_from_user_error(HAKU_ESRCH);
+    return pid;
+}
+
+/* setpgid(57). A process is already its own group leader, so putting
+ * itself (or joining its own group) is a no-op; Haku never moves another
+ * process between groups. setsid(66) is likewise already true. */
+static uint32_t sys_setpgid(uint32_t pid, uint32_t pgid) {
+    uint32_t self = scheduler_current_pid();
+    if (pid != 0u && pid != self) return copy_from_user_error(HAKU_ESRCH);
+    if (pgid != 0u && pgid != self) return copy_from_user_error(HAKU_EINVAL);
     return 0u;
 }
 
@@ -2481,6 +2521,19 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_GETPPID:
         r->eax = scheduler_parent_pid();
+        return r;
+    case HAKU_SYS_GETPGRP:
+        r->eax = scheduler_current_pid();
+        return r;
+    case HAKU_SYS_SETPGID:
+        r->eax = sys_setpgid(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_GETPGID:
+    case HAKU_SYS_GETSID:
+        r->eax = sys_getpgid(r->ebx);
+        return r;
+    case HAKU_SYS_SETSID:
+        r->eax = scheduler_current_pid();
         return r;
     case HAKU_SYS_GETTID:
         r->eax = scheduler_current_pid();

@@ -151,6 +151,16 @@ int isatty(int fd) {
     return tcgetattr(fd, &attributes) == 0;
 }
 
+int tcgetpgrp(int fd) {
+    int pgrp;
+    if (ioctl(fd, HAKU_TIOCGPGRP, &pgrp) != 0) return -1;
+    return pgrp;
+}
+
+int tcsetpgrp(int fd, int pgrp) {
+    return ioctl(fd, HAKU_TIOCSPGRP, &pgrp);
+}
+
 /* --- directory stream ------------------------------------------------ */
 
 DIR *opendir(const char *path) {

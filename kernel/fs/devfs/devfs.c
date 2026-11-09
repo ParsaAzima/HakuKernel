@@ -73,6 +73,16 @@ static int32_t console_write(const void *buffer, uint32_t count,
     return terminal_write_bytes(buffer, count, out_count);
 }
 
+/* 1 for the entries that are the terminal. A shell opens /dev/tty by path
+ * and then asks that descriptor for its termios and foreground process
+ * group, so ioctl has to recognise it as a console. */
+static int devfs_is_tty(void *handle_ptr) {
+    devfs_handle_t *handle = (devfs_handle_t *)handle_ptr;
+    if (!handle || !handle->entry) return 0;
+    return name_equal(handle->entry->name, "tty") ||
+           name_equal(handle->entry->name, "console");
+}
+
 static const devfs_entry_t devfs_entries[] = {
     { "null", null_read, null_write },
     { "zero", zero_read, null_write },
@@ -247,6 +257,8 @@ static const vfs_fs_ops_t devfs_ops = {
     devfs_truncate,
     0,                /* symlink */
     0,                /* readlink */
+    0,                /* lstat */
+    devfs_is_tty,
 };
 
 int devfs_init(void) {

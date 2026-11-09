@@ -72,6 +72,26 @@ int getppid(void) {
     return haku_syscall0(HAKU_SYS_GETPPID);
 }
 
+int getpgrp(void) {
+    return haku_syscall0(HAKU_SYS_GETPGRP);
+}
+
+int getpgid(int pid) {
+    return haku_errno_check(haku_syscall1(HAKU_SYS_GETPGID, pid));
+}
+
+int setpgid(int pid, int pgid) {
+    return haku_errno_check(haku_syscall2(HAKU_SYS_SETPGID, pid, pgid));
+}
+
+int setsid(void) {
+    return haku_errno_check(haku_syscall0(HAKU_SYS_SETSID));
+}
+
+int getsid(int pid) {
+    return haku_errno_check(haku_syscall1(HAKU_SYS_GETSID, pid));
+}
+
 int getuid(void) {
     return haku_syscall0(HAKU_SYS_GETUID);
 }

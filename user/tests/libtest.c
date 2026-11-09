@@ -298,6 +298,16 @@ static void test_filesystem_abi(void) {
     expect(isatty(1) == 1, "isatty(1)");
     expect(isatty(-1) == 0, "isatty(-1)");
 
+    /* Job-control setup: the process is its own group and session, and the
+     * console reports it as the foreground group. */
+    expect(getpgrp() == getpid(), "getpgrp");
+    expect(getpgid(0) == getpid(), "getpgid(0)");
+    expect(setpgid(0, 0) == 0, "setpgid(0, 0)");
+    expect(setsid() == getpid(), "setsid");
+    expect(getsid(0) == getpid(), "getsid(0)");
+    expect(tcgetpgrp(1) == getpid(), "tcgetpgrp(1)");
+    expect(tcsetpgrp(1, getpid()) == 0, "tcsetpgrp(1, getpid())");
+
     /* Limits, process name, persona, and randomness. */
     expect(getrlimit(RLIMIT_NOFILE, &limits) == 0 && limits.rlim_cur == 32,
            "getrlimit NOFILE");

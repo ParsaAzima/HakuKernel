@@ -73,13 +73,20 @@ SHELL_CHECK_SCRIPT = (
     'sh -c "' + SHELL_SETUP +
     'echo SHELL-OK; echo UNAME:$(uname -n); '
     'echo APPS:$(ls /bin | wc -l); '
-    'ls /; cat /proc/version; echo SHELL-DONE; exec sh"')
+    'ls /; cat /proc/version; '
+    # -i makes ash turn job control on, which runs exactly the sequence the
+    # interactive shell does on start-up: dup the controlling terminal above
+    # fd 9, read the foreground group, and install it back. Without the
+    # kernel's process-group answers this prints "can't access tty".
+    "sh -i -c 'echo SHELL-JOBCTL-OK'; "
+    'echo SHELL-DONE; exec sh"')
 # Output the check insists on. A boot that reaches the prompt but cannot run
 # an applet still prints SHELL-OK, so the markers alone are not enough: the
-# nodename proves uname ran, the applet count proves the links resolve, and
-# the /proc line proves a file read went through the VFS.
+# nodename proves uname ran, the applet count proves the links resolve, the
+# /proc line proves a file read went through the VFS, and the job-control
+# marker proves an interactive shell could take over the terminal.
 SHELL_EXPECTED = ["SHELL-BOOT", "SHELL-OK", "UNAME:haku", "HakuKernel",
-                  "SHELL-DONE"]
+                  "SHELL-JOBCTL-OK", "SHELL-DONE"]
 
 
 def log(msg):
@@ -816,11 +823,14 @@ def main():
             for line in content.splitlines():
                 if "PANIC" in line or "FAIL" in line:
                     log("  " + line.strip())
+                    missing.append("no PANIC/FAIL")
+        if "can't access tty" in content or "job control turned off" in content:
+            missing.append("no tty warning")
         if missing or not reached:
             sys.exit("SHELL CHECK FAILED: missing " + ", ".join(missing))
         log(f"SHELL CHECK PASSED: busybox ash ran as pid 1, "
             f"{applets.group(1)} applets resolved through $PATH, "
-            f"uname and /proc answered")
+            f"uname and /proc answered, job control enabled")
     elif mode in ("headless", "probe"):
         serial = os.path.join(BUILD, "serial.log")
         shot = os.path.join(BUILD, "screen.png")

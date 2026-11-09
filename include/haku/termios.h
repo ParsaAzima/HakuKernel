@@ -52,12 +52,17 @@ struct winsize {
 #define TCSETSF    HAKU_TCSETSF
 #define TCSBRK     HAKU_TCSBRK
 #define TCFLSH     HAKU_TCFLSH
+#define TIOCGPGRP  HAKU_TIOCGPGRP
+#define TIOCSPGRP  HAKU_TIOCSPGRP
 #define TIOCGWINSZ HAKU_TIOCGWINSZ
 #define FIONREAD   HAKU_FIONREAD
+#define TIOCNOTTY  HAKU_TIOCNOTTY
 
 int ioctl(int fd, unsigned int request, void *argument);
 int tcgetattr(int fd, termios_t *attributes);
 int tcsetattr(int fd, int action, const termios_t *attributes);
+int tcgetpgrp(int fd);
+int tcsetpgrp(int fd, int pgrp);
 int isatty(int fd);
 
 #endif

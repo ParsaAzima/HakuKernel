@@ -1356,11 +1356,16 @@ uint32_t vfs_poll_events(uint32_t pid, uint32_t fd, int for_write) {
     return VFS_POLLNVAL;
 }
 
-int vfs_is_console(uint32_t pid, uint32_t fd) {    vfs_ofd_t *ofd;
+int vfs_is_console(uint32_t pid, uint32_t fd) {
+    vfs_ofd_t *ofd;
     int result = 0;
     mutex_lock(&vfs_lock);
     ofd = fd_ofd(pid, fd);
-    if (ofd && ofd->kind == VFS_OFD_DEVICE) result = 1;
+    if (ofd) {
+        if (ofd->kind == VFS_OFD_DEVICE) result = 1;
+        else if (ofd->kind == VFS_OFD_FILE && ofd->ops && ofd->ops->is_tty)
+            result = ofd->ops->is_tty(ofd->backend);
+    }
     mutex_unlock(&vfs_lock);
     return result;
 }

@@ -56,6 +56,13 @@ int personality(unsigned int persona);
 #define PER_QUERY HAKU_PER_QUERY
 int getpid(void);
 int getppid(void);
+/* Process groups and sessions: a process is its own group and session,
+ * so each of these reports or accepts the caller's pid. */
+int getpgrp(void);
+int getpgid(int pid);
+int setpgid(int pid, int pgid);
+int setsid(void);
+int getsid(int pid);
 int getuid(void);
 int geteuid(void);
 int getgid(void);

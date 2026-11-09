@@ -67,7 +67,9 @@ compatibility is not a short-term goal.
   read/write counts, returning the exact break from `brk`, demand-grown
   user stack, 64-entry `mmap` table, FAT12 exec bits, cross-mount symlink
   expansion, and an in-kernel exec image cache to make QEMU/TCG performance
-  usable.
+  usable. The interactive shell also turns job control on: the descriptor
+  table reaches fd 31 (ash dups the terminal to fd 10) and a `/dev/tty`
+  opened by path answers `TIOCGPGRP`/`TIOCSPGRP` with pid-as-group.
 - [x] An x86-64 (long mode) target built from the same tree — `python
   build.py x64` produces `haku64.img` — with a long-mode entry, four-level
   paging and a 2 MiB-page physmap of all RAM (so no 1020 MiB ceiling), an
@@ -355,8 +357,9 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   wakes it with `EINTR`. `fork`/`vfork` reset the dispositions and keep the
   blocked set; `execve` resets the dispositions and keeps the blocked set
   and the pending signals. Covered by `USER-SIGNAL-OK` in the C library
-  self-test. Still missing: process groups, job control, `sigqueue`, and
-  real-time signals.
+  self-test. Still missing: real process groups and job control (the group
+  and session calls report pid-as-group so an interactive shell can turn
+  job control on), `sigqueue`, and real-time signals.
 - [x] Add the memory syscalls a libc needs: `mmap2` with
   `MAP_FIXED`/`MAP_ANONYMOUS`/`MAP_SHARED`, `mprotect`, `mremap`,
   `madvise`, and thread-local storage through `set_thread_area` (today
@@ -400,7 +403,9 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   reader and writer counts (end of file once every write end closes,
   `EPIPE` plus `SIGPIPE` once every read end does), `fcntl` reports and sets
   `O_APPEND`/`O_NONBLOCK` and duplicates onto a requested descriptor, and
-  the console answers `TCGETS`/`TCSETS*`, `TIOCGWINSZ`, and `FIONREAD`.
+  the console answers `TCGETS`/`TCSETS*`, `TIOCGWINSZ`, `FIONREAD`,
+  `TIOCGPGRP`/`TIOCSPGRP` with the caller's pid as the foreground group, and
+  `TIOCNOTTY`, while a `/dev/tty` opened by path answers the same requests.
   Permission and ownership calls succeed without changing anything because
   FAT12 has no mode or owner bits, and `getrlimit` reports the fixed table
   sizes (32 descriptors, 4 tasks). `poll` blocks (zero scans once, negative

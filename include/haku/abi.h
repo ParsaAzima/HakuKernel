@@ -45,6 +45,15 @@
 #define HAKU_SYS_GETEGID 50u
 #define HAKU_SYS_DUP2    63u
 #define HAKU_SYS_GETPPID 64u
+/* Process groups and sessions. Haku has no group or session model: a
+ * process is its own group leader and its own session, so these calls
+ * report the caller's pid. They exist because a job-control shell asks
+ * for all of them before it will turn job control on. */
+#define HAKU_SYS_SETPGID 57u
+#define HAKU_SYS_GETPGRP 65u
+#define HAKU_SYS_SETSID  66u
+#define HAKU_SYS_GETPGID 132u
+#define HAKU_SYS_GETSID  147u
 #define HAKU_SYS_GETRUSAGE 77u
 #define HAKU_SYS_GETTIMEOFDAY 78u
 /* i386 old_mmap: a single pointer to haku_mmap_arg_t in ebx. */
@@ -755,8 +764,11 @@ typedef struct {
 #define HAKU_TCSETSF    0x5404u
 #define HAKU_TCSBRK     0x5409u
 #define HAKU_TCFLSH     0x540Bu
+#define HAKU_TIOCGPGRP  0x540Fu
+#define HAKU_TIOCSPGRP  0x5410u
 #define HAKU_TIOCGWINSZ 0x5413u
 #define HAKU_FIONREAD   0x541Bu
+#define HAKU_TIOCNOTTY  0x5422u
 
 /* termios flag bits Haku honours (the rest are stored and reported back
  * unchanged). */

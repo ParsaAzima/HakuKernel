@@ -587,7 +587,8 @@ the signal number in the wait status the way Linux reports it. A signal
 queued for a task blocked in a syscall wakes it with `EINTR` (the console
 read loop re-checks the input ring instead of returning `EINTR`). `kill`
 with pid 0 targets the caller and pid -1 targets every other process,
-because Haku has no process groups; any other negative pid gives `ESRCH`.
+because Haku has no scheduler process groups; any other negative pid gives
+`ESRCH`.
 `fork` and
 `vfork` reset the dispositions to the default and keep the blocked set;
 `execve` resets the dispositions and keeps both the blocked set and the
@@ -595,8 +596,9 @@ pending signals. The C library wrappers live in `user/lib/signal.c` behind
 `include/haku/signal.h`, and the ring-3 self-test covers delivery, blocking,
 `SIG_IGN`, `SA_SIGINFO`, `SA_RESTORER`, the pid/tid forms, the default
 fatal disposition, and the `EINTR` wake-up (`USER-SIGNAL-OK`). Haku has no
-process groups, no job control (the stop signals end the process), no
-`sigqueue`, and one thread per process, so a thread id is a process id.
+scheduler process-group model, no job control (the stop signals end the
+process), no `sigqueue`, and one thread per process, so a thread id is a
+process id.
 
 Writes are not atomic: there is no journal, so a failing multi-sector
 write leaves exactly its durable prefix (a short count means those bytes
@@ -676,7 +678,13 @@ descriptors with `EINVAL`.
 (`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`, erase `0x7F`,
 EOF `^D`), accepts `TCSETS`/`TCSETSW`/`TCSETSF` without changing that mode,
 reports an 80x25 window for `TIOCGWINSZ`, and returns `ENOTTY` for a
-descriptor that is not the console. `poll` reports readiness per descriptor (a
+descriptor that is not the console. A terminal opened by path (`/dev/tty`,
+`/dev/console`) answers the same requests, and `TIOCGPGRP`/`TIOCSPGRP`
+report and accept the caller's pid as the foreground process group while
+`TIOCNOTTY` is accepted. Haku has no scheduler process groups, so `getpgrp`,
+`getpgid`, `getsid` and `setsid` report the caller's pid and `setpgid`
+accepts only the caller's own group — enough for an interactive `ash` to
+turn job control on instead of announcing that it cannot access a tty. `poll` reports readiness per descriptor (a
 pipe with data is `POLLIN`, a closed write end adds `POLLHUP`, a closed read
 end makes the write side `POLLERR`), and it blocks: a zero timeout scans once,
 a negative one waits indefinitely, and a positive one is a millisecond
@@ -754,7 +762,8 @@ userland; conformance is not a goal. What exists, by area:
 
 - **Process:** `exit`/`exit_group`, `fork`, `vfork`, `clone` (fork form),
   `wait4`/`waitpid`, `execve`, `getpid`/`getppid`/`getuid`/`geteuid`/
-  `getgid`/`getegid`/`gettid`, `kill`/`tkill`/`tgkill`, `rt_sigaction`/
+  `getgid`/`getegid`/`gettid`, `getpgrp`/`getpgid`/`setpgid`/`setsid`/
+  `getsid`, `kill`/`tkill`/`tgkill`, `rt_sigaction`/
   `rt_sigprocmask`/`rt_sigreturn`, `sched_yield`, `prctl` (process name),
   `personality`, `times`, `getrusage` (zeroed), `uname`,
   `getrlimit`/`setrlimit`/`prlimit64` (fixed values), `getrandom`.
@@ -772,9 +781,11 @@ userland; conformance is not a goal. What exists, by area:
 - **Time:** `gettimeofday`, `nanosleep`.
 - **Haku-specific:** `spawn`, `getusage`, `futex`.
 
-Deliberately absent: process groups and job control, threads (`clone`
-rejects the thread flags), hard links, file-backed mappings,
-`socket`, `mount` (the boot namespace is fixed at boot), and networking.
+Deliberately absent: scheduler process groups (the group and session calls
+report pid-as-group so a shell can enable job control, but stop signals still
+end a process), threads (`clone` rejects the thread flags), hard links,
+file-backed mappings, `socket`, `mount` (the boot namespace is fixed at
+boot), and networking.
 Where a call exists but cannot be honoured — permission bits, record locks,
 terminal modes — it succeeds
 without changing state and the limitation is documented above instead of
@@ -1092,6 +1103,13 @@ usable shell":
   reuses it, which is the difference between "unusable" and "instant". The
   cache is keyed by path and size, and is also seeded with the boot image so
   PID 1 never pays for it. `ata_read_one` additionally moved to `rep insw`.
+- **Job control is terminal-only.** `ash` enables it only after it dups the
+  controlling terminal above fd 9, reads the foreground group, and writes it
+  back. The descriptor table reaches fd 31, a `/dev/tty` opened by path
+  answers the termios and `TIOCGPGRP`/`TIOCSPGRP` requests, and the
+  process-group calls report the caller's pid, so the shell starts without
+  `can't access tty; job control turned off` (the scripted check runs
+  `sh -i -c` to assert exactly that setup). Stop signals still end a process.
 
 Interactive use is the same image without `INIT.CMD`: `python build.py shell`
 drops into `ash` on the serial console. `ls` (sorted columns, 300+ entries),
