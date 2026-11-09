@@ -16,6 +16,8 @@ void outb(uint16_t port, uint8_t val);
 void outw(uint16_t port, uint16_t val);
 uint8_t inb(uint16_t port);
 uint16_t inw(uint16_t port);
+/* Bulk port read: `count` words from `port` into memory in one `rep insw`. */
+void inw_string(uint16_t port, void *destination, uint32_t count);
 uint32_t cpu_irq_save(void);
 void cpu_irq_restore(uint32_t flags);
 /* ~1us delay via the POST-card port, like Linux io_delay(). */

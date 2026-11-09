@@ -47,6 +47,13 @@
 #define PAGING_ENTRIES    1024u
 #define PAGING_USER_LIMIT  0xC0000000u
 
+/* Lowest user virtual address the kernel will map. It has to stay above the
+ * supervisor identity map (0-8 MiB) that every user directory shares, or a
+ * user page would land in a page table the kernel also uses. 16 MiB leaves
+ * the identity window and its margin well clear, and is low enough that a
+ * stock Linux binary linked at the usual 0x08048000 loads unchanged. */
+#define PAGING_USER_MIN    0x01000000u
+
 /* Supervisor window for the linear framebuffer. It starts at the user
  * limit and covers one page-directory entry (4 MiB), which is the most a
  * VBE mode may use. The direct map follows it so the two never overlap,

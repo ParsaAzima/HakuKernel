@@ -13,7 +13,10 @@
 #define PF_W 2u
 #define PF_R 4u
 #define ELF_MAX_PHDRS 32u
-#define USER_IMAGE_MIN 0x40000000u
+/* Where a user image may start. PAGING_USER_MIN keeps it clear of the
+ * supervisor identity map; the old value (1 GiB) was a guess, and it
+ * rejected every binary linked at the conventional 0x08048000 base. */
+#define USER_IMAGE_MIN PAGING_USER_MIN
 #define USER_STACK_BOTTOM (USER_STACK_TOP - 2u * USER_PAGE_SIZE)
 /* A copy of the program headers lives here when the image does not map
  * them itself. It sits below the stack, where the stack overflow check

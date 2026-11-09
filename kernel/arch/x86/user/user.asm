@@ -129,13 +129,18 @@ _user_program_start:
     int 0x80
     cmp eax, -38
     jne .fail
+    ; A count above the kernel's internal chunk size is legal: Linux serves a
+    ; big read or write in pieces and reports what it moved, which is what a
+    ; libc relies on (busybox cat reads 64 KiB at a time). The count is no
+    ; longer rejected before the descriptor is looked at, so a bad descriptor
+    ; now reports EBADF where it used to report EINVAL.
     mov esi, 10
     mov eax, SYS_WRITE
-    mov ebx, 1
-    mov ecx, USER_DATA_BASE + (startup_message - data_start)
+    mov ebx, 77                 ; never opened
+    mov ecx, USER_CODE_BASE     ; the code segment is large enough for 4097
     mov edx, 4097
     int 0x80
-    cmp eax, -22
+    cmp eax, -9                 ; EBADF
     jne .fail
 
     ; Invalid open flag combinations and bad descriptors fail distinctly.

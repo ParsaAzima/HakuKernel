@@ -60,6 +60,7 @@
 #define VFS_DIRENT_RECORD_MAX 96u
 
 /* File types for vfs_stat_t.mode. */
+#define VFS_S_IFMT  HAKU_S_IFMT
 #define VFS_S_IFREG HAKU_S_IFREG
 #define VFS_S_IFDIR HAKU_S_IFDIR
 #define VFS_S_IFLNK HAKU_S_IFLNK
@@ -204,6 +205,11 @@ int vfs_open_stdio(uint32_t pid);
 int32_t vfs_inherit(uint32_t parent_pid, uint32_t child_pid);
 /* Number of descriptors currently open for a process (0..VFS_FD_COUNT). */
 uint32_t vfs_open_count(uint32_t pid);
+/* Follow symbolic links in the last component across mounts, writing the
+ * resolved path to `out` (which may alias `path`). Returns 1 or a negative
+ * -VFS_E* error. execve uses it so the loader opens the real file, which
+ * also gives every applet symlink the same name to cache. */
+int32_t vfs_resolve_links(const char *path, char out[VFS_PATH_MAX]);
 int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags);
 int32_t vfs_close(uint32_t pid, uint32_t fd);
 int32_t vfs_read(uint32_t pid, uint32_t fd, void *buffer, uint32_t count);

@@ -545,12 +545,10 @@ static int ata_read_one(ata_channel_t *channel, uint8_t device, int lba48,
     if (wait != ATA_WAIT_OK)
         return wait;
 
-    for (uint32_t word = 0; word < 256u; word++) {
-        uint16_t value = inw((uint16_t)(channel->io_base + ATA_REG_DATA));
-        destination[word * 2u] = (uint8_t)value;
-        destination[word * 2u + 1u] = (uint8_t)(value >> 8);
-    }
-
+    /* One `rep insw` for the whole sector: the drive is already in PIO
+     * transfer state, so 256 individual port reads only add latency. */
+    inw_string((uint16_t)(channel->io_base + ATA_REG_DATA), destination,
+               256u);
     return ata_wait_ready(channel, 0, ATA_POLL_LIMIT);
 }
 

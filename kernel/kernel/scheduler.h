@@ -65,6 +65,10 @@ regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
                         uint32_t user_rusage, regs_t *frame);
 regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame);
 uint32_t scheduler_brk(uint32_t requested);
+/* Grow the user stack down to cover fault_addr, if it lies within the
+ * stack's growth window. Returns 1 when the page was mapped and the faulting
+ * instruction can be retried, 0 when the fault is not a stack growth. */
+int scheduler_grow_user_stack(uint32_t fault_addr);
 uint32_t scheduler_mmap(uint32_t length, int writable);
 /* The memory syscalls a libc needs: an anonymous mapping with the full
  * protection set and MAP_FIXED placement, protection changes, moving or

@@ -22,7 +22,10 @@
 #include "pit.h"
 #include "vfs.h"
 
-#define RAMFS_MAX_NODES 160u
+/* Room for a busybox /bin: `busybox --install -s` creates one symlink per
+ * applet, and Alpine's build has a few hundred. The table is static, so this
+ * costs about 60 KiB of .bss and nothing at runtime. */
+#define RAMFS_MAX_NODES 512u
 #define RAMFS_MAX_NAME  48u    /* longest component, without the NUL */
 /* Large enough for an externally built static binary unpacked from the
  * initramfs; contents come from the heap, so this only caps one file. */

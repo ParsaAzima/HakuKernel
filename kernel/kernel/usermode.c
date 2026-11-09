@@ -14,7 +14,10 @@
 #include "heap.h"
 #include "vfs.h"
 
-#define USER_ELF_MAX_SIZE (256u * 1024u)
+/* Largest program image the loader accepts. It has to cover a static libc
+ * binary: a musl busybox is about 1 MiB, so 1.2 MiB leaves headroom. The
+ * limit is a single kmalloc of the file's real size, not this worst case. */
+#define USER_ELF_MAX_SIZE (1280u * 1024u)
 /* Room for the whole initramfs: the Haku test programs plus an externally
  * built /init, which can be a static libc binary several times larger than
  * any of them. */
@@ -148,15 +151,35 @@ static int32_t read_vfs_file(const char *path, uint8_t *buffer, uint32_t size,
     return 1;
 }
 
+/* A boot file exists and is not empty. */
+static int boot_file_present(const char *path) {
+    vfs_stat_t stat;
+    return vfs_stat(1, path, &stat) == 1 && stat.st_size > 0;
+}
+
+/* Defined next to load_elf_file; the boot path seeds it before the first
+ * exec so the shell does not re-read its own binary from the disk. */
+static int exec_cache_store(const char *path, uint8_t *image, uint32_t size);
+
 /* Mount the boot namespace. With an initramfs on the data disk the root is
  * the RAM filesystem, the disk is /disk, and /dev and /proc are their own
  * backends; without one the FAT12 volume stays the root so an older image
- * still boots. Returns the path of the program to run first. */
-static const char *mount_boot_filesystem(void) {
+ * still boots.
+ *
+ * A BUSYBOX file on the disk takes precedence over the initramfs' /init: it
+ * is a whole userland in one binary, so there is nothing for a test program
+ * to add. The shell still gets the ramfs root with /dev and /proc mounted,
+ * because those are what its applets read.
+ *
+ * Returns the path of the program to run first and sets *argv0 to the name
+ * it should see there (busybox dispatches on argv[0], so it has to be "sh",
+ * not the file name). */
+static const char *mount_boot_filesystem(const char **argv0) {
     uint8_t *archive;
     uint32_t archive_size = 0;
     int32_t read_result;
     int32_t mount_point;
+    int shell;
 
     if (!vfs_register_device(&console_device)) {
         klog_log(KLOG_ERROR, "VFS-DEVICE-FAIL: console device registration\n");
@@ -186,6 +209,8 @@ static const char *mount_boot_filesystem(void) {
         return 0;
     }
 
+    shell = boot_file_present("disk/BUSYBOX");
+
     archive = (uint8_t *)kmalloc(USER_INITRAMFS_MAX_SIZE);
     if (!archive) {
         klog_log(KLOG_ERROR, "INITRAMFS-FAIL: kernel heap exhausted\n");
@@ -195,45 +220,119 @@ static const char *mount_boot_filesystem(void) {
                                 USER_INITRAMFS_MAX_SIZE, &archive_size);
     if (read_result != 1 || archive_size < 128u) {
         kfree(archive);
-        klog_log(KLOG_INFO, "INITRAMFS-NONE: booting the FAT12 root\n");
-        /* An older image has no archive: keep the FAT12 volume as the root
-         * (it stays reachable at /disk as well). */
-        if (vfs_mount_root("fat12") != 1) {
-            klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: FAT12 root mount\n");
-            return 0;
+        if (!shell) {
+            klog_log(KLOG_INFO, "INITRAMFS-NONE: booting the FAT12 root\n");
+            /* An older image has no archive: keep the FAT12 volume as the
+             * root (it stays reachable at /disk as well). */
+            if (vfs_mount_root("fat12") != 1) {
+                klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: FAT12 root mount\n");
+                return 0;
+            }
+            return "HAKU.ELF";
         }
-        return "HAKU.ELF";
-    }
-
-    if (initramfs_unpack(archive, archive_size) < 0) {
+        /* A shell image needs no archive, but it does need the ramfs root
+         * that /dev and /proc are mounted into, so fall through. */
+        klog_log(KLOG_INFO, "INITRAMFS-NONE: shell image, ramfs root\n");
+    } else if (initramfs_unpack(archive, archive_size) < 0) {
         klog_log(KLOG_ERROR, "INITRAMFS-FAIL: archive rejected\n");
         kfree(archive);
         return 0;
+    } else {
+        kfree(archive);
     }
-    kfree(archive);
+
     if (vfs_mount("dev", "devfs", 0) != 1 ||
         vfs_mount("proc", "procfs", 0) != 1) {
         klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: /dev or /proc\n");
         return 0;
     }
+    if (shell) {
+        *argv0 = "sh";
+        klog_prefix();
+        klog_write("SHELL-BOOT: busybox is /disk/busybox, pid 1 runs sh\n");
+        /* Lower case, because that is the spelling the shell's own paths
+         * canonicalize to: the FAT12 lookup folds case anyway, and matching
+         * the name lets the boot image seed the exec cache so the first
+         * applet does not have to read it from the disk again. */
+        return "disk/busybox";
+    }
     klog_prefix();
     klog_write("INITRAMFS-ROOT: ramfs is /, disk is /disk, /init is pid 1\n");
+    *argv0 = "init";
     return "init";
 }
 
 /* Give the first process the stack layout an execve() would build. Linux
  * starts PID 1 with argv[0] set to the program name, so do the same: a
- * static libc reads argv[0] and the auxiliary vector before main(). */
-static uint32_t build_initial_stack(const char *name, loaded_elf_t *program) {
+ * static libc reads argv[0] and the auxiliary vector before main().
+ *
+ * An optional /disk/INIT.CMD adds arguments: one line, space separated,
+ * with single or double quotes grouping a word that contains spaces. That is
+ * how a scripted boot asks the shell for `sh -c "..."` without a keyboard,
+ * which is also what the headless check uses. There are no escapes; the file
+ * is a boot command, not a scripting language. */
+static uint32_t build_initial_stack(const char *argv0, loaded_elf_t *program) {
     exec_arguments_t arguments;
+    /* A boot command is a shell one-liner and easily longer than a line of
+     * text; 255 bytes truncated a realistic `sh -c` script in the middle of
+     * a quoted word and turned it into a parse error. */
+    uint8_t line[512];
+    uint8_t strings[512];
     uint32_t length = 0;
+    uint32_t in = 0;
+    uint32_t out = 0;
+    char quote = 0;
+    int32_t read_result;
 
-    while (name[length] && length + 1u < USER_EXEC_MAX_BYTES) length++;
     memset(&arguments, 0, sizeof(arguments));
-    arguments.strings = (uint8_t *)name;
-    arguments.bytes_used = length + 1u;
-    arguments.argv_offsets[0] = 0;
-    arguments.argc = 1;
+    arguments.strings = strings;
+
+    read_result = read_vfs_file("disk/INIT.CMD", line, sizeof(line) - 1u,
+                                &length);
+    if (read_result != 1 || length == 0) {
+        /* No command file: argv is just the program name. */
+        while (argv0[out] && out + 2u < sizeof(strings)) {
+            strings[out] = (uint8_t)argv0[out];
+            out++;
+        }
+        strings[out] = 0;
+        arguments.argv_offsets[0] = 0;
+        arguments.argc = 1;
+        arguments.bytes_used = out + 1u;
+        return build_exec_stack(program, &arguments);
+    }
+
+    line[length] = 0;
+    while (in < length && arguments.argc < USER_EXEC_MAX_ARGUMENTS) {
+        char c = (char)line[in];
+        if (c == '\n' || c == '\r') break;
+        if (c == ' ' || c == '\t') {
+            in++;
+            continue;
+        }
+        arguments.argv_offsets[arguments.argc++] = out;
+        while (in < length && out + 2u < sizeof(strings)) {
+            c = (char)line[in];
+            if (quote) {
+                if (c == quote) {
+                    quote = 0;
+                    in++;
+                    continue;
+                }
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+                in++;
+                continue;
+            } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                break;
+            }
+            strings[out++] = (uint8_t)c;
+            in++;
+        }
+        strings[out++] = 0;
+    }
+    arguments.bytes_used = out;
+    if (arguments.argc == 0) return (uint32_t)-HAKU_EINVAL;
     return build_exec_stack(program, &arguments);
 }
 
@@ -242,6 +341,8 @@ int usermode_init(void) {
     uint32_t image_size = 0;
     uint8_t *image;
     const char *program;
+    const char *argv0 = "init";
+    vfs_stat_t stat;
     int read_result;
     uint32_t stack_result;
 
@@ -249,15 +350,27 @@ int usermode_init(void) {
      * namespace. Everything below (syscalls, self-tests) only speaks the
      * vfs_* interface from here on. */
     vfs_init();
-    program = mount_boot_filesystem();
+    program = mount_boot_filesystem(&argv0);
     if (!program) return 0;
 
-    image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
+    /* Size the read buffer from the file itself: a 1 MiB program must not
+     * make the boot path reserve the 1.2 MiB worst case out of a 3 MiB
+     * heap that the initramfs is also using. */
+    read_result = vfs_stat(1, program, &stat);
+    if (read_result != 1 || stat.st_size == 0) {
+        klog_log(KLOG_ERROR, "ELF-DISK-FAIL: cannot size the boot program\n");
+        return 0;
+    }
+    if (stat.st_size > USER_ELF_MAX_SIZE) {
+        klog_log(KLOG_ERROR, "ELF-DISK-FAIL: boot program is too large\n");
+        return 0;
+    }
+    image = (uint8_t *)kmalloc((uint32_t)stat.st_size);
     if (!image) {
         klog_log(KLOG_ERROR, "ELF-DISK-FAIL: kernel heap exhausted\n");
         return 0;
     }
-    read_result = read_vfs_file(program, image, USER_ELF_MAX_SIZE,
+    read_result = read_vfs_file(program, image, (uint32_t)stat.st_size,
                                 &image_size);
     if (read_result != 1) {
         if (klog_begin(KLOG_ERROR)) {
@@ -288,8 +401,11 @@ int usermode_init(void) {
         kfree(image);
         return 0;
     }
-    kfree(image);
-    stack_result = build_initial_stack(program, &initial_program);
+    /* Seed the exec cache with the boot image: pid 1 is about to exec it
+     * again for every command, and re-reading 1 MiB from PIO for each one is
+     * what made the shell slow. */
+    if (!exec_cache_store(program, image, image_size)) kfree(image);
+    stack_result = build_initial_stack(argv0, &initial_program);
     if (stack_result) {
         klog_prefix();
         klog_write("USER-STACK-FAIL: error=");
@@ -518,8 +634,6 @@ static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
     uint8_t chunk[128];
     uint32_t offset = 0;
 
-    if (count > USER_IO_MAX)
-        return copy_from_user_error(HAKU_EINVAL);
     if (!paging_user_range_valid(user_buffer, count, 0))
         return copy_from_user_error(HAKU_EFAULT);
     if (count == 0)
@@ -548,7 +662,11 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
     uint32_t copied = 0;
     uint8_t chunk[128];
 
-    if (count > USER_IO_MAX) return copy_from_user_error(HAKU_EINVAL);
+    /* A libc asks for a whole buffer at a time (busybox cat reads 64 KiB at
+     * once), so a count above USER_IO_MAX is ordinary rather than an error:
+     * serve the first USER_IO_MAX bytes, which is a legal short read. The
+     * old EINVAL here made every cat/grep/ls on a large file fail. */
+    if (count > USER_IO_MAX) count = USER_IO_MAX;
     if (count == 0)
         return (uint32_t)vfs_read(scheduler_current_pid(), fd, 0, 0);
     if (!paging_user_range_valid(user_buffer, count, 1))
@@ -628,12 +746,50 @@ static int copy_user_string(uint32_t user_string, char *out, uint32_t size) {
     return 1;
 }
 
+/* Cache of the last executable image read from disk.
+ *
+ * A shell re-execs the same binary for every command, and the data disk is
+ * PIO: 1 MiB read one sector at a time costs about fifteen seconds on an
+ * emulated machine, which makes an interactive shell unusable. Keeping the
+ * last image turns the second and every later exec of the same path into a
+ * memory read. Exactly one image is held and it is replaced wholesale, so
+ * the cache cannot grow beyond one executable, and a failed allocation only
+ * means the next exec goes back to the disk. */
+static uint8_t *exec_image_cache;
+static uint32_t exec_image_cache_size;
+static char exec_image_cache_path[VFS_PATH_MAX];
+
+static int same_path(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* Take ownership of `image` so later execs of `path` can skip the disk.
+ * Returns 1 when the image was kept; on 0 the caller still owns it. */
+static int exec_cache_store(const char *path, uint8_t *image, uint32_t size) {
+    uint32_t i;
+    if (!path || !image || size == 0 || size > USER_ELF_MAX_SIZE) return 0;
+    for (i = 0; path[i] && i + 1u < sizeof(exec_image_cache_path); i++)
+        exec_image_cache_path[i] = path[i];
+    if (path[i]) return 0;
+    exec_image_cache_path[i] = 0;
+    if (exec_image_cache) kfree(exec_image_cache);
+    exec_image_cache = image;
+    exec_image_cache_size = size;
+    return 1;
+}
+
 static int32_t load_elf_file(uint32_t pid, const char *path,
-                             loaded_elf_t *program) {    vfs_stat_t stat;
+                             loaded_elf_t *program) {
+    vfs_stat_t stat;
     uint8_t *image;
     uint32_t offset = 0;
     int32_t result;
     int32_t fd;
+    int cached = 0;
 
     fd = vfs_open(pid, path, VFS_O_RDONLY);
     if (fd < 0) return fd;
@@ -647,34 +803,43 @@ static int32_t load_elf_file(uint32_t pid, const char *path,
         return -(int32_t)(stat.st_size ? HAKU_E2BIG : HAKU_ENOEXEC);
     }
 
-    image = (uint8_t *)kmalloc((uint32_t)stat.st_size);
-    if (!image) {
-        vfs_close(pid, (uint32_t)fd);
-        return -(int32_t)HAKU_ENOMEM;
-    }
-    while (offset < stat.st_size) {
-        uint32_t amount = (uint32_t)(stat.st_size - offset);
-        if (amount > USER_IO_MAX) amount = USER_IO_MAX;
-        result = vfs_read(pid, (uint32_t)fd, image + offset, amount);
-        if (result <= 0 || (uint32_t)result > amount) {
+    /* A hit skips both the disk read and the buffer allocation; the cached
+     * image is read-only from here on, exactly like a freshly read one. */
+    cached = exec_image_cache && exec_image_cache_size == stat.st_size &&
+             same_path(exec_image_cache_path, path);
+    if (cached) {
+        image = exec_image_cache;
+    } else {
+        image = (uint8_t *)kmalloc((uint32_t)stat.st_size);
+        if (!image) {
             vfs_close(pid, (uint32_t)fd);
-            kfree(image);
-            return result < 0 ? result : -(int32_t)HAKU_EIO;
+            return -(int32_t)HAKU_ENOMEM;
         }
-        offset += (uint32_t)result;
+        while (offset < stat.st_size) {
+            uint32_t amount = (uint32_t)(stat.st_size - offset);
+            if (amount > USER_IO_MAX) amount = USER_IO_MAX;
+            result = vfs_read(pid, (uint32_t)fd, image + offset, amount);
+            if (result <= 0 || (uint32_t)result > amount) {
+                vfs_close(pid, (uint32_t)fd);
+                kfree(image);
+                return result < 0 ? result : -(int32_t)HAKU_EIO;
+            }
+            offset += (uint32_t)result;
+        }
     }
     result = vfs_close(pid, (uint32_t)fd);
     if (result < 0) {
-        kfree(image);
+        if (!cached) kfree(image);
         return result;
     }
 
     memset(program, 0, sizeof(*program));
     if (!elf_load_executable(image, (uint32_t)stat.st_size, program)) {
-        kfree(image);
+        if (!cached) kfree(image);
         return -(int32_t)HAKU_ENOEXEC;
     }
-    kfree(image);
+    if (!cached && !exec_cache_store(path, image, (uint32_t)stat.st_size))
+        kfree(image);
     return 0;
 }
 
@@ -686,6 +851,13 @@ static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
     int32_t result;
 
     result = resolve_at(HAKU_AT_FDCWD, user_path, path);
+    if (result != 1) return (uint32_t)result;
+    /* exec follows symbolic links, so the loader opens the real file. That
+     * matters twice over: /bin/ls is a link to the busybox on the data disk,
+     * and resolving it here also gives every applet the same name, so the
+     * exec cache hits for all of them instead of re-reading 1 MiB per
+     * command. */
+    result = vfs_resolve_links(path, path);
     if (result != 1) return (uint32_t)result;
     memset(&arguments, 0, sizeof(arguments));
     arguments.strings = (uint8_t *)kmalloc(USER_EXEC_MAX_BYTES);
@@ -1477,13 +1649,14 @@ static int32_t resolve_at(uint32_t dirfd, uint32_t user_path,
 }
 
 /* The flags the VFS itself handles; the rest are either accepted as
- * no-ops (O_CLOEXEC, O_NOCTTY, O_NOFOLLOW without symlinks) or applied to
- * the description after the open (O_NONBLOCK). */
+ * no-ops (O_CLOEXEC, O_NOCTTY, O_NOFOLLOW without symlinks, O_LARGEFILE)
+ * or applied to the description after the open (O_NONBLOCK). */
 #define USER_OPEN_PASS_FLAGS \
     (HAKU_O_ACCMODE | HAKU_O_CREAT | HAKU_O_EXCL | HAKU_O_TRUNC | \
      HAKU_O_APPEND | HAKU_O_DIRECTORY)
 #define USER_OPEN_IGNORED_FLAGS \
-    (HAKU_O_CLOEXEC | HAKU_O_NOCTTY | HAKU_O_NOFOLLOW | HAKU_O_NONBLOCK)
+    (HAKU_O_CLOEXEC | HAKU_O_NOCTTY | HAKU_O_NOFOLLOW | HAKU_O_NONBLOCK | \
+     HAKU_O_LARGEFILE)
 
 static uint32_t sys_open_common(uint32_t dirfd, uint32_t user_path,
                                 uint32_t flags) {

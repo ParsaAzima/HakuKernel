@@ -120,6 +120,14 @@ regs_t *isr_handler(regs_t *r) {
             if (space && paging_break_cow(space, paging_get_cr2()))
                 return r;
         }
+        /* Not present and inside the stack window: the program walked off
+         * the two pages it starts with. Map the page it touched and let the
+         * instruction run again, the way Linux grows a stack, instead of
+         * killing a process that merely recursed or sized a buffer on the
+         * stack. */
+        if ((r->err_code & 1u) == 0 &&
+            scheduler_grow_user_stack(paging_get_cr2()))
+            return r;
         return abort_user(r);
     }
     if (r->int_no < 32 && (r->cs & 3u) == 3u) {

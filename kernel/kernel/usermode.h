@@ -8,6 +8,11 @@
 
 #define USER_CODE_BASE  0x40000000u
 #define USER_STACK_TOP  0xC0000000u
+/* How far below USER_STACK_TOP the kernel will grow the user stack on a
+ * page fault. A process is started with two pages only; this is the ceiling
+ * for the demand-grown part, and it stays well clear of the mmap window at
+ * 0x60000000. */
+#define USER_STACK_GROWTH 0x00100000u
 #define USER_PAGE_SIZE  0x1000u
 #define USER_IO_MAX     4096u
 

@@ -10,7 +10,13 @@
 #include "vfs.h"
 
 #define TASK_KERNEL_STACK_PAGES 2u
-#define TASK_MAX_MMAP_REGIONS 8u
+/* Anonymous mappings a process may hold at once. A libc allocates its heap
+ * with mmap whenever the program break is not usable, one mapping per
+ * expansion, so the limit is reached long before a program looks large:
+ * eight regions capped a process at a few kilobytes of malloc and made
+ * `ls` on a 250-entry directory and `sort` on a few thousand lines fail with
+ * "out of memory". */
+#define TASK_MAX_MMAP_REGIONS 64u
 
 /* The task keeps its working directory inline; the two limits must agree so
  * a validated path always fits. */
@@ -92,6 +98,11 @@ static void init_task_identity(task_t *task) {
 static void inherit_task_identity(task_t *child, const task_t *parent) {
     memcpy(child->cwd, parent->cwd, sizeof(child->cwd));
     memcpy(child->comm, parent->comm, sizeof(child->comm));
+    /* The thread pointer. A child shares the parent's address space
+     * copy-on-write, so the same virtual base is valid there, and a libc
+     * writes errno through it before it does anything else: a child that
+     * started with %gs based at zero wrote to address 0 and faulted. */
+    child->fs_base = parent->fs_base;
 }
 
 /* Ends the current task with an explicit wait status (the value a parent
@@ -1721,6 +1732,28 @@ static int map_user_zero_pages(address_space_t *space, uint32_t start,
  * The break is page-rounded and never returns below USER_HEAP_BASE. A zero
  * request just queries the current break; an invalid size returns
  * -EINVAL/-ENOMEM. */
+/* Demand-grown user stack. A process starts with two pages, which is all a
+ * libc's start-up needs, but any program that recurses or puts a buffer on
+ * the stack walks off them: `sort` faulted 9 KiB below the stack top and
+ * was killed. Linux grows the stack on the fault instead of reserving it up
+ * front, and so does this. The growth is bounded so runaway recursion still
+ * dies at a predictable point instead of eating the address space down to
+ * the mmap window at 0x60000000. */
+int scheduler_grow_user_stack(uint32_t fault_addr) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t page;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX) return 0;
+    if (fault_addr >= USER_STACK_TOP) return 0;
+    if (fault_addr < USER_STACK_TOP - USER_STACK_GROWTH) return 0;
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    if (!space->directory_phys) return 0;
+    page = fault_addr & 0xFFFFF000u;
+    if (page < USER_STACK_TOP - USER_STACK_GROWTH) return 0;
+    return map_user_zero_pages(space, page, page + USER_PAGE_SIZE, 1);
+}
+
 uint32_t scheduler_brk(uint32_t requested) {
     task_t *task;
     address_space_t *space;
@@ -1750,8 +1783,16 @@ uint32_t scheduler_brk(uint32_t requested) {
             paging_unmap_user_page(space, address);
         task->heap_top = rounded;
     }
-    task->heap_brk = rounded;
-    return rounded;
+    /* Linux returns exactly the break the caller asked for, even though it
+     * only guarantees the pages up to the next boundary are usable. A libc
+     * checks that return value against its own request, and musl treats a
+     * mismatch as a failed brk and falls back to mmap for every heap
+     * expansion. Haku only allows eight mmap regions per task, so a program
+     * that made a few hundred allocations ran out of regions and reported
+     * "out of memory" with megabytes free. Returning the request keeps the
+     * heap on brk, which is unbounded here. */
+    task->heap_brk = requested;
+    return requested;
 }
 
 /* First fit for a page-aligned anonymous mapping, scanning the sorted

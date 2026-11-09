@@ -53,6 +53,34 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(ROOT, "build")
 os.makedirs(BUILD, exist_ok=True)
 
+# What the shell target runs as PID 1. Alpine's busybox is not built with a
+# standalone shell, so an applet is only found through $PATH, and $PATH only
+# helps if there is a file to exec: `--install -s /bin` fills /bin with one
+# symlink per applet, and every one of those links names the binary
+# relatively ("busybox"), so /bin/busybox has to exist first or the whole
+# directory dangles. The setup then exports PATH and the check proves the
+# whole path -- ash parsing, applet dispatch through $PATH, the syscalls
+# behind uname/ls/cat/free, and /proc -- and leaves an interactive shell
+# running so PID 1 never exits and the guest never panics on an empty run
+# queue.
+SHELL_SETUP = ("/disk/busybox mkdir -p /bin; "
+               "/disk/busybox ln -s /disk/busybox /bin/busybox; "
+               "/disk/busybox --install -s /bin; export PATH=/bin; ")
+SHELL_INTERACTIVE_SCRIPT = (
+    'sh -c "' + SHELL_SETUP +
+    'echo Haku shell: busybox ash, type help or exit; exec sh"')
+SHELL_CHECK_SCRIPT = (
+    'sh -c "' + SHELL_SETUP +
+    'echo SHELL-OK; echo UNAME:$(uname -n); '
+    'echo APPS:$(ls /bin | wc -l); '
+    'ls /; cat /proc/version; echo SHELL-DONE; exec sh"')
+# Output the check insists on. A boot that reaches the prompt but cannot run
+# an applet still prints SHELL-OK, so the markers alone are not enough: the
+# nodename proves uname ran, the applet count proves the links resolve, and
+# the /proc line proves a file read went through the VFS.
+SHELL_EXPECTED = ["SHELL-BOOT", "SHELL-OK", "UNAME:haku", "HakuKernel",
+                  "SHELL-DONE"]
+
 
 def log(msg):
     print(msg, flush=True)
@@ -272,6 +300,50 @@ def find_x64_toolchain():
     return cc, find_lld_link(), "clang-cl/lld-link (x86_64-pc-windows-msvc)"
 
 
+def shell_busybox(explicit):
+    """Path to a static i386 busybox, fetching one on first use.
+
+    The binary is 1 MiB and belongs to someone else, so it is cached under
+    build/ and never committed. `--busybox=PATH` points the build at a local
+    copy instead, which is what an offline machine or CI wants.
+    """
+    if explicit:
+        if not os.path.isfile(explicit):
+            sys.exit(f"no such busybox: {explicit}")
+        return explicit
+    cached = os.path.join(BUILD, "busybox")
+    if os.path.isfile(cached) and os.path.getsize(cached) > 0:
+        return cached
+    log("no busybox cached; fetching a static musl build (Alpine x86)")
+    rc = subprocess.run([sys.executable,
+                         os.path.join(ROOT, "tools", "getbusybox.py"),
+                         cached]).returncode
+    if rc != 0:
+        sys.exit("could not obtain busybox; pass --busybox=PATH")
+    return cached
+
+
+def build_shell_image(py, user_elf, busybox, command):
+    """FAT12 image holding busybox and, optionally, the boot command line.
+
+    The kernel picks /disk/BUSYBOX over the initramfs when it is present, so
+    this image needs no archive: the ramfs root, /dev and /proc are mounted
+    either way, and busybox is the whole userland.
+    """
+    image = os.path.join(BUILD, "haku_shell.img")
+    args = [py, os.path.join(ROOT, "tools", "mkfat12.py"),
+            user_elf, image, f"BUSYBOX={busybox}"]
+    if command is not None:
+        cmd_path = os.path.join(BUILD, "init.cmd")
+        with open(cmd_path, "w", encoding="ascii", newline="\n") as f:
+            f.write(command + "\n")
+        args.append(f"INIT.CMD={cmd_path}")
+    run(args)
+    log(f"shell image ready ({os.path.getsize(image)} bytes, "
+        f"busybox {os.path.getsize(busybox)} bytes)")
+    return image
+
+
 def build_x64(nasm, py, memory_mb):
     """Build and boot haku64.img: the same floppy, with a 64-bit kernel.
 
@@ -439,8 +511,20 @@ def main():
     init_override = None
     expectations = []
     memory_mb = 512
+    busybox_path = None
+    shell_command = None
+    shell_check = False
     for flag in raw_args:
         if flag == "--fresh":
+            continue
+        if flag == "--check":
+            shell_check = True
+            continue
+        if flag.startswith("--busybox="):
+            busybox_path = flag.split("=", 1)[1]
+            continue
+        if flag.startswith("--cmd="):
+            shell_command = flag.split("=", 1)[1]
             continue
         if flag.startswith("--init="):
             init_override = flag.split("=", 1)[1]
@@ -458,8 +542,9 @@ def main():
             memory_mb = int(value)
             continue
         if flag.startswith("-"):
-            sys.exit(f"unknown flag: {flag} "
-                     "(use --fresh, --memory=MB, --init=PATH, --expect=MARKER)")
+            sys.exit(f"unknown flag: {flag} (use --fresh, --memory=MB, "
+                     "--init=PATH, --expect=MARKER, --busybox=PATH, "
+                     "--cmd=TEXT, --check)")
     fresh = "--fresh" in raw_args
     if len(positionals) > 1:
         sys.exit(f"unexpected argument: {positionals[1]}")
@@ -470,8 +555,18 @@ def main():
             sys.exit(f"no such file: {init_override}")
         if not expectations:
             sys.exit("probe needs at least one --expect=MARKER")
+    elif mode == "shell":
+        if shell_command is None:
+            shell_command = (SHELL_CHECK_SCRIPT if shell_check
+                             else SHELL_INTERACTIVE_SCRIPT)
+        elif init_override or expectations:
+            sys.exit("--init and --expect do not apply to `shell`")
+        if shell_check and init_override:
+            sys.exit("--init does not apply to `shell`")
     elif init_override or expectations:
         sys.exit("--init and --expect only apply to `probe`")
+    if shell_check and mode != "shell":
+        sys.exit("--check only applies to `shell`")
 
     if mode == "x64":
         build_x64(nasm, py, memory_mb)
@@ -541,6 +636,14 @@ def main():
     stage1_bin = os.path.join(BUILD, "stage1.bin")
     stage2_bin = os.path.join(BUILD, "stage2.bin")
     img = os.path.join(ROOT, "haku.img")
+
+    # The shell target boots a different data disk: busybox plus, for the
+    # scripted check, an INIT.CMD. Keeping it separate means the test image
+    # and the shell image never overwrite each other.
+    if mode == "shell":
+        filesystem_image = build_shell_image(py, user_elf,
+                                             shell_busybox(busybox_path),
+                                             shell_command)
 
     # 1. User ELFs are always rebuilt (build artifacts), but the FAT12 data
     #    disk is user data: an existing image is reused untouched so files
@@ -682,6 +785,42 @@ def main():
     if mode == "run":
         log("Booting Haku in QEMU (close the window to return)...")
         subprocess.run(disk)
+    elif mode == "shell" and not shell_check:
+        log("Booting the Haku shell in QEMU (close the window to return)...")
+        log("busybox ash is pid 1: type a command at the prompt")
+        subprocess.run(disk)
+    elif mode == "shell":
+        serial = os.path.join(BUILD, "serial.log")
+        if os.path.exists(serial):
+            os.remove(serial)
+        proc = subprocess.Popen(disk + ["-display", "none",
+                                        "-serial", f"file:{serial}"])
+        reached = wait_for_serial(serial, "SHELL-DONE",
+                                  float(os.environ.get("HAKU_SHELL_TIMEOUT",
+                                                       "300")))
+        proc.kill()
+        proc.wait()
+        with open(serial, errors="replace") as f:
+            content = f.read()
+        log("--- serial log (shell) ---")
+        log(content)
+        missing = [marker for marker in SHELL_EXPECTED if marker not in content]
+        # The applet count is the one thing a marker cannot express: it proves
+        # that /bin was filled and that a directory listing came back through
+        # getdents, so a boot that reaches the prompt but cannot run anything
+        # still fails here.
+        applets = re.search(r"APPS:(\d+)", content)
+        if not applets or int(applets.group(1)) < 100:
+            missing.append("APPS:<count >= 100>")
+        if "PANIC" in content or "FAIL" in content:
+            for line in content.splitlines():
+                if "PANIC" in line or "FAIL" in line:
+                    log("  " + line.strip())
+        if missing or not reached:
+            sys.exit("SHELL CHECK FAILED: missing " + ", ".join(missing))
+        log(f"SHELL CHECK PASSED: busybox ash ran as pid 1, "
+            f"{applets.group(1)} applets resolved through $PATH, "
+            f"uname and /proc answered")
     elif mode in ("headless", "probe"):
         serial = os.path.join(BUILD, "serial.log")
         shot = os.path.join(BUILD, "screen.png")

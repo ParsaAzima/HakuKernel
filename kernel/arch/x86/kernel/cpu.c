@@ -37,6 +37,29 @@ uint16_t inw(uint16_t port) {
     return value;
 }
 
+/* Move `count` 16-bit words from an I/O port into memory with one `rep
+ * insw`. A PIO sector is 256 words, and 256 separate `in` instructions are
+ * 256 trips out of the CPU: reading a 1 MiB binary that way took fifteen
+ * seconds, which is the difference between a shell that is usable and one
+ * that is not. The bytes land in memory exactly as the per-word loop wrote
+ * them, little endian, so callers do not change. */
+void inw_string(uint16_t port, void *destination, uint32_t count) {
+    /* Copied into locals first: MSVC's __asm takes a parameter name to mean
+     * its stack slot, which makes the operand size ambiguous for a pointer. */
+    uint32_t target = (uint32_t)destination;
+    __asm {
+        push edi
+        push ecx
+        mov dx, port
+        mov edi, target
+        mov ecx, count
+        cld
+        rep insw
+        pop ecx
+        pop edi
+    }
+}
+
 uint32_t cpu_irq_save(void) {
     uint32_t flags;
     __asm {

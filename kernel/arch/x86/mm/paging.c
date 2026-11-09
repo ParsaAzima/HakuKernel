@@ -259,7 +259,7 @@ int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
     if (!space || !space->directory_phys ||
         (virtual_addr & 0xFFFu) != 0 ||
         (physical_addr & 0xFFFu) != 0 ||
-        virtual_addr < 0x40000000u ||
+        virtual_addr < PAGING_USER_MIN ||
         virtual_addr >= PAGING_USER_LIMIT ||
         physical_addr >= PAGING_PHYS_LIMIT)
         return 0;
@@ -303,7 +303,7 @@ int paging_protect_user_range(address_space_t *space, uint32_t virtual_addr,
     int current;
 
     if (!space || !space->directory_phys || length == 0) return 0;
-    if (virtual_addr < 0x40000000u ||
+    if (virtual_addr < PAGING_USER_MIN ||
         virtual_addr >= PAGING_USER_LIMIT ||
         length - 1u > 0xFFFFFFFFu - virtual_addr)
         return 0;
@@ -362,7 +362,7 @@ uint32_t paging_user_page_physical(address_space_t *space,
 
     if (!space || !space->directory_phys ||
         (virtual_addr & 0xFFFu) != 0 ||
-        virtual_addr < 0x40000000u ||
+        virtual_addr < PAGING_USER_MIN ||
         virtual_addr >= PAGING_USER_LIMIT)
         return 0;
 
@@ -391,7 +391,7 @@ int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
 
     if (!space || !space->directory_phys ||
         (virtual_addr & 0xFFFu) != 0 ||
-        virtual_addr < 0x40000000u ||
+        virtual_addr < PAGING_USER_MIN ||
         virtual_addr >= PAGING_USER_LIMIT)
         return 0;
 
@@ -497,8 +497,12 @@ int paging_share_user_space(address_space_t *source,
 
     /* Only the user half of the address space belongs to the process; the
      * supervisor direct map and the framebuffer window are shared by every
-     * space and must stay shared. */
-    for (uint32_t di = 256; di < (PAGING_USER_LIMIT >> 22); di++) {
+     * space and must stay shared. The user half starts at PAGING_USER_MIN,
+     * not at 1 GiB: a program linked at the conventional 0x08048000 lives
+     * far below that, and a fork that skipped it produced a child with no
+     * memory at all. */
+    for (uint32_t di = (PAGING_USER_MIN >> 22);
+         di < (PAGING_USER_LIMIT >> 22); di++) {
         uint32_t pde = source_directory[di];
         uint32_t table_phys;
         uint32_t *table;
@@ -581,7 +585,7 @@ int paging_break_cow(address_space_t *space, uint32_t virtual_addr) {
     int current;
 
     if (!space || !space->directory_phys ||
-        virtual_addr < 0x40000000u || virtual_addr >= PAGING_USER_LIMIT)
+        virtual_addr < PAGING_USER_MIN || virtual_addr >= PAGING_USER_LIMIT)
         return 0;
 
     directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
@@ -628,7 +632,8 @@ void paging_destroy_user_space(address_space_t *space) {
     if (space->shared) return;
 
     directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
-    for (uint32_t di = 256; di < (PAGING_USER_LIMIT >> 22); di++) {
+    for (uint32_t di = (PAGING_USER_MIN >> 22);
+         di < (PAGING_USER_LIMIT >> 22); di++) {
         uint32_t pde = directory[di];
         /* The user window may also hold shared supervisor mappings in
          * some build: skip anything without U/S=1 so destroy can only
@@ -662,7 +667,7 @@ int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
     uint32_t *directory;
 
     if (length == 0) return 1;
-    if (virtual_addr < 0x40000000u ||
+    if (virtual_addr < PAGING_USER_MIN ||
         virtual_addr >= PAGING_USER_LIMIT ||
         length - 1u > 0xFFFFFFFFu - virtual_addr)
         return 0;
@@ -710,7 +715,7 @@ int paging_copy_to_user_space(address_space_t *space,
     uint32_t *directory;
 
     if (!space || !space->directory_phys || (!source && length) ||
-        virtual_addr < 0x40000000u ||
+        virtual_addr < PAGING_USER_MIN ||
         virtual_addr >= PAGING_USER_LIMIT ||
         length > PAGING_USER_LIMIT - virtual_addr)
         return 0;

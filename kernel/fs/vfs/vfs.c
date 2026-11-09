@@ -330,6 +330,83 @@ int32_t vfs_mount_root_flags(const char *name, uint32_t flags) {
     return vfs_mount("", name, flags);
 }
 
+/* Expand symbolic links in the last path component, following the target
+ * through the mount table.
+ *
+ * A backend resolves links inside its own tree, and that is not enough when
+ * the target lives on another mount: `/bin/ls -> /disk/busybox` is stored on
+ * the ramfs, where "disk" is an empty directory, so the ramfs cannot find
+ * the target even though the VFS can. Expanding one hop here, where every
+ * mount is visible, is what lets a shell run an applet found on $PATH while
+ * busybox itself sits on the data disk.
+ *
+ * Copies `path` into `out`, follows up to VFS_MAX_LINK_HOPS links, and
+ * returns 1, or a negative -VFS_E* error. Takes no lock on entry. */
+#define VFS_MAX_LINK_HOPS 8u
+
+int32_t vfs_resolve_links(const char *path, char out[VFS_PATH_MAX]) {
+    uint32_t length = 0;
+    while (path[length]) {
+        if (length + 1u >= VFS_PATH_MAX) return -VFS_ENAMETOOLONG;
+        out[length] = path[length];
+        length++;
+    }
+    out[length] = 0;
+    for (uint32_t hop = 0; hop < VFS_MAX_LINK_HOPS; hop++) {
+        vfs_mount_t *mount;
+        const char *relative = 0;
+        vfs_stat_t st;
+        char target[VFS_PATH_MAX];
+        uint32_t target_length = 0;
+        int32_t got;
+        if (!out[0]) return 1;
+        mutex_lock(&vfs_lock);
+        mount = mount_resolve(out, &relative);
+        if (!mount || !mount->ops->readlink) {
+            mutex_unlock(&vfs_lock);
+            return 1;
+        }
+        /* lstat, so the final component is described as the link it is
+         * rather than as its target. */
+        got = mount->ops->lstat ? mount->ops->lstat(relative, &st)
+                                : mount->ops->stat(relative, &st);
+        if (got != 1 || (st.st_mode & VFS_S_IFMT) != VFS_S_IFLNK) {
+            mutex_unlock(&vfs_lock);
+            return 1;
+        }
+        got = mount->ops->readlink(relative, target, sizeof(target) - 1u,
+                                   &target_length);
+        mutex_unlock(&vfs_lock);
+        if (got != 1 || target_length == 0) return 1;
+        target[target_length] = 0;
+        if (target[0] == '/') {
+            /* An absolute target replaces the whole path. VFS paths are
+             * canonical and carry no leading slash, so it is dropped: a
+             * "/disk/busybox" left as is would not match the "disk" mount
+             * and would be looked up as a name inside the ramfs root. */
+            uint32_t i;
+            for (i = 0; target[i + 1u]; i++) {
+                if (i + 1u >= VFS_PATH_MAX) return -VFS_ENAMETOOLONG;
+                out[i] = target[i + 1u];
+            }
+            out[i] = 0;
+        } else {
+            /* A relative target replaces the last component and keeps the
+             * directory the link was found in. */
+            uint32_t slash = 0;
+            uint32_t i;
+            for (i = 0; i < length; i++)
+                if (out[i] == '/') slash = i + 1u;
+            if (slash + target_length + 1u >= VFS_PATH_MAX)
+                return -VFS_ENAMETOOLONG;
+            for (i = 0; i <= target_length; i++) out[slash + i] = target[i];
+        }
+        length = 0;
+        while (out[length]) length++;
+    }
+    return -VFS_ELOOP;
+}
+
 /* Validate a canonical mount prefix: no leading or trailing slash, no empty
  * components. */
 static int prefix_valid(const char *prefix) {
@@ -479,6 +556,7 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
     vfs_ofd_t *ofd;
     vfs_mount_t *mount;
     const char *relative = 0;
+    char resolved[VFS_PATH_MAX];
     uint32_t fd;
     int ofd_index;
     void *handle = 0;
@@ -489,6 +567,11 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
         ((flags & VFS_O_TRUNC) &&
          (flags & VFS_O_ACCMODE) == VFS_O_RDONLY))
         return -VFS_EINVAL;
+    /* A symlink is expanded here, not only inside the backend, so a link can
+     * point at another mount (see vfs_resolve_links). */
+    opened = vfs_resolve_links(path, resolved);
+    if (opened != 1) return opened;
+    path = resolved;
     /* A directory opens for enumeration only: creation and truncation do
      * not apply to it. */
     if (flags & VFS_O_DIRECTORY) {
@@ -836,8 +919,12 @@ int32_t vfs_rmdir(uint32_t pid, const char *path) {
 int32_t vfs_stat(uint32_t pid, const char *path, vfs_stat_t *out) {
     vfs_mount_t *mount;
     const char *relative = 0;
+    char resolved[VFS_PATH_MAX];
     int32_t stated;
     if (!pid_valid(pid) || !path || !out) return -VFS_EINVAL;
+    stated = vfs_resolve_links(path, resolved);
+    if (stated != 1) return stated;
+    path = resolved;
     mutex_lock(&vfs_lock);
     mount = mount_resolve(path, &relative);
     if (!mount) {
@@ -952,11 +1039,15 @@ int32_t vfs_opendir(uint32_t pid, const char *path) {
     vfs_ofd_t *ofd;
     vfs_mount_t *mount;
     const char *relative = 0;
+    char resolved[VFS_PATH_MAX];
     uint32_t fd;
     int ofd_index;
     void *handle = 0;
     int32_t opened;
     if (!pid_valid(pid) || !path) return -VFS_EINVAL;
+    opened = vfs_resolve_links(path, resolved);
+    if (opened != 1) return opened;
+    path = resolved;
     mutex_lock(&vfs_lock);
     mount = mount_resolve(path, &relative);
     if (!mount) {

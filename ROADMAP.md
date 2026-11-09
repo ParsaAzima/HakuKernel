@@ -59,6 +59,15 @@ compatibility is not a short-term goal.
   vector, Linux-shaped `set_thread_area`, and the `_llseek`/`readv`/`writev`/
   `set_tid_address` calls an outside libc expects. `python build.py probe`
   boots any externally built ELF as PID 1 and asserts its markers.
+- [x] `python build.py shell` boots a static busybox (musl, i386) as PID 1
+  and runs `ash` with `PATH`-resolved applets, `uname`, `ls`, `cat`, `sort`,
+  `wc`, and `/proc` access, all through the Linux-compatible ABI
+  (`SHELL CHECK PASSED: busybox ash ran as pid 1, 306 applets resolved
+  through $PATH`). This required accepting `O_LARGEFILE`, clamping large
+  read/write counts, returning the exact break from `brk`, demand-grown
+  user stack, 64-entry `mmap` table, FAT12 exec bits, cross-mount symlink
+  expansion, and an in-kernel exec image cache to make QEMU/TCG performance
+  usable.
 - [x] An x86-64 (long mode) target built from the same tree — `python
   build.py x64` produces `haku64.img` — with a long-mode entry, four-level
   paging and a 2 MiB-page physmap of all RAM (so no 1020 MiB ceiling), an
@@ -412,7 +421,7 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   points, and `EXDEV` for a rename across mounts. `ramfs` is the writable
   root: 48-byte name components, mode bits, PIT timestamps, nested
   directories, symlinks with a hop limit, unlink-while-open, and a fixed
-  160-node table with heap-backed file data. `devfs` serves the six device
+  512-node table with heap-backed file data. `devfs` serves the six device
   nodes through the ordinary descriptor path (`ESPIPE` on seek, no unlink or
   rename), and `procfs` generates `version`/`uptime`/`meminfo` at open time
   and refuses writes with `EACCES`. `symlink`/`readlink` became real
@@ -462,9 +471,11 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   with the release image; the release still contains Haku's own userland.
 
 **Acceptance criteria:** A statically linked musl binary runs as PID 1 from
-an initramfs, executes shell builtins and applets, reads and writes files
-in the RAM filesystem, and the headless test asserts its output; glibc,
-dynamic linking, and shared libraries stay out of scope.
+an initramfs or FAT12 data disk, executes shell builtins and applets
+(`python build.py shell` boots busybox `ash` and asserts `SHELL-OK`,
+`APPS:<count>`, and `SHELL-DONE`), reads and writes files in the RAM
+filesystem, and the headless test asserts its output; glibc, dynamic
+linking, and shared libraries stay out of scope.
 
 ### 8. x86-64 (long mode)
 

@@ -133,7 +133,10 @@ static int32_t fat12_vfs_rmdir(const char *path) {
 static void fat12_stat_to_vfs(const fat12_stat_t *st, vfs_stat_t *out) {
     out->st_dev = 1u;
     out->st_ino = st->ino;
-    out->st_mode = st->is_dir ? HAKU_STAT_MODE_DIR : HAKU_STAT_MODE_REG;
+    /* FAT stores no permission bits, so report files as 0755: without the
+     * execute bit a shell refuses to run a program it found on $PATH, and
+     * `busybox --install` puts its applet symlinks on a FAT-backed $PATH. */
+    out->st_mode = st->is_dir ? HAKU_STAT_MODE_DIR : HAKU_STAT_MODE_FILE_EXEC;
     out->st_nlink = 1u;
     out->st_uid = 0u;
     out->st_gid = 0u;

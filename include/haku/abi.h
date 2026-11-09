@@ -293,6 +293,11 @@
 #define HAKU_O_TRUNC   0x0200u
 #define HAKU_O_APPEND  0x0400u
 #define HAKU_O_NONBLOCK 0x0800u
+/* Set by a 32-bit libc on every open(2) call to ask for a 64-bit file
+ * offset. Haku's offsets are already 32-bit and a file cannot be larger
+ * than the disk image, so the flag is accepted and ignored; rejecting it
+ * made musl's opendir(), which passes it, fail with EINVAL. */
+#define HAKU_O_LARGEFILE 0x8000u
 #define HAKU_O_DIRECTORY 0x10000u
 #define HAKU_O_NOFOLLOW 0x20000u
 #define HAKU_O_CLOEXEC  0x80000u
@@ -401,6 +406,11 @@
 /* Default permissions Haku reports for FAT12 entries. */
 #define HAKU_STAT_MODE_REG 0x81A4u /* S_IFREG | 0644 */
 #define HAKU_STAT_MODE_DIR 0x41EDu /* S_IFDIR | 0755 */
+/* S_IFREG | 0755, for a filesystem that stores no permission bits at all.
+ * A shell will not run a program it finds on $PATH unless the file has an
+ * execute bit, so a FAT volume has to report one: the format cannot express
+ * permissions, and a vfat mount with mode=0755 behaves the same way. */
+#define HAKU_STAT_MODE_FILE_EXEC 0x81EDu
 #define HAKU_STAT_SIZE     64u
 #define HAKU_STAT64_SIZE   96u
 #define HAKU_STAT_BLKSIZE  512u

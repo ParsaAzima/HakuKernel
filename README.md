@@ -73,6 +73,8 @@ python build.py                 :: build haku.img only (data image preserved)
 python build.py run             :: build + boot in a QEMU window
 python build.py run --fresh     :: recreate the FAT12 data image, then boot
 python build.py headless        :: fresh data image + boot headless, verify
+python build.py shell           :: boot a busybox ash shell (interactive)
+python build.py shell --check   :: scripted shell run, assert its markers
 python build.py x64             :: build haku64.img (64-bit kernel) and boot it
 python build.py probe --init=X  :: boot an external ELF as /init, check markers
 python build.py --memory=1024   :: guest RAM in MiB (default 512, kernel cap 1020)
@@ -97,6 +99,22 @@ copy-on-write `fork` and `vfork` (`USER-COW-OK`, `USER-VFORK-OK`,
 `VFORK-EXEC-RAN`), signal delivery and dispositions (`USER-SIGNAL-OK`),
 the user C library (`USER-LIB-OK`), and timer IRQs
 through the serial log.
+
+`python build.py shell` boots something else entirely: a real static
+`busybox` (musl, i386) as PID 1, so the guest comes up in `ash` instead of
+Haku's own test userland. The image is a separate FAT12 volume
+(`build/haku_shell.img`) holding `BUSYBOX` and, for the scripted run, a
+one-line `INIT.CMD`; the kernel prefers `disk/BUSYBOX` over the initramfs
+when it is there and hands it `sh -c "…"`. busybox is 1 MiB and belongs to
+someone else, so it is cached under `build/` and never committed —
+`tools/getbusybox.py` fetches the Alpine `busybox-static` build on first use
+and `--busybox=PATH` points the build at a local copy instead (offline
+machines, CI). `--cmd=TEXT` replaces the boot command line, and
+`shell --check` runs the fixed script
+(`mkdir -p /bin`, `--install -s /bin`, `export PATH=/bin`, then `uname`,
+`ls /bin | wc -l`, `ls /`, `cat /proc/version`) and asserts
+`SHELL-BOOT`, `SHELL-OK`, `UNAME:haku`, `APPS:<count ≥ 100>`, `HakuKernel`,
+and `SHELL-DONE`. Today it reports 306 applets resolved through `$PATH`.
 
 ### Data image lifecycle
 
@@ -187,7 +205,7 @@ Memory map:
 | `0x40000000` | user program code/data virtual base (per-process mapping) |
 | `0x50000000–0x54000000` | user `brk` heap region (lazily mapped) |
 | `0x60000000–0x70000000` | anonymous `mmap` region (lazily mapped) |
-| `0xBFFFE000–0xC0000000` | two user stack pages |
+| `0xBFFFE000–0xC0000000` | user stack (two pages initially, grows downward on fault up to 1 MiB) |
 | `0xB8000` | VGA text buffer |
 
 ### x86-64: boot path, memory and interrupts (work in progress)
@@ -471,8 +489,8 @@ ticks, syscall count, and voluntary/involuntary context switches.
 `resident_bytes` covers mapped user pages; `kernel_bytes` covers the user page
 tables, the page directory, and the 8 KiB kernel stack; `total_bytes` is their
 sum. A NULL or unmapped buffer returns `EFAULT`. Accounting is per process,
-not per thread (the kernel has no threads), there is no demand paging, and
-ticks have 10 ms granularity.
+not per thread (the kernel has no threads), there is no demand paging
+apart from the user stack, and ticks have 10 ms granularity.
 
 ### User-mode system calls
 
@@ -487,11 +505,15 @@ file handles, and the device itself only forwards to the terminal layer.
 Paths are `/`-separated 8.3 names: a relative name starts at the process
 working directory, an absolute one at the volume root, `.` keeps the current
 directory, and `..` climbs to the parent (clamped at the root). `stat`
-and `fstat` report byte size and mode (`S_IFREG | 0644` for files,
-`S_IFDIR | 0755` for directories) through an 8-byte user buffer. Reads
-and writes are bounded to 4096 bytes, and errors return
-negative errno values (the user library in `user/lib` translates these to
-`errno`).
+and `fstat` report byte size and mode (`S_IFREG | 0755` for files,
+`S_IFDIR | 0755` for directories — FAT12 has no permission bits, and the
+execute bits are what let a shell run an applet it found through `$PATH`)
+through the Linux-shaped 64-byte `struct stat`. Reads and writes accept any
+count: one above the 4 KiB internal window is served as a short read or a
+short write, which is legal, so a libc that hands `cat` a 64 KiB buffer
+works unchanged (the old `EINVAL` there made every `cat`, `grep`, and `ls`
+on a large file fail). Errors return negative errno values (the user
+library in `user/lib` translates these to `errno`).
 Every FAT12 failure class keeps one distinct errno end to end: missing
 files give `ENOENT`, bad flags/whence/pointers give `EINVAL`, existing
 files give `EEXIST`, bad descriptors give `EBADF`, a full volume gives
@@ -988,8 +1010,9 @@ archive still boots the old way with FAT12 as the root.
 - **`ramfs`** (`kernel/fs/ramfs`) is the writable root: long names (48 bytes
   per component), permission bits, timestamps from the PIT, nested
   directories, and symbolic links with a hop limit of 8. Nodes come from a
-  fixed 160-entry table and file data from the kernel heap (256 KiB per file,
-  enough for a static libc binary),
+  fixed 512-entry table and file data from the kernel heap (256 KiB per
+  file, which is why the busybox shell loads its 1 MiB binary from the FAT12
+  disk and not from an initramfs),
   so nothing survives a reboot — which is exactly what an initramfs needs.
   Unlinking a file that is still open keeps the data alive until the last
   descriptor closes, the same promise FAT12 makes.
@@ -1018,6 +1041,70 @@ describes the last component itself (ramfs walks with `follow_last = 0`),
 without links answers exactly like `stat`. `symlink` and `readlink` are
 available to user mode; `readlink` truncates to the caller's buffer instead
 of failing, like Linux.
+
+### Running a real userland: busybox and musl
+
+`python build.py shell` is the first time an unmodified third-party program
+owns the machine. It also turned out to be the most demanding test the ABI
+has had, because a shell does things a hand-written self-test never does:
+`ls` a directory with 306 entries, `cat` a file into a 64 KiB buffer, `sort`
+a few thousand lines (musl falls back to `mmap` for that), `fork`/`execve`
+per command, and `--install -s /bin` to create 306 symlinks.
+
+The boot path is the existing one. The shell image is a FAT12 volume with
+`BUSYBOX` on it, the kernel mounts ramfs on `/`, mounts the FAT disk at
+`/disk`, sees `disk/BUSYBOX`, and runs it with `argv[0] = "sh"` and
+`argv[1..]` from `INIT.CMD` (`SHELL-BOOT`). busybox dispatches applets by the
+basename of `argv[0]`, so the kernel must pass a name that is also a real
+file: it uses the lowercase `disk/busybox` (FAT12 upper-cases 8.3 names
+itself). The Alpine build has no standalone shell, so `sh` finds `ls` and
+`cat` only through `$PATH` — the scripted run creates the links first.
+
+What had to change in the kernel to get from "musl prints a line" to "a
+usable shell":
+
+- **`O_LARGEFILE` is accepted and ignored.** A 32-bit libc sets `0x8000` on
+  every `open`, and `opendir` adds `O_DIRECTORY|O_CLOEXEC`; rejecting the
+  flag made `ls /` fail with `EINVAL`.
+- **Large `read`/`write` counts are clamped, not rejected.** busybox `cat`
+  asks for 64 KiB at once; a short read is the correct answer.
+- **`brk` returns exactly the break that was asked for.** musl treats the
+  page-rounded value as a refusal and falls back to `mmap` for every
+  allocation, which then hits the next limit.
+- **The user stack grows on demand.** Two pages were enough for the
+  self-test and not for `sort`; a fault below the initial stack now maps one
+  more page, up to 1 MiB (`USER_STACK_GROWTH`).
+- **A process can own more than 8 `mmap` regions.** `ls` on a large
+  directory and `sort` on a few thousand lines both ran out of them; the
+  per-process table is 64 entries now.
+- **FAT12 files report mode `0755`.** A shell will not `exec` a `$PATH` file
+  without an execute bit, and FAT has no permission bits to report.
+- **Symlinks are followed across mount points.** `--install -s /bin` makes
+  `/bin/ls -> /disk/busybox`, and an absolute target crosses from ramfs into
+  the FAT12 mount. `vfs_resolve_links` expands up to 8 hops, strips the
+  leading slash from an absolute target (VFS paths are canonical), and is
+  applied at the top of `vfs_open`, `vfs_stat`, and `vfs_opendir` so every
+  backend sees a path it can resolve itself. `execve` follows the link too,
+  so all 306 applet names share one loaded image.
+- **A 1 MiB exec is cached.** QEMU here is TCG-only, so one 1 MiB PIO load
+  costs about 14 s; the first `execve` of a path reads it and keeps the
+  image, and every later exec of the same file (or of another symlink to it)
+  reuses it, which is the difference between "unusable" and "instant". The
+  cache is keyed by path and size, and is also seeded with the boot image so
+  PID 1 never pays for it. `ata_read_one` additionally moved to `rep insw`.
+
+Interactive use is the same image without `INIT.CMD`: `python build.py shell`
+drops into `ash` on the serial console. `ls` (sorted columns, 300+ entries),
+`cat`, `head`, `grep`, `seq`, `sort`, `wc`, `uname`, `echo`, `mkdir`, `ln`,
+`rm`, `cp`, `mv`, and `--install` all behave, `cat /proc/meminfo` and
+`/proc/uptime` return live values, and `seq 1 20000 | wc -l` prints 20000. It
+is a shell on top of the kernel's own VFS, not a Linux emulation layer, so
+the tools that need a fuller `/proc` are shallow: `ps` prints only its header
+(there is no `/proc/<pid>`), `df`/`mount` look for `/proc/mounts` and report
+it missing, and `free` prints zeros because there is no `sysinfo` syscall.
+There is also no `/etc`, no line discipline beyond what the console
+provides, and `--install -s /bin` only fills the FAT12 image, which is
+regenerated on every build.
 
 ### Locking
 
