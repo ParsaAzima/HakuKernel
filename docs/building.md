@@ -49,6 +49,13 @@ copy-on-write `fork` and `vfork` (`USER-COW-OK`, `USER-VFORK-OK`,
 the user C library (`USER-LIB-OK`), and timer IRQs
 through the serial log.
 
+`python build.py x64` builds and boots `haku64.img` separately and asserts
+its own marker set. That run ends with `HAKU64-ELF-REJECT-OK` (six malformed
+ELF64 images refused with a reason), `HAKU64-ELF-OK` (the embedded static
+executable mapped into a fresh address space) and `HAKU64-ELF-RUN-OK` (the
+program ran in ring 3, wrote its BSS and exited through `INT 0x80`). The
+32-bit `haku.img` stays the default image.
+
 `python build.py shell` boots something else entirely: a real static
 `busybox` (musl, i386) as PID 1, so the guest comes up in `ash` instead of
 Haku's own test userland. The image is a separate FAT12 volume

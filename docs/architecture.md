@@ -63,6 +63,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x1B`/`SS=0x23` enters user mode | `HAKU64-USER-OK` |
 | syscall | the DPL-3 `INT 0x80` gate runs `write` and `exit` | `HAKU64-SYSCALL-OK` |
+| ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
 
 The physmap is why the 64-bit build has no equivalent of the 32-bit
@@ -128,10 +129,38 @@ inside the user half before printing it, and implements `write` and `exit`
 and no second entry stub; the roadmap keeps the Linux-compatible syscall
 table for a later stage.
 
-The 64-bit path still has no ELF64 loader or userland, and `haku.img` remains
-the default image; [the roadmap](../ROADMAP.md) (Milestone 8) lists the
-remaining stages. The 64-bit sources are excluded from the 32-bit link line,
-so both targets build from one tree.
+The 64-bit path now has an ELF64 loader too, but no 64-bit libc or filesystem
+image; `haku.img` remains the default image and
+[the roadmap](../ROADMAP.md) (Milestone 8) lists the remaining stages. The
+64-bit sources are excluded from the 32-bit link line, so both targets build
+from one tree.
+
+`kernel/arch/x86_64/elf/elf64.c` follows the 32-bit loader's rules — validate
+the whole image before mapping, accept only static `ET_EXEC`, require
+readable `PT_LOAD` segments that are not both writable and executable, refuse
+segments whose offset is not congruent with their address, and name the first
+reason a file was rejected. It maps each segment into a fresh
+`paging64_create_space` space, zero-filling the pages the file does not cover,
+then allocates a four-page stack ending one page below the top of PML4 slot
+1; the gap between the stack and the image is unmapped, so a runaway stack
+faults instead of overwriting code. Images must load above
+`0x0000008000010000`, which keeps the first 64 KiB of the slot unmapped.
+There is no `AT_PHDR` or auxiliary vector yet because nothing walks it; the
+loader records the page-aligned start of the first writable segment so the
+self-test can read it back.
+
+The test executable is `kernel/arch/x86_64/user/ring3_elf64.asm`: a flat
+`[BITS 64]` program that writes `ELF64`, stores a magic word in its BSS page
+and exits through `INT 0x80`. `tools/mkelf64.py` wraps the flat binary in an
+`ET_EXEC`/`EM_X86_64` image with an RX `PT_LOAD` at `0x0000008000400000` and a
+zero-filesz RW segment one page above it; `user64_image.asm` embeds the result
+in `.rdata`, which `tools/pe2bin.py` copies into the kernel image. The boot
+test first feeds `elf64_load` six malformed copies (wrong class, wrong
+machine, W+X, bad entry, offset past the file, truncated header) and requires
+a reason for each, then loads the valid image, checks that the BSS page is
+zero, and runs it as a user task. The magic word (`0x48414B55`) can only be
+there if ring 3 reached the store, so `HAKU64-ELF-RUN-OK` proves execution
+rather than a successful mapping.
 
 Physical layout on the 64-bit path: `0–2 MiB` firmware, boot stages, kernel
 image and the boot page tables; `2–16 MiB` boot allocations (page tables,

@@ -553,8 +553,21 @@ the port is complete.
 - [ ] Syscall ABI: widen the `INT 0x80` handler from three arguments to the
   x86-64 Linux `rdi/rsi/rdx/r10/r8/r9` convention and port the i386 number
   table from `usermode.c` (97 cases).
-- [ ] Userland: ELF64 loader, a 64-bit build of `user/lib`, and `musl-gcc`
-  binaries in the probe.
+- [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a
+  per-process space, and run in ring 3. `kernel/arch/x86_64/elf/elf64.c`
+  follows the 32-bit loader's checks (ELF class/data, `EM_X86_64`, static
+  linking only, readable `PT_LOAD` with no W+X, offset/address congruence,
+  non-overlapping page ranges, entry inside an executable segment) and names
+  the first reason a file was refused. It zero-fills `memsz` beyond `filesz`,
+  allocates a four-page stack at the top of PML4 slot 1, and frees the
+  mapped frames on `elf64_unload` because `paging64_destroy_space` only owns
+  tables. The test image is `user/ring3_elf64.asm`, wrapped by
+  `tools/mkelf64.py` and embedded through `user64_image.asm`; the boot test
+  refuses six malformed variants, checks the BSS page starts zero, and then
+  runs the image, whose BSS store proves execution. Markers:
+  `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK`.
+- [ ] Userland: a 64-bit build of `user/lib` and `musl-gcc` binaries in the
+  probe.
 
 **Acceptance criteria:** `python build.py x64` boots to a 64-bit user process
 running the same test suite as the 32-bit image, with its own headless marker

@@ -37,6 +37,18 @@ typedef signed long long s64;
 #define K64_USER_BASE 0x0000008000000000ull
 #define K64_USER_END  0x0000010000000000ull
 
+/* User layout used by the ELF64 loader. Images load above
+ * K64_USER_IMAGE_MIN (the first 64 KiB of the slot stay unmapped, so a NULL
+ * dereference is a fault rather than a valid read). The stack grows down
+ * from the top of the slot; the highest page is left unmapped, and the
+ * space between the stack and the image is unmapped too, so a runaway stack
+ * faults instead of overwriting code. */
+#define K64_USER_IMAGE_MIN   (K64_USER_BASE + 0x10000ull)
+#define K64_USER_STACK_TOP   (K64_USER_END - K64_PAGE_SIZE)
+#define K64_USER_STACK_PAGES 4u
+#define K64_USER_STACK_BOTTOM \
+    (K64_USER_STACK_TOP - (u64)K64_USER_STACK_PAGES * K64_PAGE_SIZE)
+
 /* Physical layout this stage reserves (all identity mapped, so a plain
  * pointer works):
  *   0x000000-0x200000  firmware, stage1/stage2, E820 and VBE handover,
@@ -195,6 +207,65 @@ int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user);
 u64 paging64_translate_space(u64 space, u64 virt);
 void paging64_destroy_space(u64 space);
 void paging64_switch_space(u64 space);
+
+/* ------------------------------------------------------------- ELF64 loader
+ * On-disk layout (the loader validates it before touching memory). The
+ * supported subset is static ET_EXEC: no PT_INTERP, no PT_DYNAMIC, readable
+ * PT_LOAD segments that are not both writable and executable. */
+#define K64_ELF64_MAX_PHDRS 16u
+#define K64_ELF64_MAX_PAGES 64u
+
+#pragma pack(push, 1)
+typedef struct {
+    u8 ident[16];
+    u16 type;
+    u16 machine;
+    u32 version;
+    u64 entry;
+    u64 phoff;
+    u64 shoff;
+    u32 flags;
+    u16 ehsize;
+    u16 phentsize;
+    u16 phnum;
+    u16 shentsize;
+    u16 shnum;
+    u16 shstrndx;
+} elf64_header_t;
+
+typedef struct {
+    u32 type;
+    u32 flags;
+    u64 offset;
+    u64 vaddr;
+    u64 paddr;
+    u64 filesz;
+    u64 memsz;
+    u64 align;
+} elf64_phdr_t;
+#pragma pack(pop)
+
+/* What elf64_load produced. `writable` is the page-aligned start of the
+ * first writable segment (0 when the image has none) and is what the
+ * self-test reads back after ring 3 has run. */
+typedef struct {
+    u64 space;
+    u64 entry;
+    u64 stack_top;
+    u64 stack_bottom;
+    u64 image_low;
+    u64 image_high;
+    u64 writable;
+    u32 pages;
+} loaded_elf64_t;
+
+int elf64_load(const u8 *image, u64 image_size, loaded_elf64_t *loaded);
+void elf64_unload(loaded_elf64_t *loaded);
+const char *elf64_last_error(void);
+
+/* user64_image.asm: the ELF64 test program, embedded by the build. */
+extern const u8 user64_image[];
+extern const u8 user64_image_end[];
 
 /* frame64.c */
 int frame64_init(u64 phys_limit);

@@ -38,6 +38,10 @@ Haku/
                         task64.c: tasks, per-task kernel stacks, round-robin
                         preemptive scheduler and the frame-pointer switch;
                         syscall64.c: DPL-3 INT 0x80 gate (write/exit)
+      elf/              elf64.c: validated static ELF64 PT_LOAD loader that
+                        maps segments into a per-process space
+      user/             ring3_elf64.asm: ELF64 test program (write, BSS store,
+                        exit); user64_image.asm: embeds the built image
       mm/               paging64.c: four-level paging, physmap and
                         per-process address spaces;
                         frame64.c: E820 frame allocator (no 1 GiB ceiling);
@@ -72,7 +76,7 @@ Haku/
                       string.c, unistd.c, crt0.asm, syscall.asm: user C library
     tests/            libtest.c: C library self-test installed as LIB.ELF
                       musl_probe.c: portable probe built by the CI musl job
-  include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
+  include/haku/         abi.h + abi.inc + abi64.inc: shared user/kernel ABI constants
                         types/errno/string/stdlib/unistd/fcntl/stat/stdio/
                         signal/mman/dirent/poll/termios/resource.h: user
                         library headers, plus haku.h
@@ -81,6 +85,8 @@ Haku/
   tools/mkfat12.py     FAT12 image builder for the user ELF
   tools/mkcpio.py      cpio "newc" initramfs builder (INITRD on the FAT volume)
   tools/pe2elf.py      fixed-base PE32 to ELF32 (RX/R/RW) for user C
+  tools/mkelf64.py     flat x86-64 binary → static ELF64 (RX code + RW BSS) for
+                      the 64-bit loader test
   .github/workflows/  ci.yml: hosted headless build/test + artifacts
                       release.yml: tag-driven bootable image release
   build.py             the whole build: cl/link/nasm/qemu orchestration

@@ -361,9 +361,9 @@ def build_x64(nasm, py, memory_mb):
     """Build and boot haku64.img: the same floppy, with a 64-bit kernel.
 
     The entry path, memory subsystem, interrupts, per-process address
-    spaces, the scheduler, ring-3 entry and the INT 0x80 gate are all
-    64-bit; there is no ELF64 loader or userland yet. The 32-bit kernel is
-    untouched and remains the default image.
+    spaces, the scheduler, ring-3 entry, the INT 0x80 gate and the ELF64
+    loader are all 64-bit; there is no 64-bit libc or filesystem image yet.
+    The 32-bit kernel is untouched and remains the default image.
     """
     cc, linker, label = find_x64_toolchain()
     log(f"x64 toolchain: {label}")
@@ -372,17 +372,23 @@ def build_x64(nasm, py, memory_mb):
     arch64 = os.path.join(ROOT, "kernel", "arch", "x86_64")
     entry_asm = os.path.join(arch64, "boot", "entry64.asm")
     isr_asm = os.path.join(arch64, "kernel", "isr64.asm")
+    user_src = os.path.join(arch64, "user", "ring3_elf64.asm")
+    user_image_asm = os.path.join(arch64, "user", "user64_image.asm")
     stage1_asm = os.path.join(arch32, "boot", "stage1.asm")
     stage2_asm = os.path.join(arch32, "boot", "stage2.asm")
 
     entry_obj = os.path.join(BUILD, "entry64.obj")
     isr_obj = os.path.join(BUILD, "isr64.obj")
+    user_flat = os.path.join(BUILD, "ring3_elf64.bin")
+    user_elf = os.path.join(BUILD, "ring3_elf64.elf")
+    user_image_obj = os.path.join(BUILD, "user64_image.obj")
     kernel_pe = os.path.join(BUILD, "kernel64.pe")
     kernel_bin = os.path.join(BUILD, "kernel64.bin")
     stage1_bin = os.path.join(BUILD, "stage1.bin")
     stage2_bin = os.path.join(BUILD, "stage2_64.bin")
     serial = os.path.join(BUILD, "serial64.log")
     img = os.path.join(ROOT, "haku64.img")
+    user_base = 0x0000008000400000
 
     # 1. the 64-bit entry stub and every C file under arch/x86_64
     include_dirs = [os.path.join(arch64, "kernel"), os.path.join(arch64, "mm")]
@@ -401,10 +407,22 @@ def build_x64(nasm, py, memory_mb):
             + ["/Fo" + obj, src])
         objects.append(obj)
     log(f"{len(objects)} x64 C objects built")
+
+    # 2. the ring-3 test program: flat binary -> static ELF64 -> embedded
+    #    .rdata object. mkelf64.py also refuses a program too large for the
+    #    one-page code segment the layout promises.
+    run([nasm, "-I" + os.path.join(ROOT, "include"), "-f", "bin",
+         f"-DUSER64_BASE={user_base:#x}", user_src, "-o", user_flat])
+    run([py, os.path.join(ROOT, "tools", "mkelf64.py"),
+         user_flat, user_elf, f"--base={user_base:#x}"])
+    embedded = user_elf.replace("/", "\\")
+    run([nasm, "-f", "win64", f"-DUSER64_IMAGE={embedded}",
+         user_image_asm, "-o", user_image_obj])
+
     run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:NATIVE",
                   "/ENTRY:entry64", "/BASE:0x10000", "/ALIGN:16", "/FIXED",
                   "/NODEFAULTLIB", "/OUT:" + kernel_pe,
-                  entry_obj, isr_obj] + objects)
+                  entry_obj, isr_obj, user_image_obj] + objects)
     pe = subprocess.run([py, os.path.join(ROOT, "tools", "pe2bin.py"),
                          kernel_pe, kernel_bin],
                         capture_output=True, text=True)
@@ -418,7 +436,7 @@ def build_x64(nasm, py, memory_mb):
     entry = m.group(1)
     log(f"x64 kernel entry: {entry}")
 
-    # 2. the same two boot stages, aimed at the 64-bit entry
+    # 3. the same two boot stages, aimed at the 64-bit entry
     run([nasm, "-f", "bin", stage1_asm, "-o", stage1_bin])
     kernel_sectors = (os.path.getsize(kernel_bin) + 511) // 512
     run([nasm, "-f", "bin", f"-DKERNEL_ENTRY={entry}",
@@ -427,7 +445,7 @@ def build_x64(nasm, py, memory_mb):
          stage1_bin, stage2_bin, kernel_bin, str(kernel_sectors), img,
          stage1_asm, stage2_asm])
 
-    # 3. boot it. qemu-system-i386 refuses long mode without a 64-bit CPU
+    # 4. boot it. qemu-system-i386 refuses long mode without a 64-bit CPU
     #    model, so this mode uses the x86_64 binary.
     qemu = find_tool("qemu-system-x86_64",
                      [r"C:\Program Files\qemu\qemu-system-x86_64.exe"], "QEMU")
@@ -448,7 +466,8 @@ def build_x64(nasm, py, memory_mb):
                 "HAKU64-FRAME-OK", "HAKU64-HEAP-OK", "HAKU64-GDT-OK",
                 "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
                 "HAKU64-VM-OK", "HAKU64-PROC-OK", "HAKU64-USER-OK",
-                "HAKU64-SYSCALL-OK", "HAKU64-SELFTEST-OK"]
+                "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
+                "HAKU64-ELF-REJECT-OK", "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():

@@ -14,7 +14,9 @@
  *   7. per-process address spaces (two PML4s mapping one virtual address
  *      to different frames, switched by writing CR3),
  *   8. two kernel tasks proving the frame-pointer context switch, then a
- *      ring-3 task whose INT 0x80 calls prove the syscall gate.
+ *      ring-3 task whose INT 0x80 calls prove the syscall gate,
+ *   9. the ELF64 loader: malformed images refused, then an embedded static
+ *      executable mapped into a fresh space and run in ring 3.
  *
  * Each step prints a marker the headless check asserts, so a regression
  * shows up as a missing line rather than a silent hang. The 32-bit kernel
@@ -451,6 +453,145 @@ static int test_user(void) {
     return 1;
 }
 
+/* --------------------------------------------------------- ELF64 user image
+ * The embedded executable comes from kernel/arch/x86_64/user/ring3_elf64.asm
+ * through tools/mkelf64.py. Every rejection case starts from a fresh copy of
+ * the valid image and changes one field. */
+static int expect_reject64(u8 *image, u64 size, const char *what) {
+    loaded_elf64_t loaded;
+
+    if (elf64_load(image, size, &loaded)) {
+        k64_puts("HAKU64-ELF-REJECT-FAIL: accepted ");
+        k64_puts(what);
+        k64_puts("\r\n");
+        elf64_unload(&loaded);
+        return 0;
+    }
+    if (memcmp(elf64_last_error(), "no error", 8) == 0) {
+        k64_puts("HAKU64-ELF-REJECT-FAIL: no reason for ");
+        k64_puts(what);
+        k64_puts("\r\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int test_elf64_reject(void) {
+    u64 size = (u64)(user64_image_end - user64_image);
+    u8 *copy = (u8 *)kmalloc64(size);
+    elf64_header_t good_header;
+    elf64_phdr_t good_phdrs[2];
+    elf64_header_t *header;
+    elf64_phdr_t *phdrs;
+    int ok = 1;
+
+    if (!copy) return 0;
+    memcpy(copy, user64_image, size);
+    header = (elf64_header_t *)copy;
+    if (header->phnum < 2) {
+        kfree64(copy);
+        return 0;
+    }
+    memcpy(&good_header, header, sizeof(good_header));
+    memcpy(good_phdrs, copy + header->phoff, sizeof(good_phdrs));
+    phdrs = (elf64_phdr_t *)(copy + header->phoff);
+
+    header->ident[4] = 1;                  /* ELFCLASS32 */
+    if (!expect_reject64(copy, size, "a 32-bit class")) ok = 0;
+    memcpy(header, &good_header, sizeof(good_header));
+
+    header->machine = 3;                   /* EM_386 */
+    if (!expect_reject64(copy, size, "the wrong machine")) ok = 0;
+    memcpy(header, &good_header, sizeof(good_header));
+
+    phdrs[0].flags = 7;                    /* R+W+X */
+    if (!expect_reject64(copy, size, "a writable executable segment")) ok = 0;
+    memcpy(phdrs, good_phdrs, sizeof(good_phdrs));
+
+    header->entry = K64_USER_STACK_TOP;    /* inside no segment */
+    if (!expect_reject64(copy, size, "an entry outside the code")) ok = 0;
+    memcpy(header, &good_header, sizeof(good_header));
+
+    phdrs[0].offset = size;                /* past the end of the file */
+    if (!expect_reject64(copy, size, "a segment past end of file")) ok = 0;
+    memcpy(phdrs, good_phdrs, sizeof(good_phdrs));
+
+    if (!expect_reject64(copy, 32, "a truncated header")) ok = 0;
+
+    kfree64(copy);
+    return ok;
+}
+
+static int test_elf64(void) {
+    loaded_elf64_t loaded;
+    u64 size = (u64)(user64_image_end - user64_image);
+    u64 before = sys64_count();
+    u64 deadline;
+    u64 phys;
+    int id;
+
+    if (!elf64_load(user64_image, size, &loaded)) {
+        k64_puts("HAKU64-ELF-FAIL: ");
+        k64_puts(elf64_last_error());
+        k64_puts("\r\n");
+        return 0;
+    }
+    if (loaded.entry == 0 || loaded.writable == 0 ||
+        loaded.image_high <= loaded.image_low) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    /* The read-write segment's BSS tail must be zero before ring 3 runs. */
+    phys = paging64_translate_space(loaded.space, loaded.writable);
+    if (!phys || *(const volatile u32 *)phys_to_virt64(phys) != 0) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    k64_puts("HAKU64-ELF-OK: entry=");
+    k64_hex(loaded.entry);
+    k64_puts(" pages=");
+    k64_dec(loaded.pages);
+    k64_puts(" bss=");
+    k64_hex(loaded.writable);
+    k64_puts("\r\n");
+
+    id = task64_create_user(loaded.entry, loaded.stack_top, loaded.space);
+    if (id < 0) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    deadline = timer64_ticks() + 200;
+    while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
+        cpu_pause64();
+    if (task64_state(id) != K64_TASK_DONE) return 0;
+
+    /* write + exit. The magic word is only in the image's BSS page if the
+     * program actually reached the store, so it proves ring-3 execution
+     * rather than a successful mapping. */
+    if (sys64_count() < before + 2) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+    phys = paging64_translate_space(loaded.space, loaded.writable);
+    if (!phys || *(const volatile u32 *)phys_to_virt64(phys) != 0x48414B55u) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    k64_puts("HAKU64-ELF-RUN-OK: syscalls=");
+    k64_dec(sys64_count() - before);
+    k64_puts(" bss=0x48414B55\r\n");
+
+    /* The task is done and the scheduler is on the boot context again, so
+     * its frames and address space can be released. Its kernel stack stays
+     * with the dead task slot, like the ring-3 test above. */
+    elf64_unload(&loaded);
+    return 1;
+}
+
 void kernel64_main(void) {
     u64 top;
     u64 highest;
@@ -543,8 +684,14 @@ void kernel64_main(void) {
     k64_dec(sys64_count());
     k64_puts(" state=done\r\n");
 
+    if (!test_elf64_reject()) k64_fail("ELF64 loader accepted a malformed"
+                                       " image");
+    k64_puts("HAKU64-ELF-REJECT-OK: six malformed images refused\r\n");
+
+    if (!test_elf64()) k64_fail("ELF64 loader self-test");
+
     k64_puts("HAKU64-SELFTEST-OK: physmap, frames, 4 KiB mapping, heap, "
-             "exceptions, timer, spaces, tasks, ring 3, syscalls\r\n");
+             "exceptions, timer, spaces, tasks, ring 3, syscalls, ELF64\r\n");
     k64_puts("HAKU64-READY: interrupts online, 32-bit kernel still boots "
              "the system\r\n");
     for (;;) cpu_halt64();
