@@ -60,10 +60,11 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
+| files | read-only in-memory store: `open`, `read`, `lseek`, `close` | `HAKU64-FS-OK`, `HAKU64-FILE-OK` |
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `write`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
@@ -147,20 +148,41 @@ as a DPL-3 fallback, and the test program exercises both entry points.
 
 `sys64_dispatch` implements the x86-64 Linux convention — number in `RAX`,
 arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in `RAX` or a negative
-errno — with the Linux x86-64 numbers for `write`, `writev`, `mmap`,
-`munmap`, `getpid`, `clock_gettime` and `exit`/`exit_group`; an unimplemented
-number returns `-ENOSYS`. Every user pointer is resolved through the current
-space with `paging64_query_space` before it is dereferenced, and the copies
-move through the physmap: a ring-0 page fault halts the kernel, so the CPU
-cannot be relied on to reject a bad address. `mmap` accepts private or shared
-anonymous mappings. `MAP_FIXED` places a mapping at a page-aligned address
-inside the anonymous window and refuses an occupied range instead of
-replacing it; a file descriptor or offset is still `-EINVAL` because there is
-no 64-bit VFS yet. Without `MAP_FIXED` the per-task bump region from
-`K64_USER_MMAP_BASE` supplies the address, and `munmap` clears the leaves and
-frees their frames. `clock_gettime` reports `CLOCK_MONOTONIC` as time since
-boot and `CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the
-ticks elapsed since that sample; when the RTC cannot be read it falls back to
+errno — with the Linux x86-64 numbers for `read`, `write`, `open`, `close`,
+`lseek`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime` and
+`exit`/`exit_group`; an unimplemented number returns `-ENOSYS`. Every user
+pointer is resolved through the current space with `paging64_query_space`
+before it is dereferenced, and the copies move through the physmap: a ring-0
+page fault halts the kernel, so the CPU cannot be relied on to reject a bad
+address.
+
+`mmap` accepts anonymous ranges (`fd` must be `-1`) and file-backed ones.
+`MAP_FIXED` places a mapping at a page-aligned address inside the anonymous
+window and refuses an occupied range instead of replacing it; without it the
+per-task bump region from `K64_USER_MMAP_BASE` supplies the address.
+`MAP_SHARED` on a file maps the file's own frames, so a store through the
+mapping is visible to `read`; `MAP_PRIVATE` copies the pages at map time,
+because there is no fork and therefore no COW. Mapping past the end of a file
+is `-EINVAL` rather than the `SIGBUS` a Linux process would take, and a
+page-aligned `offset` selects where in the file the mapping starts. Because
+`munmap` may not free a frame the file still owns, each task carries a small
+table of mapping ranges and whether their frames are owned; a task's table is
+consulted page by page.
+
+Files come from `kernel/arch/x86_64/kernel/fs64.c`, the read-only in-memory
+store the boot stage seeds from data in the kernel image: `/hello.txt` (the
+16-byte `HAKU64-FILE-OK\r\n` marker) and `/pattern.bin` (three pages of a
+deterministic pattern, so a mapping with a non-zero offset has data on every
+page). Each file is a list of frames from the frame allocator, which is what
+lets a shared mapping alias a page instead of copying it. `open` takes
+`O_RDONLY` only, descriptors 0..2 are the console, and the per-task table
+(`fs64_fd_*`) hands out 3 and up. There is still no disk filesystem or path
+walking in the 64-bit image; that arrives with the userland stage, and this
+store is its placeholder rather than a claim of VFS support.
+
+`clock_gettime` reports `CLOCK_MONOTONIC` as time since boot and
+`CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the ticks
+elapsed since that sample; when the RTC cannot be read it falls back to
 monotonic time. The full i386 number table stays with the later userland
 stage.
 
@@ -190,8 +212,12 @@ The test executable is `kernel/arch/x86_64/user/ring3_elf64.asm`: a flat
 the six-argument syscall ABI (`writev`, `getpid`, `CLOCK_MONOTONIC` and
 `CLOCK_REALTIME`, anonymous `mmap`/`munmap`, `MAP_FIXED` placement,
 `MAP_SHARED|MAP_ANONYMOUS`, and the `EBADF`/`EFAULT`/`ENOSYS`/`EINVAL` error
-paths over `INT 0x80`), prints `HAKU64-ABI-OK`, stores a magic word in its
-BSS page and exits with status 0.
+paths over `INT 0x80`), reads `/hello.txt` and prints the bytes it read
+(`HAKU64-FILE-OK`), maps that file privately and checks a store does not
+reach the file, maps it shared and checks the store does, maps
+`/pattern.bin` at a page offset and compares it with a `read` of the same
+range, prints `HAKU64-ABI-OK`, stores a magic word in its BSS page and exits
+with status 0.
 `tools/mkelf64.py` wraps the flat binary in an
 `ET_EXEC`/`EM_X86_64` image with an RX `PT_LOAD` at `0x0000008000400000` and a
 zero-filesz RW segment one page above it; `user64_image.asm` embeds the result

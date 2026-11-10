@@ -2,13 +2,14 @@
 ;
 ; tools/mkelf64.py wraps this flat binary in an ELF image at USER64_BASE and
 ; the kernel embeds the result in .rdata. The program exercises the six
-; argument INT 0x80 ABI: the success paths for write, writev, getpid,
-; clock_gettime, mmap and munmap, and the error paths for a bad descriptor,
-; a bad user pointer, an unknown number, a W+X mapping, a bad mmap
-; descriptor/offset and an unaligned munmap. It prints HAKU64-ABI-OK, stores
-; a magic word in its zero-filled BSS page and exits with status 0; the
-; kernel reads both back, which proves the image ran in ring 3 instead of
-; merely being mapped.
+; argument SYSCALL ABI: the success paths for write, writev, getpid,
+; clock_gettime, open/read/close/lseek, anonymous and file-backed mmap and
+; munmap, and the error paths for a bad descriptor, a bad user pointer, an
+; unknown number, a W+X mapping, a bad mmap descriptor/offset and an
+; unaligned munmap. It prints HAKU64-FILE-OK by reading the file store and
+; HAKU64-ABI-OK, stores a magic word in its zero-filled BSS page and exits
+; with status 0; the kernel reads both back, which proves the image ran in
+; ring 3 instead of merely being mapped.
 ;
 ; The code is position independent (RIP-relative operands only), so the flat
 ; binary does not need a linker to resolve USER64_BASE: mkelf64.py chooses the
@@ -28,6 +29,10 @@ default rel
 ; A free page inside the kernel's anonymous mmap window (K64_USER_MMAP_BASE
 ; is 0x8010000000), used to exercise MAP_FIXED.
 %define USER64_FIXED 0x0000008010008000
+
+; Scratch inside the writable segment for file buffers. The magic word the
+; kernel reads back lives at offset 0, so the buffers start further in.
+%define FILE_BUF (USER64_BSS + 0x200)
 
 _start:
     ; write(1, "ELF64\n", 6) through SYSCALL, then prove the SYSRET return
@@ -195,6 +200,252 @@ _start:
     test rax, rax
     jne fail
 
+    ; ---- file store and file-backed mmap -----------------------------
+    ; open("/hello.txt", O_RDONLY) hands out a descriptor above 2.
+    mov rbx, FILE_BUF
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_hello]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jle fail
+    cmp rax, 2
+    jbe fail
+    mov r15, rax
+
+    ; read() returns the file bytes; printing them is the HAKU64-FILE-OK
+    ; marker, so the console line itself is the proof.
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r15
+    mov rsi, rbx
+    mov edx, 32
+    syscall
+    cmp rax, 16
+    jne fail
+    mov eax, HAKU64_SYS_WRITE
+    mov edi, 1
+    mov rsi, rbx
+    mov edx, 16
+    syscall
+    cmp rax, 16
+    jne fail
+
+    ; A private mapping copies the page: its bytes match the file, but a
+    ; store to it does not change what read() sees.
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ | HAKU64_PROT_WRITE
+    mov r10d, HAKU64_MAP_PRIVATE
+    mov r8, r15
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle fail
+    mov r13, rax
+    mov rcx, [rbx]
+    cmp [r13], rcx
+    jne fail
+    mov rcx, [rbx + 8]
+    cmp [r13 + 8], rcx
+    jne fail
+    mov byte [r13], 'X'
+    mov eax, HAKU64_SYS_LSEEK
+    mov rdi, r15
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jne fail
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r15
+    lea rsi, [rbx + 64]
+    mov edx, 1
+    syscall
+    cmp rax, 1
+    jne fail
+    cmp byte [rbx + 64], 'H'
+    jne fail
+    mov eax, HAKU64_SYS_MUNMAP
+    mov rdi, r13
+    mov esi, 0x1000
+    syscall
+    test rax, rax
+    jne fail
+
+    ; A shared mapping is the file's own page: the store is visible to
+    ; read(), and munmap must not take the frame with it.
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ | HAKU64_PROT_WRITE
+    mov r10d, HAKU64_MAP_SHARED
+    mov r8, r15
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle fail
+    mov r13, rax
+    mov byte [r13], 'S'
+    mov eax, HAKU64_SYS_LSEEK
+    mov rdi, r15
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jne fail
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r15
+    lea rsi, [rbx + 64]
+    mov edx, 1
+    syscall
+    cmp rax, 1
+    jne fail
+    cmp byte [rbx + 64], 'S'
+    jne fail
+    mov byte [r13], 'H'              ; put the marker byte back
+    mov eax, HAKU64_SYS_MUNMAP
+    mov rdi, r13
+    mov esi, 0x1000
+    syscall
+    test rax, rax
+    jne fail
+
+    ; The file survived that munmap: a fresh read still returns the marker.
+    mov eax, HAKU64_SYS_LSEEK
+    mov rdi, r15
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jne fail
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r15
+    mov rsi, rbx
+    mov edx, 16
+    syscall
+    cmp rax, 16
+    jne fail
+    lea rax, [msg_file]
+    mov rcx, [rax]
+    cmp rcx, [rbx]
+    jne fail
+    mov rcx, [rax + 8]
+    cmp rcx, [rbx + 8]
+    jne fail
+
+    ; The three-page pattern file: a page-aligned offset maps the page the
+    ; offset selects, and the mapping matches a read() of the same range.
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_pattern]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jle fail
+    mov r14, rax
+    mov eax, HAKU64_SYS_LSEEK
+    mov rdi, r14
+    mov esi, 0x1000
+    xor edx, edx
+    syscall
+    cmp rax, 0x1000
+    jne fail
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r14
+    mov rsi, rbx
+    mov edx, 16
+    syscall
+    cmp rax, 16
+    jne fail
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ
+    mov r10d, HAKU64_MAP_PRIVATE
+    mov r8, r14
+    mov r9d, 0x1000
+    syscall
+    test rax, rax
+    jle fail
+    mov r13, rax
+    mov rcx, [rbx]
+    cmp [r13], rcx
+    jne fail
+    mov rcx, [rbx + 8]
+    cmp [r13 + 8], rcx
+    jne fail
+    mov eax, HAKU64_SYS_MUNMAP
+    mov rdi, r13
+    mov esi, 0x1000
+    syscall
+    test rax, rax
+    jne fail
+
+    ; A non-page-aligned offset and a range past the end of the file are
+    ; both -EINVAL: there is no SIGBUS model to report a late access.
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ
+    mov r10d, HAKU64_MAP_PRIVATE
+    mov r8, r14
+    mov r9d, 0x10
+    syscall
+    cmp rax, -HAKU64_EINVAL
+    jne fail
+
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ
+    mov r10d, HAKU64_MAP_PRIVATE
+    mov r8, r14
+    mov r9d, 0x3000
+    syscall
+    cmp rax, -HAKU64_EINVAL
+    jne fail
+
+    ; close() drops the descriptor, so read() and mmap() are -EBADF;
+    ; open() of an unknown name is -ENOENT and a write open is -EINVAL.
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r14
+    syscall
+    test rax, rax
+    jne fail
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r14
+    mov rsi, rbx
+    mov edx, 1
+    syscall
+    cmp rax, -HAKU64_EBADF
+    jne fail
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ
+    mov r10d, HAKU64_MAP_PRIVATE
+    mov r8, r14
+    xor r9d, r9d
+    syscall
+    cmp rax, -HAKU64_EBADF
+    jne fail
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_missing]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    cmp rax, -HAKU64_ENOENT
+    jne fail
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_hello]
+    mov esi, HAKU64_O_WRONLY
+    xor edx, edx
+    syscall
+    cmp rax, -HAKU64_EINVAL
+    jne fail
+
     ; The INT 0x80 gate stays available; the error paths below use it so
     ; both entry points run in the same program.
     ; write() to a descriptor other than 1 or 2 is -EBADF.
@@ -309,6 +560,19 @@ msg_boot_end:
 msg_sys64:
     db 'HAKU64-SYSCALL64-OK', 10
 msg_sys64_end:
+
+msg_file:
+    db 'HAKU64-FILE-OK', 13, 10
+msg_file_end:
+
+path_hello:
+    db '/hello.txt', 0
+
+path_pattern:
+    db '/pattern.bin', 0
+
+path_missing:
+    db '/nope', 0
 
 msg_abi:
     db 'HAKU64-ABI-OK'

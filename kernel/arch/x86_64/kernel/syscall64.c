@@ -30,6 +30,7 @@
 #define SYS64_TIMESPEC    16ull
 
 #define SYS64_EPERM  1ull
+#define SYS64_ENOENT 2ull
 #define SYS64_EBADF  9ull
 #define SYS64_ENOMEM 12ull
 #define SYS64_EFAULT 14ull
@@ -183,21 +184,23 @@ static u64 sys64_writev(u64 fd, u64 iov, u64 count) {
     return total;
 }
 
-/* mmap(address, length, prot, flags, fd, offset): anonymous mappings only,
- * private or shared. Without MAP_FIXED the address must be 0 and the range
- * comes from the task's bump pointer. MAP_FIXED takes a page-aligned
- * address inside the anonymous window and refuses a range that is already
- * mapped instead of replacing it, so a fixed mapping can never silently
- * discard the program or its stack. A file descriptor or offset is still
- * -EINVAL: file-backed mappings need the 64-bit VFS. */
+/* mmap(address, length, prot, flags, fd, offset): anonymous or file-backed.
+ * Without MAP_FIXED the address must be 0 and the range comes from the
+ * task's bump pointer; MAP_FIXED takes a page-aligned address inside the
+ * anonymous window and refuses a range that is already mapped instead of
+ * replacing it, so a fixed mapping can never silently discard the program
+ * or its stack. A file-backed mapping needs an open descriptor and a
+ * page-aligned offset inside the file: MAP_SHARED maps the file's own
+ * frames (writes are visible to read), MAP_PRIVATE copies them at map time
+ * because there is no fork and therefore no COW. Mapping past the end of
+ * the file is -EINVAL rather than the SIGBUS a Linux process would see. */
 static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
                       u64 offset) {
     int id = sched64_current();
-    u64 space, pages, base, kind, end;
-    int writable, fixed;
+    u64 space, pages, base, kind, end, file_size;
+    int writable, fixed, anon, file = -1, owned = 1;
 
-    if (length == 0 || fd != ~0ull || offset != 0)
-        return (u64)0 - SYS64_EINVAL;
+    if (length == 0) return (u64)0 - SYS64_EINVAL;
     if (prot & ~(u64)(K64_PROT_READ | K64_PROT_WRITE | K64_PROT_EXEC))
         return (u64)0 - SYS64_EINVAL;
     if ((prot & K64_PROT_WRITE) && (prot & K64_PROT_EXEC))
@@ -208,11 +211,26 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
     kind = flags & ~(u64)(K64_MAP_PRIVATE | K64_MAP_SHARED | K64_MAP_FIXED |
                           K64_MAP_ANONYMOUS);
     if (kind != 0) return (u64)0 - SYS64_EINVAL;
-    if ((flags & K64_MAP_ANONYMOUS) == 0) return (u64)0 - SYS64_EINVAL;
     if (((flags & K64_MAP_PRIVATE) != 0) == ((flags & K64_MAP_SHARED) != 0))
         return (u64)0 - SYS64_EINVAL;
 
     pages = (length + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
+    anon = (flags & K64_MAP_ANONYMOUS) != 0;
+    if (anon) {
+        if (fd != ~0ull || offset != 0) return (u64)0 - SYS64_EINVAL;
+    } else {
+        if ((offset & (K64_PAGE_SIZE - 1)) != 0)
+            return (u64)0 - SYS64_EINVAL;
+        file = fs64_fd_file(id, (int)fd);
+        if (file < 0) return (u64)0 - SYS64_EBADF;
+        file_size = fs64_pages(file) * K64_PAGE_SIZE;
+        if (offset >= file_size) return (u64)0 - SYS64_EINVAL;
+        if (length > file_size - offset) return (u64)0 - SYS64_EINVAL;
+        /* Shared pages are the file's; private pages are copies we own and
+         * therefore have to free again on munmap. */
+        owned = (flags & K64_MAP_SHARED) == 0;
+    }
+
     fixed = (flags & K64_MAP_FIXED) != 0;
     space = sched64_space(id);
 
@@ -237,16 +255,28 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
         if (!base) return (u64)0 - SYS64_ENOMEM;
     }
 
+    if (!task64_map_record(id, base, pages, owned))
+        return (u64)0 - SYS64_ENOMEM;
+
     writable = (prot & K64_PROT_WRITE) != 0;
     for (u64 i = 0; i < pages; i++) {
         u64 virt = base + i * K64_PAGE_SIZE;
-        u64 frame = frame64_alloc();
+        u64 frame;
 
-        if (!frame) goto fail;
-        memset(phys_to_virt64(frame), 0, K64_PAGE_SIZE);
+        if (anon || owned) {
+            frame = frame64_alloc();
+            if (!frame) goto fail;
+            memset(phys_to_virt64(frame), 0, K64_PAGE_SIZE);
+            if (!anon)
+                fs64_read(file, offset + i * K64_PAGE_SIZE,
+                          phys_to_virt64(frame), K64_PAGE_SIZE);
+        } else {
+            frame = fs64_page(file, offset / K64_PAGE_SIZE + i);
+            if (!frame) goto fail;
+        }
         if (!paging64_map_space(space, virt, frame, writable, 1,
                                 (prot & K64_PROT_EXEC) != 0)) {
-            frame64_free(frame);
+            if (anon || owned) frame64_free(frame);
             goto fail;
         }
     }
@@ -261,14 +291,18 @@ fail:
 
         if (!paging64_query_space(space, virt, 0, 0, 0)) continue;
         phys = paging64_unmap_space(space, virt);
-        if (phys) frame64_free(phys);
+        if (phys && task64_map_owned(id, virt)) frame64_free(phys);
     }
+    task64_map_drop(id, base, pages * K64_PAGE_SIZE);
     return (u64)0 - SYS64_ENOMEM;
 }
 
 /* munmap(address, length). The address must be page aligned; a page that
- * is already absent is skipped, so unmapping twice is harmless. */
+ * is already absent is skipped, so unmapping twice is harmless. The mapping
+ * records decide whether a frame is ours to free: a MAP_SHARED file mapping
+ * aliases frames the file still owns. */
 static u64 sys64_munmap(u64 address, u64 length) {
+    int id = sched64_current();
     u64 space, pages;
 
     if ((address & (K64_PAGE_SIZE - 1)) != 0) return (u64)0 - SYS64_EINVAL;
@@ -280,11 +314,106 @@ static u64 sys64_munmap(u64 address, u64 length) {
     pages = (length + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
     space = current_space();
     for (u64 i = 0; i < pages; i++) {
-        u64 phys = paging64_unmap_space(space, address + i * K64_PAGE_SIZE);
+        u64 virt = address + i * K64_PAGE_SIZE;
+        u64 phys = paging64_unmap_space(space, virt);
 
-        if (phys) frame64_free(phys);
+        if (phys && task64_map_owned(id, virt)) frame64_free(phys);
     }
+    task64_map_drop(id, address, pages * K64_PAGE_SIZE);
     return 0;
+}
+
+/* open(path, flags, mode): read-only, from fs64.c. The path is copied out
+ * of user memory one byte at a time -- a page-sized copy would fault on a
+ * short string that ends near the end of a page -- into a bounded kernel
+ * buffer, so nothing here can run off the end of a name. */
+static u64 sys64_open(u64 path, u64 flags, u64 mode) {
+    char name[K64_FS_PATH_MAX + 1];
+    u64 space = current_space();
+    int file, fd;
+
+    (void)mode;
+    if (flags != K64_O_RDONLY) return (u64)0 - SYS64_EINVAL;
+
+    for (u64 i = 0; i <= (u64)K64_FS_PATH_MAX; i++) {
+        if (!copy_from_user64(space, &name[i], path + i, 1))
+            return (u64)0 - SYS64_EFAULT;
+        if (name[i] == '\0') break;
+        if (i == (u64)K64_FS_PATH_MAX) return (u64)0 - SYS64_EINVAL;
+    }
+
+    file = fs64_open(name);
+    if (file < 0) return (u64)0 - SYS64_ENOENT;
+    fd = fs64_fd_open(sched64_current(), file);
+    if (fd < 0) return (u64)0 - SYS64_ENOMEM;
+    return (u64)fd;
+}
+
+/* read(fd, buffer, count): file descriptors only. The data is staged in a
+ * small kernel buffer and copied out page by page, so a bad pointer after
+ * some bytes is a short read rather than a fault. */
+static u64 sys64_read(u64 fd, u64 buffer, u64 count) {
+    int id = sched64_current(), file;
+    u64 space, pos, size, done = 0;
+    u8 chunk[64];
+
+    file = fs64_fd_file(id, (int)fd);
+    if (file < 0) return (u64)0 - SYS64_EBADF;
+    if (count == 0) return 0;
+    if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+
+    pos = fs64_fd_pos(id, (int)fd);
+    size = fs64_size(file);
+    if (pos >= size) return 0;
+    if (count > size - pos) count = size - pos;
+
+    space = current_space();
+    while (done < count) {
+        u64 n = count - done;
+
+        if (n > sizeof(chunk)) n = sizeof(chunk);
+        n = fs64_read(file, pos + done, chunk, n);
+        if (n == 0) break;
+        if (!copy_to_user64(space, buffer + done, chunk, n)) {
+            if (done) break;
+            return (u64)0 - SYS64_EFAULT;
+        }
+        done += n;
+    }
+    fs64_fd_seek(id, (int)fd, pos + done);
+    return done;
+}
+
+/* close(fd): -EBADF for anything that is not an open file descriptor. */
+static u64 sys64_close(u64 fd) {
+    int id = sched64_current();
+
+    if (fs64_fd_file(id, (int)fd) < 0) return (u64)0 - SYS64_EBADF;
+    fs64_fd_close(id, (int)fd);
+    return 0;
+}
+
+/* lseek(fd, offset, whence). The offset is a signed byte count, so a
+ * negative result is -EINVAL instead of a huge unsigned position. */
+static u64 sys64_lseek(u64 fd, u64 offset, u64 whence) {
+    int id = sched64_current();
+    int file = fs64_fd_file(id, (int)fd);
+    s64 delta = (s64)offset, pos;
+
+    if (file < 0) return (u64)0 - SYS64_EBADF;
+    switch (whence) {
+    case K64_SEEK_SET: pos = 0; break;
+    case K64_SEEK_CUR: pos = (s64)fs64_fd_pos(id, (int)fd); break;
+    case K64_SEEK_END: pos = (s64)fs64_size(file); break;
+    default: return (u64)0 - SYS64_EINVAL;
+    }
+    if (delta > 0 && pos > (s64)0x7FF0000000000000ull - delta)
+        return (u64)0 - SYS64_EINVAL;
+    pos += delta;
+    if (pos < 0) return (u64)0 - SYS64_EINVAL;
+
+    fs64_fd_seek(id, (int)fd, (u64)pos);
+    return (u64)pos;
 }
 
 /* getpid(): task index + 1, so a process never sees pid 0. */
@@ -342,6 +471,22 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
     }
 
     switch (frame->rax) {
+    case K64_SYS_READ:
+        result = sys64_read(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
+    case K64_SYS_OPEN:
+        result = sys64_open(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
+    case K64_SYS_CLOSE:
+        result = sys64_close(frame->rdi);
+        break;
+
+    case K64_SYS_LSEEK:
+        result = sys64_lseek(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
     case K64_SYS_WRITE:
         result = sys64_write(frame->rdi, frame->rsi, frame->rdx);
         wrote = 1;

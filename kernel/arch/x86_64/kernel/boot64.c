@@ -598,6 +598,30 @@ static int test_elf64_reject(void) {
     return ok;
 }
 
+/* The store must return exactly the bytes each file advertises, because the
+ * mmap path copies and aliases those same frames. */
+static int test_fs(void) {
+    static const char marker[16] = "HAKU64-FILE-OK\r\n";
+    char hello[16];
+    u8 pattern[32];
+    int file;
+
+    file = fs64_open("/hello.txt");
+    if (file < 0 || fs64_size(file) != sizeof(hello)) return 0;
+    if (fs64_read(file, 0, hello, sizeof(hello)) != sizeof(hello)) return 0;
+    if (memcmp(hello, marker, sizeof(hello)) != 0) return 0;
+    if (fs64_open("/missing") >= 0) return 0;
+
+    file = fs64_open("/pattern.bin");
+    if (file < 0 || fs64_pages(file) != 3) return 0;
+    if (fs64_read(file, 0x1000, pattern, sizeof(pattern)) !=
+        sizeof(pattern))
+        return 0;
+    for (u32 i = 0; i < sizeof(pattern); i++)
+        if (pattern[i] != fs64_pattern_byte(0x1000 + i)) return 0;
+    return 1;
+}
+
 static int test_elf64(void) {
     loaded_elf64_t loaded;
     u64 size = (u64)(user64_image_end - user64_image);
@@ -652,12 +676,13 @@ static int test_elf64(void) {
     }
 
     /* The program makes more than a dozen calls: the success paths for
-     * write, writev, getpid, clock_gettime, mmap and munmap, plus the
-     * error matrix. The bump pointer advanced by the initial two pages and
-     * the one-page MAP_SHARED mapping (MAP_FIXED does not bump), which
-     * proves the mapping tests ran even though munmap released the pages. */
+     * write, writev, getpid, clock_gettime, open/read/close/lseek, mmap and
+     * munmap, plus the error matrix. The bump pointer advanced by the two
+     * initial pages, the one-page MAP_SHARED anonymous mapping and the three
+     * file mappings (MAP_FIXED does not bump), which proves the mapping
+     * tests ran even though munmap released the pages again. */
     if (sys64_count() < before + 10 ||
-        task64_mmap_base(id) != K64_USER_MMAP_BASE + 3 * K64_PAGE_SIZE) {
+        task64_mmap_base(id) != K64_USER_MMAP_BASE + 6 * K64_PAGE_SIZE) {
         elf64_unload(&loaded);
         return 0;
     }
@@ -724,6 +749,16 @@ void kernel64_main(void) {
     if (!test_frames()) k64_fail("frame allocator self-test");
     if (!test_paging()) k64_fail("4 KiB mapping self-test");
     if (!test_heap()) k64_fail("heap self-test");
+
+    if (!fs64_init()) k64_fail("in-memory file store");
+    if (!test_fs()) k64_fail("file store self-test");
+    k64_puts("HAKU64-FS-OK: files=");
+    k64_dec(fs64_file_count());
+    k64_puts(" hello=");
+    k64_dec(fs64_size(fs64_open("/hello.txt")));
+    k64_puts(" pattern=");
+    k64_dec(fs64_size(fs64_open("/pattern.bin")));
+    k64_puts("\r\n");
 
     gdt64_init();
     k64_puts("HAKU64-GDT-OK: tss=");
@@ -793,8 +828,8 @@ void kernel64_main(void) {
     if (!test_elf64()) k64_fail("ELF64 loader self-test");
 
     k64_puts("HAKU64-SELFTEST-OK: physmap, frames, 4 KiB mapping, heap, "
-             "exceptions, timer, RTC, spaces, tasks, ring 3, syscalls, NX, "
-             "ELF64\r\n");
+             "files, exceptions, timer, RTC, spaces, tasks, ring 3, syscalls, "
+             "NX, ELF64\r\n");
     k64_puts("HAKU64-READY: interrupts online, 32-bit kernel still boots "
              "the system\r\n");
     for (;;) cpu_halt64();

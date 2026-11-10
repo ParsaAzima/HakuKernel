@@ -58,8 +58,11 @@ control and pipelines working.
 - **Userland** — freestanding C library (`user/lib`), busybox/musl as PID 1,
   headless self-tests for every subsystem listed above.
 - **x86-64** — in progress: long-mode entry, four-level paging with a physmap,
-  frame allocator, heap, GDT/TSS with IST stacks, IDT/PIC, timer, and self-tests
-  all pass; there is no scheduler, syscall layer, or userland yet.
+  frame allocator, heap, GDT/TSS with IST stacks, IDT/PIC, timer, RTC wall
+  clock, round-robin scheduler, ring 3 with `SYSCALL`/`SYSRET` and the Linux
+  syscall convention, NX enforcement, an ELF64 loader, and a read-only
+  in-memory file store that file-backed `mmap` maps from. No fork, signals,
+  threads, disk filesystem or 64-bit libc yet.
 
 ## Quick start
 

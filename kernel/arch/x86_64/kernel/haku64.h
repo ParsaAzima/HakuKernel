@@ -122,7 +122,11 @@ typedef signed long long s64;
  * number in RAX, arguments in RDI/RSI/RDX/R10/R8/R9, result in RAX, or a
  * negative errno. The numbers are the Linux x86-64 ones, so a static
  * Linux-targeted binary reaches the implemented calls unchanged. */
+#define K64_SYS_READ          0u
 #define K64_SYS_WRITE         1u
+#define K64_SYS_OPEN          2u
+#define K64_SYS_CLOSE         3u
+#define K64_SYS_LSEEK         8u
 #define K64_SYS_MMAP          9u
 #define K64_SYS_MUNMAP        11u
 #define K64_SYS_WRITEV        20u
@@ -131,11 +135,12 @@ typedef signed long long s64;
 #define K64_SYS_CLOCK_GETTIME 228u
 #define K64_SYS_EXIT_GROUP    231u
 
-/* PROT_* and MAP_* as Linux spells them. mmap is anonymous only: there is
- * no file-backed mapping until a 64-bit VFS exists. MAP_SHARED is accepted
- * because anonymous shared pages are identical to private ones without a
- * fork, and MAP_FIXED maps at a caller-chosen address if that range is free
- * (it does not replace an existing mapping). */
+/* PROT_* and MAP_* as Linux spells them. mmap takes either an anonymous
+ * range (fd must be -1) or an open descriptor from fs64.c, and MAP_SHARED
+ * file pages are the file's own frames, so a write through the mapping is
+ * visible to read(). MAP_PRIVATE copies the pages at map time (there is no
+ * COW without fork). MAP_FIXED maps at a caller-chosen address if that
+ * range is free; it does not replace an existing mapping. */
 #define K64_PROT_READ   1u
 #define K64_PROT_WRITE  2u
 #define K64_PROT_EXEC   4u
@@ -143,6 +148,16 @@ typedef signed long long s64;
 #define K64_MAP_PRIVATE   0x02u
 #define K64_MAP_FIXED     0x10u
 #define K64_MAP_ANONYMOUS 0x20u
+
+/* open() flags: the store is read-only, so only O_RDONLY is accepted. */
+#define K64_O_RDONLY 0u
+#define K64_O_WRONLY 1u
+#define K64_O_RDWR   2u
+
+/* lseek() whence values, with the Linux numbering. */
+#define K64_SEEK_SET 0u
+#define K64_SEEK_CUR 1u
+#define K64_SEEK_END 2u
 
 #define K64_CLOCK_REALTIME  0u
 #define K64_CLOCK_MONOTONIC 1u
@@ -362,7 +377,7 @@ extern u64 gdt64_rsp0_value;
  * A task's context is the regs64_t frame the interrupt stubs already
  * build, so a switch is "return a different frame pointer from
  * isr64_dispatch". New tasks start from a frame assembled on their own
- * kernel stack; a user task's frame carries CS=0x1B/SS=0x23 and is
+ * kernel stack; a user task's frame carries CS=0x23/SS=0x1B and is
  * entered with IRETQ from the same path. */
 #define K64_TASK_MAX        8u
 #define K64_TASK_STACK_SIZE 16384ull
@@ -398,8 +413,33 @@ u64 task64_fault_address(int id);
  * request would reach the stack guard or exceed the page cap. */
 u64 task64_mmap_base(int id);
 u64 task64_mmap_reserve(int id, u64 pages);
+/* Mapping records: munmap has to know whether the frames in a range belong
+ * to the mapping (anonymous or a private file copy) or to a file that a
+ * MAP_SHARED mapping aliases, because only the first kind may be freed. */
+int task64_map_record(int id, u64 base, u64 pages, int owned);
+int task64_map_owned(int id, u64 address);
+void task64_map_drop(int id, u64 base, u64 length);
 
-/* syscall64.c: INT 0x80 dispatch */
+/* fs64.c: the read-only in-memory file store and the per-task descriptor
+ * table. Files are whole frames, so mmap can alias a file page directly. */
+#define K64_FS_FDS      16u
+#define K64_FS_PATH_MAX 64u
+int fs64_init(void);
+int fs64_open(const char *name);
+int fs64_file_count(void);
+const char *fs64_name(int file);
+u64 fs64_size(int file);
+u64 fs64_pages(int file);
+u64 fs64_page(int file, u64 index);
+u64 fs64_read(int file, u64 offset, void *dst, u64 count);
+u8 fs64_pattern_byte(u64 offset);
+int fs64_fd_open(int task, int file);
+int fs64_fd_file(int task, int fd);
+u64 fs64_fd_pos(int task, int fd);
+int fs64_fd_seek(int task, int fd, u64 pos);
+void fs64_fd_close(int task, int fd);
+
+/* syscall64.c: SYSCALL/SYSRET dispatch */
 void syscall64_init(void);
 regs64_t *sys64_dispatch(regs64_t *frame);
 u64 sys64_count(void);

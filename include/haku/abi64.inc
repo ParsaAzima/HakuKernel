@@ -8,7 +8,11 @@
 
 %define HAKU64_SYSCALL_VECTOR 0x80
 
+%define HAKU64_SYS_READ          0
 %define HAKU64_SYS_WRITE         1
+%define HAKU64_SYS_OPEN          2
+%define HAKU64_SYS_CLOSE         3
+%define HAKU64_SYS_LSEEK         8
 %define HAKU64_SYS_MMAP          9
 %define HAKU64_SYS_MUNMAP        11
 %define HAKU64_SYS_WRITEV        20
@@ -16,6 +20,14 @@
 %define HAKU64_SYS_EXIT          60
 %define HAKU64_SYS_CLOCK_GETTIME 228
 %define HAKU64_SYS_EXIT_GROUP    231
+
+%define HAKU64_O_RDONLY 0
+%define HAKU64_O_WRONLY 1
+%define HAKU64_O_RDWR   2
+
+%define HAKU64_SEEK_SET 0
+%define HAKU64_SEEK_CUR 1
+%define HAKU64_SEEK_END 2
 
 %define HAKU64_PROT_READ  1
 %define HAKU64_PROT_WRITE 2
@@ -30,6 +42,7 @@
 %define HAKU64_CLOCK_MONOTONIC 1
 
 ; Linux errno values the test program compares against.
+%define HAKU64_ENOENT 2
 %define HAKU64_EBADF  9
 %define HAKU64_ENOMEM 12
 %define HAKU64_EFAULT 14

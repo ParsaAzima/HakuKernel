@@ -569,20 +569,27 @@ the port is complete.
   builds the usual `regs64_t` frame, and returns with `SYSRET` for a ring-3
   frame (or the shared `IRETQ` tail for a kernel frame). `INT 0x80` stays as
   a DPL-3 fallback and the test image uses both. `syscall64.c` dispatches
-  `write`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime` and
-  `exit`/`exit_group` (`-ENOSYS` otherwise), returns `-errno` on failure,
-  and validates every user pointer through `paging64_query_space` before
-  touching it — a ring-0 page fault is fatal, so the page tables, not the
-  CPU, are the check. `mmap` accepts private or shared anonymous mappings:
-  `MAP_FIXED` takes a page-aligned free address inside the anonymous window,
-  the default form grows a per-task bump region, and file-backed mappings
-  stay `-EINVAL` until the 64-bit VFS exists. `munmap` frees the frames it
-  unmaps. `CLOCK_REALTIME` is the CMOS RTC epoch sampled once at boot plus
-  elapsed ticks (`rtc64.c`), falling back to monotonic time if the chip is
-  unreadable; `CLOCK_MONOTONIC` stays time since boot. The ELF64 test image
-  drives the success and error matrix (`EBADF`, `EFAULT`, `ENOSYS`,
-  `EINVAL`) and the run asserts the exit status and the BSS word
-  (`HAKU64-ABI-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-RTC-OK`).
+  `read`, `write`, `open`, `close`, `lseek`, `writev`, `mmap`, `munmap`,
+  `getpid`, `clock_gettime` and `exit`/`exit_group` (`-ENOSYS` otherwise),
+  returns `-errno` on failure, and validates every user pointer through
+  `paging64_query_space` before touching it — a ring-0 page fault is fatal,
+  so the page tables, not the CPU, are the check. `mmap` takes anonymous
+  ranges (`fd` `-1`) and file-backed ones: `MAP_FIXED` takes a page-aligned
+  free address inside the anonymous window, the default form grows a
+  per-task bump region, `MAP_SHARED` aliases the file's own frames and
+  `MAP_PRIVATE` copies them because there is no fork and no COW. Each task
+  records which mapping ranges own their frames, so `munmap` frees only
+  what it allocated. Files come from `fs64.c`, a read-only store seeded at
+  boot from the kernel image (`/hello.txt`, `/pattern.bin`); open accepts
+  `O_RDONLY` only, and a disk filesystem is the userland stage's job, so
+  this is a placeholder store rather than a VFS. `CLOCK_REALTIME` is the
+  CMOS RTC epoch sampled once at boot plus elapsed ticks (`rtc64.c`),
+  falling back to monotonic time if the chip is unreadable;
+  `CLOCK_MONOTONIC` stays time since boot. The ELF64 test image drives the
+  success and error matrix (`EBADF`, `ENOENT`, `EFAULT`, `ENOSYS`,
+  `EINVAL`), reads and maps the store, and the run asserts the exit status
+  and the BSS word (`HAKU64-ABI-OK`, `HAKU64-SYSCALL64-OK`,
+  `HAKU64-RTC-OK`, `HAKU64-FS-OK`, `HAKU64-FILE-OK`).
 - [ ] Syscall table: port the i386 number table from `usermode.c` (97 cases)
   and the wider VFS/process surface onto the 64-bit ABI.
 - [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a

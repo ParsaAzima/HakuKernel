@@ -42,6 +42,23 @@ static int current_index = -1;
 static u32 enabled;
 static u64 switch_count;
 
+/* ------------------------------------------------------- mapping records
+ * munmap frees the frames of a mapping it created, but a MAP_SHARED file
+ * mapping aliases the file's own frames: freeing those would empty the file.
+ * Each task keeps a small table of ranges and whether the frames are owned,
+ * and munmap consults it page by page. A range that is not in the table is
+ * treated as owned, which keeps anonymous mappings freed as before. */
+#define K64_TASK_MAPS 8u
+
+typedef struct {
+    u64 base;
+    u64 pages;
+    u32 owned;
+    u32 used;
+} map64_t;
+
+static map64_t mappings[K64_TASK_MAX][K64_TASK_MAPS];
+
 /* One FXSAVE area per task. The area is 512 bytes and must be 16-byte
  * aligned, which a __declspec(align(16)) array guarantees. */
 static __declspec(align(16)) u8 fxsave_areas[K64_TASK_MAX][512];
@@ -84,6 +101,7 @@ static void prepare_sse(int id) {
 
 void sched64_init(void) {
     memset(tasks, 0, sizeof(tasks));
+    memset(mappings, 0, sizeof(mappings));
     current_index = 0;
     switch_count = 0;
 
@@ -301,6 +319,64 @@ u64 task64_mmap_reserve(int id, u64 pages) {
     if (next < base || next > K64_USER_STACK_BOTTOM) return 0;
     tasks[id].mmap_next = next;
     return base;
+}
+
+int task64_map_record(int id, u64 base, u64 pages, int owned) {
+    if (!valid_id(id) || pages == 0) return 0;
+    for (u32 i = 0; i < K64_TASK_MAPS; i++) {
+        map64_t *map = &mappings[id][i];
+
+        if (map->used) continue;
+        map->base = base;
+        map->pages = pages;
+        map->owned = owned ? 1u : 0u;
+        map->used = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* 1 when munmap may free the frame behind `address`. */
+int task64_map_owned(int id, u64 address) {
+    if (!valid_id(id)) return 1;
+    for (u32 i = 0; i < K64_TASK_MAPS; i++) {
+        map64_t *map = &mappings[id][i];
+        u64 end;
+
+        if (!map->used) continue;
+        end = map->base + map->pages * K64_PAGE_SIZE;
+        if (address >= map->base && address < end) return map->owned != 0;
+    }
+    return 1;
+}
+
+/* Forget the part of a record that munmap released. A range that is covered
+ * exactly is dropped and a partial overlap trims the record; a hole in the
+ * middle is left in place on purpose, because keeping a range costs nothing
+ * while splitting it would need a second slot that may not exist, and a
+ * stale record never frees a frame that munmap did not unmap. */
+void task64_map_drop(int id, u64 base, u64 length) {
+    u64 end = base + length;
+
+    if (!valid_id(id) || length == 0 || end < base) return;
+    for (u32 i = 0; i < K64_TASK_MAPS; i++) {
+        map64_t *map = &mappings[id][i];
+        u64 map_end;
+
+        if (!map->used) continue;
+        map_end = map->base + map->pages * K64_PAGE_SIZE;
+        if (map_end <= base || map->base >= end) continue;
+        if (map->base >= base && map_end <= end) {
+            map->used = 0;
+        } else if (map->base < base) {
+            map->pages = (base - map->base) / K64_PAGE_SIZE;
+            if (map->pages == 0) map->used = 0;
+        } else {
+            map->base = end;
+            map->pages = (map_end - end) / K64_PAGE_SIZE;
+            if (map->pages == 0) map->used = 0;
+        }
+    }
 }
 
 u64 sched64_switches(void) {
