@@ -59,6 +59,10 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | IDT/PIC | 256 gates, 8259 remapped to `0x20`/`0x28`, IRQ0 unmasked | `HAKU64-IDT-OK` |
 | exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
+| spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
+| tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
+| ring 3 | an `IRETQ` frame with `CS=0x1B`/`SS=0x23` enters user mode | `HAKU64-USER-OK` |
+| syscall | the DPL-3 `INT 0x80` gate runs `write` and `exit` | `HAKU64-SYSCALL-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
 
 The physmap is why the 64-bit build has no equivalent of the 32-bit
@@ -77,23 +81,57 @@ TSS exists purely to describe `RSP0` and those stacks, since long mode has no
 hardware task switching.
 
 Because MSVC x64 has no inline assembly, `CLI`/`STI`/`LIDT`/`LGDT`/`LTR`,
-port I/O, `CR2` and `PAUSE` all live in `isr64.asm` as small callable
-functions. The same file holds three exception probes (`int3_probe64`,
-`probe_load64`, `probe_div64`). Recovering from a fault means skipping the
-faulting instruction, so instead of decoding it each probe exports a label
-for the instruction *after* the one that faults and the handler sets `RIP` to
-it — no hardcoded instruction lengths, and the test fails if the handler's
-frame is wrong.
+port I/O, `CR2`/`CR3`, `PAUSE`, `FXSAVE`/`FXRSTOR` and the CR4/CR0 bits that
+enable SSE all live in `isr64.asm` as small callable functions. The same file
+holds three exception probes (`int3_probe64`, `probe_load64`, `probe_div64`).
+Recovering from a fault means skipping the faulting instruction, so instead of
+decoding it each probe exports a label for the instruction *after* the one
+that faults and the handler sets `RIP` to it — no hardcoded instruction
+lengths, and the test fails if the handler's frame is wrong.
 
 `gdt64_load` replaces the boot GDT with `LGDT` and reloads only the data
 segments. CS is deliberately not reloaded: the new table keeps the boot code
 descriptor byte-identical at selector `0x08`, so the cached descriptor stays
 valid. Index 1 must therefore remain the kernel code descriptor.
 
-The 64-bit path still has no scheduler, syscalls, or userland, and `haku.img`
-remains the default image; [the roadmap](../ROADMAP.md) (Milestone 8) lists the remaining
-stages. The 64-bit sources are excluded from the 32-bit link line, so both
-targets build from one tree.
+Processes reuse that frame rather than adding a second switch mechanism.
+`kernel/arch/x86_64/kernel/task64.c` saves the `regs64_t` pointer and, when
+the round-robin scan picks another task, returns a frame that lives on the
+incoming task's kernel stack; the stub moves `RSP` to it, pops and `IRETQ`s.
+New tasks start from a frame assembled on top of a private 16 KiB kernel
+stack, placed so the entry point sees the same stack alignment a `CALL`
+would produce. IRQ0 drives the switch, so nothing has to yield. Because the
+x86-64 ABI puts SSE2 in the baseline, `sched64_init` sets `CR4.OSFXSR` and
+`CR4.OSXMMEXCPT` and every switch `FXSAVE`s the outgoing task and `FXRSTOR`s
+the incoming one; unlike the 32-bit build, this path cannot pretend the
+vector registers are unused.
+
+An address space is a PML4 that copies the two kernel slots — the 1 GiB
+identity map and the physmap — and owns PML4 slot 1, starting at
+`0x0000008000000000` in the lower canonical half. `paging64_create_space`
+takes the root from the frame allocator, and `paging64_map_space` allocates
+the three intermediate levels under a caller-supplied root, so the kernel's
+own tables are never edited by a user mapping. `paging64_switch_space` writes
+`CR3`; the self-test maps one virtual address to two frames, writes through
+both and checks the physmap and identity map still resolve. `RSP0` is
+repointed at the incoming task's kernel stack on every switch, because that
+is what the CPU loads when a ring-3 trap enters the kernel.
+
+Ring-3 entry is an ordinary `IRETQ` from a frame whose `CS` is `0x1B` and
+whose `SS` is `0x23`; the same instruction that returns from an interrupt
+performs the privilege change. The system call gate is vector `0x80`, the one
+DPL-3 IDT entry. `sys64_dispatch` takes the number in `RAX`, arguments in
+`RDI`/`RSI`/`RDX` and returns in `RAX`, validates that the buffer pointer is
+inside the user half before printing it, and implements `write` and `exit`
+(`K64_SYS_WRITE`/`K64_SYS_EXIT`). `INT 0x80` is slower than
+`SYSCALL`/`SYSRET` but needs no `STAR`/`LSTAR`/`FMASK` setup, no `SWAPGS`
+and no second entry stub; the roadmap keeps the Linux-compatible syscall
+table for a later stage.
+
+The 64-bit path still has no ELF64 loader or userland, and `haku.img` remains
+the default image; [the roadmap](../ROADMAP.md) (Milestone 8) lists the
+remaining stages. The 64-bit sources are excluded from the 32-bit link line,
+so both targets build from one tree.
 
 Physical layout on the 64-bit path: `0–2 MiB` firmware, boot stages, kernel
 image and the boot page tables; `2–16 MiB` boot allocations (page tables,

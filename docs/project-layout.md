@@ -24,16 +24,22 @@ Haku/
       boot/             entry64.asm: PAE + EFER.LME + PML4/PDPT/PD, far jump
                         into a 64-bit code segment, then call into C
       kernel/           boot64.c: bring-up sequence (E820 → physmap → frames
-                        → heap → GDT/TSS → IDT/PIC → timer → self-tests);
+                        → heap → GDT/TSS → IDT/PIC → timer → spaces → tasks
+                        → ring 3 → self-tests);
                         haku64.h: shared types, layout, asm declarations;
                         serial64.c: COM1 output + memset/memcpy;
                         bootmem64.c: bump allocator for early tables;
                         gdt64.c: GDT, TSS and the IST stacks;
-                        idt64.c: 256 gates + exception/IRQ dispatch;
+                        idt64.c: 256 gates + exception/IRQ/syscall dispatch;
                         isr64.asm: stubs, CLI/STI/LIDT/LGDT/LTR, port I/O,
-                        CR2, exception probes; pic64.c: 8259 remap, masks,
-                        EOI; timer64.c: 100 Hz PIT tick counter
-      mm/               paging64.c: four-level paging + physmap;
+                        CR2/CR3, SSE enable, FXSAVE/FXRSTOR, exception
+                        probes; pic64.c: 8259 remap, masks, EOI;
+                        timer64.c: 100 Hz PIT tick counter;
+                        task64.c: tasks, per-task kernel stacks, round-robin
+                        preemptive scheduler and the frame-pointer switch;
+                        syscall64.c: DPL-3 INT 0x80 gate (write/exit)
+      mm/               paging64.c: four-level paging, physmap and
+                        per-process address spaces;
                         frame64.c: E820 frame allocator (no 1 GiB ceiling);
                         heap64.c: 8 MiB free-list kernel heap
     drivers/            ata.c/.h: primary/secondary ATA (master/slave) LBA28/LBA48

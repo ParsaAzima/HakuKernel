@@ -533,12 +533,26 @@ the port is complete.
   after the faulting one — no instruction decoder and no hardcoded lengths.
   The IDT layout is asserted separately (`IST` indices, gate type, distinct
   stubs per vector, one shared catch-all).
-- [ ] Processes: 64-bit context switch, per-process page tables, ring-3
-  entry, and the syscall gate (`syscall`/`sysret`, or `int 0x80` with a
-  64-bit frame).
-- [ ] Syscall ABI: x86-64 Linux syscall numbers and the
-  `rdi/rsi/rdx/r10/r8/r9` convention, replacing the i386 table in
-  `usermode.c` (97 cases).
+- [x] Processes: 64-bit context switch, per-process page tables, ring-3
+  entry, and the syscall gate (`int 0x80` with a 64-bit frame).
+  `task64.c` makes the context switch the interrupt path it already had: a
+  task is the `regs64_t` frame on its own 16 KiB kernel stack, and
+  `sched64_tick` returns a different frame from IRQ0 so the stub's `IRETQ`
+  resumes another task. New tasks start from a frame built on their stack;
+  `sched64_init` enables `CR4.OSFXSR` and each switch `FXSAVE`s/`FXRSTOR`s
+  the XMM state, because SSE2 is part of the x86-64 ABI. A space is a PML4
+  that copies the kernel's identity map and physmap and owns slot 1 at
+  `0x0000008000000000`; `paging64_map_space` builds the levels under any
+  root and `CR3` switches between them. The same frame enters ring 3 with
+  `CS=0x1B`/`SS=0x23`, and vector `0x80` is the one DPL-3 gate, dispatching
+  `write` and `exit` with the number in `RAX` and arguments in
+  `RDI`/`RSI`/`RDX`. Markers: `HAKU64-VM-OK` (one virtual address, two
+  frames, both CR3s), `HAKU64-PROC-OK` (two preempted tasks on distinct
+  stacks), `HAKU64-USER-OK` and `HAKU64-SYSCALL-OK` (a hand-assembled
+  three-page user program prints `RING3` and exits through the gate).
+- [ ] Syscall ABI: widen the `INT 0x80` handler from three arguments to the
+  x86-64 Linux `rdi/rsi/rdx/r10/r8/r9` convention and port the i386 number
+  table from `usermode.c` (97 cases).
 - [ ] Userland: ELF64 loader, a 64-bit build of `user/lib`, and `musl-gcc`
   binaries in the probe.
 
