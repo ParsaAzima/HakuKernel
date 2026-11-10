@@ -84,10 +84,11 @@ compatibility is not a short-term goal.
   build.py x64` produces `haku64.img` — with a long-mode entry, four-level
   paging and a 2 MiB-page physmap of all RAM (so no 1020 MiB ceiling), an
   E820 frame allocator, a kernel heap, a GDT/TSS with IST stacks, a 64-bit
-  IDT with ISR stubs, the 8259 remapped to `0x20`/`0x28`, and a 100 Hz PIT
-  (`HAKU64-TIMER-OK`). It has no scheduler, syscalls, or userland yet;
-  `haku.img` is still the default image and the only one that runs the
-  system.
+  IDT, the 8259 remapped to `0x20`/`0x28`, a 100 Hz PIT, a round-robin
+  scheduler, ring 3 with the Linux syscall convention, an ELF64 loader, a
+  FAT12 disk behind a page cache, and `fork`/`wait4` with default-action
+  signals. `haku.img` is still the default image and the only one that runs
+  the full userland.
 
 ## Proposed Milestones
 
@@ -577,19 +578,47 @@ the port is complete.
   ranges (`fd` `-1`) and file-backed ones: `MAP_FIXED` takes a page-aligned
   free address inside the anonymous window, the default form grows a
   per-task bump region, `MAP_SHARED` aliases the file's own frames and
-  `MAP_PRIVATE` copies them because there is no fork and no COW. Each task
-  records which mapping ranges own their frames, so `munmap` frees only
-  what it allocated. Files come from `fs64.c`, a read-only store seeded at
-  boot from the kernel image (`/hello.txt`, `/pattern.bin`); open accepts
-  `O_RDONLY` only, and a disk filesystem is the userland stage's job, so
-  this is a placeholder store rather than a VFS. `CLOCK_REALTIME` is the
+  `MAP_PRIVATE` copies them because there is no COW. A writable shared file
+  mapping requires a descriptor opened for writing. Each task records which
+  mapping ranges own their frames and which ones another space aliases, so
+  `munmap` frees only what it allocated and `fork` knows what to alias.
+  `CLOCK_REALTIME` is the
   CMOS RTC epoch sampled once at boot plus elapsed ticks (`rtc64.c`),
   falling back to monotonic time if the chip is unreadable;
   `CLOCK_MONOTONIC` stays time since boot. The ELF64 test image drives the
   success and error matrix (`EBADF`, `ENOENT`, `EFAULT`, `ENOSYS`,
-  `EINVAL`), reads and maps the store, and the run asserts the exit status
+  `EINVAL`), reads and maps the disk, and the run asserts the exit status
   and the BSS word (`HAKU64-ABI-OK`, `HAKU64-SYSCALL64-OK`,
   `HAKU64-RTC-OK`, `HAKU64-FS-OK`, `HAKU64-FILE-OK`).
+- [x] Disk filesystem: a FAT12 volume with path walking and file writes,
+  without a second filesystem implementation. The 64-bit build compiles
+  `kernel/drivers/ata.c` and `kernel/fs/fat12/fat12.c` unchanged against
+  `kernel/arch/x86_64/compat` (port I/O, `klog_*` over `k64_*`, a spin
+  mutex), and `fs64.c` is a page cache in front of it: eight paths of up to
+  32 frames (128 KiB) each, `open`/`read`/`write`/`lseek`/`close` plus
+  `mkdir`, and `.`/`..` handled by FAT12's own path resolver. `open` accepts
+  `O_RDONLY`, `O_WRONLY`, `O_RDWR` with `O_CREAT`/`O_EXCL`/`O_TRUNC`/
+  `O_APPEND`; dirty pages are written back on last close and on task exit,
+  so the cache is write-back. Limits: 8.3 names, no `unlink`/`rename`/
+  `getdents`, no symlinks, no write-through. `build.py x64` generates
+  `build/haku64_fs.img` with `tools/mkfat12.py --empty`, seeds `HELLO.TXT`
+  and `PATTERN.BIN`, attaches it to QEMU, and verifies the image with
+  `tools/lsfat12.py --check` after the run; the ring-3 test creates `/TMP`,
+  writes and re-reads `NOTE.TXT`, and the kernel re-reads the file after
+  close (`HAKU64-DISK-OK`).
+- [x] `fork` and `wait4`: `paging64_clone_space` walks the parent's user
+  pages and aliases the ranges a mapping record marks shared, copying
+  everything else — there is no copy-on-write, so private pages are copied
+  up front. The child gets its own 16 KiB kernel stack, a copy of the
+  parent's syscall frame with `RAX=0`, and a copy of the descriptor and
+  mapping tables. `wait4` blocks until a child is `DONE`, reports
+  `(status & 0xFF) << 8` or the terminating signal, and reaps it, which is
+  the only place a task's space, frames and stack are released. Signals are
+  terminate-only (`SIGINT`, `SIGKILL`, `SIGTERM`, `SIGSEGV`): `kill` and a
+  ring-3 fault end the task and `wait4` reports the number; `SIGCHLD` is not
+  delivered and there are no handlers or masks. The ring-3 test forks,
+  observes one `MAP_SHARED` page from both processes and prints
+  `HAKU64-FORK-OK`.
 - [ ] Syscall table: port the i386 number table from `usermode.c` (97 cases)
   and the wider VFS/process surface onto the 64-bit ABI.
 - [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a

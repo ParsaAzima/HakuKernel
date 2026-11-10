@@ -50,13 +50,18 @@ the user C library (`USER-LIB-OK`), and timer IRQs
 through the serial log.
 
 `python build.py x64` builds and boots `haku64.img` separately and asserts
-its own marker set. That run ends with `HAKU64-ELF-REJECT-OK` (six malformed
+its own marker set. That run starts a fresh FAT12 data disk
+(`build/haku64_fs.img`), ends with `HAKU64-ELF-REJECT-OK` (six malformed
 ELF64 images refused with a reason), `HAKU64-ELF-OK` (the embedded static
 executable mapped into a fresh address space), `HAKU64-ELF-RUN-OK` (the
-program ran in ring 3, stored its BSS word and exited with status 0) and
+program ran in ring 3, stored its BSS word and exited with status 0),
 `HAKU64-ABI-OK` (the six-argument `INT 0x80` ABI passed its success and error
-matrix, including `mmap`/`munmap`). The 32-bit `haku.img` stays the default
-image.
+matrix, including `mmap`/`munmap`), `HAKU64-DISK-OK` (the program created
+`/TMP`, wrote `NOTE.TXT` there and the kernel read it back from the volume
+after `close`) and `HAKU64-FORK-OK` (a forked child and its parent observed
+the same `MAP_SHARED` page). After QEMU exits, `tools/lsfat12.py --check`
+verifies the volume the guest just wrote. The 32-bit `haku.img` stays the
+default image.
 
 `python build.py shell` boots something else entirely: a real static
 `busybox` (musl, i386) as PID 1, so the guest comes up in `ash` instead of

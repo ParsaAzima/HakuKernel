@@ -60,11 +60,12 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
-| files | read-only in-memory store: `open`, `read`, `lseek`, `close` | `HAKU64-FS-OK`, `HAKU64-FILE-OK` |
+| files | FAT12 on an ATA disk, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
+| fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `wait4`, `kill`, `getpid`, `getppid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
@@ -149,8 +150,9 @@ as a DPL-3 fallback, and the test program exercises both entry points.
 `sys64_dispatch` implements the x86-64 Linux convention — number in `RAX`,
 arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in `RAX` or a negative
 errno — with the Linux x86-64 numbers for `read`, `write`, `open`, `close`,
-`lseek`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime` and
-`exit`/`exit_group`; an unimplemented number returns `-ENOSYS`. Every user
+`lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `wait4`, `kill`,
+`getpid`, `getppid`, `clock_gettime` and `exit`/`exit_group`; an
+unimplemented number returns `-ENOSYS`. Every user
 pointer is resolved through the current space with `paging64_query_space`
 before it is dereferenced, and the copies move through the physmap: a ring-0
 page fault halts the kernel, so the CPU cannot be relied on to reject a bad
@@ -162,23 +164,53 @@ window and refuses an occupied range instead of replacing it; without it the
 per-task bump region from `K64_USER_MMAP_BASE` supplies the address.
 `MAP_SHARED` on a file maps the file's own frames, so a store through the
 mapping is visible to `read`; `MAP_PRIVATE` copies the pages at map time,
-because there is no fork and therefore no COW. Mapping past the end of a file
+because copy-on-write is not implemented. Mapping past the end of a file
 is `-EINVAL` rather than the `SIGBUS` a Linux process would take, and a
-page-aligned `offset` selects where in the file the mapping starts. Because
-`munmap` may not free a frame the file still owns, each task carries a small
-table of mapping ranges and whether their frames are owned; a task's table is
-consulted page by page.
+page-aligned `offset` selects where in the file the mapping starts. A
+writable shared file mapping needs a descriptor opened for writing and is
+`-EACCES` otherwise. Because `munmap` may not free a frame the file still
+owns, each task carries a small table of mapping ranges recording whether
+their frames are owned and whether another space aliases them; a task's
+table is consulted page by page, and `fork` copies it.
 
-Files come from `kernel/arch/x86_64/kernel/fs64.c`, the read-only in-memory
-store the boot stage seeds from data in the kernel image: `/hello.txt` (the
-16-byte `HAKU64-FILE-OK\r\n` marker) and `/pattern.bin` (three pages of a
-deterministic pattern, so a mapping with a non-zero offset has data on every
-page). Each file is a list of frames from the frame allocator, which is what
-lets a shared mapping alias a page instead of copying it. `open` takes
-`O_RDONLY` only, descriptors 0..2 are the console, and the per-task table
-(`fs64_fd_*`) hands out 3 and up. There is still no disk filesystem or path
-walking in the 64-bit image; that arrives with the userland stage, and this
-store is its placeholder rather than a claim of VFS support.
+Files live on a FAT12 volume attached as the primary-master ATA disk. The
+64-bit image compiles the 32-bit `kernel/drivers/ata.c` and
+`kernel/fs/fat12/fat12.c` unchanged and supplies the seams they expect
+(`kernel/arch/x86_64/compat`): port I/O, the `klog_*` surface over `k64_*`,
+and a single-CPU spin mutex. `fs64.c` is a page cache in front of that
+filesystem: each path gets a slot holding up to 32 frames (128 KiB) and eight
+paths are cached at once, which is what lets `mmap` alias a file's frames and
+keeps every descriptor of one path looking at the same bytes. `open` accepts
+`O_RDONLY`, `O_WRONLY`, `O_RDWR` plus `O_CREAT`, `O_EXCL`, `O_TRUNC` and
+`O_APPEND`; `mkdir` creates one 8.3 directory, and paths may contain `.` and
+`..` because FAT12 resolves them. Dirty pages are written back when the last
+descriptor on a path closes or the owning task exits, so the cache is
+write-back, not write-through: a crash can lose the last pages. The limits
+are explicit: only 8.3 names, no `unlink`, `rename` or `getdents`, no
+symbolic links, at most 32 cached pages per file, and a writable
+`MAP_SHARED` mapping requires a writable descriptor. A shared mapping also
+relies on its descriptor staying open, because only descriptors pin a cache
+slot. `python build.py x64` builds `build/haku64_fs.img` with
+`tools/mkfat12.py --empty` on every run,
+seeds `HELLO.TXT` and `PATTERN.BIN`, attaches it to QEMU and checks the
+resulting image with `tools/lsfat12.py --check`, so a disk write is proven
+from the host's view of the volume and not only from the kernel's cache.
+
+`fork` clones the address space page by page: `paging64_clone_space` walks
+the parent's user leaves, aliases the frames a mapping record marks shared,
+and copies everything else into fresh frames. There is no copy-on-write yet,
+so a private page costs its copy at fork time. The child gets a copy of the
+parent's syscall frame on its own 16 KiB kernel stack with `RAX=0`, a copy of
+the descriptor table (cache slots and positions are shared) and the mapping
+table, with shared ranges marked borrow-only. `wait4` blocks until a child is
+`DONE`, writes `(status & 0xFF) << 8` or the terminating signal, and reaps
+it; a task's space, frames and kernel stack are released only at that point,
+which is also what lets the boot test inspect a task after it stopped.
+Signals have no handlers: `kill` and a ring-3 fault perform the default
+action, terminate, and `wait4` reports the signal number. `SIGCHLD` is not
+delivered, there are no signal masks, and a task cannot signal itself
+through `kill` — that path goes through `exit` so the dispatcher never
+resumes the frame.
 
 `clock_gettime` reports `CLOCK_MONOTONIC` as time since boot and
 `CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the ticks
@@ -186,11 +218,11 @@ elapsed since that sample; when the RTC cannot be read it falls back to
 monotonic time. The full i386 number table stays with the later userland
 stage.
 
-The 64-bit path now has an ELF64 loader too, but no 64-bit libc or filesystem
-image; `haku.img` remains the default image and
-[the roadmap](../ROADMAP.md) (Milestone 8) lists the remaining stages. The
-64-bit sources are excluded from the 32-bit link line, so both targets build
-from one tree.
+The 64-bit path now has an ELF64 loader and a FAT12 data disk, but no
+64-bit libc and no bootable root filesystem image; `haku.img` remains the
+default image and [the roadmap](../ROADMAP.md) (Milestone 8) lists the
+remaining stages. The 64-bit sources are excluded from the 32-bit link line,
+so both targets build from one tree.
 
 `kernel/arch/x86_64/elf/elf64.c` follows the 32-bit loader's rules — validate
 the whole image before mapping, accept only static `ET_EXEC`, require
@@ -212,12 +244,17 @@ The test executable is `kernel/arch/x86_64/user/ring3_elf64.asm`: a flat
 the six-argument syscall ABI (`writev`, `getpid`, `CLOCK_MONOTONIC` and
 `CLOCK_REALTIME`, anonymous `mmap`/`munmap`, `MAP_FIXED` placement,
 `MAP_SHARED|MAP_ANONYMOUS`, and the `EBADF`/`EFAULT`/`ENOSYS`/`EINVAL` error
-paths over `INT 0x80`), reads `/hello.txt` and prints the bytes it read
+paths over `INT 0x80`), reads `/HELLO.TXT` and prints the bytes it read
 (`HAKU64-FILE-OK`), maps that file privately and checks a store does not
 reach the file, maps it shared and checks the store does, maps
-`/pattern.bin` at a page offset and compares it with a `read` of the same
-range, prints `HAKU64-ABI-OK`, stores a magic word in its BSS page and exits
-with status 0.
+`/PATTERN.BIN` at a page offset and compares it with a `read` of the same
+range, creates `/TMP`, writes `/TMP/NOTE.TXT`, reads it back before and after
+`close` (`HAKU64-DISK-OK`), resolves `/TMP/../HELLO.TXT` and `/./HELLO.TXT`,
+then maps a shared anonymous page, forks, and requires the child to see the
+parent's word and the parent to see the child's store after `wait4`
+(`HAKU64-FORK-OK`). Finally it prints `HAKU64-ABI-OK`, stores a magic word in
+its BSS page and exits with status 0; every failure exits with the number of
+the step that failed, which is what `HAKU64-ELF-RUN-FAIL: exit=` reports.
 `tools/mkelf64.py` wraps the flat binary in an
 `ET_EXEC`/`EM_X86_64` image with an RX `PT_LOAD` at `0x0000008000400000` and a
 zero-filesz RW segment one page above it; `user64_image.asm` embeds the result

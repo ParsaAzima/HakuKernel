@@ -60,9 +60,10 @@ control and pipelines working.
 - **x86-64** — in progress: long-mode entry, four-level paging with a physmap,
   frame allocator, heap, GDT/TSS with IST stacks, IDT/PIC, timer, RTC wall
   clock, round-robin scheduler, ring 3 with `SYSCALL`/`SYSRET` and the Linux
-  syscall convention, NX enforcement, an ELF64 loader, and a read-only
-  in-memory file store that file-backed `mmap` maps from. No fork, signals,
-  threads, disk filesystem or 64-bit libc yet.
+  syscall convention, NX enforcement, an ELF64 loader, a FAT12 disk with file
+  writes behind a page cache that file-backed `mmap` maps from, and
+  `fork`/`wait4` with default-action signals. No threads, copy-on-write,
+  signal handlers, or 64-bit libc yet.
 
 ## Quick start
 
@@ -126,10 +127,12 @@ build.py             the whole build, test, and QEMU orchestration
 
 Haku does not claim POSIX compatibility. It implements a subset aimed at
 statically linked Linux binaries, on a single CPU, without threads, demand
-paging, swap, networking, or a page cache. FAT12 has 8.3 names, no timestamps,
-and no permission bits. The x86-64 image is a bring-up milestone, not a usable
-system. Everything beyond the implemented subset returns `ENOSYS` rather than
-pretending to work.
+paging, swap, or networking. FAT12 has 8.3 names, no timestamps, and no
+permission bits. The x86-64 image is a bring-up milestone, not a usable
+system: its filesystem cache holds eight paths of at most 128 KiB each, its
+`fork` copies pages instead of sharing them copy-on-write, and its signals
+only terminate. Everything beyond the implemented subset returns `ENOSYS`
+rather than pretending to work.
 
 ## Policies
 
