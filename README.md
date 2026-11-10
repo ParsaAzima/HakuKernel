@@ -784,7 +784,8 @@ userland; conformance is not a goal. What exists, by area:
   `stat`/`lstat`/`fstat` (32- and 64-bit), `fstatat64`, `statx`,
   `symlink`/`readlink` (on the RAM root),
   `truncate`, `ftruncate`, `access`/`faccessat`, `chdir`, `getcwd`,
-  `getdents`, `getdents64`, `poll`, `select`, and
+  `getdents`, `getdents64`, `poll`, `select`, `utimensat` (accepted,
+  timestamps are not stored), and
   `chmod`/`chown`/`fchmod`/`fchown` (accepted,
   nothing to change).
 - **Time:** `gettimeofday`, `nanosleep`.

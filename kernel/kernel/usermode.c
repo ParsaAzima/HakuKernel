@@ -1753,6 +1753,33 @@ static uint32_t sys_access(uint32_t dirfd, uint32_t user_path,
     return 0u;
 }
 
+/* utimensat(320): the VFS keeps no timestamps, but touch and cp -p call
+ * this and must not fail with ENOSYS. The arguments are validated (the path
+ * must resolve, the descriptor form must name an open file, the times array
+ * must be readable) and the call then reports success without storing
+ * anything. A NULL path is the futimens(fd, times) form. */
+static uint32_t sys_utimensat(uint32_t dirfd, uint32_t user_path,
+                              uint32_t user_times, uint32_t flags) {
+    char path[VFS_PATH_MAX];
+    vfs_stat_t st;
+    int32_t resolved;
+    int32_t result;
+
+    if (flags & ~(haku_u32)HAKU_AT_SYMLINK_NOFOLLOW)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (user_times && !paging_user_range_valid(user_times, 16u, 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    if (!user_path) {
+        result = vfs_get_status_flags(scheduler_current_pid(), dirfd);
+        return result < 0 ? (uint32_t)result : 0u;
+    }
+    resolved = resolve_at(dirfd, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
+    result = stat_path((flags & HAKU_AT_SYMLINK_NOFOLLOW) != 0, path, &st);
+    if (result != 1) return (uint32_t)result;
+    return 0u;
+}
+
 /* getdents64(220): pack linux_dirent64 records into the user buffer. The
  * kernel side builds them in a small staging buffer and copies each batch
  * out, so no VFS write ever touches a user pointer. */
@@ -2646,6 +2673,9 @@ regs_t *user_syscall(regs_t *r) {
         r->eax = truncated == 1 ? 0u : (uint32_t)truncated;
         return r;
     }
+    case HAKU_SYS_UTIMENSAT:
+        r->eax = sys_utimensat(r->ebx, r->ecx, r->edx, r->esi);
+        return r;
     case HAKU_SYS_GETDENTS64:
         r->eax = sys_getdents64(r->ebx, r->ecx, r->edx);
         return r;
