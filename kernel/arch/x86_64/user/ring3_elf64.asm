@@ -4,12 +4,17 @@
 ; the kernel embeds the result in .rdata. The program exercises the six
 ; argument SYSCALL ABI: the success paths for write, writev, getpid,
 ; clock_gettime, open/read/close/lseek, anonymous and file-backed mmap and
-; munmap, and the error paths for a bad descriptor, a bad user pointer, an
+; munmap, directory creation and file writes on the FAT12 disk, fork and
+; wait4, and the error paths for a bad descriptor, a bad user pointer, an
 ; unknown number, a W+X mapping, a bad mmap descriptor/offset and an
-; unaligned munmap. It prints HAKU64-FILE-OK by reading the file store and
-; HAKU64-ABI-OK, stores a magic word in its zero-filled BSS page and exits
-; with status 0; the kernel reads both back, which proves the image ran in
-; ring 3 instead of merely being mapped.
+; unaligned munmap. It prints HAKU64-FILE-OK by reading the disk, proves the
+; write path with HAKU64-DISK-OK, observes a MAP_SHARED page through a
+; forked child and prints HAKU64-FORK-OK, stores a magic word in its
+; zero-filled BSS page and exits with status 0; the kernel reads both back,
+; which proves the image ran in ring 3 instead of merely being mapped. A
+; failure exits with the number of the step that failed (the early ABI tests
+; leave 1, the disk and fork steps use 20-37), which the kernel prints as
+; HAKU64-ELF-RUN-FAIL: exit=N.
 ;
 ; The code is position independent (RIP-relative operands only), so the flat
 ; binary does not need a linker to resolve USER64_BASE: mkelf64.py chooses the
@@ -32,9 +37,13 @@ default rel
 
 ; Scratch inside the writable segment for file buffers. The magic word the
 ; kernel reads back lives at offset 0, so the buffers start further in.
-%define FILE_BUF (USER64_BSS + 0x200)
+%define FILE_BUF   (USER64_BSS + 0x200)
+%define STATUS_BUF (USER64_BSS + 0x300)
+%define NOTE_BUF   (USER64_BSS + 0x400)
+%define REREAD_BUF (USER64_BSS + 0x500)
 
 _start:
+    mov r15d, 1                     ; step number reported by fail (see top)
     ; write(1, "ELF64\n", 6) through SYSCALL, then prove the SYSRET return
     ; with a second write that only ring 3 can reach after the first one.
     mov eax, HAKU64_SYS_WRITE
@@ -201,11 +210,13 @@ _start:
     jne fail
 
     ; ---- file store and file-backed mmap -----------------------------
-    ; open("/hello.txt", O_RDONLY) hands out a descriptor above 2.
+    ; open("/hello.txt", O_RDWR) hands out a descriptor above 2. It has to
+    ; be writable because the MAP_SHARED test below stores through the
+    ; mapping, and the kernel requires a writable descriptor for that.
     mov rbx, FILE_BUF
     mov eax, HAKU64_SYS_OPEN
     lea rdi, [path_hello]
-    xor esi, esi
+    mov esi, HAKU64_O_RDWR
     xor edx, edx
     syscall
     test rax, rax
@@ -440,11 +451,218 @@ _start:
     jne fail
     mov eax, HAKU64_SYS_OPEN
     lea rdi, [path_hello]
-    mov esi, HAKU64_O_WRONLY
+    mov esi, 0x8000
     xor edx, edx
     syscall
     cmp rax, -HAKU64_EINVAL
     jne fail
+
+    ; ---- FAT12 disk: mkdir, create, write, read back ------------------
+    ; /TMP does not exist on the fresh seed volume; a rerun against a
+    ; volume that still has it must also pass.
+    mov r15d, 20
+    mov eax, HAKU64_SYS_MKDIR
+    lea rdi, [path_tmp]
+    xor esi, esi
+    syscall
+    test rax, rax
+    jz .tmp_ready
+    cmp rax, -HAKU64_EEXIST
+    jne fail
+.tmp_ready:
+
+    mov r15d, 21
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_note]
+    mov esi, HAKU64_O_CREAT | HAKU64_O_TRUNC | HAKU64_O_RDWR
+    xor edx, edx
+    syscall
+    test rax, rax
+    jle fail
+    mov r14, rax
+
+    mov r15d, 22
+    mov eax, HAKU64_SYS_WRITE
+    mov rdi, r14
+    lea rsi, [msg_disk]
+    mov edx, msg_disk_end - msg_disk
+    syscall
+    cmp rax, msg_disk_end - msg_disk
+    jne fail
+
+    ; Read the bytes back through the descriptor before closing it: this
+    ; is the page cache, and close() is what flushes it to the volume.
+    mov r15d, 23
+    mov eax, HAKU64_SYS_LSEEK
+    mov rdi, r14
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 24
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r14
+    mov rsi, NOTE_BUF
+    mov edx, msg_disk_end - msg_disk
+    syscall
+    cmp rax, msg_disk_end - msg_disk
+    jne fail
+    lea rax, [msg_disk]
+    mov rcx, [rax]
+    mov rdx, NOTE_BUF
+    cmp rcx, [rdx]
+    jne fail
+    mov rcx, [rax + 8]
+    cmp rcx, [rdx + 8]
+    jne fail
+    mov r15d, 25
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r14
+    syscall
+    test rax, rax
+    jne fail
+
+    ; The marker is the file's own contents, printed after the flush.
+    mov r15d, 26
+    mov eax, HAKU64_SYS_WRITE
+    mov edi, 1
+    mov rsi, NOTE_BUF
+    mov edx, msg_disk_end - msg_disk
+    syscall
+    cmp rax, msg_disk_end - msg_disk
+    jne fail
+
+    ; "." and ".." are real path components on the volume, not text the
+    ; kernel strips: /TMP/../HELLO.TXT and /./HELLO.TXT both reach the
+    ; seeded file.
+    mov r15d, 27
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_dotdot]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jle fail
+    mov r14, rax
+    mov r15d, 28
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r14
+    mov rsi, REREAD_BUF
+    mov edx, msg_file_end - msg_file
+    syscall
+    cmp rax, msg_file_end - msg_file
+    jne fail
+    lea rax, [msg_file]
+    mov rcx, [rax]
+    mov rdx, REREAD_BUF
+    cmp rcx, [rdx]
+    jne fail
+    mov rcx, [rax + 8]
+    cmp rcx, [rdx + 8]
+    jne fail
+    mov r15d, 29
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r14
+    syscall
+    test rax, rax
+    jne fail
+
+    mov r15d, 30
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_dot]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jle fail
+    mov r14, rax
+    mov r15d, 31
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r14
+    syscall
+    test rax, rax
+    jne fail
+
+    ; ---- fork: a MAP_SHARED page has a second observer -----------------
+    ; The parent stores a word, the child sees it and overwrites it, and
+    ; the parent sees the child's value after wait4(). That is only true
+    ; if fork aliases the shared frame instead of copying it.
+    mov r15d, 32
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ | HAKU64_PROT_WRITE
+    mov r10d, HAKU64_MAP_SHARED | HAKU64_MAP_ANONYMOUS
+    mov r8, -1
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle fail
+    mov r12, rax
+    mov rax, 0x1111222233334444
+    mov [r12], rax
+
+    mov r15d, 33
+    mov eax, HAKU64_SYS_FORK
+    syscall
+    test rax, rax
+    js fail
+    jz child_proc
+
+    ; Parent: wait for the child and check its exit status is 7.
+    mov r13, rax
+    mov r15d, 34
+    mov eax, HAKU64_SYS_WAIT4
+    mov rdi, r13
+    mov rsi, STATUS_BUF
+    xor edx, edx
+    syscall
+    cmp rax, r13
+    jne fail
+    mov rdx, STATUS_BUF
+    mov rax, [rdx]
+    shr rax, 8
+    and eax, 0xFF
+    cmp eax, 7
+    jne fail
+
+    ; The child's store is visible in the parent's mapping.
+    mov r15d, 35
+    mov rax, 0xAAAABBBBCCCCDDDD
+    cmp [r12], rax
+    jne fail
+
+    mov r15d, 36
+    mov eax, HAKU64_SYS_MUNMAP
+    mov rdi, r12
+    mov esi, 0x1000
+    syscall
+    test rax, rax
+    jne fail
+
+    mov r15d, 37
+    mov eax, HAKU64_SYS_WRITE
+    mov edi, 1
+    lea rsi, [msg_fork]
+    mov edx, msg_fork_end - msg_fork
+    syscall
+    cmp rax, msg_fork_end - msg_fork
+    jne fail
+    jmp fork_done
+
+child_proc:
+    mov rax, 0x1111222233334444
+    cmp [r12], rax
+    jne fail
+    mov rax, 0xAAAABBBBCCCCDDDD
+    mov [r12], rax
+    mov eax, HAKU64_SYS_EXIT
+    mov edi, 7
+    syscall
+    jmp $
+
+fork_done:
 
     ; The INT 0x80 gate stays available; the error paths below use it so
     ; both entry points run in the same program.
@@ -547,9 +765,12 @@ _start:
 .hang:
     jmp .hang
 
+; R15 holds the step number from the header; exiting with it names the check
+; that failed. The INT 0x80 gate is used so this path exercises both entry
+; points even when the fast path is what broke.
 fail:
+    mov rdi, r15
     mov eax, HAKU64_SYS_EXIT
-    mov edi, 1
     int HAKU64_SYSCALL_VECTOR
     jmp $
 
@@ -565,6 +786,14 @@ msg_file:
     db 'HAKU64-FILE-OK', 13, 10
 msg_file_end:
 
+msg_disk:
+    db 'HAKU64-DISK-OK', 13, 10
+msg_disk_end:
+
+msg_fork:
+    db 'HAKU64-FORK-OK', 13, 10
+msg_fork_end:
+
 path_hello:
     db '/hello.txt', 0
 
@@ -573,6 +802,18 @@ path_pattern:
 
 path_missing:
     db '/nope', 0
+
+path_tmp:
+    db '/TMP', 0
+
+path_note:
+    db '/TMP/NOTE.TXT', 0
+
+path_dotdot:
+    db '/TMP/../HELLO.TXT', 0
+
+path_dot:
+    db '/./HELLO.TXT', 0
 
 msg_abi:
     db 'HAKU64-ABI-OK'

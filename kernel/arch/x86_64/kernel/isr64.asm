@@ -36,6 +36,9 @@ global fxrstor64
 global cpu_pause64
 global outb64
 global inb64
+global inw64
+global outw64
+global inw_string64
 
 global int3_probe64
 global probe_load64
@@ -411,6 +414,34 @@ inb64:
     mov dx, cx
     in al, dx
     movzx eax, al
+    ret
+
+; u16 inw64(u16 port)  [port in CX]
+inw64:
+    mov dx, cx
+    in ax, dx
+    movzx eax, ax
+    ret
+
+; void outw64(u16 port, u16 value)  [port in CX, value in DX]
+outw64:
+    mov r8w, dx
+    mov dx, cx
+    mov ax, r8w
+    out dx, ax
+    ret
+
+; void inw_string64(u16 port, void *destination, u32 count)
+; One `rep insw`: the ATA data port is already in PIO state, so 256
+; individual 16-bit reads only add latency.
+inw_string64:
+    mov r9, rdi
+    mov rdi, rdx
+    mov edx, ecx
+    mov rcx, r8
+    cld
+    rep insw
+    mov rdi, r9
     ret
 
 ; ------------------------------------------------------- exception probes

@@ -17,13 +17,22 @@
 %define HAKU64_SYS_MUNMAP        11
 %define HAKU64_SYS_WRITEV        20
 %define HAKU64_SYS_GETPID        39
+%define HAKU64_SYS_FORK          57
 %define HAKU64_SYS_EXIT          60
+%define HAKU64_SYS_WAIT4         61
+%define HAKU64_SYS_KILL          62
+%define HAKU64_SYS_MKDIR         83
+%define HAKU64_SYS_GETPPID       110
 %define HAKU64_SYS_CLOCK_GETTIME 228
 %define HAKU64_SYS_EXIT_GROUP    231
 
 %define HAKU64_O_RDONLY 0
 %define HAKU64_O_WRONLY 1
 %define HAKU64_O_RDWR   2
+%define HAKU64_O_CREAT  0x40
+%define HAKU64_O_EXCL   0x80
+%define HAKU64_O_TRUNC  0x200
+%define HAKU64_O_APPEND 0x400
 
 %define HAKU64_SEEK_SET 0
 %define HAKU64_SEEK_CUR 1
@@ -46,5 +55,6 @@
 %define HAKU64_EBADF  9
 %define HAKU64_ENOMEM 12
 %define HAKU64_EFAULT 14
+%define HAKU64_EEXIST 17
 %define HAKU64_EINVAL 22
 %define HAKU64_ENOSYS 38

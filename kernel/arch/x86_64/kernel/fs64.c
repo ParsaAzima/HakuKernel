@@ -1,181 +1,465 @@
-/* Haku x86-64 file store and per-task descriptor table.
+/* Haku x86-64 file layer: a page cache in front of the on-disk FAT12
+ * volume.
  *
- * The 64-bit image has no disk driver, no initramfs and no VFS yet, so the
- * smallest honest source of real files is a read-only table seeded at boot
- * from data in the kernel image. Each file is stored as whole frames taken
- * from the frame allocator; that is what lets mmap alias a file page into a
- * user space instead of copying it, which is the point of file-backed
- * mappings.
+ * The 64-bit image now boots with an ATA disk attached and mounts the same
+ * FAT12 filesystem the 32-bit kernel uses (kernel/fs/fat12/fat12.c). That
+ * gives this port what the earlier in-memory placeholder could not: real
+ * directories, path walking (including "." and ".."), file creation and
+ * writes that survive a reboot.
  *
- * Two files exist, both chosen for what they can prove:
+ * Files are cached page by page in frames from the frame allocator. The
+ * cache is what makes mmap work: MAP_SHARED aliases a cached page, so a
+ * store through the mapping is immediately visible to read() and to every
+ * other descriptor on the same path, while a dirty page is written back to
+ * the disk when the last descriptor closes (or when the task that owns it
+ * exits). MAP_PRIVATE copies the page at map time; there is no COW.
  *
- *   /hello.txt    16 bytes, the HAKU64-FILE-OK marker, so a read can be
- *                 compared byte for byte (and printed as proof).
- *   /pattern.bin  3 pages of a deterministic byte pattern, so a mapping with
- *                 a non-zero page offset has data on every page.
- *
- * Nothing can be written or created: open() accepts O_RDONLY only, and the
- * files are boot-lifetime data that is never freed. Descriptors 0..2 are the
- * console (write already accepts 1 and 2); fs64_fd_open hands out 3 and up.
+ * Limits, stated rather than hidden: a cached file is at most 32 pages
+ * (128 KiB), at most 8 paths are cached at once, and the cache is shared by
+ * every descriptor of the same path (opened read-write internally). Only
+ * 8.3 names exist because that is what FAT12 stores; there is no unlink,
+ * rename or getdents syscall yet. The cache is written back, not write-
+ * through: after a crash, the last dirty pages can be lost. A mapping also
+ * does not hold a cache reference of its own, so a descriptor must stay
+ * open for as long as a shared file mapping aliases its pages: closing the
+ * last descriptor flushes the slot and may recycle it, leaving the mapping
+ * pointing at frames that no longer belong to the file.
  */
 #include "haku64.h"
+#include "fat12.h"
 
-#define FS64_FILE_MAX 4u
-#define FS64_PAGE_MAX 8u
+#define FS64_CACHE_MAX 8u
+#define FS64_PAGE_MAX  32u
+#define FS64_FD_MAX    K64_FS_FDS
 
 typedef struct {
-    const char *name;
-    u64 size;                    /* bytes on "disk" */
-    u64 pages;                   /* frames backing it */
-    u64 frame[FS64_PAGE_MAX];
-} fs64_file_t;
+    u32 used;
+    u32 refs;                      /* open descriptors on this path */
+    u32 dirty;                     /* bit i: cached page i differs from disk */
+    u32 valid;                     /* bit i: frame[i] holds page i */
+    char path[K64_FS_PATH_MAX + 1];/* canonical (upper-case) cache key */
+    fat12_file_t handle;
+    u64 size;                      /* bytes visible to read() */
+    u64 disk_size;                 /* size the FAT12 entry currently has */
+    u64 frame[FS64_PAGE_MAX];      /* 0 means "not loaded" */
+} fs64_cache_t;
 
-static fs64_file_t files[FS64_FILE_MAX];
-static u32 file_count;
+static fs64_cache_t cache[FS64_CACHE_MAX];
 
-/* One descriptor table per task. int so -1 can mean "not a file". */
-static int fd_file[K64_TASK_MAX][K64_FS_FDS];
-static u64 fd_pos[K64_TASK_MAX][K64_FS_FDS];
+/* One descriptor table per task: cache slot, access mode, position. */
+static int fd_file[K64_TASK_MAX][FS64_FD_MAX];
+static u64 fd_pos[K64_TASK_MAX][FS64_FD_MAX];
+static u32 fd_flags[K64_TASK_MAX][FS64_FD_MAX];
 
-/* Byte `offset` of /pattern.bin. Exported so the boot self-test can check a
- * read and a mapping against the same formula without a second copy. */
-u8 fs64_pattern_byte(u64 offset) {
-    return (u8)((offset * 7u + 3u) & 0xFFu);
+/* Linux errno numbers, returned as negative ints by the helpers below. */
+#define FS64_EPERM    1
+#define FS64_ENOENT   2
+#define FS64_EIO      5
+#define FS64_EBADF    9
+#define FS64_EEXIST   17
+#define FS64_ENOTDIR  20
+#define FS64_EISDIR   21
+#define FS64_EINVAL   22
+#define FS64_ENOSPC   28
+#define FS64_ENOTEMPTY 39
+
+static int fat_error(int result) {
+    switch (result) {
+    case 1: return 0;
+    case -FAT12_ERR_NOT_FOUND: return -FS64_ENOENT;
+    case -FAT12_ERR_EXISTS: return -FS64_EEXIST;
+    case -FAT12_ERR_NO_SPACE: return -FS64_ENOSPC;
+    case -FAT12_ERR_IS_DIR: return -FS64_EISDIR;
+    case -FAT12_ERR_NOT_DIR: return -FS64_ENOTDIR;
+    case -FAT12_ERR_NOT_EMPTY: return -FS64_ENOTEMPTY;
+    case -FAT12_ERR_IO: return -FS64_EIO;
+    default: return -FS64_EINVAL;
+    }
 }
 
-static int add_file(const char *name, const u8 *data, u64 size, int patterned) {
-    fs64_file_t *file;
-    u64 pages = (size + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
+static void cache_clear(fs64_cache_t *slot) {
+    for (u32 i = 0; i < FS64_PAGE_MAX; i++) {
+        if (slot->frame[i]) frame64_free(slot->frame[i]);
+        slot->frame[i] = 0;
+    }
+    slot->used = 0;
+    slot->refs = 0;
+    slot->dirty = 0;
+    slot->valid = 0;
+    slot->size = 0;
+    slot->disk_size = 0;
+    slot->path[0] = 0;
+    memset(&slot->handle, 0, sizeof(slot->handle));
+}
 
-    if (file_count >= FS64_FILE_MAX || pages == 0 || pages > FS64_PAGE_MAX)
-        return 0;
+/* Upper-case key so /hello.txt and /HELLO.TXT share one cache entry, which
+ * is how FAT12 resolves them too. */
+static int cache_key(const char *path, char out[K64_FS_PATH_MAX + 1]) {
+    u64 i = 0;
 
-    file = &files[file_count];
-    file->name = name;
-    file->size = size;
-    file->pages = pages;
+    if (!path || !*path) return 0;
+    while (path[i]) {
+        if (i >= (u64)K64_FS_PATH_MAX) return 0;
+        out[i] = (path[i] >= 'a' && path[i] <= 'z')
+                     ? (char)(path[i] - 'a' + 'A')
+                     : path[i];
+        i++;
+    }
+    out[i] = 0;
+    return 1;
+}
 
-    for (u64 i = 0; i < pages; i++) {
-        u64 frame = frame64_alloc();
-        u8 *page;
+static fs64_cache_t *cache_find(const char *key) {
+    for (u32 i = 0; i < FS64_CACHE_MAX; i++) {
+        fs64_cache_t *slot = &cache[i];
+        u64 j = 0;
 
-        if (!frame) {
-            while (i > 0) frame64_free(file->frame[--i]);
+        if (!slot->used) continue;
+        while (slot->path[j] && slot->path[j] == key[j]) j++;
+        if (slot->path[j] == 0 && key[j] == 0) return slot;
+    }
+    return 0;
+}
+
+static int cache_flush(fs64_cache_t *slot);
+
+/* A free cache slot, evicting an unreferenced one if the table is full. A
+ * slot with an open descriptor (or a live mapping, which requires one) is
+ * never evicted. */
+static fs64_cache_t *cache_alloc(void) {
+    for (u32 i = 0; i < FS64_CACHE_MAX; i++)
+        if (!cache[i].used) return &cache[i];
+
+    for (u32 i = 0; i < FS64_CACHE_MAX; i++) {
+        fs64_cache_t *slot = &cache[i];
+
+        if (slot->refs) continue;
+        (void)cache_flush(slot);
+        (void)fat12_file_close(&slot->handle);
+        cache_clear(slot);
+        return slot;
+    }
+    return 0;
+}
+
+/* Load page `index` into its frame, reading the available bytes from disk.
+ * Bytes past the end of the file stay zero, which is what an mmap of the
+ * last partial page must see. */
+static int cache_page(fs64_cache_t *slot, u64 index) {
+    u64 frame;
+    u8 *page;
+    u64 at, bytes;
+    uint32_t got, new_pos;
+
+    if (!slot || index >= FS64_PAGE_MAX) return 0;
+    if (slot->valid & (1u << index)) return 1;
+
+    frame = frame64_alloc();
+    if (!frame) return 0;
+    page = (u8 *)phys_to_virt64(frame);
+    memset(page, 0, K64_PAGE_SIZE);
+
+    at = index * K64_PAGE_SIZE;
+    if (at < slot->size) {
+        bytes = slot->size - at;
+        if (bytes > K64_PAGE_SIZE) bytes = K64_PAGE_SIZE;
+        if (fat12_file_seek(&slot->handle, (int32_t)at, FAT12_SEEK_SET,
+                            &new_pos) != 1 ||
+            fat12_file_read(&slot->handle, page, (uint32_t)bytes, &got) != 1 ||
+            got != bytes) {
+            frame64_free(frame);
             return 0;
         }
-        page = (u8 *)phys_to_virt64(frame);
-        memset(page, 0, K64_PAGE_SIZE);
-        for (u64 j = 0; j < K64_PAGE_SIZE; j++) {
-            u64 at = i * K64_PAGE_SIZE + j;
-
-            if (at >= size) break;
-            page[j] = patterned ? fs64_pattern_byte(at) : data[at];
-        }
-        file->frame[i] = frame;
     }
-    file_count++;
+    slot->frame[index] = frame;
+    slot->valid |= 1u << index;
     return 1;
+}
+
+static int cache_flush(fs64_cache_t *slot) {
+    uint32_t new_pos;
+
+    if (!slot || !slot->used) return 1;
+
+    /* Tell FAT12 the new length first: growing zero-fills the tail and
+     * shrinking releases clusters past the new end. */
+    if (slot->size != slot->disk_size) {
+        if (fat12_file_truncate(&slot->handle, (uint32_t)slot->size) != 1)
+            return 0;
+        slot->disk_size = slot->size;
+    }
+
+    for (u32 i = 0; i < FS64_PAGE_MAX; i++) {
+        u64 at, bytes;
+        uint32_t written;
+
+        if (!(slot->dirty & (1u << i)) || !slot->frame[i]) continue;
+        at = (u64)i * K64_PAGE_SIZE;
+        if (at >= slot->size) continue;
+        bytes = slot->size - at;
+        if (bytes > K64_PAGE_SIZE) bytes = K64_PAGE_SIZE;
+        if (fat12_file_seek(&slot->handle, (int32_t)at, FAT12_SEEK_SET,
+                            &new_pos) != 1 ||
+            fat12_file_write(&slot->handle,
+                             (const u8 *)phys_to_virt64(slot->frame[i]),
+                             (uint32_t)bytes, &written) != 1 ||
+            written != bytes)
+            return 0;
+    }
+    slot->dirty = 0;
+    return 1;
+}
+
+/* Create or find the cache entry for `path`. `flags` is the FAT12 open
+ * mask (READ/WRITE plus CREATE/TRUNC/EXCL). Returns the slot or NULL. */
+static fs64_cache_t *cache_open(const char *path, u8 flags, int *error) {
+    char key[K64_FS_PATH_MAX + 1];
+    fs64_cache_t *slot;
+    fat12_stat_t stat;
+    int result;
+
+    if (error) *error = 0;
+    if (!cache_key(path, key)) {
+        if (error) *error = -FS64_EINVAL;
+        return 0;
+    }
+
+    slot = cache_find(key);
+    if (slot) {
+        if ((flags & FAT12_OPEN_CREATE) && (flags & FAT12_OPEN_EXCL)) {
+            if (error) *error = -FS64_EEXIST;
+            return 0;
+        }
+        if (flags & FAT12_OPEN_TRUNC) {
+            if (fat12_file_truncate(&slot->handle, 0u) != 1) {
+                if (error) *error = -FS64_EIO;
+                return 0;
+            }
+            /* Cached pages are stale after a truncate; zero them so a later
+             * write that extends the file sees zeros, not old bytes. */
+            for (u32 i = 0; i < FS64_PAGE_MAX; i++)
+                if (slot->frame[i])
+                    memset(phys_to_virt64(slot->frame[i]), 0,
+                           K64_PAGE_SIZE);
+            slot->size = 0;
+            slot->disk_size = 0;
+            slot->dirty = 0;
+        }
+        return slot;
+    }
+
+    slot = cache_alloc();
+    if (!slot) {
+        if (error) *error = -FS64_ENOSPC;
+        return 0;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+
+    /* Every cached path is opened read-write internally; the descriptor's
+     * own access mode is enforced in fs64_fd_access. */
+    result = fat12_file_open(path, (u8)(FAT12_OPEN_READ | FAT12_OPEN_WRITE |
+                                        flags), &slot->handle);
+    if (result != 1) {
+        if (error) *error = fat_error(result);
+        return 0;
+    }
+
+    if (fat12_file_fstat(&slot->handle, &stat) != 1) {
+        (void)fat12_file_close(&slot->handle);
+        memset(slot, 0, sizeof(*slot));
+        if (error) *error = -FS64_EIO;
+        return 0;
+    }
+
+    slot->used = 1;
+    slot->refs = 0;
+    slot->size = stat.size;
+    slot->disk_size = stat.size;
+    {
+        u64 i = 0;
+        while (key[i]) { slot->path[i] = key[i]; i++; }
+        slot->path[i] = 0;
+    }
+    return slot;
 }
 
 int fs64_init(void) {
-    static const char hello[] = "HAKU64-FILE-OK\r\n";
-
-    file_count = 0;
+    for (u32 i = 0; i < FS64_CACHE_MAX; i++)
+        memset(&cache[i], 0, sizeof(cache[i]));
     for (u32 task = 0; task < K64_TASK_MAX; task++)
-        for (u32 fd = 0; fd < K64_FS_FDS; fd++)
+        for (u32 fd = 0; fd < FS64_FD_MAX; fd++) {
             fd_file[task][fd] = -1;
+            fd_pos[task][fd] = 0;
+            fd_flags[task][fd] = 0;
+        }
 
-    if (!add_file("/hello.txt", (const u8 *)hello, sizeof(hello) - 1, 0))
-        return 0;
-    if (!add_file("/pattern.bin", 0, 3 * K64_PAGE_SIZE, 1))
-        return 0;
+    if (fat12_mount() != 1) return 0;
     return 1;
 }
 
-int fs64_file_count(void) {
-    return (int)file_count;
-}
+/* Find (and cache) a path without a descriptor, for the boot self-test. */
+int fs64_lookup(const char *path) {
+    fs64_cache_t *slot;
+    int error;
 
-const char *fs64_name(int file) {
-    if (file < 0 || (u32)file >= file_count) return 0;
-    return files[file].name;
+    slot = cache_open(path, FAT12_OPEN_READ, &error);
+    if (!slot) return -1;
+    for (u32 i = 0; i < FS64_CACHE_MAX; i++)
+        if (&cache[i] == slot) return (int)i;
+    return -1;
 }
 
 u64 fs64_size(int file) {
-    if (file < 0 || (u32)file >= file_count) return 0;
-    return files[file].size;
+    if (file < 0 || (u32)file >= FS64_CACHE_MAX || !cache[file].used) return 0;
+    return cache[file].size;
 }
 
 u64 fs64_pages(int file) {
-    if (file < 0 || (u32)file >= file_count) return 0;
-    return files[file].pages;
+    u64 size = fs64_size(file);
+    return (size + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
 }
 
-/* Physical frame of one file page. mmap maps it (MAP_SHARED) or copies it
- * (MAP_PRIVATE); either way the frame is owned by the file, not the task. */
+/* Physical frame of one file page, loaded from disk on first use. mmap
+ * aliases it for MAP_SHARED and copies it for MAP_PRIVATE. */
 u64 fs64_page(int file, u64 index) {
-    if (file < 0 || (u32)file >= file_count || index >= files[file].pages)
-        return 0;
-    return files[file].frame[index];
+    if (file < 0 || (u32)file >= FS64_CACHE_MAX) return 0;
+    if (!cache_page(&cache[file], index)) return 0;
+    return cache[file].frame[index];
 }
 
-/* Read up to `count` bytes at `offset`, clipped at end of file. */
+/* Read from the cache, loading pages as needed. The count is clipped to
+ * the end of the file, so a short read is the normal EOF result. */
 u64 fs64_read(int file, u64 offset, void *dst, u64 count) {
     u8 *out = (u8 *)dst;
+    fs64_cache_t *slot;
     u64 done = 0;
 
-    if (file < 0 || (u32)file >= file_count) return 0;
-    if (offset >= files[file].size) return 0;
-    if (count > files[file].size - offset) count = files[file].size - offset;
+    if (file < 0 || (u32)file >= FS64_CACHE_MAX) return 0;
+    slot = &cache[file];
+    if (!slot->used || offset >= slot->size) return 0;
+    if (count > slot->size - offset) count = slot->size - offset;
 
     while (done < count) {
         u64 at = offset + done;
+        u64 index = at / K64_PAGE_SIZE;
         u64 in_page = at & (K64_PAGE_SIZE - 1);
         u64 chunk = K64_PAGE_SIZE - in_page;
-        const u8 *src;
 
         if (chunk > count - done) chunk = count - done;
-        src = (const u8 *)phys_to_virt64(files[file].frame[at / K64_PAGE_SIZE]);
-        memcpy(out + done, src + in_page, chunk);
+        if (!cache_page(slot, index)) break;
+        memcpy(out + done,
+               (const u8 *)phys_to_virt64(slot->frame[index]) + in_page,
+               chunk);
         done += chunk;
     }
     return done;
 }
 
-/* open() by name: linear search, no directories, no globbing. */
-int fs64_open(const char *name) {
-    u64 length = 0;
+/* Write into the cache, extending the file up to FS64_PAGE_MAX pages.
+ * Returns the number of bytes accepted; 0 means the file is at the limit. */
+u64 fs64_write(int file, u64 offset, const void *src, u64 count) {
+    const u8 *in = (const u8 *)src;
+    fs64_cache_t *slot;
+    u64 max = (u64)FS64_PAGE_MAX * K64_PAGE_SIZE;
+    u64 done = 0;
 
-    if (!name || !*name) return -1;
-    while (name[length] && length < K64_FS_PATH_MAX) length++;
-    if (name[length] != '\0') return -1;
+    if (file < 0 || (u32)file >= FS64_CACHE_MAX) return 0;
+    slot = &cache[file];
+    if (!slot->used || offset >= max) return 0;
+    if (count > max - offset) count = max - offset;
 
-    for (u32 i = 0; i < file_count; i++) {
-        u64 j = 0;
-        const char *other = files[i].name;
+    while (done < count) {
+        u64 at = offset + done;
+        u64 index = at / K64_PAGE_SIZE;
+        u64 in_page = at & (K64_PAGE_SIZE - 1);
+        u64 chunk = K64_PAGE_SIZE - in_page;
 
-        while (j <= length && name[j] == other[j]) j++;
-        if (j == length + 1) return (int)i;
+        if (chunk > count - done) chunk = count - done;
+        if (!cache_page(slot, index)) break;
+        memcpy((u8 *)phys_to_virt64(slot->frame[index]) + in_page,
+               in + done, chunk);
+        slot->dirty |= 1u << index;
+        done += chunk;
     }
-    return -1;
+
+    if (offset + done > slot->size) slot->size = offset + done;
+    return done;
+}
+
+int fs64_truncate(int file, u64 size) {
+    fs64_cache_t *slot;
+
+    if (file < 0 || (u32)file >= FS64_CACHE_MAX) return -FS64_EINVAL;
+    slot = &cache[file];
+    if (!slot->used) return -FS64_EINVAL;
+    if (size > (u64)FS64_PAGE_MAX * K64_PAGE_SIZE) return -FS64_ENOSPC;
+    slot->size = size;
+    if (size < slot->disk_size) {
+        /* The old tail is gone; dirty bits for pages outside the file would
+         * otherwise be written back after the truncate. */
+        u64 first = (size + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
+        for (u32 i = (u32)first; i < FS64_PAGE_MAX; i++)
+            slot->dirty &= ~(1u << i);
+    }
+    return 0;
+}
+
+int fs64_create_dir(const char *path) {
+    if (!path || !*path) return -FS64_EINVAL;
+    return fat_error(fat12_dir_create(path));
 }
 
 static int valid_fd(int task, int fd) {
     return task >= 0 && task < (int)K64_TASK_MAX &&
-           fd >= 3 && fd < (int)K64_FS_FDS;
+           fd >= 3 && fd < (int)FS64_FD_MAX;
 }
 
-int fs64_fd_open(int task, int file) {
-    if (task < 0 || task >= (int)K64_TASK_MAX) return -1;
-    if (file < 0 || (u32)file >= file_count) return -1;
+/* open(path, flags) for one task. Only O_RDONLY/O_WRONLY/O_RDWR plus
+ * O_CREAT/O_EXCL/O_TRUNC/O_APPEND are accepted. */
+int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
+    fs64_cache_t *slot;
+    int fd, resolved;
+    u8 fat_flags = FAT12_OPEN_READ | FAT12_OPEN_WRITE;
+    u32 access = (u32)(flags & 3u);
 
-    for (u32 fd = 3; fd < K64_FS_FDS; fd++) {
-        if (fd_file[task][fd] >= 0) continue;
-        fd_file[task][fd] = (int)file;
-        fd_pos[task][fd] = 0;
-        return (int)fd;
+    if (error) *error = 0;
+    if (task < 0 || task >= (int)K64_TASK_MAX) {
+        if (error) *error = -FS64_EINVAL;
+        return -1;
     }
-    return -1;
+    if (flags & ~(u64)(K64_O_RDONLY | K64_O_WRONLY | K64_O_RDWR |
+                       K64_O_CREAT | K64_O_EXCL | K64_O_TRUNC |
+                       K64_O_APPEND) ||
+        (access != K64_O_RDONLY && access != K64_O_WRONLY &&
+         access != K64_O_RDWR)) {
+        if (error) *error = -FS64_EINVAL;
+        return -1;
+    }
+
+    if (flags & K64_O_CREAT) fat_flags |= FAT12_OPEN_CREATE;
+    if (flags & K64_O_EXCL) fat_flags |= FAT12_OPEN_EXCL;
+    if (flags & K64_O_TRUNC) fat_flags |= FAT12_OPEN_TRUNC;
+    if (flags & K64_O_APPEND) fat_flags |= FAT12_OPEN_APPEND;
+
+    slot = cache_open(path, fat_flags, &resolved);
+    if (!slot) {
+        if (error) *error = resolved ? resolved : -FS64_EIO;
+        return -1;
+    }
+
+    for (fd = 3; fd < (int)FS64_FD_MAX; fd++)
+        if (fd_file[task][fd] < 0) break;
+    if (fd >= (int)FS64_FD_MAX) {
+        if (error) *error = -FS64_ENOSPC;
+        return -1;
+    }
+
+    fd_file[task][fd] = (int)(slot - cache);
+    fd_pos[task][fd] = (flags & K64_O_APPEND) ? slot->size : 0;
+    fd_flags[task][fd] = access;
+    slot->refs++;
+    return fd;
 }
 
 int fs64_fd_file(int task, int fd) {
@@ -194,8 +478,51 @@ int fs64_fd_seek(int task, int fd, u64 pos) {
     return 1;
 }
 
+/* 0 = read-only, 1 = write-only, 2 = read-write. */
+int fs64_fd_access(int task, int fd) {
+    if (!valid_fd(task, fd) || fd_file[task][fd] < 0) return -1;
+    return (int)fd_flags[task][fd];
+}
+
 void fs64_fd_close(int task, int fd) {
-    if (!valid_fd(task, fd)) return;
+    fs64_cache_t *slot;
+
+    if (!valid_fd(task, fd) || fd_file[task][fd] < 0) return;
+    slot = &cache[fd_file[task][fd]];
     fd_file[task][fd] = -1;
     fd_pos[task][fd] = 0;
+    fd_flags[task][fd] = 0;
+    if (!slot->used) return;
+
+    /* Persist on every close so a later open sees the bytes on disk even
+     * after the cache slot has been recycled. */
+    (void)cache_flush(slot);
+    if (slot->refs > 0) {
+        slot->refs--;
+        if (slot->refs == 0) {
+            (void)fat12_file_close(&slot->handle);
+            cache_clear(slot);
+        }
+    }
+}
+
+/* fork inherits the descriptors; both tasks then share the cache entry and
+ * therefore see each other's writes through it. */
+void fs64_fork_fds(int parent, int child) {
+    if (parent < 0 || child < 0 || parent >= (int)K64_TASK_MAX ||
+        child >= (int)K64_TASK_MAX)
+        return;
+    for (u32 fd = 0; fd < FS64_FD_MAX; fd++) {
+        fd_file[child][fd] = fd_file[parent][fd];
+        fd_pos[child][fd] = fd_pos[parent][fd];
+        fd_flags[child][fd] = fd_flags[parent][fd];
+        if (fd >= 3 && fd_file[child][fd] >= 0)
+            cache[fd_file[child][fd]].refs++;
+    }
+}
+
+void fs64_task_cleanup(int task) {
+    if (task < 0 || task >= (int)K64_TASK_MAX) return;
+    for (u32 fd = 3; fd < FS64_FD_MAX; fd++)
+        if (fd_file[task][fd] >= 0) fs64_fd_close(task, (int)fd);
 }

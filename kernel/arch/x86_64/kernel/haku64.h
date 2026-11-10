@@ -131,16 +131,22 @@ typedef signed long long s64;
 #define K64_SYS_MUNMAP        11u
 #define K64_SYS_WRITEV        20u
 #define K64_SYS_GETPID        39u
+#define K64_SYS_FORK          57u
 #define K64_SYS_EXIT          60u
+#define K64_SYS_WAIT4         61u
+#define K64_SYS_KILL          62u
+#define K64_SYS_MKDIR         83u
+#define K64_SYS_GETPPID       110u
 #define K64_SYS_CLOCK_GETTIME 228u
 #define K64_SYS_EXIT_GROUP    231u
 
 /* PROT_* and MAP_* as Linux spells them. mmap takes either an anonymous
- * range (fd must be -1) or an open descriptor from fs64.c, and MAP_SHARED
- * file pages are the file's own frames, so a write through the mapping is
- * visible to read(). MAP_PRIVATE copies the pages at map time (there is no
- * COW without fork). MAP_FIXED maps at a caller-chosen address if that
- * range is free; it does not replace an existing mapping. */
+ * range (fd must be -1) or an open descriptor from fs64.c. MAP_SHARED
+ * aliases the page cache, so a store through the mapping is visible to
+ * read(), to another descriptor, and to a child created by fork();
+ * MAP_PRIVATE copies the pages at map time because there is no COW.
+ * MAP_FIXED maps at a caller-chosen address if that range is free; it does
+ * not replace an existing mapping. */
 #define K64_PROT_READ   1u
 #define K64_PROT_WRITE  2u
 #define K64_PROT_EXEC   4u
@@ -149,10 +155,26 @@ typedef signed long long s64;
 #define K64_MAP_FIXED     0x10u
 #define K64_MAP_ANONYMOUS 0x20u
 
-/* open() flags: the store is read-only, so only O_RDONLY is accepted. */
+/* open() flags, with the Linux numbering. */
 #define K64_O_RDONLY 0u
 #define K64_O_WRONLY 1u
 #define K64_O_RDWR   2u
+#define K64_O_CREAT  0x40u
+#define K64_O_EXCL   0x80u
+#define K64_O_TRUNC  0x200u
+#define K64_O_APPEND 0x400u
+
+/* wait4() options and the status encoding. */
+#define K64_WNOHANG 1u
+#define K64_WSTATUS_CODE(status) (((status) >> 8) & 0xFFu)
+
+/* Signals: only the default action is implemented, which is termination.
+ * There are no user handlers and no signal masks yet. */
+#define K64_SIGINT  2u
+#define K64_SIGKILL 9u
+#define K64_SIGSEGV 11u
+#define K64_SIGTERM 15u
+#define K64_SIGCHLD 17u
 
 /* lseek() whence values, with the Linux numbering. */
 #define K64_SEEK_SET 0u
@@ -228,6 +250,9 @@ void fxrstor64(void *area);
 void cpu_pause64(void);
 void outb64(u16 port, u8 value);
 u8 inb64(u16 port);
+u16 inw64(u16 port);
+void outw64(u16 port, u16 value);
+void inw_string64(u16 port, void *destination, u32 count);
 void int3_probe64(void);
 u64 probe_load64(u64 address);
 u64 probe_div64(u64 a, u64 b);
@@ -286,6 +311,12 @@ int paging64_query_space(u64 space, u64 virt, u64 *phys, int *writable,
 /* Clear one user leaf and return the frame it mapped, or 0. */
 u64 paging64_unmap_space(u64 space, u64 virt);
 void paging64_destroy_space(u64 space);
+/* fork support: clone every user page (shared ranges are aliased, the rest
+ * copied) and free a space's frames, keeping the ones `keep` claims. */
+u64 paging64_clone_space(u64 parent,
+                         int (*shared)(u64 virt, void *ctx), void *ctx);
+void paging64_free_space_frames(u64 space,
+                                int (*keep)(u64 virt, void *ctx), void *ctx);
 void paging64_switch_space(u64 space);
 
 /* ------------------------------------------------------------- ELF64 loader
@@ -414,30 +445,50 @@ u64 task64_fault_address(int id);
 u64 task64_mmap_base(int id);
 u64 task64_mmap_reserve(int id, u64 pages);
 /* Mapping records: munmap has to know whether the frames in a range belong
- * to the mapping (anonymous or a private file copy) or to a file that a
- * MAP_SHARED mapping aliases, because only the first kind may be freed. */
-int task64_map_record(int id, u64 base, u64 pages, int owned);
+ * to the mapping (anonymous or a private file copy) or to a cache page that
+ * a MAP_SHARED mapping aliases, because only the first kind may be freed.
+ * `shared` also tells fork whether the child aliases the frame or gets a
+ * private copy. */
+int task64_map_record(int id, u64 base, u64 pages, int owned, int shared);
 int task64_map_owned(int id, u64 address);
+int task64_map_shared(int id, u64 address);
 void task64_map_drop(int id, u64 base, u64 length);
 
-/* fs64.c: the read-only in-memory file store and the per-task descriptor
- * table. Files are whole frames, so mmap can alias a file page directly. */
+/* fork/wait: a child gets a copy of its parent's user pages (shared ranges
+ * are aliased, everything else is copied) and of its descriptor table. The
+ * parent blocks in wait4 until the child is DONE, then the child's space,
+ * frames and kernel stack are released. */
+regs64_t *sched64_fork(regs64_t *frame);
+/* end the caller on a signal (no handlers exist, so this is exit-by-signal) */
+regs64_t *sched64_terminate(regs64_t *frame, u32 signal);
+/* reap a DONE child of `parent`; returns the child id or a negative errno */
+int task64_reap(int parent, int pid, u64 *status);
+/* terminate a task as if by a signal; returns 0 or a negative errno */
+int task64_signal(int id, u32 signal);
+int task64_parent(int id);
+
+/* fs64.c: a page cache in front of the FAT12 volume on the ATA disk.
+ * Each cached path is at most 32 pages (128 KiB) and eight paths are
+ * cached at once. */
 #define K64_FS_FDS      16u
 #define K64_FS_PATH_MAX 64u
 int fs64_init(void);
-int fs64_open(const char *name);
-int fs64_file_count(void);
-const char *fs64_name(int file);
+int fs64_lookup(const char *path);
+int fs64_create_dir(const char *path);
 u64 fs64_size(int file);
 u64 fs64_pages(int file);
 u64 fs64_page(int file, u64 index);
 u64 fs64_read(int file, u64 offset, void *dst, u64 count);
-u8 fs64_pattern_byte(u64 offset);
-int fs64_fd_open(int task, int file);
+u64 fs64_write(int file, u64 offset, const void *src, u64 count);
+int fs64_truncate(int file, u64 size);
+int fs64_open_fd(int task, const char *path, u64 flags, int *error);
 int fs64_fd_file(int task, int fd);
 u64 fs64_fd_pos(int task, int fd);
 int fs64_fd_seek(int task, int fd, u64 pos);
+int fs64_fd_access(int task, int fd);
 void fs64_fd_close(int task, int fd);
+void fs64_fork_fds(int parent, int child);
+void fs64_task_cleanup(int task);
 
 /* syscall64.c: SYSCALL/SYSRET dispatch */
 void syscall64_init(void);

@@ -32,9 +32,12 @@
 #define SYS64_EPERM  1ull
 #define SYS64_ENOENT 2ull
 #define SYS64_EBADF  9ull
+#define SYS64_ECHILD 10ull
 #define SYS64_ENOMEM 12ull
+#define SYS64_EACCES 13ull
 #define SYS64_EFAULT 14ull
 #define SYS64_EINVAL 22ull
+#define SYS64_ENOSPC 28ull
 #define SYS64_ENOSYS 38ull
 
 /* RFLAGS bits SYSCALL clears (FMASK): TF, IF, DF and AC. Interrupts stay
@@ -123,11 +126,45 @@ static void note_write(u64 count) {
     k64_puts("\r\n");
 }
 
-/* write(1 or 2, buffer, count). Output is raw bytes: the caller decides
- * about line endings. A bad page after some bytes were written is a short
- * write, which is what write() is allowed to do. */
+/* write(fd, buffer, count). Descriptors 1 and 2 go to COM1; a file
+ * descriptor from fs64.c writes into the page cache, which is flushed to
+ * the FAT12 volume when the file is closed. A bad page after some bytes
+ * were written is a short write, which is what write() is allowed to do. */
 static u64 sys64_write(u64 fd, u64 buffer, u64 count) {
+    int id = sched64_current(), file, access;
     u64 space, written = 0;
+
+    if (fd > 2) {
+        u8 chunk[64];
+        u64 pos, done = 0;
+
+        file = fs64_fd_file(id, (int)fd);
+        if (file < 0) return (u64)0 - SYS64_EBADF;
+        access = fs64_fd_access(id, (int)fd);
+        if (access == 0) return (u64)0 - SYS64_EBADF;   /* O_RDONLY */
+        if (count == 0) return 0;
+        if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+
+        pos = fs64_fd_pos(id, (int)fd);
+        space = current_space();
+        while (done < count) {
+            u64 n = count - done;
+
+            if (n > sizeof(chunk)) n = sizeof(chunk);
+            if (!copy_from_user64(space, chunk, buffer + done, n)) {
+                if (done) break;
+                return (u64)0 - SYS64_EFAULT;
+            }
+            n = fs64_write(file, pos + done, chunk, n);
+            if (n == 0) {
+                if (done == 0) return (u64)0 - SYS64_ENOSPC;
+                break;
+            }
+            done += n;
+        }
+        fs64_fd_seek(id, (int)fd, pos + done);
+        return done;
+    }
 
     if (fd != 1 && fd != 2) return (u64)0 - SYS64_EBADF;
     if (count == 0) return 0;
@@ -198,7 +235,7 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
                       u64 offset) {
     int id = sched64_current();
     u64 space, pages, base, kind, end, file_size;
-    int writable, fixed, anon, file = -1, owned = 1;
+    int writable, fixed, anon, file = -1, owned = 1, shared;
 
     if (length == 0) return (u64)0 - SYS64_EINVAL;
     if (prot & ~(u64)(K64_PROT_READ | K64_PROT_WRITE | K64_PROT_EXEC))
@@ -216,6 +253,7 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
 
     pages = (length + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
     anon = (flags & K64_MAP_ANONYMOUS) != 0;
+    shared = (flags & K64_MAP_SHARED) != 0;
     if (anon) {
         if (fd != ~0ull || offset != 0) return (u64)0 - SYS64_EINVAL;
     } else {
@@ -226,9 +264,14 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
         file_size = fs64_pages(file) * K64_PAGE_SIZE;
         if (offset >= file_size) return (u64)0 - SYS64_EINVAL;
         if (length > file_size - offset) return (u64)0 - SYS64_EINVAL;
+        /* A writable shared mapping writes the file, so the descriptor has
+         * to be open for writing; a private copy does not touch the file. */
+        if (shared && (prot & K64_PROT_WRITE) &&
+            fs64_fd_access(id, (int)fd) == 0)
+            return (u64)0 - SYS64_EACCES;
         /* Shared pages are the file's; private pages are copies we own and
          * therefore have to free again on munmap. */
-        owned = (flags & K64_MAP_SHARED) == 0;
+        owned = !shared;
     }
 
     fixed = (flags & K64_MAP_FIXED) != 0;
@@ -255,7 +298,7 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
         if (!base) return (u64)0 - SYS64_ENOMEM;
     }
 
-    if (!task64_map_record(id, base, pages, owned))
+    if (!task64_map_record(id, base, pages, owned, shared))
         return (u64)0 - SYS64_ENOMEM;
 
     writable = (prot & K64_PROT_WRITE) != 0;
@@ -323,17 +366,17 @@ static u64 sys64_munmap(u64 address, u64 length) {
     return 0;
 }
 
-/* open(path, flags, mode): read-only, from fs64.c. The path is copied out
- * of user memory one byte at a time -- a page-sized copy would fault on a
- * short string that ends near the end of a page -- into a bounded kernel
- * buffer, so nothing here can run off the end of a name. */
+/* open(path, flags, mode): the FAT12 page cache. The path is copied out of
+ * user memory one byte at a time -- a page-sized copy would fault on a short
+ * string that ends near the end of a page -- into a bounded kernel buffer,
+ * so nothing here can run off the end of a name. O_CREAT/O_EXCL/O_TRUNC/
+ * O_APPEND and the three access modes are the accepted set. */
 static u64 sys64_open(u64 path, u64 flags, u64 mode) {
     char name[K64_FS_PATH_MAX + 1];
     u64 space = current_space();
-    int file, fd;
+    int fd, error = 0;
 
     (void)mode;
-    if (flags != K64_O_RDONLY) return (u64)0 - SYS64_EINVAL;
 
     for (u64 i = 0; i <= (u64)K64_FS_PATH_MAX; i++) {
         if (!copy_from_user64(space, &name[i], path + i, 1))
@@ -342,11 +385,24 @@ static u64 sys64_open(u64 path, u64 flags, u64 mode) {
         if (i == (u64)K64_FS_PATH_MAX) return (u64)0 - SYS64_EINVAL;
     }
 
-    file = fs64_open(name);
-    if (file < 0) return (u64)0 - SYS64_ENOENT;
-    fd = fs64_fd_open(sched64_current(), file);
-    if (fd < 0) return (u64)0 - SYS64_ENOMEM;
+    fd = fs64_open_fd(sched64_current(), name, flags, &error);
+    if (fd < 0) return (u64)error;
     return (u64)fd;
+}
+
+/* mkdir(path, mode): one directory, 8.3 name, parent must exist. */
+static u64 sys64_mkdir(u64 path, u64 mode) {
+    char name[K64_FS_PATH_MAX + 1];
+    u64 space = current_space();
+
+    (void)mode;
+    for (u64 i = 0; i <= (u64)K64_FS_PATH_MAX; i++) {
+        if (!copy_from_user64(space, &name[i], path + i, 1))
+            return (u64)0 - SYS64_EFAULT;
+        if (name[i] == '\0') break;
+        if (i == (u64)K64_FS_PATH_MAX) return (u64)0 - SYS64_EINVAL;
+    }
+    return (u64)fs64_create_dir(name);
 }
 
 /* read(fd, buffer, count): file descriptors only. The data is staged in a
@@ -359,6 +415,7 @@ static u64 sys64_read(u64 fd, u64 buffer, u64 count) {
 
     file = fs64_fd_file(id, (int)fd);
     if (file < 0) return (u64)0 - SYS64_EBADF;
+    if (fs64_fd_access(id, (int)fd) == 1) return (u64)0 - SYS64_EBADF;
     if (count == 0) return 0;
     if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
 
@@ -421,6 +478,58 @@ static u64 sys64_getpid(void) {
     int id = sched64_current();
 
     return id < 0 ? 1 : (u64)(id + 1);
+}
+
+/* getppid(): the parent's pid, or 0 for a task the boot context created. */
+static u64 sys64_getppid(void) {
+    int parent = task64_parent(sched64_current());
+
+    return parent < 0 ? 0 : (u64)(parent + 1);
+}
+
+/* wait4(pid, status, options): block until one child is DONE, write its
+ * status, and reap it. Waiters sleep with interrupts enabled: the timer
+ * preempts them, the child runs to completion, and the loop sees DONE on
+ * the way back in. WNOHANG makes it a poll instead. */
+static u64 sys64_wait4(u64 pid, u64 status, u64 options) {
+    int id = sched64_current();
+    u64 space = current_space();
+    u64 code = 0;
+    s64 want = (s64)pid;
+    int result;
+
+    if (options & ~(u64)K64_WNOHANG) return (u64)0 - SYS64_EINVAL;
+    if (want < -1 || want == 0) return (u64)0 - SYS64_EINVAL;
+    if (status != 0 && !user_page64(space, status, 0, 1))
+        return (u64)0 - SYS64_EFAULT;
+
+    for (;;) {
+        result = task64_reap(id, (int)want, &code);
+        if (result >= 0) break;
+        if (result == -(int)SYS64_ECHILD) return (u64)0 - SYS64_ECHILD;
+        if (options & K64_WNOHANG) return 0;
+        sti64();
+        cpu_halt64();
+        cli64();
+    }
+
+    if (status != 0) {
+        u32 value = (u32)code;
+
+        if (!copy_to_user64(space, status, &value, 4))
+            return (u64)0 - SYS64_EFAULT;
+    }
+    return (u64)result;
+}
+
+/* kill(pid, signal): pid 1 and up is a task index + 1. Only the default
+ * action (terminate) exists; the caller's own pid is handled in the
+ * dispatcher because it must not resume its frame. */
+static u64 sys64_kill(u64 pid, u64 signal) {
+    s64 want = (s64)pid;
+
+    if (want <= 0) return (u64)0 - SYS64_EINVAL;
+    return (u64)task64_signal((int)want - 1, (u32)signal);
 }
 
 /* clock_gettime(clock_id, timespec). CLOCK_MONOTONIC counts timer ticks
@@ -506,8 +615,31 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
         result = sys64_munmap(frame->rdi, frame->rsi);
         break;
 
+    case K64_SYS_MKDIR:
+        result = sys64_mkdir(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_FORK:
+        return sched64_fork(frame);
+
+    case K64_SYS_WAIT4:
+        result = sys64_wait4(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
+    case K64_SYS_KILL:
+        /* kill() of the caller ends it instead of returning: the frame the
+         * handler was given must never be resumed. */
+        if (frame->rdi == sys64_getpid() && frame->rsi != 0)
+            return sched64_terminate(frame, (u32)frame->rsi);
+        result = sys64_kill(frame->rdi, frame->rsi);
+        break;
+
     case K64_SYS_GETPID:
         result = sys64_getpid();
+        break;
+
+    case K64_SYS_GETPPID:
+        result = sys64_getppid();
         break;
 
     case K64_SYS_CLOCK_GETTIME:

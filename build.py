@@ -24,8 +24,11 @@ Pipeline:
 
 `python build.py x64` is a separate pipeline: entry64.asm, isr64.asm and the
 kernel/arch/x86_64 C sources are compiled for x86-64, linked as a PE32+
-image, and booted from the same stage1/stage2 floppy as haku64.img. It shares
-nothing with the i386 link line, so neither target can break the other.
+image, and booted from the same stage1/stage2 floppy as haku64.img. It also
+builds a fresh FAT12 seed disk (build/haku64_fs.img) with the shared ATA
+driver and filesystem sources, attaches it as the primary-master IDE disk,
+and verifies the volume after QEMU exits. It shares nothing with the i386
+link line, so neither target can break the other.
 
 The data image (build/haku_fs.img) is user data: an existing image is
 reused as-is so files from previous QEMU sessions survive the build, and
@@ -357,14 +360,37 @@ def build_shell_image(py, user_elf, busybox, command):
     return image
 
 
+def build_x64_fs(py, image):
+    """Seed the x86-64 data disk: two files the kernel reads at boot.
+
+    HELLO.TXT carries the 16-byte marker the ELF64 self-test prints, and
+    PATTERN.BIN is three pages so a file mapping and a multi-page read both
+    have data on every page. The pattern is the same (offset*37+11) & 0xFF
+    formula boot64.c uses to verify it. The image is rebuilt on every x64
+    run because the kernel also creates /TMP and writes NOTE.TXT into it.
+    """
+    hello = b"HAKU64-FILE-OK\r\n"
+    pattern = bytes(((i * 37 + 11) & 0xFF) for i in range(3 * 4096))
+    hello_path = os.path.join(BUILD, "haku64_hello.txt")
+    pattern_path = os.path.join(BUILD, "haku64_pattern.bin")
+    with open(hello_path, "wb") as f:
+        f.write(hello)
+    with open(pattern_path, "wb") as f:
+        f.write(pattern)
+
+    run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
+         f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}"])
+    log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes)")
+
+
 def build_x64(nasm, py, memory_mb):
     """Build and boot haku64.img: the same floppy, with a 64-bit kernel.
 
     The entry path, memory subsystem, interrupts, per-process address
-    spaces, the scheduler, ring-3 entry, the six-argument INT 0x80 syscall
-    ABI and the ELF64 loader are all 64-bit; there is no 64-bit libc or
-    filesystem image yet. The 32-bit kernel is untouched and remains the
-    default image.
+    spaces, the scheduler, ring-3 entry, the six-argument syscall ABI, the
+    ELF64 loader and a FAT12 disk (the same ATA driver and filesystem the
+    32-bit kernel uses, behind a small compatibility layer) are all 64-bit.
+    The 32-bit kernel is untouched and remains the default image.
     """
     cc, linker, label = find_x64_toolchain()
     log(f"x64 toolchain: {label}")
@@ -389,12 +415,21 @@ def build_x64(nasm, py, memory_mb):
     stage2_bin = os.path.join(BUILD, "stage2_64.bin")
     serial = os.path.join(BUILD, "serial64.log")
     img = os.path.join(ROOT, "haku64.img")
+    fs_img = os.path.join(BUILD, "haku64_fs.img")
     user_base = 0x0000008000400000
 
-    # 1. the 64-bit entry stub and every C file under arch/x86_64
-    include_dirs = [os.path.join(arch64, "kernel"), os.path.join(arch64, "mm")]
+    # 1. the 64-bit entry stub and every C file under arch/x86_64. The ATA
+    #    driver and FAT12 filesystem are the 32-bit sources, compiled against
+    #    kernel/arch/x86_64/compat so the 64-bit port reuses tested logic
+    #    instead of growing a second disk stack.
+    include_dirs = [os.path.join(arch64, "kernel"), os.path.join(arch64, "mm"),
+                    os.path.join(arch64, "compat"),
+                    os.path.join(ROOT, "kernel", "drivers"),
+                    os.path.join(ROOT, "kernel", "fs", "fat12")]
     sources = sorted(glob.glob(os.path.join(arch64, "**", "*.c"),
                                recursive=True))
+    sources += [os.path.join(ROOT, "kernel", "drivers", "ata.c"),
+                os.path.join(ROOT, "kernel", "fs", "fat12", "fat12.c")]
     if not sources:
         sys.exit("no kernel/arch/x86_64/**/*.c files found")
     run([nasm, "-f", "win64", entry_asm, "-o", entry_obj])
@@ -446,14 +481,22 @@ def build_x64(nasm, py, memory_mb):
          stage1_bin, stage2_bin, kernel_bin, str(kernel_sectors), img,
          stage1_asm, stage2_asm])
 
-    # 4. boot it. qemu-system-i386 refuses long mode without a 64-bit CPU
-    #    model, so this mode uses the x86_64 binary.
+    # 4. a fresh FAT12 volume for the disk filesystem test. The kernel
+    #    creates /TMP and writes NOTE.TXT during the run, so the seed files
+    #    are rebuilt every time rather than reused.
+    build_x64_fs(py, fs_img)
+
+    # 5. boot it. qemu-system-i386 refuses long mode without a 64-bit CPU
+    #    model, so this mode uses the x86_64 binary. writethrough keeps the
+    #    guest's disk writes in the host file when QEMU is killed.
     qemu = find_tool("qemu-system-x86_64",
                      [r"C:\Program Files\qemu\qemu-system-x86_64.exe"], "QEMU")
     if os.path.exists(serial):
         os.remove(serial)
     proc = subprocess.Popen([qemu, "-m", str(memory_mb), "-cpu", "qemu64",
                              "-drive", f"file={img},format=raw,if=floppy,index=0",
+                             "-drive", f"file={fs_img},format=raw,if=ide,"
+                                       "index=0,media=disk,cache=writethrough",
                              "-boot", "order=a", "-no-reboot",
                              "-display", "none", "-serial", f"file:{serial}"])
     reached = wait_for_serial(serial, "HAKU64-SELFTEST-OK", 30.0)
@@ -470,7 +513,8 @@ def build_x64(nasm, py, memory_mb):
                 "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
                 "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",
                 "HAKU64-RTC-OK", "HAKU64-SYSCALL64-OK", "HAKU64-FS-OK",
-                "HAKU64-FILE-OK", "HAKU64-SELFTEST-OK"]
+                "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
+                "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():
@@ -478,6 +522,16 @@ def build_x64(nasm, py, memory_mb):
                 sys.exit(f"X64 CHECK FAILED: {line.strip()}")
     if missing or not reached:
         sys.exit("X64 CHECK FAILED: missing markers: " + ", ".join(missing))
+
+    # The run created /TMP/NOTE.TXT and flushed it through the ATA cache, so
+    # a layout check of the host-side image proves the write reached the
+    # volume, not just the kernel's page cache.
+    check = subprocess.run([py, os.path.join(ROOT, "tools", "lsfat12.py"),
+                            "--check", fs_img], capture_output=True, text=True)
+    print(check.stdout, end="")
+    if check.returncode != 0:
+        print(check.stderr, end="")
+        sys.exit("X64 CHECK FAILED: the disk image is not valid after the run")
     log("X64 CHECK PASSED: " + ", ".join(required))
 
 

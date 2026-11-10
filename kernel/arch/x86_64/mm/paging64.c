@@ -325,6 +325,127 @@ void paging64_destroy_space(u64 space) {
     frame64_free(space);
 }
 
+/* Visit every present 4 KiB leaf in the user half. Slots below the user
+ * base are the kernel's own and are never reported. The callback returns 0
+ * to stop the walk, which clone uses to bail out on the first failure. */
+static int walk_user_pages(u64 space,
+                           int (*visit)(u64 virt, u64 phys, u64 flags,
+                                        void *ctx),
+                           void *ctx) {
+    u64 *pml4, *pdpt, *pd, *pt;
+    u32 slot, i, j, k;
+
+    if (!space) return 0;
+    pml4 = (u64 *)phys_to_virt64(space);
+    for (slot = PML4_INDEX(K64_USER_BASE);
+         slot <= PML4_INDEX(K64_USER_END - 1); slot++) {
+        if (!(pml4[slot] & PAGE_PRESENT)) continue;
+        pdpt = (u64 *)phys_to_virt64(pml4[slot] & K64_PHYS_MASK);
+        for (i = 0; i < 512; i++) {
+            if (!(pdpt[i] & PAGE_PRESENT)) continue;
+            pd = (u64 *)phys_to_virt64(pdpt[i] & K64_PHYS_MASK);
+            for (j = 0; j < 512; j++) {
+                if (!(pd[j] & PAGE_PRESENT) || (pd[j] & PAGE_LARGE)) continue;
+                pt = (u64 *)phys_to_virt64(pd[j] & K64_PHYS_MASK);
+                for (k = 0; k < 512; k++) {
+                    u64 virt;
+                    if (!(pt[k] & PAGE_PRESENT)) continue;
+                    virt = ((u64)slot << 39) | ((u64)i << 30) |
+                           ((u64)j << 21) | ((u64)k << 12);
+                    if (!visit(virt, pt[k] & K64_PHYS_MASK, pt[k], ctx))
+                        return 0;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+typedef struct {
+    u64 child;
+    int (*shared)(u64 virt, void *ctx);
+    void *ctx;
+} clone_state_t;
+
+static int clone_visit(u64 virt, u64 phys, u64 flags, void *opaque) {
+    clone_state_t *st = (clone_state_t *)opaque;
+    int writable = (flags & PAGE_WRITABLE) != 0;
+    int executable = (flags & PAGE_NX) == 0;
+    u64 frame;
+    u8 *dst;
+
+    /* A shared range is the same memory in both spaces: alias the frame and
+     * leave ownership with whoever allocated it. */
+    if (st->shared && st->shared(virt, st->ctx))
+        return paging64_map_space(st->child, virt, phys, writable, 1,
+                                  executable);
+
+    /* Everything else is a private copy. There is no copy-on-write: fork
+     * pays for the copy up front, so the child can never see a later parent
+     * store. */
+    frame = frame64_alloc();
+    if (!frame) return 0;
+    dst = (u8 *)phys_to_virt64(frame);
+    memcpy(dst, (const u8 *)phys_to_virt64(phys), K64_PAGE_SIZE);
+    if (!paging64_map_space(st->child, virt, frame, writable, 1, executable)) {
+        frame64_free(frame);
+        return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    int (*keep)(u64 virt, void *ctx);
+    void *ctx;
+} free_state_t;
+
+static int free_visit(u64 virt, u64 phys, u64 flags, void *opaque) {
+    free_state_t *st = (free_state_t *)opaque;
+
+    (void)flags;
+    if (st->keep && st->keep(virt, st->ctx)) return 1;
+    frame64_free(phys);
+    return 1;
+}
+
+/* A new space with a copy of every present user page. Pages `shared` reports
+ * true are aliased, the rest are copied into fresh frames. On failure the
+ * half-built space is torn down and 0 is returned. */
+u64 paging64_clone_space(u64 parent,
+                         int (*shared)(u64 virt, void *ctx), void *ctx) {
+    clone_state_t state;
+    free_state_t teardown;
+    u64 child;
+
+    if (!parent) return 0;
+    child = paging64_create_space();
+    if (!child) return 0;
+
+    state.child = child;
+    state.shared = shared;
+    state.ctx = ctx;
+    if (!walk_user_pages(parent, clone_visit, &state)) {
+        teardown.keep = shared;
+        teardown.ctx = ctx;
+        (void)walk_user_pages(child, free_visit, &teardown);
+        paging64_destroy_space(child);
+        return 0;
+    }
+    return child;
+}
+
+/* Release every user frame in `space` that `keep` does not claim. A task
+ * uses this on exit: its anonymous and private-copy pages are freed, while
+ * file cache pages it only aliased stay alive for the next reader. */
+void paging64_free_space_frames(u64 space,
+                                int (*keep)(u64 virt, void *ctx), void *ctx) {
+    free_state_t state;
+
+    state.keep = keep;
+    state.ctx = ctx;
+    (void)walk_user_pages(space, free_visit, &state);
+}
+
 void paging64_switch_space(u64 space) {
     write_cr3_64(space);
 }
