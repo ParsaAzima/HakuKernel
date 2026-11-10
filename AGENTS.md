@@ -1,8 +1,9 @@
 # Repository Agent Instructions
 
-These instructions apply to all work in this repository. Read [README.md](README.md)
-for the current architecture and build prerequisites, and [ROADMAP.md](ROADMAP.md)
-for planned work and known scope boundaries.
+These instructions apply to all work in this repository. Read
+[docs/README.md](docs/README.md) for the current architecture and build
+prerequisites, and [ROADMAP.md](ROADMAP.md) for planned work and known scope
+boundaries.
 
 ## Project Constraints
 
@@ -13,7 +14,7 @@ for planned work and known scope boundaries.
   runtime. Avoid hosted-library or compiler-runtime dependencies.
 - Keep the implementation compatible with the existing toolchain and patterns.
   NASM objects linked with MSVC need explicit sections and matching symbol
-  naming; see the troubleshooting section in the README.
+  naming; see [troubleshooting](docs/troubleshooting.md).
 - Treat disk images and generated files as user data. Do not overwrite or
   discard them except through the documented build or test flow.
 - Keep syscall user-pointer validation and `-errno` behavior consistent. Never
@@ -29,7 +30,8 @@ python build.py headless
 ```
 
 Use `python build.py` for a build-only check and `python build.py run` to boot
-the image in a QEMU window. See the README for required tools and troubleshooting.
+the image in a QEMU window. See [building and running](docs/building.md) for
+required tools and troubleshooting.
 For documentation-only changes, verify links and spelling; a kernel build is
 not required.
 
@@ -37,8 +39,8 @@ not required.
 
 - Make focused changes and follow existing naming, formatting, and error
   handling conventions.
-- Update README or roadmap documentation when architecture, commands, behavior,
-  limitations, or project priorities change.
+- Update the documentation under `docs/` or the roadmap when architecture,
+  commands, behavior, limitations, or project priorities change.
 - Add or update headless/self-tests for observable kernel behavior where
   practical.
 - Do not claim full POSIX compatibility; describe the implemented subset

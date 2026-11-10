@@ -106,7 +106,8 @@ compatibility is not a short-term goal.
   writes, and document that operations are not atomic (`FS-ROLLBACK-OK`:
   gap failures keep the old size, short writes keep their durable prefix,
   directory-persist failures roll the chain back, failed TRUNC zeroes the
-  entry; README documents the non-atomic model and its limits).
+  entry; [the syscall notes](docs/syscalls.md#user-mode-system-calls)
+  document the non-atomic model and its limits).
 - [x] Avoid overwriting user data images during every build; separate initial
   image creation from preservation of an existing data image (existing
   `build/haku_fs.img` is reused as-is; only missing images or `--fresh`
@@ -158,8 +159,8 @@ unexpectedly lost image data across restarts.
   locks are still missing: `F_SETLK` is accepted and changes nothing).
 - [x] Decide separately whether to support long filenames, partition tables,
   or FAT16; require interoperability tests before expanding scope (decision:
-  none of the three for the data disk. README "Why FAT12 with 8.3 names, and
-  not something bigger" records the reasoning — the userland root moves to an
+  none of the three for the data disk. [Storage and filesystems](docs/storage.md#why-fat12-with-83-names-and-not-something-bigger)
+  records the reasoning: the userland root moves to an
   in-memory filesystem with long names and permission bits, which leaves
   FAT12 as an interchange format where 8.3 names suffice. Any future change to
   the on-disk format must first pass an `mtools`/`fsck.fat` round-trip in CI
@@ -217,7 +218,7 @@ address-space or descriptor sharing.
   `spin_lock`/`spin_unlock`, and `spin_lock_irqsave`; VFS uses one
   task-context lock around descriptor/OFD changes and backend calls, the
   frame/heap allocators and console use IRQ-save locks, ATA and the keyboard
-  ring buffer are serialized per the README "Locking" rules).
+  ring buffer are serialized per the [locking rules](docs/kernel-internals.md#locking)).
 - [x] Separate wait queues and sleep/wakeup from busy-waiting so blocking I/O
   sleeps the current process instead of spinning (`kernel/kernel/scheduler.h`
   wait queues use a task-slot bitmap and a distinct `TASK_BLOCKED` state;
@@ -301,14 +302,16 @@ prevent boot.
   FAT suite stays `FS-ERRORS-OK`/`FS-EROFS-OK`/`FS-FILE-EDGE-OK`/
   `FS-CORRUPT-OK`/`FS-ATA-OK`/`FS-STAT-OK`/`FS-ROLLBACK-OK`/`FS-ENOSPC-OK`).
 - [x] Define the limited POSIX subset actually supported; add conformance
-  tests and document limitations for each capability (README's "Supported
-  POSIX subset" lists the implemented calls by area, what is deliberately
+  tests and document limitations for each capability
+  ([the POSIX subset notes](docs/syscalls.md#supported-posix-subset) list
+  the implemented calls by area, what is deliberately
   absent, and which calls are accepted without changing state; the ring-3
   self-tests `USER-LIB-OK` and `USER-FS-ABI-OK` exercise the surface, though
   there is no formal conformance suite).
 - [x] Document manual testing and disk-image recovery or replacement
-  (README's "Manual testing and image recovery": a windowed run for
-  hands-on testing, `--fresh` to rebuild a discarded data image, and
+  ([manual testing](docs/building.md#manual-testing-and-image-recovery): a
+  windowed run for hands-on testing, `--fresh` to rebuild a discarded data
+  image, and
   `inspect --check` to prove an image is damaged before throwing it away).
 
 **Acceptance criteria:** An independent C program can be built and run using

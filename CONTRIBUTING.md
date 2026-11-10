@@ -6,7 +6,7 @@ project's small, testable design and accurately document current limitations.
 
 ## Before You Start
 
-- Read [README.md](README.md) for the architecture, setup, and known
+- Read [docs/README.md](docs/README.md) for the architecture, setup, and known
   limitations.
 - Check [ROADMAP.md](ROADMAP.md) to see whether the work fits an existing
   milestone. For substantial design changes, open an issue before investing in
@@ -17,7 +17,8 @@ project's small, testable design and accurately document current limitations.
 ## Development Environment
 
 The supported development workflow is Windows with Visual Studio 2022's
-32-bit MSVC compiler, NASM, Python 3, and QEMU. See the README for details.
+32-bit MSVC compiler, NASM, Python 3, and QEMU. See
+[docs/building.md](docs/building.md) for details.
 
 ```powershell
 python build.py
