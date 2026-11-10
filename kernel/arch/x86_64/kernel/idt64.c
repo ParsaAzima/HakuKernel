@@ -202,6 +202,19 @@ static regs64_t *handle_exception(regs64_t *r) {
             k64_puts("\r\n");
             return r;
         }
+        if ((r->cs & 3u) == 3u) {
+            /* There is no signal model yet, so a user fault terminates the
+             * task instead of halting the machine. That is what makes an
+             * NX violation or a wild stack access testable. */
+            k64_puts("HAKU64-USER-FAULT: vector=14 error=");
+            k64_hex(r->error);
+            k64_puts(" rip=");
+            k64_hex(r->rip);
+            k64_puts(" cr2=");
+            k64_hex(cr2);
+            k64_puts("\r\n");
+            return sched64_fault(r, 14, cr2);
+        }
         report_frame("HAKU64-EXC-PF-UNEXPECTED", r);
         halt_forever();
     }
@@ -212,8 +225,25 @@ static regs64_t *handle_exception(regs64_t *r) {
             k64_puts("HAKU64-EXC-DE-OK: divide by zero recovered\r\n");
             return r;
         }
+        if ((r->cs & 3u) == 3u) {
+            k64_puts("HAKU64-USER-FAULT: vector=0 rip=");
+            k64_hex(r->rip);
+            k64_puts("\r\n");
+            return sched64_fault(r, 0, 0);
+        }
         report_frame("HAKU64-EXC-DE-UNEXPECTED", r);
         halt_forever();
+    }
+
+    if ((r->cs & 3u) == 3u) {
+        k64_puts("HAKU64-USER-FAULT: vector=");
+        k64_dec(vector);
+        k64_puts(" error=");
+        k64_hex(r->error);
+        k64_puts(" rip=");
+        k64_hex(r->rip);
+        k64_puts("\r\n");
+        return sched64_fault(r, vector, 0);
     }
 
     k64_puts("HAKU64-EXC-UNHANDLED: ");

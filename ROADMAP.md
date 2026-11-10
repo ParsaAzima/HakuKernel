@@ -544,25 +544,45 @@ the port is complete.
   that copies the kernel's identity map and physmap and owns slot 1 at
   `0x0000008000000000`; `paging64_map_space` builds the levels under any
   root and `CR3` switches between them. The same frame enters ring 3 with
-  `CS=0x1B`/`SS=0x23`, and vector `0x80` is the one DPL-3 gate, dispatching
-  `write` and `exit` with the number in `RAX`; the syscall ABI item below
-  widens that to the Linux convention and the core call set. Markers:
-  `HAKU64-VM-OK` (one virtual address, two
+  `CS=0x23`/`SS=0x1B` (the user descriptors sit data-then-code so `SYSRET`
+  can derive them from `STAR`), and vector `0x80` is a DPL-3 gate,
+  dispatching `write` and `exit` with the number in `RAX`; the syscall ABI
+  item below widens that to the Linux convention and the core call set.
+  Markers: `HAKU64-VM-OK` (one virtual address, two
   frames, both CR3s), `HAKU64-PROC-OK` (two preempted tasks on distinct
   stacks), `HAKU64-USER-OK` and `HAKU64-SYSCALL-OK` (a hand-assembled
   three-page user program prints `RING3` and exits through the gate).
-- [x] Syscall ABI: widen the `INT 0x80` handler from three arguments to the
-  x86-64 Linux `rdi/rsi/rdx/r10/r8/r9` convention and implement the Linux
-  x86-64 numbers for the core calls. `syscall64.c` now dispatches `write`,
-  `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime` and
+- [x] Execution protection: `EFER.NXE` and a no-execute bit on data, BSS,
+  stack and non-`PROT_EXEC` mappings, with executable `PT_LOAD` pages
+  clearing it. Ring-3 `#PF`/`#DE` and other user exceptions now terminate the
+  task through `sched64_fault` (recording vector and `CR2`) instead of
+  halting the machine; kernel faults stay fatal. The NX self-test jumps into
+  a writable page and requires vector 14 with `CR2` at that page
+  (`HAKU64-NX-OK`). Physical frame extraction uses `K64_PHYS_MASK`, so the
+  NX bit never reaches a page-table base.
+
+- [x] Syscall ABI: widen the handler from three arguments to the x86-64
+  Linux `rdi/rsi/rdx/r10/r8/r9` convention, implement the Linux x86-64
+  numbers for the core calls, and enter through `SYSCALL`/`SYSRET`.
+  `syscall64_init` programs `STAR`/`LSTAR`/`FMASK` and sets `EFER.SCE`;
+  `isr64.asm`'s `syscall64_entry` switches to the task's kernel stack,
+  builds the usual `regs64_t` frame, and returns with `SYSRET` for a ring-3
+  frame (or the shared `IRETQ` tail for a kernel frame). `INT 0x80` stays as
+  a DPL-3 fallback and the test image uses both. `syscall64.c` dispatches
+  `write`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime` and
   `exit`/`exit_group` (`-ENOSYS` otherwise), returns `-errno` on failure,
   and validates every user pointer through `paging64_query_space` before
   touching it — a ring-0 page fault is fatal, so the page tables, not the
-  CPU, are the check. `mmap` is private anonymous only, refuses W+X and a
-  file descriptor/offset/fixed address, and grows a per-task bump region;
-  `munmap` frees the frames it unmaps. The ELF64 test image drives the
-  success and error matrix (`EBADF`, `EFAULT`, `ENOSYS`, `EINVAL`) and the
-  run asserts the exit status and the BSS word (`HAKU64-ABI-OK`).
+  CPU, are the check. `mmap` accepts private or shared anonymous mappings:
+  `MAP_FIXED` takes a page-aligned free address inside the anonymous window,
+  the default form grows a per-task bump region, and file-backed mappings
+  stay `-EINVAL` until the 64-bit VFS exists. `munmap` frees the frames it
+  unmaps. `CLOCK_REALTIME` is the CMOS RTC epoch sampled once at boot plus
+  elapsed ticks (`rtc64.c`), falling back to monotonic time if the chip is
+  unreadable; `CLOCK_MONOTONIC` stays time since boot. The ELF64 test image
+  drives the success and error matrix (`EBADF`, `EFAULT`, `ENOSYS`,
+  `EINVAL`) and the run asserts the exit status and the BSS word
+  (`HAKU64-ABI-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-RTC-OK`).
 - [ ] Syscall table: port the i386 number table from `usermode.c` (97 cases)
   and the wider VFS/process surface onto the 64-bit ABI.
 - [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a

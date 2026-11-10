@@ -32,6 +32,8 @@ typedef struct {
     u64 stack_top;  /* kernel stack, i.e. TSS.RSP0 while the task runs */
     regs64_t *frame;
     u64 exit_status; /* exit/exit_group argument, readable after DONE */
+    u64 fault_vector; /* non-zero when the task stopped on a ring-3 fault */
+    u64 fault_address;
     u64 mmap_next;   /* per-task bump pointer for anonymous mappings */
 } task64_t;
 
@@ -94,6 +96,8 @@ void sched64_init(void) {
     tasks[0].stack_top = 0;        /* ring 0 only, so RSP0 is not used */
     tasks[0].frame = 0;
     tasks[0].exit_status = 0;
+    tasks[0].fault_vector = 0;
+    tasks[0].fault_address = 0;
     tasks[0].mmap_next = 0;
     memcpy(fxsave_areas[0], fxsave_default, sizeof(fxsave_default));
 
@@ -118,6 +122,8 @@ int task64_create_kernel(void (*entry)(void)) {
     tasks[id].stack_top = top;
     tasks[id].frame = frame_on_stack(top, (u64)entry);
     tasks[id].exit_status = 0;
+    tasks[id].fault_vector = 0;
+    tasks[id].fault_address = 0;
     tasks[id].mmap_next = 0;
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
@@ -152,6 +158,8 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].stack_top = top;
     tasks[id].frame = frame;
     tasks[id].exit_status = 0;
+    tasks[id].fault_vector = 0;
+    tasks[id].fault_address = 0;
     tasks[id].mmap_next = K64_USER_MMAP_BASE;
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
@@ -222,6 +230,26 @@ regs64_t *sched64_exit(regs64_t *frame) {
     return switch_to(next, 0);
 }
 
+/* A ring-3 exception ends the task: there is no signal model on the 64-bit
+ * port, so the closest honest behaviour is a terminated process. The fault
+ * reason is kept for the boot test (and a future parent). */
+regs64_t *sched64_fault(regs64_t *frame, u32 vector, u64 address) {
+    int next;
+
+    if (!enabled || current_index < 0) return frame;
+    tasks[current_index].state = K64_TASK_DONE;
+    tasks[current_index].fault_vector = vector;
+    tasks[current_index].fault_address = address;
+
+    next = pick_ready();
+    if (next < 0) {
+        k64_puts("HAKU64-TASK-HALT: no runnable task after a user fault\r\n");
+        cli64();
+        for (;;) cpu_halt64();
+    }
+    return switch_to(next, 0);
+}
+
 /* Mark a task finished from outside (the boot self-test does this to the
  * CPU-burner tasks once they have proven they ran). The current task is
  * never killed this way, because it would then have no frame to return
@@ -245,6 +273,14 @@ u64 sched64_space(int id) {
 
 u64 task64_exit_status(int id) {
     return valid_id(id) ? tasks[id].exit_status : 0;
+}
+
+u64 task64_fault_vector(int id) {
+    return valid_id(id) ? tasks[id].fault_vector : 0;
+}
+
+u64 task64_fault_address(int id) {
+    return valid_id(id) ? tasks[id].fault_address : 0;
 }
 
 u64 task64_mmap_base(int id) {

@@ -85,6 +85,7 @@ static const char *segment_error(const elf64_phdr_t *phdr, u64 image_size,
 static int map_segment(const u8 *image, const elf64_phdr_t *phdr, u64 space,
                        u64 *frames, u32 *frame_count) {
     int writable = (phdr->flags & PF_W) != 0;
+    int executable = (phdr->flags & PF_X) != 0;
     u64 page_start = phdr->vaddr & K64_PAGE_MASK;
     u64 page_end = (phdr->vaddr + phdr->memsz + K64_PAGE_SIZE - 1) &
                    K64_PAGE_MASK;
@@ -105,7 +106,7 @@ static int map_segment(const u8 *image, const elf64_phdr_t *phdr, u64 space,
                    image + phdr->offset + consumed, amount);
         }
         if (*frame_count >= K64_ELF64_MAX_PAGES ||
-            !paging64_map_space(space, page, frame, writable, 1)) {
+            !paging64_map_space(space, page, frame, writable, 1, executable)) {
             frame64_free(frame);
             return 0;
         }
@@ -198,7 +199,7 @@ int elf64_load(const u8 *image, u64 image_size, loaded_elf64_t *loaded) {
         if (!frame) goto fail;
         memset(phys_to_virt64(frame), 0, K64_PAGE_SIZE);
         if (frame_count >= K64_ELF64_MAX_PAGES ||
-            !paging64_map_space(space, page, frame, 1, 1)) {
+            !paging64_map_space(space, page, frame, 1, 1, 0)) {
             frame64_free(frame);
             goto fail;
         }

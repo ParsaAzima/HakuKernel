@@ -31,6 +31,7 @@
 #define PAGE_WRITABLE 0x002ull
 #define PAGE_USER     0x004ull
 #define PAGE_LARGE    0x080ull   /* PS: 2 MiB page in a page directory */
+#define PAGE_NX       K64_PAGE_NX
 
 #define PML4_INDEX(v) (((v) >> 39) & 0x1FFull)
 #define PDPT_INDEX(v) (((v) >> 30) & 0x1FFull)
@@ -99,7 +100,7 @@ static u64 *page_table_for(u64 virt, int create) {
         if (!pdpt) return 0;
         pml4[PML4_INDEX(virt)] = (u64)pdpt | PAGE_PRESENT | PAGE_WRITABLE;
     }
-    pdpt = (u64 *)(pml4[PML4_INDEX(virt)] & K64_PAGE_MASK);
+    pdpt = (u64 *)(pml4[PML4_INDEX(virt)] & K64_PHYS_MASK);
 
     if (!(pdpt[PDPT_INDEX(virt)] & PAGE_PRESENT)) {
         if (!create) return 0;
@@ -107,7 +108,7 @@ static u64 *page_table_for(u64 virt, int create) {
         if (!pd) return 0;
         pdpt[PDPT_INDEX(virt)] = (u64)pd | PAGE_PRESENT | PAGE_WRITABLE;
     }
-    pd = (u64 *)(pdpt[PDPT_INDEX(virt)] & K64_PAGE_MASK);
+    pd = (u64 *)(pdpt[PDPT_INDEX(virt)] & K64_PHYS_MASK);
 
     if (pd[PD_INDEX(virt)] & PAGE_LARGE) return 0;
     if (!(pd[PD_INDEX(virt)] & PAGE_PRESENT)) {
@@ -116,7 +117,7 @@ static u64 *page_table_for(u64 virt, int create) {
         if (!pt) return 0;
         pd[PD_INDEX(virt)] = (u64)pt | PAGE_PRESENT | PAGE_WRITABLE;
     }
-    pt = (u64 *)(pd[PD_INDEX(virt)] & K64_PAGE_MASK);
+    pt = (u64 *)(pd[PD_INDEX(virt)] & K64_PHYS_MASK);
     return &pt[PT_INDEX(virt)];
 }
 
@@ -140,7 +141,7 @@ int paging64_unmap_page(u64 virt) {
 u64 paging64_translate(u64 virt) {
     u64 *entry = page_table_for(virt, 0);
     if (!entry || !(*entry & PAGE_PRESENT)) return 0;
-    return (*entry & K64_PAGE_MASK) | (virt & ~K64_PAGE_MASK);
+    return (*entry & K64_PHYS_MASK) | (virt & ~K64_PAGE_MASK);
 }
 
 u64 paging64_phys_map_bytes(void) {
@@ -191,7 +192,8 @@ u64 paging64_create_space(void) {
  * as needed. Only the user half is accepted: letting a caller put a leaf in
  * slot 0 or in the physmap slot would mean editing a table the kernel
  * shares with every other space. */
-int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user) {
+int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user,
+                       int executable) {
     u64 *pml4, *pdpt, *pd, *pt;
     u64 entry_flags = PAGE_PRESENT | PAGE_WRITABLE | (user ? PAGE_USER : 0);
 
@@ -203,14 +205,14 @@ int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user) {
         if (!pdpt) return 0;
         pml4[PML4_INDEX(virt)] = table_phys(pdpt) | entry_flags;
     }
-    pdpt = (u64 *)phys_to_virt64(pml4[PML4_INDEX(virt)] & K64_PAGE_MASK);
+    pdpt = (u64 *)phys_to_virt64(pml4[PML4_INDEX(virt)] & K64_PHYS_MASK);
 
     if (!(pdpt[PDPT_INDEX(virt)] & PAGE_PRESENT)) {
         pd = space_table();
         if (!pd) return 0;
         pdpt[PDPT_INDEX(virt)] = table_phys(pd) | entry_flags;
     }
-    pd = (u64 *)phys_to_virt64(pdpt[PDPT_INDEX(virt)] & K64_PAGE_MASK);
+    pd = (u64 *)phys_to_virt64(pdpt[PDPT_INDEX(virt)] & K64_PHYS_MASK);
 
     if (pd[PD_INDEX(virt)] & PAGE_LARGE) return 0;
     if (!(pd[PD_INDEX(virt)] & PAGE_PRESENT)) {
@@ -218,11 +220,12 @@ int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user) {
         if (!pt) return 0;
         pd[PD_INDEX(virt)] = table_phys(pt) | entry_flags;
     }
-    pt = (u64 *)phys_to_virt64(pd[PD_INDEX(virt)] & K64_PAGE_MASK);
+    pt = (u64 *)phys_to_virt64(pd[PD_INDEX(virt)] & K64_PHYS_MASK);
 
     pt[PT_INDEX(virt)] = (phys & K64_PAGE_MASK) | PAGE_PRESENT |
                          (writable ? PAGE_WRITABLE : 0) |
-                         (user ? PAGE_USER : 0);
+                         (user ? PAGE_USER : 0) |
+                         (executable ? 0 : PAGE_NX);
     /* Harmless for a non-current space: the TLB only has entries for the
      * current CR3, and a CR3 write flushes the rest. */
     invlpg64(virt);
@@ -240,16 +243,16 @@ static u64 *space_leaf(u64 space, u64 virt) {
     pml4 = (u64 *)phys_to_virt64(space);
     entry = pml4[PML4_INDEX(virt)];
     if (!(entry & PAGE_PRESENT)) return 0;
-    pdpt = (u64 *)phys_to_virt64(entry & K64_PAGE_MASK);
+    pdpt = (u64 *)phys_to_virt64(entry & K64_PHYS_MASK);
 
     entry = pdpt[PDPT_INDEX(virt)];
     if (!(entry & PAGE_PRESENT)) return 0;
-    pd = (u64 *)phys_to_virt64(entry & K64_PAGE_MASK);
+    pd = (u64 *)phys_to_virt64(entry & K64_PHYS_MASK);
 
     entry = pd[PD_INDEX(virt)];
     if (!(entry & PAGE_PRESENT)) return 0;
     if (entry & PAGE_LARGE) return 0;      /* never produced by map_space */
-    pt = (u64 *)phys_to_virt64(entry & K64_PAGE_MASK);
+    pt = (u64 *)phys_to_virt64(entry & K64_PHYS_MASK);
 
     return &pt[PT_INDEX(virt)];
 }
@@ -260,7 +263,7 @@ u64 paging64_translate_space(u64 space, u64 virt) {
     if (!space || !user_address(virt)) return 0;
     entry = space_leaf(space, virt);
     if (!entry || !(*entry & PAGE_PRESENT)) return 0;
-    return (*entry & K64_PAGE_MASK) | (virt & ~K64_PAGE_MASK);
+    return (*entry & K64_PHYS_MASK) | (virt & ~K64_PAGE_MASK);
 }
 
 /* Query one leaf without creating anything. This is the check every
@@ -274,7 +277,7 @@ int paging64_query_space(u64 space, u64 virt, u64 *phys, int *writable,
     if (!space || !user_address(virt)) return 0;
     entry = space_leaf(space, virt);
     if (!entry || !(*entry & PAGE_PRESENT)) return 0;
-    if (phys) *phys = (*entry & K64_PAGE_MASK) | (virt & ~K64_PAGE_MASK);
+    if (phys) *phys = (*entry & K64_PHYS_MASK) | (virt & ~K64_PAGE_MASK);
     if (writable) *writable = (*entry & PAGE_WRITABLE) != 0;
     if (user) *user = (*entry & PAGE_USER) != 0;
     return 1;
@@ -288,7 +291,7 @@ u64 paging64_unmap_space(u64 space, u64 virt) {
     entry = space_leaf(space, virt);
     if (!entry || !(*entry & PAGE_PRESENT)) return 0;
     if (!(*entry & PAGE_USER)) return 0;
-    phys = *entry & K64_PAGE_MASK;
+    phys = *entry & K64_PHYS_MASK;
     *entry = 0;
     invlpg64(virt);
     return phys;
@@ -306,13 +309,13 @@ void paging64_destroy_space(u64 space) {
 
     if (pml4[PML4_INDEX(K64_USER_BASE)] & PAGE_PRESENT) {
         pdpt = (u64 *)phys_to_virt64(
-            pml4[PML4_INDEX(K64_USER_BASE)] & K64_PAGE_MASK);
+            pml4[PML4_INDEX(K64_USER_BASE)] & K64_PHYS_MASK);
         for (i = 0; i < 512; i++) {
             if (!(pdpt[i] & PAGE_PRESENT)) continue;
-            pd = (u64 *)phys_to_virt64(pdpt[i] & K64_PAGE_MASK);
+            pd = (u64 *)phys_to_virt64(pdpt[i] & K64_PHYS_MASK);
             for (j = 0; j < 512; j++) {
                 if (!(pd[j] & PAGE_PRESENT) || (pd[j] & PAGE_LARGE)) continue;
-                pt = (u64 *)phys_to_virt64(pd[j] & K64_PAGE_MASK);
+                pt = (u64 *)phys_to_virt64(pd[j] & K64_PHYS_MASK);
                 frame64_free(table_phys(pt));
             }
             frame64_free(table_phys(pd));

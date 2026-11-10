@@ -32,6 +32,10 @@ static u64 gdt[GDT_ENTRIES];
 static table_desc64_t gdtr;
 static tss64_t tss;
 
+/* Kept equal to tss.rsp0: the SYSCALL entry stub has no kernel stack yet
+ * when it starts, so isr64.asm loads RSP from this global. */
+u64 gdt64_rsp0_value;
+
 /* .bss, and part of the flat image: 28 KiB total, which the 448 KiB load
  * window at 0x10000 has plenty of room for. */
 static __declspec(align(16)) u8 ist_double_fault[8192];
@@ -64,11 +68,15 @@ void gdt64_init(void) {
     memset(gdt, 0, sizeof(gdt));
     set_code(&gdt[1], 0);          /* K64_KERNEL_CS */
     set_data(&gdt[2], 0);          /* K64_KERNEL_DS */
-    set_code(&gdt[3], 3);          /* K64_USER_CS   */
-    set_data(&gdt[4], 3);          /* K64_USER_DS   */
+    /* Data before code: SYSRET computes SS = base + 8 and CS = base + 16
+     * from STAR, so the two user descriptors have to be adjacent in that
+     * order. See the selector block in haku64.h. */
+    set_data(&gdt[3], 3);          /* K64_USER_DS   */
+    set_code(&gdt[4], 3);          /* K64_USER_CS   */
 
     memset(&tss, 0, sizeof(tss));
     tss.rsp0 = (u64)(ring0_stack + sizeof(ring0_stack));
+    gdt64_rsp0_value = tss.rsp0;
     tss.ist[0] = (u64)(ist_double_fault + sizeof(ist_double_fault));
     tss.ist[1] = (u64)(ist_nmi + sizeof(ist_nmi));
     /* An I/O map base past the limit means "no bitmap": every port is
@@ -97,6 +105,7 @@ u64 gdt64_ist_top(u32 index) {
  * scheduler must repoint it at the task it is about to run. */
 void gdt64_set_rsp0(u64 top) {
     tss.rsp0 = top;
+    gdt64_rsp0_value = top;
 }
 
 u64 gdt64_rsp0(void) {

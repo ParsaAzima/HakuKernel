@@ -1,17 +1,19 @@
-/* Haku x86-64 system calls: the DPL-3 INT 0x80 gate.
+/* Haku x86-64 system calls: SYSCALL/SYSRET with an INT 0x80 fallback.
  *
- * There is no SYSCALL/SYSRET setup: a single IDT gate gives ring 3 one way
- * in, arrives with the same regs64_t frame every other vector uses, and
- * needs no STAR/LSTAR/FMASK MSRs, no SWAPGS and no separate entry stub.
- * The trade-off is speed, which is the right trade until the port has a
- * userland to measure.
+ * SYSCALL is the fast path: LSTAR points at syscall64_entry in isr64.asm,
+ * which switches to the task's kernel stack, builds the same regs64_t frame
+ * every interrupt stub builds, and calls sys64_dispatch. It returns with
+ * SYSRET unless the scheduler handed back a kernel frame, in which case the
+ * shared IRETQ tail resumes it. The IDT keeps a DPL-3 gate at vector 0x80,
+ * so code that only knows INT 0x80 still works and the error-path tests can
+ * cover both entry points.
  *
  * Calling convention is the x86-64 Linux one:
  *   RAX  number
  *   RDI  first argument, RSI second, RDX third, R10 fourth, R8 fifth,
  *   R9   sixth
  *   RAX  result, or a negative errno
- * The handler edits the frame in place; the stub's IRETQ delivers the
+ * The handler edits the frame in place and the entry stub delivers the
  * result back to ring 3.
  *
  * Every user pointer is resolved through the page tables of the current
@@ -33,6 +35,21 @@
 #define SYS64_EFAULT 14ull
 #define SYS64_EINVAL 22ull
 #define SYS64_ENOSYS 38ull
+
+/* RFLAGS bits SYSCALL clears (FMASK): TF, IF, DF and AC. Interrupts stay
+ * off for the whole handler, exactly as with the interrupt gate. */
+#define SYS64_FMASK (0x100ull | 0x200ull | 0x400ull | 0x40000ull)
+
+void syscall64_init(void) {
+    u64 star = ((u64)K64_STAR_BASE << 48) | ((u64)K64_KERNEL_CS << 32);
+
+    syscall64_setup(star, (u64)syscall64_entry, SYS64_FMASK);
+    k64_puts("HAKU64-SYSCALL64-SETUP: star=");
+    k64_hex(star);
+    k64_puts(" entry=");
+    k64_hex((u64)syscall64_entry);
+    k64_puts("\r\n");
+}
 
 static u64 syscall_count;
 static u32 ring3_seen;
@@ -166,19 +183,20 @@ static u64 sys64_writev(u64 fd, u64 iov, u64 count) {
     return total;
 }
 
-/* mmap(address, length, prot, flags, fd, offset): private anonymous
- * mappings only. A fixed address, a shared mapping, a file descriptor, an
- * offset, unknown bits or W+X are all -EINVAL; an unaffordable length is
- * -ENOMEM. Pages are zero-filled by the frame allocator's caller here. */
+/* mmap(address, length, prot, flags, fd, offset): anonymous mappings only,
+ * private or shared. Without MAP_FIXED the address must be 0 and the range
+ * comes from the task's bump pointer. MAP_FIXED takes a page-aligned
+ * address inside the anonymous window and refuses a range that is already
+ * mapped instead of replacing it, so a fixed mapping can never silently
+ * discard the program or its stack. A file descriptor or offset is still
+ * -EINVAL: file-backed mappings need the 64-bit VFS. */
 static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
                       u64 offset) {
     int id = sched64_current();
-    u64 space, pages, base;
-    int writable;
+    u64 space, pages, base, kind, end;
+    int writable, fixed;
 
-    if (address != 0 || length == 0 || offset != 0) return (u64)0 - SYS64_EINVAL;
-    if (fd != ~0ull) return (u64)0 - SYS64_EINVAL;
-    if (flags != (u64)(K64_MAP_PRIVATE | K64_MAP_ANONYMOUS))
+    if (length == 0 || fd != ~0ull || offset != 0)
         return (u64)0 - SYS64_EINVAL;
     if (prot & ~(u64)(K64_PROT_READ | K64_PROT_WRITE | K64_PROT_EXEC))
         return (u64)0 - SYS64_EINVAL;
@@ -187,11 +205,38 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
     if (length > (u64)K64_USER_MMAP_PAGES_MAX * K64_PAGE_SIZE)
         return (u64)0 - SYS64_ENOMEM;
 
-    pages = (length + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
-    base = task64_mmap_reserve(id, pages);
-    if (!base) return (u64)0 - SYS64_ENOMEM;
+    kind = flags & ~(u64)(K64_MAP_PRIVATE | K64_MAP_SHARED | K64_MAP_FIXED |
+                          K64_MAP_ANONYMOUS);
+    if (kind != 0) return (u64)0 - SYS64_EINVAL;
+    if ((flags & K64_MAP_ANONYMOUS) == 0) return (u64)0 - SYS64_EINVAL;
+    if (((flags & K64_MAP_PRIVATE) != 0) == ((flags & K64_MAP_SHARED) != 0))
+        return (u64)0 - SYS64_EINVAL;
 
+    pages = (length + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
+    fixed = (flags & K64_MAP_FIXED) != 0;
     space = sched64_space(id);
+
+    if (fixed) {
+        end = address + length;
+        if (address == 0 || (address & (K64_PAGE_SIZE - 1)) != 0)
+            return (u64)0 - SYS64_EINVAL;
+        if (end < address || address < K64_USER_MMAP_BASE ||
+            end > K64_USER_MMAP_END)
+            return (u64)0 - SYS64_EINVAL;
+        /* Refuse occupied ranges rather than unmapping them: the window is
+         * where this port hands out anonymous pages, and replacing a
+         * mapping here is not worth the bookkeeping yet. */
+        for (u64 i = 0; i < pages; i++)
+            if (paging64_query_space(space, address + i * K64_PAGE_SIZE,
+                                     0, 0, 0))
+                return (u64)0 - SYS64_EINVAL;
+        base = address;
+    } else {
+        if (address != 0) return (u64)0 - SYS64_EINVAL;
+        base = task64_mmap_reserve(id, pages);
+        if (!base) return (u64)0 - SYS64_ENOMEM;
+    }
+
     writable = (prot & K64_PROT_WRITE) != 0;
     for (u64 i = 0; i < pages; i++) {
         u64 virt = base + i * K64_PAGE_SIZE;
@@ -199,7 +244,8 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
 
         if (!frame) goto fail;
         memset(phys_to_virt64(frame), 0, K64_PAGE_SIZE);
-        if (!paging64_map_space(space, virt, frame, writable, 1)) {
+        if (!paging64_map_space(space, virt, frame, writable, 1,
+                                (prot & K64_PROT_EXEC) != 0)) {
             frame64_free(frame);
             goto fail;
         }
@@ -248,11 +294,12 @@ static u64 sys64_getpid(void) {
     return id < 0 ? 1 : (u64)(id + 1);
 }
 
-/* clock_gettime(clock_id, timespec). Both clocks count from boot; there
- * is no wall-clock source on this port, so CLOCK_REALTIME is not a real
- * calendar time. */
+/* clock_gettime(clock_id, timespec). CLOCK_MONOTONIC counts timer ticks
+ * from boot; CLOCK_REALTIME adds the RTC epoch sampled at boot. When the
+ * RTC is unreadable the realtime clock degrades to the monotonic one, so
+ * the call still succeeds. */
 static u64 sys64_clock_gettime(u64 clock_id, u64 tp) {
-    u64 ticks, hz, timespec[2];
+    u64 ticks, hz, seconds, wall, timespec[2];
 
     if (clock_id != K64_CLOCK_REALTIME && clock_id != K64_CLOCK_MONOTONIC)
         return (u64)0 - SYS64_EINVAL;
@@ -260,7 +307,12 @@ static u64 sys64_clock_gettime(u64 clock_id, u64 tp) {
     if (hz == 0) return (u64)0 - SYS64_EINVAL;
 
     ticks = timer64_ticks();
-    timespec[0] = ticks / hz;
+    seconds = ticks / hz;
+    if (clock_id == K64_CLOCK_REALTIME) {
+        wall = rtc64_realtime(ticks, hz);
+        if (wall != 0) seconds = wall;
+    }
+    timespec[0] = seconds;
     timespec[1] = (ticks % hz) * (1000000000ull / hz);
 
     if (!copy_to_user64(current_space(), tp, timespec, SYS64_TIMESPEC))

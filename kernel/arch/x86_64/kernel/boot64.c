@@ -268,6 +268,22 @@ static int test_timer(void) {
     return 1;
 }
 
+/* The RTC anchor must be a plausible calendar time and must advance with
+ * the tick counter. Nothing here depends on the host's current year, so
+ * the check stays stable on any machine QEMU emulates. */
+static int test_rtc(void) {
+    u64 epoch = rtc64_epoch();
+    u64 hz = timer64_hz();
+    u64 now = timer64_ticks();
+
+    /* 2000-01-01 .. 2200-01-01 in Unix seconds. */
+    if (epoch < 946684800ull || epoch > 7258118400ull) return 0;
+    if (hz == 0) return 0;
+    if (rtc64_realtime(now, hz) < epoch) return 0;
+    if (rtc64_realtime(now + hz, hz) != rtc64_realtime(now, hz) + 1) return 0;
+    return 1;
+}
+
 /* ------------------------------------------------------- user address space
  * Three pages in PML4 slot 1. The code page is read-execute, the other two
  * are writable; nothing in slot 0 or the physmap slot is touched. */
@@ -290,8 +306,8 @@ static int test_spaces(void) {
     u32 ok = 1;
 
     if (!space_a || !space_b || !frame_a || !frame_b) return 0;
-    if (!paging64_map_space(space_a, virt, frame_a, 1, 1)) return 0;
-    if (!paging64_map_space(space_b, virt, frame_b, 1, 1)) return 0;
+    if (!paging64_map_space(space_a, virt, frame_a, 1, 1, 0)) return 0;
+    if (!paging64_map_space(space_b, virt, frame_b, 1, 1, 0)) return 0;
     if (paging64_translate_space(space_a, virt) != frame_a) return 0;
     if (paging64_translate_space(space_b, virt) != frame_b) return 0;
 
@@ -427,9 +443,9 @@ static int test_user(void) {
     u64 deadline;
 
     if (!space || !code || !data || !stack) return 0;
-    if (!paging64_map_space(space, USER_CODE_ADDR, code, 0, 1)) return 0;
-    if (!paging64_map_space(space, USER_DATA_ADDR, data, 1, 1)) return 0;
-    if (!paging64_map_space(space, USER_STACK_PAGE, stack, 1, 1)) return 0;
+    if (!paging64_map_space(space, USER_CODE_ADDR, code, 0, 1, 1)) return 0;
+    if (!paging64_map_space(space, USER_DATA_ADDR, data, 1, 1, 0)) return 0;
+    if (!paging64_map_space(space, USER_STACK_PAGE, stack, 1, 1, 0)) return 0;
 
     length = build_user_program(program);
     memcpy(phys_to_virt64(code), program, length);
@@ -448,6 +464,64 @@ static int test_user(void) {
     /* The task is done and the scheduler is back on the boot context, so
      * its space and pages can be released; the kernel stack stays with the
      * dead task slot for now. */
+    paging64_destroy_space(space);
+    frame64_free(code);
+    frame64_free(data);
+    frame64_free(stack);
+    return 1;
+}
+
+/* --------------------------------------------------------- NX user fetch
+ * EFER.NXE is on, data and stack pages are mapped with the NX bit, and a
+ * ring-3 fetch from one must fault. The fault handler now terminates the
+ * task instead of halting, so the boot context resumes and can inspect why
+ * the task stopped. */
+#define NX_CODE_ADDR  (K64_USER_BASE + 0x4000)
+#define NX_DATA_ADDR  (K64_USER_BASE + 0x5000)
+#define NX_STACK_PAGE (K64_USER_BASE + 0x6000)
+#define NX_STACK_TOP  (K64_USER_BASE + 0x7000)
+
+static int test_nx(void) {
+    u64 space = paging64_create_space();
+    u64 code = frame64_alloc();
+    u64 data = frame64_alloc();
+    u64 stack = frame64_alloc();
+    u8 program[16];
+    u32 length = 0;
+    u32 faults_before = exc64_count(14);
+    int id;
+    u64 deadline;
+
+    if (!space || !code || !data || !stack) return 0;
+    if (!paging64_map_space(space, NX_CODE_ADDR, code, 0, 1, 1)) return 0;
+    if (!paging64_map_space(space, NX_DATA_ADDR, data, 1, 1, 0)) return 0;
+    if (!paging64_map_space(space, NX_STACK_PAGE, stack, 1, 1, 0)) return 0;
+
+    program[length++] = 0x48;                 /* mov rax, imm64 */
+    program[length++] = 0xB8;
+    for (u32 i = 0; i < 8; i++)
+        program[length++] = (u8)(NX_DATA_ADDR >> (8 * i));
+    program[length++] = 0xFF;                 /* jmp rax */
+    program[length++] = 0xE0;
+    program[length++] = 0xEB;                 /* jmp $ */
+    program[length++] = 0xFE;
+    memcpy(phys_to_virt64(code), program, length);
+
+    id = task64_create_user(NX_CODE_ADDR, NX_STACK_TOP, space);
+    if (id < 0) return 0;
+
+    deadline = timer64_ticks() + 200;
+    while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
+        cpu_pause64();
+    if (task64_state(id) != K64_TASK_DONE) return 0;
+    if (task64_fault_vector(id) != 14) return 0;
+    if ((task64_fault_address(id) & K64_PAGE_MASK) != NX_DATA_ADDR) return 0;
+    if (exc64_count(14) <= faults_before) return 0;
+
+    k64_puts("HAKU64-NX-OK: user fetch faulted vector=14 addr=");
+    k64_hex(task64_fault_address(id));
+    k64_puts("\r\n");
+
     paging64_destroy_space(space);
     frame64_free(code);
     frame64_free(data);
@@ -579,10 +653,11 @@ static int test_elf64(void) {
 
     /* The program makes more than a dozen calls: the success paths for
      * write, writev, getpid, clock_gettime, mmap and munmap, plus the
-     * error matrix. The mmap bump pointer proves the mapping test ran even
-     * though munmap released the pages again. */
+     * error matrix. The bump pointer advanced by the initial two pages and
+     * the one-page MAP_SHARED mapping (MAP_FIXED does not bump), which
+     * proves the mapping tests ran even though munmap released the pages. */
     if (sys64_count() < before + 10 ||
-        task64_mmap_base(id) != K64_USER_MMAP_BASE + 2 * K64_PAGE_SIZE) {
+        task64_mmap_base(id) != K64_USER_MMAP_BASE + 3 * K64_PAGE_SIZE) {
         elf64_unload(&loaded);
         return 0;
     }
@@ -659,6 +734,8 @@ void kernel64_main(void) {
     k64_hex(gdt64_ist_top(2));
     k64_puts("\r\n");
 
+    syscall64_init();
+
     idt64_init();
     if (!test_idt_table()) k64_fail("IDT layout self-test");
     pic64_remap(K64_IRQ_BASE, K64_IRQ_BASE + 8);
@@ -680,6 +757,14 @@ void kernel64_main(void) {
     k64_dec(timer64_ticks());
     k64_puts("\r\n");
 
+    if (!rtc64_init()) k64_fail("CMOS real-time clock unreadable");
+    if (!test_rtc()) k64_fail("real-time clock self-test");
+    k64_puts("HAKU64-RTC-OK: epoch=");
+    k64_dec(rtc64_epoch());
+    k64_puts(" realtime=");
+    k64_dec(rtc64_realtime(timer64_ticks(), timer64_hz()));
+    k64_puts("\r\n");
+
     if (!test_spaces()) k64_fail("per-process page table self-test");
     k64_puts("HAKU64-VM-OK: virt=");
     k64_hex(K64_USER_BASE + 0x100000);
@@ -699,6 +784,8 @@ void kernel64_main(void) {
     k64_dec(sys64_count());
     k64_puts(" state=done\r\n");
 
+    if (!test_nx()) k64_fail("NX user-fetch self-test");
+
     if (!test_elf64_reject()) k64_fail("ELF64 loader accepted a malformed"
                                        " image");
     k64_puts("HAKU64-ELF-REJECT-OK: six malformed images refused\r\n");
@@ -706,7 +793,8 @@ void kernel64_main(void) {
     if (!test_elf64()) k64_fail("ELF64 loader self-test");
 
     k64_puts("HAKU64-SELFTEST-OK: physmap, frames, 4 KiB mapping, heap, "
-             "exceptions, timer, spaces, tasks, ring 3, syscalls, ELF64\r\n");
+             "exceptions, timer, RTC, spaces, tasks, ring 3, syscalls, NX, "
+             "ELF64\r\n");
     k64_puts("HAKU64-READY: interrupts online, 32-bit kernel still boots "
              "the system\r\n");
     for (;;) cpu_halt64();

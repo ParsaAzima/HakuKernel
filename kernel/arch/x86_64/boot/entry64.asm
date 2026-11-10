@@ -31,6 +31,7 @@
 %define CR0_PG          (1 << 31)
 %define CR0_PE          (1 << 0)
 %define EFER_LME        (1 << 8)
+%define EFER_NXE        (1 << 11)
 %define MSR_EFER        0xC0000080
 
 global entry64
@@ -78,7 +79,7 @@ entry64:
 
     mov ecx, MSR_EFER
     rdmsr
-    or eax, EFER_LME
+    or eax, EFER_LME | EFER_NXE
     wrmsr
 
     mov eax, PML4_PHYS

@@ -468,7 +468,8 @@ def build_x64(nasm, py, memory_mb):
                 "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
                 "HAKU64-VM-OK", "HAKU64-PROC-OK", "HAKU64-USER-OK",
                 "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
-                "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK",
+                "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",
+                "HAKU64-RTC-OK", "HAKU64-SYSCALL64-OK",
                 "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:

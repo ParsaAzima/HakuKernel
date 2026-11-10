@@ -59,10 +59,12 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | IDT/PIC | 256 gates, 8259 remapped to `0x20`/`0x28`, IRQ0 unmasked | `HAKU64-IDT-OK` |
 | exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
+| RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
-| ring 3 | an `IRETQ` frame with `CS=0x1B`/`SS=0x23` enters user mode | `HAKU64-USER-OK` |
-| syscall | the DPL-3 `INT 0x80` gate: `write`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-ABI-OK` |
+| ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `write`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
+| NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
 
@@ -93,7 +95,9 @@ lengths, and the test fails if the handler's frame is wrong.
 `gdt64_load` replaces the boot GDT with `LGDT` and reloads only the data
 segments. CS is deliberately not reloaded: the new table keeps the boot code
 descriptor byte-identical at selector `0x08`, so the cached descriptor stays
-valid. Index 1 must therefore remain the kernel code descriptor.
+valid. Index 1 must therefore remain the kernel code descriptor, and indices 3
+and 4 hold the user *data* then user *code* descriptors — the order `SYSRET`
+derives from `STAR[63:48]` (`SS = base + 8`, `CS = base + 16`).
 
 Processes reuse that frame rather than adding a second switch mechanism.
 `kernel/arch/x86_64/kernel/task64.c` saves the `regs64_t` pointer and, when
@@ -118,24 +122,47 @@ both and checks the physmap and identity map still resolve. `RSP0` is
 repointed at the incoming task's kernel stack on every switch, because that
 is what the CPU loads when a ring-3 trap enters the kernel.
 
-Ring-3 entry is an ordinary `IRETQ` from a frame whose `CS` is `0x1B` and
-whose `SS` is `0x23`; the same instruction that returns from an interrupt
-performs the privilege change. The system call gate is vector `0x80`, the one
-DPL-3 IDT entry. `sys64_dispatch` implements the x86-64 Linux convention —
-number in `RAX`, arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in
-`RAX` or a negative errno — with the Linux x86-64 numbers for `write`,
-`writev`, `mmap`, `munmap`, `getpid`, `clock_gettime` and
-`exit`/`exit_group`; an unimplemented number returns `-ENOSYS`. Every user
-pointer is resolved through the current space with `paging64_query_space`
-before it is dereferenced, and the copies move through the physmap: a ring-0
-page fault halts the kernel, so the CPU cannot be relied on to reject a bad
-address. `mmap` accepts only private anonymous mappings (no fixed address, no
-file descriptor, no offset, no W+X) and grows a per-task bump region from
-`K64_USER_MMAP_BASE`; `munmap` clears the leaves and frees their frames.
-`clock_gettime` reports both clocks as time since boot. `INT 0x80` is slower
-than `SYSCALL`/`SYSRET` but needs no `STAR`/`LSTAR`/`FMASK` setup, no
-`SWAPGS` and no second entry stub; the full i386 number table stays with the
-later userland stage.
+`entry64.asm` also sets `EFER.NXE`, and every leaf `paging64_map_space`
+installs carries the matching bit: executable segments clear bit 63 while
+data, BSS, stack and non-`PROT_EXEC` mappings set it, so code pages cannot be
+written and writable pages cannot be fetched. A ring-3 `#PF` used to halt the
+machine; `idt64.c` now ends the task instead, because there is no signal
+model yet: `sched64_fault` records the vector and `CR2` and switches to the
+next runnable task, while a kernel fault stays fatal. The NX self-test jumps
+into a writable page and asserts vector 14 with `CR2` at that page. Frame
+extraction in the paging code uses `K64_PHYS_MASK` rather than
+`K64_PAGE_MASK`, so the NX bit can never leak into a physical address.
+
+Ring-3 entry is an ordinary `IRETQ` from a frame whose `CS` is `0x23` and
+whose `SS` is `0x1B`; the same instruction that returns from an interrupt
+performs the privilege change. System calls use `SYSCALL`: `syscall64_init`
+programs `STAR` (kernel segments from `0x08`, `SYSRET` base `0x10`), `LSTAR`
+and `FMASK`, and sets `EFER.SCE`. `syscall64_entry` saves the user `RSP`,
+switches to the task's kernel stack (the `TSS.RSP0` mirror
+`gdt64_rsp0_value`), builds the same `regs64_t` frame the interrupt stubs
+build, and calls `sys64_dispatch`. It returns with `SYSRET` when the
+dispatcher hands back a ring-3 frame and through the shared `IRETQ` tail when
+the scheduler hands back a kernel frame. `INT 0x80` at vector `0x80` remains
+as a DPL-3 fallback, and the test program exercises both entry points.
+
+`sys64_dispatch` implements the x86-64 Linux convention — number in `RAX`,
+arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in `RAX` or a negative
+errno — with the Linux x86-64 numbers for `write`, `writev`, `mmap`,
+`munmap`, `getpid`, `clock_gettime` and `exit`/`exit_group`; an unimplemented
+number returns `-ENOSYS`. Every user pointer is resolved through the current
+space with `paging64_query_space` before it is dereferenced, and the copies
+move through the physmap: a ring-0 page fault halts the kernel, so the CPU
+cannot be relied on to reject a bad address. `mmap` accepts private or shared
+anonymous mappings. `MAP_FIXED` places a mapping at a page-aligned address
+inside the anonymous window and refuses an occupied range instead of
+replacing it; a file descriptor or offset is still `-EINVAL` because there is
+no 64-bit VFS yet. Without `MAP_FIXED` the per-task bump region from
+`K64_USER_MMAP_BASE` supplies the address, and `munmap` clears the leaves and
+frees their frames. `clock_gettime` reports `CLOCK_MONOTONIC` as time since
+boot and `CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the
+ticks elapsed since that sample; when the RTC cannot be read it falls back to
+monotonic time. The full i386 number table stays with the later userland
+stage.
 
 The 64-bit path now has an ELF64 loader too, but no 64-bit libc or filesystem
 image; `haku.img` remains the default image and
@@ -158,10 +185,13 @@ loader records the page-aligned start of the first writable segment so the
 self-test can read it back.
 
 The test executable is `kernel/arch/x86_64/user/ring3_elf64.asm`: a flat
-`[BITS 64]` program that writes `ELF64`, exercises the six-argument syscall
-ABI (`writev`, `getpid`, `clock_gettime`, an anonymous `mmap`/`munmap`, and
-the `EBADF`/`EFAULT`/`ENOSYS`/`EINVAL` error paths), prints
-`HAKU64-ABI-OK`, stores a magic word in its BSS page and exits with status 0.
+`[BITS 64]` program that writes `ELF64` through `SYSCALL`, proves the
+`SYSRET` return by reaching a second write (`HAKU64-SYSCALL64-OK`), exercises
+the six-argument syscall ABI (`writev`, `getpid`, `CLOCK_MONOTONIC` and
+`CLOCK_REALTIME`, anonymous `mmap`/`munmap`, `MAP_FIXED` placement,
+`MAP_SHARED|MAP_ANONYMOUS`, and the `EBADF`/`EFAULT`/`ENOSYS`/`EINVAL` error
+paths over `INT 0x80`), prints `HAKU64-ABI-OK`, stores a magic word in its
+BSS page and exits with status 0.
 `tools/mkelf64.py` wraps the flat binary in an
 `ET_EXEC`/`EM_X86_64` image with an RX `PT_LOAD` at `0x0000008000400000` and a
 zero-filesz RW segment one page above it; `user64_image.asm` embeds the result

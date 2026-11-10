@@ -46,6 +46,13 @@ global probe_div64_fault
 global probe_div64_resume
 
 extern isr64_dispatch
+extern sys64_dispatch
+extern gdt64_rsp0_value
+
+; User selectors the SYSCALL stub writes into the frame it builds. They
+; must match K64_USER_CS/K64_USER_DS in haku64.h, including RPL 3.
+%define USER_CS 0x23
+%define USER_SS 0x1B
 
 section .text
 
@@ -168,6 +175,8 @@ isr64_common:
     mov rbp, rax
     mov rsp, rbp
 
+; Shared tail: RSP points at a regs64_t and IRETQ consumes its CPU frame.
+isr64_restore:
     pop r15
     pop r14
     pop r13
@@ -185,6 +194,123 @@ isr64_common:
     pop rax
     add rsp, 16                  ; vector + error code
     iretq
+
+; ------------------------------------------------------- SYSCALL and SYSRET
+; void syscall64_setup(u64 star, u64 lstar, u64 fmask)
+; STAR picks the kernel and user segments, LSTAR the entry point, and FMASK
+; the RFLAGS bits SYSCALL clears on the way in. EFER.SCE enables the pair.
+global syscall64_setup
+syscall64_setup:
+    mov r9, rcx                  ; STAR
+    mov r10, rdx                 ; LSTAR
+    mov r11, r8                  ; FMASK
+    mov ecx, 0xC0000081
+    mov rax, r9
+    mov rdx, r9
+    shr rdx, 32
+    wrmsr
+    mov ecx, 0xC0000082
+    mov rax, r10
+    mov rdx, r10
+    shr rdx, 32
+    wrmsr
+    mov ecx, 0xC0000084
+    mov rax, r11
+    mov rdx, r11
+    shr rdx, 32
+    wrmsr
+    mov ecx, 0xC0000080          ; EFER
+    rdmsr
+    or eax, 1                    ; SCE: enable SYSCALL/SYSRET
+    wrmsr
+    ret
+
+; SYSCALL entry. On arrival RCX holds the user RIP, R11 the user RFLAGS,
+; RSP is still the user stack, and CS/SS already name the kernel segments.
+; This port keeps no per-CPU GS state, so no SWAPGS is involved.
+;
+; The handler wants the same regs64_t frame every interrupt builds, so the
+; stub manufactures one on the task's kernel stack (TSS.RSP0). The frame
+; records vector 0x80 and the user selectors, which is what the C dispatcher
+; already tests with `cs & 3`. Returning to ring 3 uses SYSRET: RCX/R11 are
+; overwritten anyway by the SYSCALL ABI, so the values SYSRET needs are
+; already where it wants them after the frame is popped.
+global syscall64_entry
+syscall64_entry:
+    mov [rel syscall64_user_rsp], rsp
+    mov rsp, [rel gdt64_rsp0_value]
+    test rsp, rsp
+    jz .no_stack
+
+    push qword USER_SS
+    push qword [rel syscall64_user_rsp]
+    push r11                     ; user RFLAGS
+    push qword USER_CS
+    push rcx                     ; user RIP
+    push qword 0                 ; error code
+    push qword 128               ; same number as the INT 0x80 gate
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rbp, rsp
+    mov rcx, rsp                 ; regs64_t *frame
+    and rsp, ~0xF
+    sub rsp, 32                  ; shadow space
+    call sys64_dispatch
+    mov rsp, rax                 ; frame to resume
+
+    ; SYSRET can only return to ring 3. A kernel frame (the scheduler fell
+    ; back to the boot context) goes through the IRETQ tail instead.
+    test byte [rsp + 144], 3     ; frame->cs
+    jz isr64_restore
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16                  ; vector + error code
+    mov rcx, [rsp]               ; user RIP
+    mov r11, [rsp + 16]          ; user RFLAGS
+    mov rsp, [rsp + 24]          ; user RSP
+    o64 sysret                   ; 48 0F 07: SYSRETQ, returns in long mode
+
+.no_stack:
+    cli
+.hang:
+    hlt
+    jmp .hang
+
+section .data
+; Scratch for the user RSP between SYSCALL entry and the stack switch. One
+; CPU, interrupts masked on entry, and no nested syscall, so a single slot
+; is enough.
+syscall64_user_rsp: dq 0
+section .text
+
 
 ; ------------------------------------------------------------- primitives
 ; void isr64_load_idt(u64 idtr_addr)   [Microsoft x64: address in RCX]
