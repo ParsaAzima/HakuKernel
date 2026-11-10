@@ -12,9 +12,6 @@
 #define FAT12_CLUSTER_FREE 0x000u
 #define FAT12_CLUSTER_END 0xFFFu
 #define FAT12_ATTR_ARCHIVE 0x20u
-#define FAT12_SEEK_SET 0u
-#define FAT12_SEEK_CUR 1u
-#define FAT12_SEEK_END 2u
 
 typedef struct {
     uint32_t total_sectors;

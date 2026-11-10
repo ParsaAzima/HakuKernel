@@ -44,6 +44,11 @@ typedef struct {
 #define FAT12_OPEN_APPEND 0x10u
 #define FAT12_OPEN_EXCL   0x20u
 
+/* fat12_file_seek(3)'s whence values. */
+#define FAT12_SEEK_SET 0u
+#define FAT12_SEEK_CUR 1u
+#define FAT12_SEEK_END 2u
+
 #define FAT12_ERR_IO        1
 #define FAT12_ERR_NOT_FOUND 2
 #define FAT12_ERR_EXISTS    3
