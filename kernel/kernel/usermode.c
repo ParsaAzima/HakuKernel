@@ -68,9 +68,9 @@ static const vfs_device_ops_t console_device = {
  * controlled offsets before the process even starts. */
 #define ELF_REJECT_CASE(label, statement)                                     \
     do {                                                                      \
-        memcpy(invalid, image, sizeof(invalid));                              \
+        memcpy(invalid, image, copy_size);                                    \
         statement;                                                            \
-        if (elf_load_executable(invalid, sizeof(invalid), &rejected)) {        \
+        if (elf_load_executable(invalid, copy_size, &rejected)) {             \
             klog_log(KLOG_ERROR, "ELF-FAIL: accepted " label "\n");           \
             return 0;                                                         \
         }                                                                     \
@@ -79,9 +79,11 @@ static const vfs_device_ops_t console_device = {
 static int elf_rejection_self_test(const uint8_t *image,
                                    uint32_t image_size) {
     uint8_t invalid[116]; /* header plus two program headers */
+    /* A small image still gets tested, with only the bytes it has: passing a
+     * longer length than the caller's buffer would read past the copy. */
+    uint32_t copy_size = image_size < sizeof(invalid) ? image_size
+                                                      : sizeof(invalid);
     loaded_elf_t rejected;
-
-    if (image_size < sizeof(invalid)) return 0;
 
     /* e_ident: magic, class, byte order, version. */
     ELF_REJECT_CASE("bad magic", invalid[0] = 0);
@@ -396,8 +398,11 @@ int usermode_init(void) {
         return 0;
     }
     if (!elf_load_executable(image, image_size, &initial_program)) {
-        klog_log(KLOG_ERROR,
-                 "ELF-LOAD-FAIL: invalid or unsupported ELF32 image\n");
+        if (klog_begin(KLOG_ERROR)) {
+            klog_write("ELF-LOAD-FAIL: ");
+            klog_write(elf_last_error());
+            klog_write("\n");
+        }
         kfree(image);
         return 0;
     }

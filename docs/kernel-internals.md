@@ -88,15 +88,19 @@ from FAT12. It validates the ELF header and program-header bounds, accepts
 non-overlapping readable `PT_LOAD` segments, checks address arithmetic and
 file ranges, and rejects dynamic/interpreted images and writable-executable
 segments. Each segment is mapped according to its ELF permissions; the loader
-zeroes `p_memsz - p_filesz` for BSS and creates a two-page user stack.
+zeroes `p_memsz - p_filesz` for BSS and creates a two-page user stack. A
+rejected image records why in `elf_last_error()`, which the boot path prints
+after `ELF-LOAD-FAIL` — the reason distinguishes a wrong-architecture binary
+from overlapping segments, which look identical in a generic message.
 
 Each loaded image receives a fresh page directory containing supervisor-only
 kernel identity/direct mappings plus only that image's user pages. The scheduler
 activates each process's CR3 on dispatch and returns to the kernel page
 directory for its idle context. Exited process mappings and page tables are
 released after switching away from their kernel stacks. Dynamic linking,
-relocations, shared libraries, and ELF files larger than the current 256 KiB
-loader buffer are not supported.
+relocations, shared libraries, and images larger than the loader's limits
+(1280 KiB for a program read by the boot and exec paths, 384 KiB for the
+initramfs archive) are not supported.
 
 ## Why `link.exe` + `tools/pe2bin.py`?
 

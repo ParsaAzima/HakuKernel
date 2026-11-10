@@ -21,4 +21,8 @@ typedef struct {
 int elf_load_executable(const uint8_t *image, uint32_t image_size,
                         loaded_elf_t *loaded);
 
+/* Reason the last elf_load_executable() call failed, for the boot log.
+ * Never NULL; "no error" until a load is rejected. */
+const char *elf_last_error(void);
+
 #endif
