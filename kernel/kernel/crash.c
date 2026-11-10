@@ -37,6 +37,24 @@ static void dump_stack(const char *tag, const regs_t *r) {
     klog_write("\n");
 }
 
+static void dump_code(const char *tag, const regs_t *r) {
+    /* The kernel image lives in the stage-2 load window, which is always
+     * mapped; dumping anywhere else could fault inside the report itself.
+     * Two leading words are enough to tell a #UD apart: 0F 0B is clang's
+     * ud2, and an SSE prefix (66/F2/F3/0F ...) means the object was built
+     * for a CPU with vector registers the kernel never enabled. */
+    if ((r->cs & 3u) != 0u) return;
+    if (r->eip < 0x10000u || r->eip >= 0x80000u) return;
+    const uint32_t *code = (const uint32_t *)r->eip;
+    line_start(tag, "code eip=");
+    klog_hex(r->eip);
+    klog_write(" bytes=");
+    klog_hex(code[0]);
+    klog_write(" ");
+    klog_hex(code[1]);
+    klog_write("\n");
+}
+
 void crash_report(const char *tag, const regs_t *r) {
     line_start(tag, "cpu cr0=");
     klog_hex(paging_get_cr0());
@@ -96,5 +114,6 @@ void crash_report(const char *tag, const regs_t *r) {
     }
     klog_write("\n");
 
+    dump_code(tag, r);
     dump_stack(tag, r);
 }

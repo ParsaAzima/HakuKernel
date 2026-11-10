@@ -5,6 +5,20 @@
 Locking primitives, the sector cache, ELF32 program loading, and the
 mirror-image build strategy.
 
+## No floating point, no SSE
+
+The kernel never sets `CR4.OSFXSR`, so an SSE instruction faults with `#UD`
+at ring 0 and ring 3, and a task switch does not save any XMM state. Both
+i386 toolchains are therefore asked for integer-only code: `/arch:IA32` for
+`cl.exe`, `-mno-sse -mno-sse2 -mno-mmx` for `clang-cl`. Without that,
+clang-cl inherits MSVC's `/arch:SSE2` default and may use SSE2 for
+constant-size memory operations such as the `memset` calls at the start of
+`paging_init` — which is exactly how a clang-cl CI build once panicked with
+an invalid opcode right after the `INT3` self-test. The same flags apply to
+the user C library, whose objects run at ring 3 under the same CPU state.
+Crash reports print the two words at the faulting `EIP`, so a `#UD` can be
+told apart from a `ud2` that the compiler emitted for an unreachable path.
+
 ## Locking
 
 `kernel/kernel/sync.h` provides four primitives on top of `cpu_irq_save`/`restore`:

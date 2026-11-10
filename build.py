@@ -507,6 +507,15 @@ def main():
     log(f"LINK: {' '.join(linker)}")
     log(f"toolchain: {toolchain}")
 
+    # clang-cl inherits MSVC's /arch:SSE2 default and uses SSE2 for
+    # constant-size memory operations; MSVC keeps integer code scalar but
+    # may still emit SSE2 for other patterns. Haku never sets CR4.OSFXSR, so
+    # an SSE instruction faults with #UD at ring 0 and ring 3, and the kernel
+    # does not save XMM state across a task switch either. Build i386 objects
+    # for a CPU without vector registers, on both toolchains.
+    no_sse = (["/arch:IA32"] if toolchain.startswith("MSVC")
+              else ["-mno-sse", "-mno-sse2", "-mno-mmx"])
+
     raw_args = sys.argv[1:]
     positionals = [a for a in raw_args if not a.startswith("-")]
     mode = positionals[0] if positionals else "build"
@@ -682,12 +691,13 @@ def main():
     for source in user_lib_sources:
         obj = os.path.join(BUILD, "ulib_" +
                            os.path.splitext(os.path.basename(source))[0] + ".obj")
-        run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/O2", "/Oi-", "/W3",
-                  "/I" + include_dir, "/Fo" + obj, source])
+        run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/O2", "/Oi-", "/W3"]
+            + no_sse + ["/I" + include_dir, "/Fo" + obj, source])
         user_objects.append(obj)
     user_test_obj = os.path.join(BUILD, "ulib_libtest.obj")
-    run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Od", "/Oi-", "/W3",
-              "/I" + include_dir, "/Fo" + user_test_obj, user_test_source])
+    run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Od", "/Oi-", "/W3"]
+        + no_sse + ["/I" + include_dir, "/Fo" + user_test_obj,
+                    user_test_source])
     user_objects.append(user_test_obj)
     run(linker + ["/nologo", "/MACHINE:X86", "/SUBSYSTEM:CONSOLE",
                   "/ENTRY:start", "/BASE:0x40000000", "/FIXED",
@@ -739,8 +749,8 @@ def main():
     c_objs = []
     for src in c_files:
         obj = os.path.join(BUILD, os.path.splitext(os.path.basename(src))[0] + ".obj")
-        run(cc + ["/nologo", "/c", "/GS-", "/Os", "/W3",
-                  "/I" + include_dir]
+        run(cc + ["/nologo", "/c", "/GS-", "/Os", "/W3"]
+            + no_sse + ["/I" + include_dir]
             + ["/I" + d for d in kernel_header_dirs]
             + ["/Fo" + obj, src])
         c_objs.append(obj)

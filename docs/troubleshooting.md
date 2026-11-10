@@ -18,6 +18,12 @@ The build and boot failures that come up most often, and what causes them.
   `build/serial.log`; no `HAKU-BOOT-OK` means the kernel never started
   (check disk load / GDT / entry address). A `KERNEL PANIC:` line is followed
   by the crash report and `build/qemu.log` has the exception trace.
+- **`KERNEL PANIC: Invalid opcode` right after `INT3-RESUMED`** — an object was
+  built for a CPU with vector registers while `CR4.OSFXSR` is off. The build
+  passes `/arch:IA32` (`cl.exe`) or `-mno-sse -mno-sse2 -mno-mmx`
+  (`clang-cl`) for this reason; the crash report's `code eip=` line shows the
+  faulting bytes (`0F 0B` is a compiler-generated `ud2`, an SSE prefix such as
+  `66 0F` is vector code).
 - **NASM not found** — install it, then open a fresh terminal (PATH refresh).
 - **kernel exceeds 448 KiB** — the stage-2 loader deliberately stops below
   the bootstrap stack. Move to a memory-backed or later-stage loading design
