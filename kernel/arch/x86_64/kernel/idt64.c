@@ -5,12 +5,18 @@
  * triple-faulting into a reboot loop. Gates are interrupt gates, so IF is
  * clear inside a handler and handlers never nest on this CPU.
  *
- * The frame the stubs build is a regs64_t (see isr64.asm). Unlike the 32-bit
- * kernel there is no user mode yet, so a fault is always a kernel fault:
- * the dispatcher prints the frame and stops. The two exceptions the
+ * The frame the stubs build is a regs64_t (see isr64.asm). Vector 0x80 is
+ * the DPL-3 system call gate and is handed to sys64_dispatch; every other
+ * gate is DPL 0. A fault inside a user process is not resumable yet, so the
+ * dispatcher still prints the frame and stops; the two exceptions the
  * self-test provokes on purpose — #PF at a probe address and #DE from a
  * probe divide — are resumed by setting RIP to a label the assembler
  * exported, which is exact and does not need an instruction decoder.
+ *
+ * IRQ0 also drives the scheduler: handle_irq() hands the frame to
+ * sched64_tick(), which returns another task's frame to resume. Before
+ * sched64_init() it returns the same frame, so the timer self-test still
+ * works without a scheduler.
  */
 #include "haku64.h"
 
@@ -28,6 +34,7 @@ extern u8 isr64_16[]; extern u8 isr64_17[]; extern u8 isr64_18[]; extern u8 isr6
 extern u8 isr64_20[]; extern u8 isr64_21[]; extern u8 isr64_22[]; extern u8 isr64_23[];
 extern u8 isr64_24[]; extern u8 isr64_25[]; extern u8 isr64_26[]; extern u8 isr64_27[];
 extern u8 isr64_28[]; extern u8 isr64_29[]; extern u8 isr64_30[]; extern u8 isr64_31[];
+extern u8 isr64_128[];
 
 extern u8 irq64_0[];  extern u8 irq64_1[];  extern u8 irq64_2[];  extern u8 irq64_3[];
 extern u8 irq64_4[];  extern u8 irq64_5[];  extern u8 irq64_6[];  extern u8 irq64_7[];
@@ -101,6 +108,11 @@ void idt64_init(void) {
         set_gate(K64_IRQ_BASE + i, irq_addrs[i], K64_KERNEL_CS, K64_GATE_INT, 0);
     for (u32 i = K64_IRQ_BASE + K64_IRQ_COUNT; i < K64_IDT_ENTRIES; i++)
         set_gate(i, (u64)isr64_default, K64_KERNEL_CS, K64_GATE_INT, 0);
+
+    /* The one gate ring 3 may call. Everything else stays DPL 0, so an
+     * INT from user mode to any other vector is a #GP. */
+    set_gate(K64_SYSCALL_VECTOR, (u64)isr64_128, K64_KERNEL_CS,
+             K64_GATE_USER, 0);
 
     /* A double fault is usually the *result* of a bad kernel stack, so it
      * runs on IST1; NMI gets IST2 for the same reason. */
@@ -224,12 +236,17 @@ static regs64_t *handle_irq(regs64_t *r) {
         }
     }
     pic64_send_eoi((u8)irq);
+    /* EOI first: the next task may run for a long time, and the PIC must
+     * be able to deliver the following tick. Before sched64_init this is a
+     * no-op that hands back the same frame. */
+    if (irq == 0) return sched64_tick(r);
     return r;
 }
 
 regs64_t *isr64_dispatch(regs64_t *r) {
     u32 vector = (u32)r->vector;
     if (vector < 32) return handle_exception(r);
+    if (vector == K64_SYSCALL_VECTOR) return sys64_dispatch(r);
     if (vector >= K64_IRQ_BASE && vector < K64_IRQ_BASE + K64_IRQ_COUNT)
         return handle_irq(r);
 

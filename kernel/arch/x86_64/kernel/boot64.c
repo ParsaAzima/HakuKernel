@@ -10,12 +10,16 @@
  *   3. a frame allocator over that map,
  *   4. a kernel heap,
  *   5. the GDT/TSS with its IST stacks,
- *   6. the IDT, the 8259 remap, and the 100 Hz PIT.
+ *   6. the IDT, the 8259 remap, and the 100 Hz PIT,
+ *   7. per-process address spaces (two PML4s mapping one virtual address
+ *      to different frames, switched by writing CR3),
+ *   8. two kernel tasks proving the frame-pointer context switch, then a
+ *      ring-3 task whose INT 0x80 calls prove the syscall gate.
  *
  * Each step prints a marker the headless check asserts, so a regression
- * shows up as a missing line rather than a silent hang. There is no
- * scheduler and no userland on this path yet; when the sequence finishes
- * the CPU halts with interrupts enabled.
+ * shows up as a missing line rather than a silent hang. The 32-bit kernel
+ * is still the default image and this path has no userland yet; when the
+ * sequence finishes the CPU halts with interrupts enabled.
  */
 #include "haku64.h"
 
@@ -188,17 +192,20 @@ static int test_heap(void) {
 }
 
 /* The table layout, as opposed to "an interrupt happened": every gate is a
- * DPL-0 interrupt gate, #DF and NMI get their own IST stacks, the rest share
- * the interrupted stack, each vector has its own stub, and the unused
- * vectors all fall through to the catch-all. */
+ * DPL-0 interrupt gate except the system call vector, #DF and NMI get their
+ * own IST stacks, the rest share the interrupted stack, each vector has its
+ * own stub, and the unused vectors all fall through to the catch-all. */
 static int test_idt_table(void) {
     u32 v;
 
-    for (v = 0; v < K64_IDT_ENTRIES; v++)
-        if (idt64_gate_type(v) != K64_GATE_INT) return 0;
+    for (v = 0; v < K64_IDT_ENTRIES; v++) {
+        u8 expected = (v == K64_SYSCALL_VECTOR) ? K64_GATE_USER : K64_GATE_INT;
+        if (idt64_gate_type(v) != expected) return 0;
+    }
     if (idt64_gate_ist(8) != 1) return 0;     /* #DF -> IST1 */
     if (idt64_gate_ist(2) != 2) return 0;     /* NMI -> IST2 */
     if (idt64_gate_ist(14) != 0) return 0;    /* #PF -> interrupted stack */
+    if (idt64_gate_ist(K64_SYSCALL_VECTOR) != 0) return 0;
     if (idt64_gate_ist(K64_IRQ_BASE) != 0) return 0;
 
     /* Distinct stubs where the vector is part of the pushed frame... */
@@ -206,6 +213,8 @@ static int test_idt_table(void) {
     if (idt64_gate_handler(K64_IRQ_BASE) ==
         idt64_gate_handler(K64_IRQ_BASE + 1)) return 0;
     if (idt64_gate_handler(0) == idt64_gate_handler(K64_IRQ_BASE)) return 0;
+    if (idt64_gate_handler(K64_SYSCALL_VECTOR) ==
+        idt64_gate_handler(255)) return 0;
     /* ...and one shared catch-all above the IRQ range. */
     if (idt64_gate_handler(48) != idt64_gate_handler(255)) return 0;
     if (idt64_gate_handler(255) == idt64_gate_handler(31)) return 0;
@@ -254,6 +263,191 @@ static int test_timer(void) {
     start = timer64_ticks();
     cpu_halt64();
     if (timer64_ticks() == start) return 0;
+    return 1;
+}
+
+/* ------------------------------------------------------- user address space
+ * Three pages in PML4 slot 1. The code page is read-execute, the other two
+ * are writable; nothing in slot 0 or the physmap slot is touched. */
+#define USER_CODE_ADDR  (K64_USER_BASE)
+#define USER_DATA_ADDR  (K64_USER_BASE + 0x1000)
+#define USER_STACK_PAGE (K64_USER_BASE + 0x2000)
+#define USER_STACK_TOP  (K64_USER_BASE + 0x3000)
+
+/* Two PML4s, one virtual address, two different frames. Switching CR3 must
+ * make the same pointer read different memory, and the kernel physmap and
+ * identity map must keep working under either space. */
+static int test_spaces(void) {
+    const u64 virt = K64_USER_BASE + 0x100000;   /* 1 MiB into slot 1 */
+    u64 space_a = paging64_create_space();
+    u64 space_b = paging64_create_space();
+    u64 frame_a = frame64_alloc();
+    u64 frame_b = frame64_alloc();
+    u64 saved;
+    volatile u64 *cell;
+    u32 ok = 1;
+
+    if (!space_a || !space_b || !frame_a || !frame_b) return 0;
+    if (!paging64_map_space(space_a, virt, frame_a, 1, 1)) return 0;
+    if (!paging64_map_space(space_b, virt, frame_b, 1, 1)) return 0;
+    if (paging64_translate_space(space_a, virt) != frame_a) return 0;
+    if (paging64_translate_space(space_b, virt) != frame_b) return 0;
+
+    saved = read_cr3_64();
+    cell = (volatile u64 *)virt;
+
+    paging64_switch_space(space_a);
+    *cell = 0xAAAAAAAAAAAAAAAAull;
+    /* The same byte through the physmap, and the identity map that every
+     * space inherits, must still resolve. */
+    if (*(volatile u64 *)phys_to_virt64(frame_a) != 0xAAAAAAAAAAAAAAAAull)
+        ok = 0;
+    if (*(volatile u32 *)0x6FFC != K64_E820_COUNT) ok = 0;
+
+    paging64_switch_space(space_b);
+    if (paging64_translate_space(space_b, virt) != frame_b) ok = 0;
+    *cell = 0xBBBBBBBBBBBBBBBBull;
+    if (*(volatile u64 *)phys_to_virt64(frame_a) != 0xAAAAAAAAAAAAAAAAull)
+        ok = 0;
+    if (*(volatile u64 *)phys_to_virt64(frame_b) != 0xBBBBBBBBBBBBBBBBull)
+        ok = 0;
+
+    paging64_switch_space(space_a);
+    if (*cell != 0xAAAAAAAAAAAAAAAAull) ok = 0;
+    paging64_switch_space(space_b);
+    if (*cell != 0xBBBBBBBBBBBBBBBBull) ok = 0;
+
+    paging64_switch_space(saved);
+    if (!ok) return 0;
+
+    paging64_destroy_space(space_a);
+    paging64_destroy_space(space_b);
+    frame64_free(frame_a);
+    frame64_free(frame_b);
+    return 1;
+}
+
+/* Two kernel tasks that never yield: the only thing that can make both
+ * counters advance is the timer interrupt switching between their stacks.
+ * Each records the address of a local so the test can show the stacks are
+ * genuinely different. */
+static volatile u32 task_hits[2];
+static volatile u64 task_stack_mark[2];
+
+static void burn_task_a(void) {
+    volatile u64 local = 0;
+    task_stack_mark[0] = (u64)&local;
+    for (;;) {
+        task_hits[0]++;
+        for (u32 spin = 0; spin < 200000; spin++) cpu_pause64();
+    }
+}
+
+static void burn_task_b(void) {
+    volatile u64 local = 0;
+    task_stack_mark[1] = (u64)&local;
+    for (;;) {
+        task_hits[1]++;
+        for (u32 spin = 0; spin < 200000; spin++) cpu_pause64();
+    }
+}
+
+static int test_tasks(void) {
+    int a, b;
+    u64 deadline;
+
+    sched64_init();
+    a = task64_create_kernel(burn_task_a);
+    b = task64_create_kernel(burn_task_b);
+    if (a < 0 || b < 0) return 0;
+
+    deadline = timer64_ticks() + 200;   /* 2 s at 100 Hz, bounded */
+    while ((task_hits[0] < 3 || task_hits[1] < 3) &&
+           timer64_ticks() < deadline)
+        cpu_pause64();
+    if (task_hits[0] < 3 || task_hits[1] < 3) return 0;
+
+    /* Separate 16 KiB stacks: the two locals cannot share a page. */
+    if (task_stack_mark[0] == 0 || task_stack_mark[1] == 0) return 0;
+    if ((task_stack_mark[0] >> 12) == (task_stack_mark[1] >> 12)) return 0;
+    if (sched64_switches() < 4) return 0;
+
+    task64_kill(a);
+    task64_kill(b);
+    return 1;
+}
+
+/* Hand-assembled ring-3 program:
+ *
+ *   mov eax, SYS_WRITE ; mov edi, 1 ; mov rsi, USER_DATA_ADDR
+ *   mov edx, 5         ; int 0x80
+ *   mov eax, SYS_EXIT  ; xor edi, edi ; int 0x80
+ *   jmp $
+ *
+ * Writing it out byte by byte keeps the userland test free of a second
+ * toolchain: the point is the kernel's ring-3 entry and syscall gate, not
+ * an ELF loader (which is the next milestone stage). */
+static u32 build_user_program(u8 *code) {
+    u32 n = 0;
+    u32 i;
+
+    code[n++] = 0xB8;                 /* mov eax, imm32 */
+    code[n++] = (u8)K64_SYS_WRITE;
+    code[n++] = 0; code[n++] = 0; code[n++] = 0;
+    code[n++] = 0xBF;                 /* mov edi, imm32 */
+    code[n++] = 1;
+    code[n++] = 0; code[n++] = 0; code[n++] = 0;
+    code[n++] = 0x48; code[n++] = 0xBE;   /* mov rsi, imm64 */
+    for (i = 0; i < 8; i++) code[n++] = (u8)(USER_DATA_ADDR >> (8 * i));
+    code[n++] = 0xBA;                 /* mov edx, imm32 */
+    code[n++] = 5;
+    code[n++] = 0; code[n++] = 0; code[n++] = 0;
+    code[n++] = 0xCD; code[n++] = 0x80;   /* int 0x80 */
+
+    code[n++] = 0xB8;                 /* mov eax, imm32 */
+    code[n++] = (u8)K64_SYS_EXIT;
+    code[n++] = 0; code[n++] = 0; code[n++] = 0;
+    code[n++] = 0x31; code[n++] = 0xFF;   /* xor edi, edi */
+    code[n++] = 0xCD; code[n++] = 0x80;   /* int 0x80 */
+    code[n++] = 0xEB; code[n++] = 0xFE;   /* jmp $ */
+    return n;
+}
+
+static int test_user(void) {
+    u64 space = paging64_create_space();
+    u64 code = frame64_alloc();
+    u64 data = frame64_alloc();
+    u64 stack = frame64_alloc();
+    u8 program[64];
+    u32 length;
+    int id;
+    u64 deadline;
+
+    if (!space || !code || !data || !stack) return 0;
+    if (!paging64_map_space(space, USER_CODE_ADDR, code, 0, 1)) return 0;
+    if (!paging64_map_space(space, USER_DATA_ADDR, data, 1, 1)) return 0;
+    if (!paging64_map_space(space, USER_STACK_PAGE, stack, 1, 1)) return 0;
+
+    length = build_user_program(program);
+    memcpy(phys_to_virt64(code), program, length);
+    memcpy(phys_to_virt64(data), "RING3", 5);
+
+    id = task64_create_user(USER_CODE_ADDR, USER_STACK_TOP, space);
+    if (id < 0) return 0;
+
+    deadline = timer64_ticks() + 200;
+    while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
+        cpu_pause64();
+    if (task64_state(id) != K64_TASK_DONE) return 0;
+    if (sys64_count() < 2) return 0;
+
+    /* The task is done and the scheduler is back on the boot context, so
+     * its space and pages can be released; the kernel stack stays with the
+     * dead task slot for now. */
+    paging64_destroy_space(space);
+    frame64_free(code);
+    frame64_free(data);
+    frame64_free(stack);
     return 1;
 }
 
@@ -330,8 +524,27 @@ void kernel64_main(void) {
     k64_dec(timer64_ticks());
     k64_puts("\r\n");
 
+    if (!test_spaces()) k64_fail("per-process page table self-test");
+    k64_puts("HAKU64-VM-OK: virt=");
+    k64_hex(K64_USER_BASE + 0x100000);
+    k64_puts(" -> two frames across CR3 switches\r\n");
+
+    if (!test_tasks()) k64_fail("64-bit context switch self-test");
+    k64_puts("HAKU64-PROC-OK: hits=");
+    k64_dec(task_hits[0]);
+    k64_putc('/');
+    k64_dec(task_hits[1]);
+    k64_puts(" switches=");
+    k64_dec(sched64_switches());
+    k64_puts(" stacks=distinct\r\n");
+
+    if (!test_user()) k64_fail("ring-3 syscall self-test");
+    k64_puts("HAKU64-USER-DONE: syscalls=");
+    k64_dec(sys64_count());
+    k64_puts(" state=done\r\n");
+
     k64_puts("HAKU64-SELFTEST-OK: physmap, frames, 4 KiB mapping, heap, "
-             "exceptions, timer\r\n");
+             "exceptions, timer, spaces, tasks, ring 3, syscalls\r\n");
     k64_puts("HAKU64-READY: interrupts online, 32-bit kernel still boots "
              "the system\r\n");
     for (;;) cpu_halt64();

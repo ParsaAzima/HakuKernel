@@ -28,6 +28,11 @@ global tss64_load
 global sti64
 global cli64
 global read_cr2_64
+global read_cr3_64
+global write_cr3_64
+global enable_sse64
+global fxsave64
+global fxrstor64
 global cpu_pause64
 global outb64
 global inb64
@@ -104,6 +109,11 @@ ISR_NOERR 28
 ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
+
+; The system call gate. It is the one vector a ring-3 program may invoke
+; (the IDT entry is DPL 3, see idt64_init), and it uses the same frame as
+; every other trap: vector 0x80 plus a zero error-code slot.
+ISR_NOERR 128
 
 IRQ_STUB 0
 IRQ_STUB 1
@@ -218,6 +228,44 @@ cli64:
 ; u64 read_cr2_64(void)
 read_cr2_64:
     mov rax, cr2
+    ret
+
+; u64 read_cr3_64(void) / void write_cr3_64(u64 cr3)
+; Every process owns a PML4; switching CR3 is switching the address space.
+; There are no PCIDs here, so a write also flushes the whole TLB.
+read_cr3_64:
+    mov rax, cr3
+    ret
+
+write_cr3_64:
+    mov cr3, rcx
+    ret
+
+; void enable_sse64(void)
+; Unlike the 32-bit build, the x86-64 ABI makes SSE2 part of the baseline:
+; the compiler is allowed to emit XMM instructions, and with CR4.OSFXSR
+; clear the first one would be a #UD. CR0.EM/TS are cleared and MP set so
+; the FPU is not trapped either, and fxsave64/fxrstor64 below save the
+; resulting state across a context switch.
+enable_sse64:
+    mov rax, cr0
+    and rax, 0xFFFFFFFFFFFFFFF3      ; clear EM (bit 2) and TS (bit 3)
+    or rax, 0x2                     ; MP: WAIT/FWAIT uses the FPU
+    mov cr0, rax
+    mov rax, cr4
+    or rax, 0x600                   ; OSFXSR (9) | OSXMMEXCPT (10)
+    mov cr4, rax
+    ret
+
+; void fxsave64(void *area) / void fxrstor64(void *area)
+; The FXSAVE area is 512 bytes and must be 16-byte aligned; task64.c owns
+; one per task.
+fxsave64:
+    fxsave [rcx]
+    ret
+
+fxrstor64:
+    fxrstor [rcx]
     ret
 
 ; void cpu_pause64(void)

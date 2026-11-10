@@ -29,6 +29,14 @@ typedef signed long long s64;
 #define K64_PHYS_MAP_BASE 0xFFFF800000000000ull
 #define K64_PHYS_MAP_MAX  (64ull * 1024ull * 1024ull * 1024ull)
 
+/* User address space. PML4 slot 1 is kept out of the kernel maps on
+ * purpose: a process owns that slot and nothing else, so creating a new
+ * address space is copying the two kernel slots and zeroing this one.
+ * 0x0000008000000000 is the start of PML4 entry 1 and sits in the lower
+ * canonical half, which is the only half ring 3 can reach. */
+#define K64_USER_BASE 0x0000008000000000ull
+#define K64_USER_END  0x0000010000000000ull
+
 /* Physical layout this stage reserves (all identity mapped, so a plain
  * pointer works):
  *   0x000000-0x200000  firmware, stage1/stage2, E820 and VBE handover,
@@ -60,14 +68,25 @@ typedef signed long long s64;
 #define K64_TSS_SEL   0x28u
 
 /* --------------------------------------------------------------- interrupts
- * Vectors 0..31 are CPU exceptions, 32..47 the remapped 8259 IRQs, and
- * everything else lands on isr64_default. Gates are 64-bit interrupt gates
- * (type 0xE), so IF is cleared on entry and handlers never nest. */
+ * Vectors 0..31 are CPU exceptions, 32..47 the remapped 8259 IRQs, 0x80 the
+ * ring-3 system call gate, and everything else lands on isr64_default. Gates
+ * are 64-bit interrupt gates (type 0xE), so IF is cleared on entry and
+ * handlers never nest. */
 #define K64_IDT_ENTRIES 256u
 #define K64_GATE_INT    0x8Eu  /* present, DPL 0, 64-bit interrupt gate */
 #define K64_GATE_USER   0xEEu  /* present, DPL 3, 64-bit interrupt gate */
 #define K64_IRQ_BASE    0x20u
 #define K64_IRQ_COUNT   16u
+#define K64_SYSCALL_VECTOR 0x80u
+
+/* System calls use INT 0x80 rather than SYSCALL/SYSRET: one gate, no
+ * STAR/LSTAR/FMASK MSRs, no SWAPGS, and the same regs64_t frame the
+ * interrupt path already builds. The register convention follows the
+ * x86-64 Linux one closely enough to port later: number in RAX, arguments
+ * in RDI/RSI/RDX, result in RAX. */
+#define K64_SYS_WRITE   1u
+#define K64_SYS_EXIT    2u
+#define K64_SYS_NUMBER  3u
 
 /* Stack frame isr64.asm builds; see the comment at the top of that file. */
 typedef struct {
@@ -124,6 +143,11 @@ void tss64_load(u16 selector);
 void sti64(void);
 void cli64(void);
 u64 read_cr2_64(void);
+u64 read_cr3_64(void);
+void write_cr3_64(u64 cr3);
+void enable_sse64(void);
+void fxsave64(void *area);
+void fxrstor64(void *area);
 void cpu_pause64(void);
 void outb64(u16 port, u8 value);
 u8 inb64(u16 port);
@@ -162,6 +186,16 @@ u64 paging64_translate(u64 virt);
 u64 paging64_phys_map_bytes(void);
 void *phys_to_virt64(u64 phys);
 
+/* Per-process address spaces. A space is the physical address of a PML4
+ * that shares the kernel's identity map and physmap and owns PML4 slot 1.
+ * Tables come from the frame allocator, so a space can be created once the
+ * frame allocator is up (not before paging64_init). */
+u64 paging64_create_space(void);
+int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user);
+u64 paging64_translate_space(u64 space, u64 virt);
+void paging64_destroy_space(u64 space);
+void paging64_switch_space(u64 space);
+
 /* frame64.c */
 int frame64_init(u64 phys_limit);
 u64 frame64_alloc(void);
@@ -181,6 +215,41 @@ u64 heap64_free_bytes(void);
 void gdt64_init(void);
 u64 gdt64_tss_base(void);
 u64 gdt64_ist_top(u32 index);
+void gdt64_set_rsp0(u64 top);
+u64 gdt64_rsp0(void);
+
+/* task64.c: tasks and the preemptive round-robin scheduler.
+ *
+ * A task's context is the regs64_t frame the interrupt stubs already
+ * build, so a switch is "return a different frame pointer from
+ * isr64_dispatch". New tasks start from a frame assembled on their own
+ * kernel stack; a user task's frame carries CS=0x1B/SS=0x23 and is
+ * entered with IRETQ from the same path. */
+#define K64_TASK_MAX        8u
+#define K64_TASK_STACK_SIZE 16384ull
+
+enum {
+    K64_TASK_UNUSED = 0,
+    K64_TASK_READY,
+    K64_TASK_RUNNING,
+    K64_TASK_DONE
+};
+
+void sched64_init(void);
+int task64_create_kernel(void (*entry)(void));
+int task64_create_user(u64 entry, u64 user_stack_top, u64 space);
+regs64_t *sched64_tick(regs64_t *frame);
+regs64_t *sched64_exit(regs64_t *frame);
+void task64_kill(int id);
+int task64_state(int id);
+u64 task64_kernel_stack(int id);
+u64 sched64_switches(void);
+int sched64_current(void);
+u64 sched64_space(int id);
+
+/* syscall64.c: INT 0x80 dispatch */
+regs64_t *sys64_dispatch(regs64_t *frame);
+u64 sys64_count(void);
 
 /* idt64.c: gate table plus the C exception/IRQ dispatcher */
 void idt64_init(void);

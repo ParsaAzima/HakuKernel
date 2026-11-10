@@ -17,8 +17,9 @@
  *
  * Two IST stacks are wired up. #DF runs on IST1 so a kernel stack overflow
  * (which is what usually causes the double fault) can still be reported,
- * and NMI runs on IST2 for the same reason. RSP0 points at a private stack
- * that ring 3 will use once there is a user mode to switch from.
+ * and NMI runs on IST2 for the same reason. RSP0 starts at a private stack
+ * and is repointed at each task's kernel stack by the scheduler, because a
+ * ring-3 trap loads RSP from it.
  */
 #include "haku64.h"
 
@@ -90,4 +91,14 @@ u64 gdt64_ist_top(u32 index) {
     if (index == 1) return tss.ist[0];
     if (index == 2) return tss.ist[1];
     return 0;
+}
+
+/* RSP0 is what the CPU loads when a ring-3 trap enters the kernel, so the
+ * scheduler must repoint it at the task it is about to run. */
+void gdt64_set_rsp0(u64 top) {
+    tss.rsp0 = top;
+}
+
+u64 gdt64_rsp0(void) {
+    return tss.rsp0;
 }
