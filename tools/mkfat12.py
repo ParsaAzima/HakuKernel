@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Create a minimal FAT12 superfloppy image with root-directory files."""
+"""Create a minimal FAT12 superfloppy image with root-directory files.
+
+Usage:
+    mkfat12.py input.elf output.img [NAME.EXT=FILE ...]
+    mkfat12.py --empty output.img NAME.EXT=FILE ...
+
+The first form always adds the input ELF as HAKU.ELF (the 32-bit boot
+volume). `--empty` skips that and writes only the named files, which is how
+the x86-64 seed disk is built.
+"""
 
 import pathlib
 import re
@@ -44,14 +53,28 @@ def short_name(name):
 
 
 def main():
-    if len(sys.argv) < 3:
-        sys.exit("usage: mkfat12.py input.elf output.img [NAME.EXT=FILE ...]")
+    args = sys.argv[1:]
+    # --empty skips the implicit HAKU.ELF first file, which is what the
+    # 64-bit port's seed volume wants: an image with only the named files.
+    empty = bool(args) and args[0] == "--empty"
+    if empty:
+        args = args[1:]
+        if not args:
+            sys.exit("usage: mkfat12.py --empty output.img "
+                     "NAME.EXT=FILE ...")
+        image_path = pathlib.Path(args[0])
+        files = []
+        specifications = args[1:]
+    else:
+        if len(args) < 2:
+            sys.exit("usage: mkfat12.py input.elf output.img "
+                     "[NAME.EXT=FILE ...]")
+        image_path = pathlib.Path(args[1])
+        files = [("HAKU.ELF", pathlib.Path(args[0]).read_bytes())]
+        specifications = args[2:]
 
-    elf_path = pathlib.Path(sys.argv[1])
-    image_path = pathlib.Path(sys.argv[2])
-    files = [("HAKU.ELF", elf_path.read_bytes())]
-    names = {short_name(files[0][0])}
-    for specification in sys.argv[3:]:
+    names = {short_name(files[0][0])} if files else set()
+    for specification in specifications:
         if "=" not in specification:
             sys.exit(f"mkfat12: expected NAME.EXT=FILE, got {specification!r}")
         name, source = specification.split("=", 1)
@@ -63,6 +86,8 @@ def main():
             sys.exit(f"mkfat12: duplicate FAT filename {name}")
         names.add(encoded_name)
         files.append((name, pathlib.Path(source).read_bytes()))
+    if not files:
+        sys.exit("mkfat12: an image needs at least one file")
     if any(not payload for _, payload in files):
         sys.exit("mkfat12: refusing to create an empty file")
 
@@ -70,7 +95,7 @@ def main():
         (len(payload) + SECTOR_SIZE - 1) // SECTOR_SIZE
         for _, payload in files)
     if total_clusters > CLUSTER_COUNT:
-        sys.exit("mkfat12: ELF does not fit on the FAT12 volume")
+        sys.exit("mkfat12: payload does not fit on the FAT12 volume")
     if len(files) > ROOT_ENTRIES:
         sys.exit("mkfat12: too many files for FAT12 root directory")
 
