@@ -1,9 +1,14 @@
 /* A userland probe built against a real C library instead of the Haku one.
  *
- * The Linux CI compiles it with musl and boots it as /init:
+ * The Linux CI compiles it with an i386 musl cross compiler and boots it as
+ * /init:
  *
- *     musl-gcc -static -O2 -o musl_probe user/tests/musl_probe.c
+ *     i486-linux-musl-gcc -static -no-pie -fno-pie -Os \
+ *         -Wl,-z,separate-code -o musl_probe user/tests/musl_probe.c
  *     python build.py probe --init=musl_probe --expect=MUSL-PROBE-OK
+ *
+ * The compiler has to target i386. A host `musl-gcc` on an x86-64 machine
+ * produces a 64-bit ELF, which the loader rightly refuses.
  *
  * Everything it prints becomes a marker the headless run asserts, so a
  * regression in the ABI (thread pointer, auxiliary vector, descriptor

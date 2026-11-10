@@ -98,9 +98,13 @@ image, serial/QEMU logs, and any crash screenshots as artifacts even when the
 boot check fails. A missing marker, an unexpected `*-FAIL` marker, or
 `KERNEL PANIC` fails the job.
 
-A second job, `musl`, builds `user/tests/musl_probe.c` with `musl-gcc
--static` and boots it as `/init` with
-`python build.py probe --init=build/musl_probe --expect=MUSL-PROBE-OK`. This
+A second job, `musl`, builds `user/tests/musl_probe.c` with a prebuilt
+`i486-linux-musl` cross toolchain and boots it as `/init` with
+`python build.py probe --init=build/musl_probe --expect=MUSL-PROBE-OK`. The
+cross compiler matters: `musl-gcc` from `musl-tools` is host-native, so on an
+x86-64 runner it produces a 64-bit ELF that a 32-bit kernel must reject. The
+job checks `ELF32`/`Intel 80386` before booting so that mistake fails at the
+build step instead of looking like a loader bug. This
 is the only check that runs an outside C library on top of the kernel, so it
 is what proves the ABI in [the syscall documentation](syscalls.md): musl's own
 `_start`, auxiliary-vector

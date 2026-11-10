@@ -24,6 +24,11 @@ The build and boot failures that come up most often, and what causes them.
   (`clang-cl`) for this reason; the crash report's `code eip=` line shows the
   faulting bytes (`0F 0B` is a compiler-generated `ud2`, an SSE prefix such as
   `66 0F` is vector code).
+- **`ELF-LOAD-FAIL: image is not a 32-bit x86 executable`** — the binary was
+  built for the host, not for Haku. `musl-gcc` on an x86-64 machine targets
+  x86-64 unless a cross toolchain is used, so CI builds the musl probe with an
+  `i486-linux-musl` compiler and asserts `ELF32`/`Intel 80386` before booting
+  it. Other reasons in that line name the exact check that refused the image.
 - **NASM not found** — install it, then open a fresh terminal (PATH refresh).
 - **kernel exceeds 448 KiB** — the stage-2 loader deliberately stops below
   the bootstrap stack. Move to a memory-backed or later-stage loading design

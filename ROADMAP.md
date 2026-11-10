@@ -466,8 +466,8 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   GNU coreutils), ship it with the release artifacts, and extend the
   headless test to assert its behavior (for example `busybox sh -c "echo"`
   and a file round-trip through the RAM filesystem).
-  `user/tests/musl_probe.c` is built with `musl-gcc -static` in a dedicated
-  `musl` CI job and booted as `/init` through the new
+  `user/tests/musl_probe.c` is built with an `i486-linux-musl` cross
+  toolchain in a dedicated `musl` CI job and booted as `/init` through the new
   `python build.py probe --init=<elf> --expect=<marker>` mode, which skips
   the keyboard injection and asserts the boot markers plus the requested
   one. Making an outside libc work required four ABI corrections: the

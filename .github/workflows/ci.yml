@@ -82,19 +82,47 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install NASM, LLVM, QEMU, and musl
+      - name: Install NASM, LLVM, and QEMU
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            nasm clang lld qemu-system-x86 musl-tools
+            nasm clang lld qemu-system-x86
+
+      # musl-tools on an x86-64 runner builds host binaries, so `musl-gcc`
+      # produces a 64-bit ELF that a 32-bit kernel must reject. Haku needs an
+      # i386 musl build: musl.cc ships a prebuilt i486 cross toolchain that
+      # includes musl's static startup files. Cached because it is ~105 MiB.
+      - name: Cache the i486 musl toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/i486-linux-musl-cross
+          key: i486-linux-musl-cross-gcc11.2.1-musl1.2.2
+
+      - name: Install the i486 musl toolchain
+        run: |
+          if [ ! -x "$HOME/i486-linux-musl-cross/bin/i486-linux-musl-gcc" ]; then
+            curl -fsSL https://musl.cc/i486-linux-musl-cross.tgz |
+              tar xz -C "$HOME"
+          fi
+          echo "$HOME/i486-linux-musl-cross/bin" >> "$GITHUB_PATH"
 
       - name: Build the probe against musl
         run: |
           mkdir -p build
-          musl-gcc -static -no-pie -fno-pie -Os -Wall -Wextra \
+          # -Wl,-z,separate-code pins the segment layout Haku's loader needs:
+          # no two PT_LOAD segments share a page. It is binutils' default on
+          # i386, but the loader rejects page-rounded overlap outright.
+          i486-linux-musl-gcc -static -no-pie -fno-pie -Os -Wall -Wextra \
+            -Wl,-z,separate-code \
             -o build/musl_probe user/tests/musl_probe.c
           file build/musl_probe
           readelf -h build/musl_probe
+          readelf -h build/musl_probe | grep -q 'Class:.*ELF32'
+          readelf -h build/musl_probe | grep -q 'Machine:.*Intel 80386'
+          if readelf -l build/musl_probe | grep -q INTERP; then
+            echo "musl_probe must be statically linked" >&2
+            exit 1
+          fi
 
       - name: Boot the probe as /init
         run: python build.py probe --init=build/musl_probe --expect=MUSL-PROBE-OK
