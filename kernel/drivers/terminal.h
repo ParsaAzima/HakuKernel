@@ -40,4 +40,8 @@ int terminal_input_available(void);
 /* Block until a character is available. */
 char terminal_getchar(void);
 
+/* Boot check for the control-code filter: write the cursor-position query,
+ * then verify the reply landed on the input ring. Returns 1 on success. */
+int terminal_self_test(void);
+
 #endif

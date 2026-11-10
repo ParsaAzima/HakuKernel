@@ -39,7 +39,8 @@ void klog_hex_raw(uint32_t v);               /* 8 digits, no prefix, both */
  * threshold; klog_begin returns 0 when it was suppressed. */
 void klog_set_level(klog_level_t level);
 /* 0 sends subsequent lines to COM1 only; 1 (the default) mirrors them to
- * the active display as well. */
+ * the active display as well. usermode_run disables the mirror; panic
+ * re-enables it. */
 void klog_mirror_display(int enabled);
 klog_level_t klog_get_level(void);
 const char *klog_level_name(klog_level_t level);

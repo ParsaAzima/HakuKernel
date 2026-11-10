@@ -29,6 +29,13 @@ void kernel_main(void) {
              "Haku version 0.1 (i386) #1 HAKU-BOOT-OK\n");
     klog_log(KLOG_INFO,
              "Command line: console=ttyS0 video=vga cpu=386+ mode=protected\n");
+    if (terminal_self_test()) {
+        klog_log(KLOG_INFO,
+                 "TERMINAL-CSI-OK: ESC[6n answered with a cursor report\n");
+    } else {
+        klog_log(KLOG_ERROR,
+                 "TERMINAL-CSI-FAIL: ESC[6n was not answered\n");
+    }
     klog_self_test();
 
     idt_init();

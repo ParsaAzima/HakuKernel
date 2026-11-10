@@ -194,6 +194,12 @@ void framebuffer_putc(char c) {
         spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
+    if (c == '\b') {
+        /* Move left only; the line editor overwrites with a space. */
+        if (fb_cursor_x > 0) fb_cursor_x--;
+        spin_unlock_irqrestore(&fb_lock, flags);
+        return;
+    }
     fb_draw_glyph(fb_cursor_x, fb_cursor_y, c);
     if (++fb_cursor_x >= fb_cols) {
         fb_cursor_x = 0;
@@ -241,11 +247,23 @@ static void fb_console_clear(uint8_t color) {
     spin_unlock_irqrestore(&fb_lock, flags);
 }
 
+/* 1-based text cursor, used to answer a terminal cursor-position report. */
+static void framebuffer_cursor(uint32_t *row, uint32_t *col) {
+    irqflags_t flags;
+
+    if (!fb_ready) { *row = 1; *col = 1; return; }
+    flags = spin_lock_irqsave(&fb_lock);
+    *row = fb_cursor_y + 1u;
+    *col = fb_cursor_x + 1u;
+    spin_unlock_irqrestore(&fb_lock, flags);
+}
+
 const display_ops_t framebuffer_display = {
     "framebuffer",
     fb_console_clear,
     framebuffer_putc,
     framebuffer_status,
+    framebuffer_cursor,
 };
 
 int framebuffer_init(void) {

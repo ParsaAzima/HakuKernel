@@ -869,13 +869,25 @@ on the terminal's wait queue until IRQ1 wakes them. Neither the keyboard
 driver nor the syscall layer knows about the other.
 
 Display backends implement the shared `display_ops_t` table in
-`kernel/drivers/display.h` (`name`, `clear`, `putc`, `status`). The VGA text
-backend is selected at boot and stays the fallback; when the bootloader
-hands over a usable VBE mode, `framebuffer_init` succeeds and the boot path
-switches the active backend with `display_use(&framebuffer_display)`. Backend
-state is protected with IRQ-save spinlocks because the timer redraws the
-status line from interrupt context while the console is still booting (the
+`kernel/drivers/display.h` (`name`, `clear`, `putc`, `status`, `cursor`). The
+VGA text backend is selected at boot and stays the fallback; when the
+bootloader hands over a usable VBE mode, `framebuffer_init` succeeds and the
+boot path switches the active backend with `display_use(&framebuffer_display)`.
+Backend state is protected with IRQ-save spinlocks because the timer redraws
+the status line from interrupt context while the console is still booting (the
 redraw stops once userland owns the console; see the heartbeat note below).
+
+Console output is filtered for control codes: a CSI sequence (`ESC '[' params
+final`) is consumed instead of drawn, so an escape sequence never appears as
+text. The console answers the one query a program waits for, the
+cursor-position report `ESC[6n` that busybox's line editor sends before every
+prompt: `terminal_emit` reads the 1-based cursor from the active backend
+(`display_cursor`) and pushes `ESC[<row>;<col>R` into the terminal input ring,
+so the editor sees the reply the way it would see typed bytes. The prompt then
+renders as `$ ` instead of `$ [6n`. Both backends also implement `\b` (move the
+cursor left) and `\r` (return to column 1), which is what the line editor uses
+to erase and repaint. Other CSI sequences are ignored rather than executed:
+there is no cursor addressing, colour, or scrolling region.
 
 ### Logging, panic, and crash reports
 
@@ -888,13 +900,22 @@ default threshold and appears after lowering it (`KLOG-LEVELS-OK`).
 
 The timer heartbeat is boot progress, not a service: `pit_tick` prints
 `T+<n>s: timer heartbeat` once a second and updates the status counter in the
-top-right corner. As soon as the scheduler reports a live user task
-(`scheduler_user_tasks_live`), the line is written to COM1 only
-(`klog_mirror_display(0)` → `terminal_write_serial`) and the counter is left
-alone, so an interactive `ash` owns the screen. The serial log keeps the
+top-right corner. The heartbeat follows the same console rule as every other
+kernel log (see below): the line goes to COM1 once userland owns the console,
+and the corner counter stops at the same point. The serial log keeps the
 timeline, which is what the headless check asserts with its `T+1s`, `T+2s`,
 and `T+3s` markers. A console that never started a user task still shows the
 heartbeat.
+
+Kernel log lines are a boot-time channel on the screen. `usermode_run` calls
+`klog_mirror_display(0)` right before `scheduler_start`, so from the first
+user task onward every klog line (heartbeat, exec notes, ring-3 fault reports,
+the kernel-side FS tests that run after userland exits) goes to COM1 only and
+never draws over the shell. The serial log stays complete. `panic()` is the
+one exception: it enables the mirror again before printing `KERNEL PANIC`,
+because a dead kernel has to leave its reason on the screen. The mirror is a
+one-way latch, so a shell that exits or a crash does not bring kernel output
+back.
 
 `kernel/kernel/panic.c` is the fatal path. It disables interrupts, prints
 `KERNEL PANIC: <reason>`, and calls `crash_report` (`kernel/kernel/crash.c`),
@@ -1121,6 +1142,13 @@ usable shell":
   process-group calls report the caller's pid, so the shell starts without
   `can't access tty; job control turned off` (the scripted check runs
   `sh -i -c` to assert exactly that setup). Stop signals still end a process.
+- **The prompt is clean and the screen belongs to the shell.** busybox's line
+  editor probes the terminal with `ESC[6n` before every prompt; the console
+  answers with a cursor-position report instead of drawing the sequence, and
+  kernel log lines stop mirroring to the display the moment userland starts.
+  Typing, backspace, and command output therefore stay on a screen that no
+  `T+<n>s` line or ring-3 fault report scrolls away (those still reach
+  `build/serial.log`).
 
 Interactive use is the same image without `INIT.CMD`: `python build.py shell`
 drops into `ash` on the serial console. `ls` (sorted columns, 300+ entries),

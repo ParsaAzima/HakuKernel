@@ -40,12 +40,31 @@ static void vga_putc(char c) {
         spin_unlock_irqrestore(&vga_lock, flags);
         return;
     }
+    if (c == '\r') {
+        vga_col = 0;
+        spin_unlock_irqrestore(&vga_lock, flags);
+        return;
+    }
+    if (c == '\b') {
+        /* Move left only; the line editor overwrites with a space. */
+        if (vga_col > 0) vga_col--;
+        spin_unlock_irqrestore(&vga_lock, flags);
+        return;
+    }
     VGA[vga_row * VGA_COLS + vga_col] =
         (uint16_t)((vga_color << 8) | (uint8_t)c);
     if (++vga_col >= VGA_COLS) {
         vga_col = 0;
         if (++vga_row >= VGA_ROWS) vga_scroll();
     }
+    spin_unlock_irqrestore(&vga_lock, flags);
+}
+
+/* 1-based text cursor, used to answer a terminal cursor-position report. */
+static void vga_cursor(uint32_t *row, uint32_t *col) {
+    irqflags_t flags = spin_lock_irqsave(&vga_lock);
+    *row = (uint32_t)vga_row + 1u;
+    *col = (uint32_t)vga_col + 1u;
     spin_unlock_irqrestore(&vga_lock, flags);
 }
 
@@ -65,4 +84,5 @@ const display_ops_t vga_text_display = {
     vga_clear,
     vga_putc,
     vga_status,
+    vga_cursor,
 };

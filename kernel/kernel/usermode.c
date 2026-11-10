@@ -436,6 +436,10 @@ int usermode_init(void) {
 void usermode_run(void) {
     klog_prefix();
     klog_write("USERMODE-ENTER: iret to CPL 3\n");
+    /* The console belongs to userland from here on: kernel log lines keep
+     * going to COM1 and never draw over the screen again. panic() turns the
+     * display mirror back on for a fatal error. */
+    klog_mirror_display(0);
     scheduler_start();
 }
 

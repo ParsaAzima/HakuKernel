@@ -19,10 +19,93 @@ static wait_queue_t input_waiters = WAIT_QUEUE_INIT;
  * is held for about 70 ms at most; the timer IRQ waits that long. */
 #define TERMINAL_WRITE_CHUNK 256u
 
-void terminal_putc(char c) {
+/* --- control codes ----------------------------------------------------- */
+/* The console is a plain text screen, so an escape sequence is a control
+ * code and never glyphs. A CSI sequence (ESC '[' params final) is consumed
+ * here. The one sequence that expects an answer is the cursor-position
+ * report busybox's line editor sends before every prompt (ESC[6n): the
+ * reply is queued on the input ring as if the terminal had typed it, which
+ * keeps the prompt clean and gives the editor its cursor position. */
+static uint8_t escape_state; /* 0 text, 1 ESC, 2 ESC[, 3 ESC[6, 4 params */
+
+static void emit_raw(char c) {
     display_putc(c);
-    if (c == '\n') serial_putc('\r'); /* serial is CRLF */
-    serial_putc(c);
+    if (c == '\n') serial_putc_locked('\r'); /* serial is CRLF */
+    serial_putc_locked(c);
+}
+
+static void queue_cursor_report(void) {
+    uint32_t row = 1;
+    uint32_t col = 1;
+    char reply[24];
+    char digits[10];
+    int len = 0;
+    int n;
+
+    display_cursor(&row, &col);
+    if (row > 9999u) row = 9999u;
+    if (col > 9999u) col = 9999u;
+    reply[len++] = '\x1b';
+    reply[len++] = '[';
+    n = 0;
+    do {
+        digits[n++] = (char)('0' + (row % 10u));
+        row /= 10u;
+    } while (row);
+    while (n > 0) reply[len++] = digits[--n];
+    reply[len++] = ';';
+    n = 0;
+    do {
+        digits[n++] = (char)('0' + (col % 10u));
+        col /= 10u;
+    } while (col);
+    while (n > 0) reply[len++] = digits[--n];
+    reply[len++] = 'R';
+    for (n = 0; n < len; n++) terminal_input_push(reply[n]);
+}
+
+/* A CSI sequence ends at a byte in 0x40..0x7E. */
+static int is_csi_final(char c) {
+    return (uint8_t)c >= 0x40u && (uint8_t)c <= 0x7Eu;
+}
+
+static void emit_console_byte(char c) {
+    switch (escape_state) {
+    case 0:
+        if (c == '\x1b') {
+            escape_state = 1;
+            return;
+        }
+        emit_raw(c);
+        return;
+    case 1:
+        if (c == '[') {
+            escape_state = 2;
+            return;
+        }
+        escape_state = 0;
+        emit_raw('\x1b');
+        emit_console_byte(c); /* not a CSI: keep the text */
+        return;
+    case 2:
+        if (c == '6') {
+            escape_state = 3;
+            return;
+        }
+        escape_state = is_csi_final(c) ? 0u : 4u;
+        return;
+    case 3:
+        if (c == 'n') {
+            escape_state = 0;
+            queue_cursor_report();
+            return;
+        }
+        escape_state = is_csi_final(c) ? 0u : 4u;
+        return;
+    default:
+        if (is_csi_final(c)) escape_state = 0;
+        return;
+    }
 }
 
 /* Write a group of bytes to the display and the serial under one hold of
@@ -32,12 +115,13 @@ void terminal_putc(char c) {
 static void terminal_emit(const char *data, uint32_t count) {
     irqflags_t flags = serial_output_begin();
     for (uint32_t i = 0; i < count; i++) {
-        char c = data[i];
-        display_putc(c);
-        if (c == '\n') serial_putc_locked('\r');
-        serial_putc_locked(c);
+        emit_console_byte(data[i]);
     }
     serial_output_end(flags);
+}
+
+void terminal_putc(char c) {
+    terminal_emit(&c, 1);
 }
 
 void terminal_write(const char *s) {
@@ -59,6 +143,48 @@ void terminal_write_serial(const char *s) {
 
 void terminal_corner(const char *s) {
     display_status(s);
+}
+
+/* --- self-test --------------------------------------------------------- */
+
+/* "ESC [ <row> ; <col> R" with at least one digit on both sides. */
+static int cursor_report_ok(const char *reply, uint32_t len) {
+    uint32_t i;
+    int digits = 0;
+    int separator = 0;
+
+    if (len < 5u || reply[0] != '\x1b' || reply[1] != '[' ||
+        reply[len - 1u] != 'R')
+        return 0;
+    for (i = 2u; i + 1u < len; i++) {
+        char c = reply[i];
+        if (c >= '0' && c <= '9') {
+            digits = 1;
+            continue;
+        }
+        if (c == ';' && digits && !separator) {
+            separator = 1;
+            digits = 0;
+            continue;
+        }
+        return 0;
+    }
+    return digits && separator;
+}
+
+int terminal_self_test(void) {
+    char reply[16];
+    uint32_t used = 0;
+    int c;
+
+    while (terminal_input_poll() >= 0) {
+        /* Start from an empty ring: this runs before the keyboard IRQ. */
+    }
+    terminal_write("\x1b[6n");
+    while (used < sizeof(reply) - 1u && (c = terminal_input_poll()) >= 0)
+        reply[used++] = (char)c;
+    reply[used] = '\0';
+    return cursor_report_ok(reply, used);
 }
 
 int32_t terminal_write_bytes(const void *buffer, uint32_t count,

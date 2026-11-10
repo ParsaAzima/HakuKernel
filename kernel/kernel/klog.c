@@ -10,9 +10,9 @@
 #include "terminal.h"
 
 static klog_level_t log_threshold = KLOG_INFO;
-/* The display mirror. The timer heartbeat clears it once userland owns the
- * screen, so the serial log keeps its timeline without writing over the
- * shell. */
+/* The display mirror. The boot path clears it when the console is handed to
+ * userland, so kernel log lines keep going to the serial log without writing
+ * over the shell; panic() turns it back on. */
 static int mirror_to_display = 1;
 
 static const char *const level_names[] = {
@@ -96,8 +96,9 @@ void klog_set_level(klog_level_t level) {
     log_threshold = level;
 }
 
-/* Route log lines to COM1 only while disabled. The timer heartbeat turns
- * the display mirror off once a user task owns the console. */
+/* Route log lines to COM1 only while disabled. usermode_run() disables the
+ * mirror when it hands the console to the first user task; panic() enables
+ * it again. */
 void klog_mirror_display(int enabled) {
     mirror_to_display = enabled ? 1 : 0;
 }

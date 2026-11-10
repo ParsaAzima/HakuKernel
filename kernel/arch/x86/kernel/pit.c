@@ -19,18 +19,15 @@ static void pit_tick(regs_t *r) {
     ticks++;
     if (ticks % hz == 0) {
         seconds++;
-        /* The heartbeat reports boot progress. Once userland has a task of
-         * its own (an interactive shell), the display belongs to it: the
-         * line still goes to the serial log so the headless boot timeline
-         * stays complete, but the screen is left alone. */
-        int console_idle = !scheduler_user_tasks_live();
-        if (!console_idle) klog_mirror_display(0);
+        /* The line goes through klog, which stops mirroring to the display
+         * once userland owns the console, so only the serial boot timeline
+         * keeps it. The corner counter is boot progress too and would sit on
+         * top of the shell's text, so it stops at the same point. */
         klog_prefix();
         klog_write("T+");
         klog_dec(seconds);
         klog_write("s: timer heartbeat\n");
-        if (!console_idle) klog_mirror_display(1);
-        if (!console_idle) return;
+        if (scheduler_user_tasks_live()) return;
         /* Heartbeat in the top-right corner (redrawn every second). */
         char buf[16];
         uint32_t v = seconds;

@@ -86,7 +86,7 @@ SHELL_CHECK_SCRIPT = (
 # /proc line proves a file read went through the VFS, and the job-control
 # marker proves an interactive shell could take over the terminal.
 SHELL_EXPECTED = ["SHELL-BOOT", "SHELL-OK", "UNAME:haku", "HakuKernel",
-                  "SHELL-JOBCTL-OK", "SHELL-DONE"]
+                  "TERMINAL-CSI-OK", "SHELL-JOBCTL-OK", "SHELL-DONE"]
 
 
 def log(msg):
@@ -959,6 +959,7 @@ def main():
             "PIT-OK",        # 100 Hz timer programmed
             "KBD-OK",        # PS/2 keyboard IRQ1 handler installed
             "TERMINAL-OK",   # terminal/display abstraction selected a backend
+            "TERMINAL-CSI-OK", # ESC[6n consumed and answered on stdin
             "T+1s",          # hardware timer IRQs arriving
             "T+2s",
             "T+3s",

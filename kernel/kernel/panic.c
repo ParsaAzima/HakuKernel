@@ -5,6 +5,9 @@
 
 static void panic_common(const char *message, const regs_t *r) {
     cpu_cli();
+    /* The screen is the only place a human sees this, so take the display
+     * back even after userland retired the kernel log mirror. */
+    klog_mirror_display(1);
     klog_prefix();
     klog_write("KERNEL PANIC: ");
     klog_write(message);

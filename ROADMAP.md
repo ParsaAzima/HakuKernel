@@ -69,11 +69,14 @@ compatibility is not a short-term goal.
   expansion, and an in-kernel exec image cache to make QEMU/TCG performance
   usable. The interactive shell also turns job control on: the descriptor
   table reaches fd 31 (ash dups the terminal to fd 10) and a `/dev/tty`
-  opened by path answers `TIOCGPGRP`/`TIOCSPGRP` with pid-as-group. Once
-  userland owns the console the 1 Hz timer heartbeat stops drawing on the
-  display (the boot line and status counter would scroll the prompt away) and
-  keeps logging to COM1, so the headless `T+1s`/`T+2s`/`T+3s` markers still
-  prove the timer is alive.
+  opened by path answers `TIOCGPGRP`/`TIOCSPGRP` with pid-as-group. The
+  console owns the screen once userland starts: every kernel log line
+  (heartbeat, exec notes, ring-3 fault reports) is written to COM1 only, and
+  the 1 Hz heartbeat stops updating the corner counter, so nothing scrolls
+  the prompt away; the serial log keeps the headless `T+1s`/`T+2s`/`T+3s`
+  markers. The console also answers busybox's `ESC[6n` cursor-position query
+  (the prompt is `$ `, not `$ [6n`) and implements `\b`/`\r` for its line
+  editor.
 - [x] An x86-64 (long mode) target built from the same tree — `python
   build.py x64` produces `haku64.img` — with a long-mode entry, four-level
   paging and a 2 MiB-page physmap of all RAM (so no 1020 MiB ceiling), an
