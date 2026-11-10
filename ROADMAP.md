@@ -69,7 +69,10 @@ compatibility is not a short-term goal.
   expansion, and an in-kernel exec image cache to make QEMU/TCG performance
   usable. The interactive shell also turns job control on: the descriptor
   table reaches fd 31 (ash dups the terminal to fd 10) and a `/dev/tty`
-  opened by path answers `TIOCGPGRP`/`TIOCSPGRP` with pid-as-group. The
+  opened by path answers `TIOCGPGRP`/`TIOCSPGRP`. Process groups are real —
+  a task records its group and session, `fork` inherits them, and `setpgid`
+  plus the terminal's foreground group let ash run a foreground pipeline
+  (`ls / | wc -l`) instead of failing with "can't set tty process group". The
   console owns the screen once userland starts: every kernel log line
   (heartbeat, exec notes, ring-3 fault reports) is written to COM1 only, and
   the 1 Hz heartbeat stops updating the corner counter, so nothing scrolls
@@ -364,9 +367,10 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   wakes it with `EINTR`. `fork`/`vfork` reset the dispositions and keep the
   blocked set; `execve` resets the dispositions and keeps the blocked set
   and the pending signals. Covered by `USER-SIGNAL-OK` in the C library
-  self-test. Still missing: real process groups and job control (the group
-  and session calls report pid-as-group so an interactive shell can turn
-  job control on), `sigqueue`, and real-time signals.
+  self-test. Process groups and sessions are recorded per task, inherited
+  across `fork`, moved by `setpgid`, and addressed by a negative `kill` pid,
+  which is what a job-control shell needs. Still missing: stop/continue job
+  states, `sigqueue`, and real-time signals.
 - [x] Add the memory syscalls a libc needs: `mmap2` with
   `MAP_FIXED`/`MAP_ANONYMOUS`/`MAP_SHARED`, `mprotect`, `mremap`,
   `madvise`, and thread-local storage through `set_thread_area` (today

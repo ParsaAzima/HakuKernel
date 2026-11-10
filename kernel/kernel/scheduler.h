@@ -98,6 +98,23 @@ uint32_t scheduler_futex_wake(uint32_t address, uint32_t count,
 uint32_t scheduler_munmap(uint32_t address, uint32_t length);
 uint32_t scheduler_current_pid(void);
 uint32_t scheduler_parent_pid(void);
+/* Process groups and sessions. Every task records the group and session it
+ * belongs to; a fresh task is its own leader. A shell that turns on job
+ * control puts each pipeline in a new group and makes it the terminal's
+ * foreground group, so these calls have to be real: reporting the caller's
+ * pid for every query made the second member of a pipeline fail with EPERM
+ * ("can't set tty process group") and the whole pipeline die. */
+uint32_t scheduler_current_pgrp(void);
+int32_t scheduler_get_pgrp(uint32_t pid, uint32_t *pgrp);
+/* POSIX setpgid: pid 0 is the caller, pgid 0 means "the target's pid". A
+ * task may move itself or one of its children; the group leader must exist
+ * (a task with that pid) or the group must already have members. */
+int32_t scheduler_set_pgrp(uint32_t pid, uint32_t pgid);
+/* 1 when pgid names a live group: a task with that pid or a member. */
+int scheduler_pgrp_valid(uint32_t pgid);
+/* setsid(2): the caller becomes a session and group leader. */
+uint32_t scheduler_setsid(void);
+int32_t scheduler_get_sid(uint32_t pid, uint32_t *sid);
 /* The per-task working directory is a canonical root-relative path (the
  * empty string is the volume root). get copies the NUL-terminated name and
  * returns its length, or -ERANGE when the buffer is too small. set takes an
@@ -110,11 +127,14 @@ int32_t scheduler_set_comm(const char *name);
 /* sched_yield(2): let the next runnable task run. Returns the frame that
  * resumes the caller (which may be this task when nobody else is ready). */
 regs_t *scheduler_yield(regs_t *frame);
-/* Signals. kill(2) takes a pid, 0 for the caller, or -1 for every other
- * process; Haku has no process groups. tkill/tgkill take thread ids, and
- * a thread id is a process id here. */
+/* Signals. kill(2) takes a pid, 0 for the caller, -1 for every other
+ * process, or a negative process-group id. tkill/tgkill take thread ids,
+ * and a thread id is a process id here. */
 int32_t scheduler_kill_pid(uint32_t pid, uint32_t sig);
 int32_t scheduler_kill_all(uint32_t sig);
+/* Send a signal to every member of a process group (kill(-pgid, sig)).
+ * Signal 0 only checks that the group exists. */
+int32_t scheduler_kill_pgrp(uint32_t pgid, uint32_t sig);
 int32_t scheduler_tkill(uint32_t tid, uint32_t sig);
 int32_t scheduler_tgkill(uint32_t tgid, uint32_t tid, uint32_t sig);
 int32_t scheduler_sigaction(uint32_t sig, const haku_sigaction_t *action,

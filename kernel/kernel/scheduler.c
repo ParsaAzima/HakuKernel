@@ -37,6 +37,8 @@ typedef enum {
 typedef struct {
     uint32_t pid;
     uint32_t parent_pid;
+    uint32_t pgrp;          /* process group (a session leader's pid) */
+    uint32_t sid;           /* session id */
     task_state_t state;
     loaded_elf_t program;
     uint32_t kernel_stack;
@@ -88,7 +90,8 @@ static int waitq_marker_written;
 
 wait_queue_t scheduler_activity = WAIT_QUEUE_INIT;
 
-/* A fresh task starts at the volume root with the kernel's default name. */
+/* A fresh task starts at the volume root with the kernel's default name.
+ * The caller sets pgrp/sid once the pid is known. */
 static void init_task_identity(task_t *task) {
     memset(task->cwd, 0, sizeof(task->cwd));
     memcpy(task->comm, "haku", 5);
@@ -98,6 +101,10 @@ static void init_task_identity(task_t *task) {
 static void inherit_task_identity(task_t *child, const task_t *parent) {
     memcpy(child->cwd, parent->cwd, sizeof(child->cwd));
     memcpy(child->comm, parent->comm, sizeof(child->comm));
+    /* A fork stays in the parent's process group and session; ash moves the
+     * pipeline into a fresh group right after the fork. */
+    child->pgrp = parent->pgrp;
+    child->sid = parent->sid;
     /* The thread pointer. A child shares the parent's address space
      * copy-on-write, so the same virtual base is valid there, and a libc
      * writes errno through it before it does anything else: a child that
@@ -310,6 +317,8 @@ int scheduler_init(loaded_elf_t *initial_program) {
 
     tasks[0].pid = 1;
     tasks[0].parent_pid = 0;
+    tasks[0].pgrp = 1;
+    tasks[0].sid = 1;
     tasks[0].state = TASK_RUNNABLE;
     tasks[0].program = *initial_program;
     init_task_identity(&tasks[0]);
@@ -664,6 +673,22 @@ int32_t scheduler_kill_all(uint32_t sig) {
     return 0;
 }
 
+int32_t scheduler_kill_pgrp(uint32_t pgid, uint32_t sig) {
+    int found = 0;
+    if (pgid == 0u || pgid > SCHEDULER_MAX_PROCESSES)
+        return -(int32_t)HAKU_ESRCH;
+    if (sig > SCHEDULER_NSIG) return -(int32_t)HAKU_EINVAL;
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *task = &tasks[i];
+        if (task->state == TASK_UNUSED) continue;
+        if (task->pgrp != pgid) continue;
+        found = 1;
+        if (sig == 0u) continue;
+        if (queue_signal(task, sig) < 0) return -(int32_t)HAKU_ESRCH;
+    }
+    return found ? 0 : -(int32_t)HAKU_ESRCH;
+}
+
 int32_t scheduler_tkill(uint32_t tid, uint32_t sig) {
     /* Haku runs one thread per process, so a thread id is a process id. */
     return scheduler_kill_pid(tid, sig);
@@ -932,6 +957,79 @@ uint32_t scheduler_parent_pid(void) {
     return tasks[current_task].parent_pid;
 }
 
+uint32_t scheduler_current_pgrp(void) {
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0;
+    return tasks[current_task].pgrp;
+}
+
+int32_t scheduler_get_pgrp(uint32_t pid, uint32_t *pgrp) {
+    task_t *task;
+    if (!pgrp) return -(int32_t)HAKU_EINVAL;
+    if (pid == 0u) pid = scheduler_current_pid();
+    task = signal_find_task(pid);
+    if (!task) return -(int32_t)HAKU_ESRCH;
+    *pgrp = task->pgrp;
+    return 0;
+}
+
+/* A group is live when its leader (the task whose pid is the group id) is
+ * still in the table, or when one of its members is. The leader may not have
+ * joined yet: the parent and the second child of a pipeline both call
+ * setpgid before the first child has run, so the pid alone is enough. */
+int scheduler_pgrp_valid(uint32_t pgid) {
+    if (pgid == 0u || pgid > SCHEDULER_MAX_PROCESSES) return 0;
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        if (tasks[i].state == TASK_UNUSED) continue;
+        if (tasks[i].pid == pgid || tasks[i].pgrp == pgid) return 1;
+    }
+    return 0;
+}
+
+int32_t scheduler_set_pgrp(uint32_t pid, uint32_t pgid) {
+    task_t *self;
+    task_t *target;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return -(int32_t)HAKU_ESRCH;
+    self = &tasks[current_task];
+    if (pid == 0u) pid = self->pid;
+    if (pgid == 0u) pgid = pid;
+    if (pid > SCHEDULER_MAX_PROCESSES || pgid > SCHEDULER_MAX_PROCESSES)
+        return -(int32_t)HAKU_ESRCH;
+    target = signal_find_task(pid);
+    if (!target) return -(int32_t)HAKU_ESRCH;
+    /* A process may only move itself or one of its children. */
+    if (target != self && target->parent_pid != self->pid)
+        return -(int32_t)HAKU_EPERM;
+    /* The target is allowed to create a group named after itself even when
+     * nobody has joined it yet; joining any other group needs a live one. */
+    if (pgid != target->pid && !scheduler_pgrp_valid(pgid))
+        return -(int32_t)HAKU_EPERM;
+    target->pgrp = pgid;
+    return 0;
+}
+
+uint32_t scheduler_setsid(void) {
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX) return 0;
+    /* Haku has no controlling-terminal/session teardown to do, and a shell
+     * calls setsid on itself even when it is already a leader, so the call
+     * always succeeds and just makes the caller a leader of both. */
+    tasks[current_task].pgrp = tasks[current_task].pid;
+    tasks[current_task].sid = tasks[current_task].pid;
+    return tasks[current_task].pid;
+}
+
+int32_t scheduler_get_sid(uint32_t pid, uint32_t *sid) {
+    task_t *task;
+    if (!sid) return -(int32_t)HAKU_EINVAL;
+    if (pid == 0u) pid = scheduler_current_pid();
+    task = signal_find_task(pid);
+    if (!task) return -(int32_t)HAKU_ESRCH;
+    *sid = task->sid;
+    return 0;
+}
+
 int32_t scheduler_get_cwd(char *path, uint32_t size) {
     uint32_t length;
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX || !path)
@@ -1087,6 +1185,8 @@ int wait_queue_wake_all(wait_queue_t *queue) {
 int32_t scheduler_spawn(loaded_elf_t *program) {
     irqflags_t flags;
     uint32_t parent_pid;
+    uint32_t parent_pgrp;
+    uint32_t parent_sid;
     uint32_t slot;
     task_t *child = 0;
 
@@ -1103,6 +1203,8 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
     flags = irq_lock();
     release_reaped_slots();
     parent_pid = tasks[current_task].pid;
+    parent_pgrp = tasks[current_task].pgrp;
+    parent_sid = tasks[current_task].sid;
     for (slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
         if (tasks[slot].state == TASK_UNUSED) {
             child = &tasks[slot];
@@ -1117,6 +1219,10 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
     child->pid = slot + 1u;
     child->parent_pid = parent_pid;
     child->state = TASK_STARTING;
+    /* A spawned program replaces the image of a would-be child, so it
+     * inherits the caller's group and session like an exec does. */
+    child->pgrp = parent_pgrp;
+    child->sid = parent_sid;
     init_task_identity(child);
     irq_unlock(flags);
 
@@ -1373,7 +1479,7 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
         current_task >= SCHEDULER_IDLE_INDEX)
         return frame;
     flags = irq_lock();
-    if (options != 0 || pid == 0) {
+    if (options & ~(uint32_t)(HAKU_WUNTRACED | HAKU_WCONTINUED) || pid == 0) {
         frame->eax = 0u - HAKU_EINVAL;
         irq_unlock(flags);
         return frame;
@@ -1435,8 +1541,9 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
 }
 
 /* wait4(2): the Linux form of waitpid. It accepts WNOHANG, treats pid 0
- * as "any child" (Haku has no process groups), and writes a rusage block
- * when the caller passes one. */
+ * as "any child" (Haku has no process groups to wait on), ignores
+ * WUNTRACED/WCONTINUED because a task never stops or resumes, and writes a
+ * rusage block when the caller passes one. */
 regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
                         uint32_t user_rusage, regs_t *frame) {
     task_t *parent;
@@ -1449,7 +1556,8 @@ regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
         current_task >= SCHEDULER_IDLE_INDEX)
         return frame;
     flags = irq_lock();
-    if (options & ~(uint32_t)HAKU_WNOHANG) {
+    if (options & ~(uint32_t)(HAKU_WNOHANG | HAKU_WUNTRACED |
+                              HAKU_WCONTINUED)) {
         frame->eax = 0u - HAKU_EINVAL;
         irq_unlock(flags);
         return frame;

@@ -339,6 +339,8 @@
 %define HAKU_CLONE_VFORK   0x4000
 %define HAKU_CLONE_THREAD  0x10000
 %define HAKU_WNOHANG       0x1
+%define HAKU_WUNTRACED     0x2
+%define HAKU_WCONTINUED    0x8
 %define HAKU_SIGHUP     1
 %define HAKU_SIGINT     2
 %define HAKU_SIGQUIT    3

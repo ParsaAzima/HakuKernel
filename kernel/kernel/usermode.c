@@ -1346,10 +1346,11 @@ static uint32_t sys_kill(uint32_t pid, uint32_t sig) {
     if (sig > SCHEDULER_NSIG) return copy_from_user_error(HAKU_EINVAL);
     if (pid == 0u)
         return (uint32_t)scheduler_kill_pid(scheduler_current_pid(), sig);
-    /* Haku has no process groups, so -1 means every other process and any
-     * other negative value is not a group Haku knows about. */
+    /* -1 means every other process; any other negative value is a process
+     * group, which is how a shell signals a whole pipeline (killpg). */
     if (pid == 0xFFFFFFFFu) return (uint32_t)scheduler_kill_all(sig);
-    if (pid & 0x80000000u) return copy_from_user_error(HAKU_ESRCH);
+    if (pid & 0x80000000u)
+        return (uint32_t)scheduler_kill_pgrp(0u - pid, sig);
     return (uint32_t)scheduler_kill_pid(pid, sig);
 }
 
@@ -1940,6 +1941,13 @@ static uint32_t sys_fcntl(uint32_t fd, uint32_t command, uint32_t argument) {
     }
 }
 
+/* The terminal's foreground process group. Zero means "not set yet", and a
+ * query then reports the caller's own group, which is what a shell checks at
+ * start-up. A job-control shell replaces it with each foreground pipeline's
+ * group and puts its own group back when the job finishes. Haku has one
+ * terminal, so one variable is the whole story. */
+static uint32_t console_fg_pgrp;
+
 /* ioctl(54): the console answers the termios and window-size requests a
  * shell needs. The terminal is fixed-mode, so TCSETS* are accepted and
  * ignored rather than failing a program that probes the terminal. */
@@ -1986,12 +1994,19 @@ static uint32_t sys_ioctl(uint32_t fd, uint32_t request, uint32_t user_arg) {
             return copy_from_user_error(HAKU_EFAULT);
         return 0u;
     }
-    /* Foreground process group. There is exactly one group, the caller's,
-     * so the answers are the caller's pid and a write of that pid. ash
-     * checks both before turning job control on, and a mismatch would make
-     * it stop the shell with SIGTTIN. */
+    /* Foreground process group. A job-control shell runs a pipeline in its
+     * own group and tells the terminal about it, then takes its own group
+     * back; the stored group is what the next tcgetpgrp must report, or the
+     * shell's "am I in the background?" loop never settles. */
     case HAKU_TIOCGPGRP: {
-        haku_i32 pgrp = (haku_i32)scheduler_current_pid();
+        /* The stored group is only meaningful while it is alive: a shell
+         * that exits without cleaning up must not leave a stale answer that
+         * the next process reads as "I am in the background". */
+        uint32_t fg = console_fg_pgrp;
+        haku_i32 pgrp;
+        if (!fg || !scheduler_pgrp_valid(fg))
+            fg = scheduler_current_pgrp();
+        pgrp = (haku_i32)fg;
         if (!copy_to_user(user_arg, &pgrp, sizeof(pgrp)))
             return copy_from_user_error(HAKU_EFAULT);
         return 0u;
@@ -2000,8 +2015,10 @@ static uint32_t sys_ioctl(uint32_t fd, uint32_t request, uint32_t user_arg) {
         haku_i32 pgrp;
         if (!copy_from_user(&pgrp, user_arg, sizeof(pgrp)))
             return copy_from_user_error(HAKU_EFAULT);
-        if (pgrp != (haku_i32)scheduler_current_pid())
+        if (pgrp <= 0) return copy_from_user_error(HAKU_EINVAL);
+        if (!scheduler_pgrp_valid((uint32_t)pgrp))
             return copy_from_user_error(HAKU_EPERM);
+        console_fg_pgrp = (uint32_t)pgrp;
         return 0u;
     }
     case HAKU_TIOCNOTTY:
@@ -2213,24 +2230,26 @@ static uint32_t sys_setrlimit(uint32_t resource, uint32_t user_rlim) {
     return 0u;
 }
 
-/* getpgid(132)/getsid(147). Haku has one process per group and one per
- * session, so the group and session of a process are its pid. A caller
- * names itself with 0; any other id has to be a task slot that exists. */
+/* getpgid(132): the target's process group, or the caller's when pid is 0. */
 static uint32_t sys_getpgid(uint32_t pid) {
-    uint32_t self = scheduler_current_pid();
-    if (pid == 0u) return self;
-    if (pid > SCHEDULER_MAX_PROCESSES) return copy_from_user_error(HAKU_ESRCH);
-    return pid;
+    uint32_t pgrp;
+    int32_t result = scheduler_get_pgrp(pid, &pgrp);
+    return result < 0 ? (uint32_t)result : pgrp;
 }
 
-/* setpgid(57). A process is already its own group leader, so putting
- * itself (or joining its own group) is a no-op; Haku never moves another
- * process between groups. setsid(66) is likewise already true. */
+/* getsid(147): the target's session id (Haku keeps one task per session). */
+static uint32_t sys_getsid(uint32_t pid) {
+    uint32_t sid;
+    int32_t result = scheduler_get_sid(pid, &sid);
+    return result < 0 ? (uint32_t)result : sid;
+}
+
+/* setpgid(57). A job-control shell forks a pipeline and moves each member
+ * into the group led by the first child, in the parent and in the child;
+ * the kernel records the group instead of pretending each process is alone. */
 static uint32_t sys_setpgid(uint32_t pid, uint32_t pgid) {
-    uint32_t self = scheduler_current_pid();
-    if (pid != 0u && pid != self) return copy_from_user_error(HAKU_ESRCH);
-    if (pgid != 0u && pgid != self) return copy_from_user_error(HAKU_EINVAL);
-    return 0u;
+    int32_t result = scheduler_set_pgrp(pid, pgid);
+    return result < 0 ? (uint32_t)result : 0u;
 }
 
 /* getrandom(355): a xorshift generator seeded from the tick counter and
@@ -2527,17 +2546,19 @@ regs_t *user_syscall(regs_t *r) {
         r->eax = scheduler_parent_pid();
         return r;
     case HAKU_SYS_GETPGRP:
-        r->eax = scheduler_current_pid();
+        r->eax = scheduler_current_pgrp();
         return r;
     case HAKU_SYS_SETPGID:
         r->eax = sys_setpgid(r->ebx, r->ecx);
         return r;
     case HAKU_SYS_GETPGID:
-    case HAKU_SYS_GETSID:
         r->eax = sys_getpgid(r->ebx);
         return r;
+    case HAKU_SYS_GETSID:
+        r->eax = sys_getsid(r->ebx);
+        return r;
     case HAKU_SYS_SETSID:
-        r->eax = scheduler_current_pid();
+        r->eax = scheduler_setsid();
         return r;
     case HAKU_SYS_GETTID:
         r->eax = scheduler_current_pid();

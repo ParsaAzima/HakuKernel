@@ -77,16 +77,22 @@ SHELL_CHECK_SCRIPT = (
     # -i makes ash turn job control on, which runs exactly the sequence the
     # interactive shell does on start-up: dup the controlling terminal above
     # fd 9, read the foreground group, and install it back. Without the
-    # kernel's process-group answers this prints "can't access tty".
-    "sh -i -c 'echo SHELL-JOBCTL-OK'; "
+    # kernel's process-group answers this prints "can't access tty". The
+    # pipeline that follows forks two children that ash moves into a fresh
+    # process group and makes the terminal's foreground group; if setpgid or
+    # TIOCSPGRP only accepts the caller's own pid the second child dies with
+    # "can't set tty process group" and PIPE-DONE never appears.
+    "sh -i -c 'echo SHELL-JOBCTL-OK; echo PIPE-OUT | cat; echo PIPE-DONE'; "
     'echo SHELL-DONE; exec sh"')
 # Output the check insists on. A boot that reaches the prompt but cannot run
 # an applet still prints SHELL-OK, so the markers alone are not enough: the
 # nodename proves uname ran, the applet count proves the links resolve, the
-# /proc line proves a file read went through the VFS, and the job-control
-# marker proves an interactive shell could take over the terminal.
+# /proc line proves a file read went through the VFS, the job-control marker
+# shows the interactive shell started, and the pipeline markers prove a
+# forked foreground pipeline ran to completion.
 SHELL_EXPECTED = ["SHELL-BOOT", "SHELL-OK", "UNAME:haku", "HakuKernel",
-                  "TERMINAL-CSI-OK", "SHELL-JOBCTL-OK", "SHELL-DONE"]
+                  "TERMINAL-CSI-OK", "SHELL-JOBCTL-OK", "PIPE-OUT",
+                  "PIPE-DONE", "SHELL-DONE"]
 
 
 def log(msg):
@@ -826,11 +832,14 @@ def main():
                     missing.append("no PANIC/FAIL")
         if "can't access tty" in content or "job control turned off" in content:
             missing.append("no tty warning")
+        if "can't set tty process group" in content:
+            missing.append("no process-group error")
         if missing or not reached:
             sys.exit("SHELL CHECK FAILED: missing " + ", ".join(missing))
         log(f"SHELL CHECK PASSED: busybox ash ran as pid 1, "
             f"{applets.group(1)} applets resolved through $PATH, "
-            f"uname and /proc answered, job control enabled")
+            f"uname and /proc answered, job control enabled, "
+            f"a foreground pipeline forked and ran")
     elif mode in ("headless", "probe"):
         serial = os.path.join(BUILD, "serial.log")
         shot = os.path.join(BUILD, "screen.png")

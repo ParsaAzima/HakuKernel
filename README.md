@@ -314,9 +314,16 @@ spawn interface accepts a pathname only and starts the child with empty
 argument and environment vectors; the child inherits a copy of the parent's
 descriptor table (standard descriptors and any open files, each sharing the
 parent's open file description). `waitpid` accepts a specific child PID or
-`-1` (any child) and currently supports only options `0`; `wait4` follows the
-Linux call, accepting `WNOHANG` and writing a zeroed `struct rusage` (the
-per-process accounting described below is not yet wired into it).
+`-1` (any child) and takes no options; `wait4` follows the Linux call,
+accepting `WNOHANG` and writing a zeroed `struct rusage` (the per-process
+accounting described below is not yet wired into it). `WUNTRACED` and
+`WCONTINUED` are accepted and ignored: a task never enters a stopped state,
+but a job-control shell passes `WUNTRACED` to every `waitpid`. Each task
+records a process group and a session, inherited across `fork`; `setpgid`
+moves the caller or one of its children into a live group, `setsid` makes the
+caller a leader of both, and `kill` with a negative pid signals a whole
+group. That is what lets `ash` run a foreground pipeline: it puts both
+children in a fresh group and hands that group to the terminal.
 `exit_group` ends the calling process like `exit`. `clone` is accepted only
 for the `SIGCHLD` form (`fork` with no sharing flags) and returns `EINVAL` for
 the thread-creating flags, stack pointer, or parent-tid arguments, so no
@@ -586,19 +593,19 @@ signal, `SIG_DFL` ends the process for every signal except `SIGCHLD`,
 the signal number in the wait status the way Linux reports it. A signal
 queued for a task blocked in a syscall wakes it with `EINTR` (the console
 read loop re-checks the input ring instead of returning `EINTR`). `kill`
-with pid 0 targets the caller and pid -1 targets every other process,
-because Haku has no scheduler process groups; any other negative pid gives
-`ESRCH`.
+with pid 0 targets the caller, pid -1 targets every other process, and any
+other negative pid targets the members of that process group (`killpg`).
 `fork` and
 `vfork` reset the dispositions to the default and keep the blocked set;
 `execve` resets the dispositions and keeps both the blocked set and the
 pending signals. The C library wrappers live in `user/lib/signal.c` behind
 `include/haku/signal.h`, and the ring-3 self-test covers delivery, blocking,
 `SIG_IGN`, `SA_SIGINFO`, `SA_RESTORER`, the pid/tid forms, the default
-fatal disposition, and the `EINTR` wake-up (`USER-SIGNAL-OK`). Haku has no
-scheduler process-group model, no job control (the stop signals end the
-process), no `sigqueue`, and one thread per process, so a thread id is a
-process id.
+fatal disposition, and the `EINTR` wake-up (`USER-SIGNAL-OK`). Process
+groups exist for signal delivery and the terminal, but stop/continue
+signals still end a process, so there is no job control beyond the
+foreground group. There is no `sigqueue`, and one thread runs per process,
+so a thread id is a process id.
 
 Writes are not atomic: there is no journal, so a failing multi-sector
 write leaves exactly its durable prefix (a short count means those bytes
@@ -679,12 +686,14 @@ descriptors with `EINVAL`.
 EOF `^D`), accepts `TCSETS`/`TCSETSW`/`TCSETSF` without changing that mode,
 reports an 80x25 window for `TIOCGWINSZ`, and returns `ENOTTY` for a
 descriptor that is not the console. A terminal opened by path (`/dev/tty`,
-`/dev/console`) answers the same requests, and `TIOCGPGRP`/`TIOCSPGRP`
-report and accept the caller's pid as the foreground process group while
-`TIOCNOTTY` is accepted. Haku has no scheduler process groups, so `getpgrp`,
-`getpgid`, `getsid` and `setsid` report the caller's pid and `setpgid`
-accepts only the caller's own group — enough for an interactive `ash` to
-turn job control on instead of announcing that it cannot access a tty. `poll` reports readiness per descriptor (a
+`/dev/console`) answers the same requests. `TIOCSPGRP` records the
+foreground process group after checking that the group is alive, and
+`TIOCGPGRP` reports it (falling back to the caller's group when the stored
+group has exited); `TIOCNOTTY` is accepted. The group and session calls are
+real: `getpgrp`/`getpgid` report the recorded group, `setpgid` moves the
+caller or a child, and `setsid`/`getsid` track the session, which is what an
+interactive `ash` needs to turn job control on and run a foreground pipeline
+instead of dying with "can't set tty process group". `poll` reports readiness per descriptor (a
 pipe with data is `POLLIN`, a closed write end adds `POLLHUP`, a closed read
 end makes the write side `POLLERR`), and it blocks: a zero timeout scans once,
 a negative one waits indefinitely, and a positive one is a millisecond
@@ -781,11 +790,10 @@ userland; conformance is not a goal. What exists, by area:
 - **Time:** `gettimeofday`, `nanosleep`.
 - **Haku-specific:** `spawn`, `getusage`, `futex`.
 
-Deliberately absent: scheduler process groups (the group and session calls
-report pid-as-group so a shell can enable job control, but stop signals still
-end a process), threads (`clone` rejects the thread flags), hard links,
-file-backed mappings, `socket`, `mount` (the boot namespace is fixed at
-boot), and networking.
+Deliberately absent: job-control stop/continue states (the group and session
+calls are real, but stop signals still end a process), threads (`clone`
+rejects the thread flags), hard links, file-backed mappings, `socket`,
+`mount` (the boot namespace is fixed at boot), and networking.
 Where a call exists but cannot be honoured — permission bits, record locks,
 terminal modes — it succeeds
 without changing state and the limitation is documented above instead of
@@ -1139,9 +1147,12 @@ usable shell":
   controlling terminal above fd 9, reads the foreground group, and writes it
   back. The descriptor table reaches fd 31, a `/dev/tty` opened by path
   answers the termios and `TIOCGPGRP`/`TIOCSPGRP` requests, and the
-  process-group calls report the caller's pid, so the shell starts without
-  `can't access tty; job control turned off` (the scripted check runs
-  `sh -i -c` to assert exactly that setup). Stop signals still end a process.
+  process-group calls are real: a pipeline's children are moved into their
+  own group and made the terminal's foreground group, then the shell takes
+  its group back when the job finishes. The shell starts without
+  `can't access tty; job control turned off`, and a pipeline such as
+  `ls / | wc -l` or `echo hi | cat` forks, runs, and returns to the prompt
+  (the scripted check asserts both). Stop signals still end a process.
 - **The prompt is clean and the screen belongs to the shell.** busybox's line
   editor probes the terminal with `ESC[6n` before every prompt; the console
   answers with a cursor-position report instead of drawing the sequence, and

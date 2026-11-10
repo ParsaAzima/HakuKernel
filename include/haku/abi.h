@@ -166,8 +166,12 @@
 #define HAKU_CLONE_SIGHAND 0x800u
 #define HAKU_CLONE_VFORK   0x4000u
 #define HAKU_CLONE_THREAD  0x10000u
-/* wait4(2) options. */
+/* wait4(2) options. WUNTRACED and WCONTINUED are accepted and ignored:
+ * Haku has no job-control stop/continue states, but a shell that enables
+ * job control passes WUNTRACED to every waitpid. */
 #define HAKU_WNOHANG       0x1u
+#define HAKU_WUNTRACED     0x2u
+#define HAKU_WCONTINUED    0x8u
 
 /* Signals (Linux i386 numbering). Haku implements the standard range
  * 1..31: real-time signals (32..64) are rejected with EINVAL, and the
