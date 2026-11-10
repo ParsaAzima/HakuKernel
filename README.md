@@ -874,7 +874,8 @@ backend is selected at boot and stays the fallback; when the bootloader
 hands over a usable VBE mode, `framebuffer_init` succeeds and the boot path
 switches the active backend with `display_use(&framebuffer_display)`. Backend
 state is protected with IRQ-save spinlocks because the timer redraws the
-status line from interrupt context.
+status line from interrupt context while the console is still booting (the
+redraw stops once userland owns the console; see the heartbeat note below).
 
 ### Logging, panic, and crash reports
 
@@ -884,6 +885,16 @@ status line from interrupt context.
 `klog_write`/`klog_prefix` path stays unconditional for boot markers and
 test output. `klog_self_test` proves that `DEBUG` is suppressed at the
 default threshold and appears after lowering it (`KLOG-LEVELS-OK`).
+
+The timer heartbeat is boot progress, not a service: `pit_tick` prints
+`T+<n>s: timer heartbeat` once a second and updates the status counter in the
+top-right corner. As soon as the scheduler reports a live user task
+(`scheduler_user_tasks_live`), the line is written to COM1 only
+(`klog_mirror_display(0)` → `terminal_write_serial`) and the counter is left
+alone, so an interactive `ash` owns the screen. The serial log keeps the
+timeline, which is what the headless check asserts with its `T+1s`, `T+2s`,
+and `T+3s` markers. A console that never started a user task still shows the
+heartbeat.
 
 `kernel/kernel/panic.c` is the fatal path. It disables interrupts, prints
 `KERNEL PANIC: <reason>`, and calls `crash_report` (`kernel/kernel/crash.c`),

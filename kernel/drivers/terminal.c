@@ -46,6 +46,17 @@ void terminal_write(const char *s) {
     terminal_emit(s, count);
 }
 
+/* COM1 only, still under the serial lock so the line stays whole. The
+ * heartbeat keeps using it after userland takes over the display. */
+void terminal_write_serial(const char *s) {
+    irqflags_t flags = serial_output_begin();
+    for (; *s; s++) {
+        if (*s == '\n') serial_putc_locked('\r');
+        serial_putc_locked(*s);
+    }
+    serial_output_end(flags);
+}
+
 void terminal_corner(const char *s) {
     display_status(s);
 }

@@ -10,6 +10,10 @@
 #include "terminal.h"
 
 static klog_level_t log_threshold = KLOG_INFO;
+/* The display mirror. The timer heartbeat clears it once userland owns the
+ * screen, so the serial log keeps its timeline without writing over the
+ * shell. */
+static int mirror_to_display = 1;
 
 static const char *const level_names[] = {
     "DEBUG", "INFO", "WARN", "ERROR", "CRIT"
@@ -23,7 +27,8 @@ static void line_append_char(char c) {
     if (line_used + 1u < KLOG_LINE_MAX) line_buffer[line_used++] = c;
     if (c == '\n') {
         line_buffer[line_used] = '\0';
-        terminal_write(line_buffer);
+        if (mirror_to_display) terminal_write(line_buffer);
+        else terminal_write_serial(line_buffer);
         line_used = 0;
     }
 }
@@ -89,6 +94,12 @@ void klog_prefix(void) {
 
 void klog_set_level(klog_level_t level) {
     log_threshold = level;
+}
+
+/* Route log lines to COM1 only while disabled. The timer heartbeat turns
+ * the display mirror off once a user task owns the console. */
+void klog_mirror_display(int enabled) {
+    mirror_to_display = enabled ? 1 : 0;
 }
 
 klog_level_t klog_get_level(void) {

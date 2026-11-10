@@ -19,6 +19,10 @@ void terminal_init(void);
 /* Output. Safe from task and interrupt context. */
 void terminal_putc(char c);
 void terminal_write(const char *s);
+/* COM1 only. The timer heartbeat uses it once userland owns the display:
+ * the serial boot log keeps its timeline while the screen stays the
+ * shell's. */
+void terminal_write_serial(const char *s);
 void terminal_corner(const char *s);
 
 /* Console device operations (VFS fd 0/1/2). read() returns after a newline

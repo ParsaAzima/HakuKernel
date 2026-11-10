@@ -126,6 +126,13 @@ int scheduler_user_tasks_done(void) {
     return 1;
 }
 
+/* 1 while a user task can still make progress. Before the scheduler starts
+ * this is 0, so early boot still reports timer progress; it turns 1 for
+ * good once userland is running and the console belongs to it. */
+int scheduler_user_tasks_live(void) {
+    return scheduler_started && !scheduler_user_tasks_done();
+}
+
 /* Wake every sleeper whose deadline has been reached. Called from the
  * timer IRQ so a sleeping task resumes once its wake tick passes. The
  * unsigned subtraction compares correctly across the 32-bit tick wrap.

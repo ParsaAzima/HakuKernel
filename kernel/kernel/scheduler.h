@@ -44,6 +44,9 @@ int wait_queue_wake_all(wait_queue_t *queue);
 
 int scheduler_init(loaded_elf_t *initial_program);
 int scheduler_user_tasks_done(void);
+/* 1 while the scheduler is running and at least one user task can still
+ * make progress. The timer heartbeat stays off the console while it is 1. */
+int scheduler_user_tasks_live(void);
 void scheduler_start(void);
 regs_t *scheduler_preempt(regs_t *frame);
 regs_t *scheduler_exit_current(regs_t *frame);

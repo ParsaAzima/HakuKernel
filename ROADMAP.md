@@ -69,7 +69,11 @@ compatibility is not a short-term goal.
   expansion, and an in-kernel exec image cache to make QEMU/TCG performance
   usable. The interactive shell also turns job control on: the descriptor
   table reaches fd 31 (ash dups the terminal to fd 10) and a `/dev/tty`
-  opened by path answers `TIOCGPGRP`/`TIOCSPGRP` with pid-as-group.
+  opened by path answers `TIOCGPGRP`/`TIOCSPGRP` with pid-as-group. Once
+  userland owns the console the 1 Hz timer heartbeat stops drawing on the
+  display (the boot line and status counter would scroll the prompt away) and
+  keeps logging to COM1, so the headless `T+1s`/`T+2s`/`T+3s` markers still
+  prove the timer is alive.
 - [x] An x86-64 (long mode) target built from the same tree — `python
   build.py x64` produces `haku64.img` — with a long-mode entry, four-level
   paging and a 2 MiB-page physmap of all RAM (so no 1020 MiB ceiling), an
