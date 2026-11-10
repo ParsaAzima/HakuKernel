@@ -49,6 +49,13 @@ typedef signed long long s64;
 #define K64_USER_STACK_BOTTOM \
     (K64_USER_STACK_TOP - (u64)K64_USER_STACK_PAGES * K64_PAGE_SIZE)
 
+/* Anonymous mappings grow up from just above the image window; the top of
+ * the window is the stack guard, so a wild length cannot run into it. The
+ * per-task bump pointer lives in task64.c, and the page cap is what keeps
+ * one call from swallowing the whole address space. */
+#define K64_USER_MMAP_BASE      (K64_USER_BASE + 0x10000000ull)
+#define K64_USER_MMAP_PAGES_MAX 256u
+
 /* Physical layout this stage reserves (all identity mapped, so a plain
  * pointer works):
  *   0x000000-0x200000  firmware, stage1/stage2, E820 and VBE handover,
@@ -93,12 +100,29 @@ typedef signed long long s64;
 
 /* System calls use INT 0x80 rather than SYSCALL/SYSRET: one gate, no
  * STAR/LSTAR/FMASK MSRs, no SWAPGS, and the same regs64_t frame the
- * interrupt path already builds. The register convention follows the
- * x86-64 Linux one closely enough to port later: number in RAX, arguments
- * in RDI/RSI/RDX, result in RAX. */
-#define K64_SYS_WRITE   1u
-#define K64_SYS_EXIT    2u
-#define K64_SYS_NUMBER  3u
+ * interrupt path already builds. The convention is the x86-64 Linux one:
+ * number in RAX, arguments in RDI/RSI/RDX/R10/R8/R9, result in RAX, or a
+ * negative errno. The numbers are the Linux x86-64 ones, so a static
+ * Linux-targeted binary reaches the implemented calls unchanged. */
+#define K64_SYS_WRITE         1u
+#define K64_SYS_MMAP          9u
+#define K64_SYS_MUNMAP        11u
+#define K64_SYS_WRITEV        20u
+#define K64_SYS_GETPID        39u
+#define K64_SYS_EXIT          60u
+#define K64_SYS_CLOCK_GETTIME 228u
+#define K64_SYS_EXIT_GROUP    231u
+
+/* PROT_* and MAP_* as Linux spells them. Only private anonymous mappings
+ * exist: there is no file-backed mmap and no MAP_FIXED yet. */
+#define K64_PROT_READ   1u
+#define K64_PROT_WRITE  2u
+#define K64_PROT_EXEC   4u
+#define K64_MAP_PRIVATE   0x02u
+#define K64_MAP_ANONYMOUS 0x20u
+
+#define K64_CLOCK_REALTIME  0u
+#define K64_CLOCK_MONOTONIC 1u
 
 /* Stack frame isr64.asm builds; see the comment at the top of that file. */
 typedef struct {
@@ -205,6 +229,13 @@ void *phys_to_virt64(u64 phys);
 u64 paging64_create_space(void);
 int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user);
 u64 paging64_translate_space(u64 space, u64 virt);
+/* Query one leaf of a space without changing it. Returns 0 when the page
+ * is absent (or the address is not in the user half); on success `phys`
+ * carries the page base plus the offset, `writable`/`user` the leaf bits. */
+int paging64_query_space(u64 space, u64 virt, u64 *phys, int *writable,
+                         int *user);
+/* Clear one user leaf and return the frame it mapped, or 0. */
+u64 paging64_unmap_space(u64 space, u64 virt);
 void paging64_destroy_space(u64 space);
 void paging64_switch_space(u64 space);
 
@@ -317,6 +348,12 @@ u64 task64_kernel_stack(int id);
 u64 sched64_switches(void);
 int sched64_current(void);
 u64 sched64_space(int id);
+/* Status passed to exit/exit_group, kept after the task is done. */
+u64 task64_exit_status(int id);
+/* Next anonymous mapping address, and a reservation that fails when the
+ * request would reach the stack guard or exceed the page cap. */
+u64 task64_mmap_base(int id);
+u64 task64_mmap_reserve(int id, u64 pages);
 
 /* syscall64.c: INT 0x80 dispatch */
 regs64_t *sys64_dispatch(regs64_t *frame);

@@ -31,6 +31,8 @@ typedef struct {
     u64 space;      /* PML4 physical address this task runs under */
     u64 stack_top;  /* kernel stack, i.e. TSS.RSP0 while the task runs */
     regs64_t *frame;
+    u64 exit_status; /* exit/exit_group argument, readable after DONE */
+    u64 mmap_next;   /* per-task bump pointer for anonymous mappings */
 } task64_t;
 
 static task64_t tasks[K64_TASK_MAX];
@@ -91,6 +93,8 @@ void sched64_init(void) {
     tasks[0].space = read_cr3_64() & K64_PAGE_MASK;
     tasks[0].stack_top = 0;        /* ring 0 only, so RSP0 is not used */
     tasks[0].frame = 0;
+    tasks[0].exit_status = 0;
+    tasks[0].mmap_next = 0;
     memcpy(fxsave_areas[0], fxsave_default, sizeof(fxsave_default));
 
     enabled = 1;
@@ -113,6 +117,8 @@ int task64_create_kernel(void (*entry)(void)) {
     tasks[id].space = read_cr3_64() & K64_PAGE_MASK;
     tasks[id].stack_top = top;
     tasks[id].frame = frame_on_stack(top, (u64)entry);
+    tasks[id].exit_status = 0;
+    tasks[id].mmap_next = 0;
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
     return id;
@@ -145,6 +151,8 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].space = space;
     tasks[id].stack_top = top;
     tasks[id].frame = frame;
+    tasks[id].exit_status = 0;
+    tasks[id].mmap_next = K64_USER_MMAP_BASE;
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
     return id;
@@ -200,6 +208,10 @@ regs64_t *sched64_exit(regs64_t *frame) {
 
     if (!enabled || current_index < 0) return frame;
     tasks[current_index].state = K64_TASK_DONE;
+    /* exit()/exit_group() pass the status in RDI; the frame is not saved
+     * because the task never resumes, but the value is what a parent would
+     * read back. */
+    tasks[current_index].exit_status = frame->rdi;
 
     next = pick_ready();
     if (next < 0) {
@@ -229,6 +241,30 @@ u64 task64_kernel_stack(int id) {
 
 u64 sched64_space(int id) {
     return valid_id(id) ? tasks[id].space : 0;
+}
+
+u64 task64_exit_status(int id) {
+    return valid_id(id) ? tasks[id].exit_status : 0;
+}
+
+u64 task64_mmap_base(int id) {
+    return valid_id(id) ? tasks[id].mmap_next : 0;
+}
+
+/* Reserve `pages` at the task's bump pointer. The reservation is recorded
+ * before the caller maps anything, so a failed mapping does not have to
+ * rewind the pointer: the address range is simply never reused. */
+u64 task64_mmap_reserve(int id, u64 pages) {
+    u64 base, next;
+
+    if (!valid_id(id) || pages == 0 || pages > K64_USER_MMAP_PAGES_MAX)
+        return 0;
+    base = tasks[id].mmap_next;
+    if (base < K64_USER_MMAP_BASE) base = K64_USER_MMAP_BASE;
+    next = base + pages * K64_PAGE_SIZE;
+    if (next < base || next > K64_USER_STACK_BOTTOM) return 0;
+    tasks[id].mmap_next = next;
+    return base;
 }
 
 u64 sched64_switches(void) {

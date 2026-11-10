@@ -229,7 +229,10 @@ int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user) {
     return 1;
 }
 
-u64 paging64_translate_space(u64 space, u64 virt) {
+/* Walk to the leaf entry for a user address, without creating levels.
+ * Returns 0 when a level is missing, a large page is in the way, or the
+ * address is outside the user half. */
+static u64 *space_leaf(u64 space, u64 virt) {
     u64 *pml4, *pdpt, *pd, *pt;
     u64 entry;
 
@@ -248,9 +251,47 @@ u64 paging64_translate_space(u64 space, u64 virt) {
     if (entry & PAGE_LARGE) return 0;      /* never produced by map_space */
     pt = (u64 *)phys_to_virt64(entry & K64_PAGE_MASK);
 
-    entry = pt[PT_INDEX(virt)];
-    if (!(entry & PAGE_PRESENT)) return 0;
-    return (entry & K64_PAGE_MASK) | (virt & ~K64_PAGE_MASK);
+    return &pt[PT_INDEX(virt)];
+}
+
+u64 paging64_translate_space(u64 space, u64 virt) {
+    u64 *entry;
+
+    if (!space || !user_address(virt)) return 0;
+    entry = space_leaf(space, virt);
+    if (!entry || !(*entry & PAGE_PRESENT)) return 0;
+    return (*entry & K64_PAGE_MASK) | (virt & ~K64_PAGE_MASK);
+}
+
+/* Query one leaf without creating anything. This is the check every
+ * syscall makes before it touches a user pointer: a ring-0 fault is fatal
+ * here, so the kernel never dereferences an address it has not resolved
+ * through the page tables first. */
+int paging64_query_space(u64 space, u64 virt, u64 *phys, int *writable,
+                         int *user) {
+    u64 *entry;
+
+    if (!space || !user_address(virt)) return 0;
+    entry = space_leaf(space, virt);
+    if (!entry || !(*entry & PAGE_PRESENT)) return 0;
+    if (phys) *phys = (*entry & K64_PAGE_MASK) | (virt & ~K64_PAGE_MASK);
+    if (writable) *writable = (*entry & PAGE_WRITABLE) != 0;
+    if (user) *user = (*entry & PAGE_USER) != 0;
+    return 1;
+}
+
+u64 paging64_unmap_space(u64 space, u64 virt) {
+    u64 *entry;
+    u64 phys;
+
+    if (!space || !user_address(virt)) return 0;
+    entry = space_leaf(space, virt);
+    if (!entry || !(*entry & PAGE_PRESENT)) return 0;
+    if (!(*entry & PAGE_USER)) return 0;
+    phys = *entry & K64_PAGE_MASK;
+    *entry = 0;
+    invlpg64(virt);
+    return phys;
 }
 
 /* Free the user-half tables and the PML4. The frames the maps pointed at

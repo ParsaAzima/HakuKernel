@@ -62,7 +62,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x1B`/`SS=0x23` enters user mode | `HAKU64-USER-OK` |
-| syscall | the DPL-3 `INT 0x80` gate runs `write` and `exit` | `HAKU64-SYSCALL-OK` |
+| syscall | the DPL-3 `INT 0x80` gate: `write`, `writev`, `mmap`, `munmap`, `getpid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-ABI-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
 
@@ -121,13 +121,21 @@ is what the CPU loads when a ring-3 trap enters the kernel.
 Ring-3 entry is an ordinary `IRETQ` from a frame whose `CS` is `0x1B` and
 whose `SS` is `0x23`; the same instruction that returns from an interrupt
 performs the privilege change. The system call gate is vector `0x80`, the one
-DPL-3 IDT entry. `sys64_dispatch` takes the number in `RAX`, arguments in
-`RDI`/`RSI`/`RDX` and returns in `RAX`, validates that the buffer pointer is
-inside the user half before printing it, and implements `write` and `exit`
-(`K64_SYS_WRITE`/`K64_SYS_EXIT`). `INT 0x80` is slower than
-`SYSCALL`/`SYSRET` but needs no `STAR`/`LSTAR`/`FMASK` setup, no `SWAPGS`
-and no second entry stub; the roadmap keeps the Linux-compatible syscall
-table for a later stage.
+DPL-3 IDT entry. `sys64_dispatch` implements the x86-64 Linux convention —
+number in `RAX`, arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in
+`RAX` or a negative errno — with the Linux x86-64 numbers for `write`,
+`writev`, `mmap`, `munmap`, `getpid`, `clock_gettime` and
+`exit`/`exit_group`; an unimplemented number returns `-ENOSYS`. Every user
+pointer is resolved through the current space with `paging64_query_space`
+before it is dereferenced, and the copies move through the physmap: a ring-0
+page fault halts the kernel, so the CPU cannot be relied on to reject a bad
+address. `mmap` accepts only private anonymous mappings (no fixed address, no
+file descriptor, no offset, no W+X) and grows a per-task bump region from
+`K64_USER_MMAP_BASE`; `munmap` clears the leaves and frees their frames.
+`clock_gettime` reports both clocks as time since boot. `INT 0x80` is slower
+than `SYSCALL`/`SYSRET` but needs no `STAR`/`LSTAR`/`FMASK` setup, no
+`SWAPGS` and no second entry stub; the full i386 number table stays with the
+later userland stage.
 
 The 64-bit path now has an ELF64 loader too, but no 64-bit libc or filesystem
 image; `haku.img` remains the default image and
@@ -150,8 +158,11 @@ loader records the page-aligned start of the first writable segment so the
 self-test can read it back.
 
 The test executable is `kernel/arch/x86_64/user/ring3_elf64.asm`: a flat
-`[BITS 64]` program that writes `ELF64`, stores a magic word in its BSS page
-and exits through `INT 0x80`. `tools/mkelf64.py` wraps the flat binary in an
+`[BITS 64]` program that writes `ELF64`, exercises the six-argument syscall
+ABI (`writev`, `getpid`, `clock_gettime`, an anonymous `mmap`/`munmap`, and
+the `EBADF`/`EFAULT`/`ENOSYS`/`EINVAL` error paths), prints
+`HAKU64-ABI-OK`, stores a magic word in its BSS page and exits with status 0.
+`tools/mkelf64.py` wraps the flat binary in an
 `ET_EXEC`/`EM_X86_64` image with an RX `PT_LOAD` at `0x0000008000400000` and a
 zero-filesz RW segment one page above it; `user64_image.asm` embeds the result
 in `.rdata`, which `tools/pe2bin.py` copies into the kernel image. The boot
@@ -159,8 +170,9 @@ test first feeds `elf64_load` six malformed copies (wrong class, wrong
 machine, W+X, bad entry, offset past the file, truncated header) and requires
 a reason for each, then loads the valid image, checks that the BSS page is
 zero, and runs it as a user task. The magic word (`0x48414B55`) can only be
-there if ring 3 reached the store, so `HAKU64-ELF-RUN-OK` proves execution
-rather than a successful mapping.
+there if ring 3 reached the store, and the boot test also requires exit
+status 0 and the mmap bump pointer to have advanced, so `HAKU64-ELF-RUN-OK`
+proves execution rather than a successful mapping.
 
 Physical layout on the 64-bit path: `0–2 MiB` firmware, boot stages, kernel
 image and the boot page tables; `2–16 MiB` boot allocations (page tables,

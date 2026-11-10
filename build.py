@@ -361,9 +361,10 @@ def build_x64(nasm, py, memory_mb):
     """Build and boot haku64.img: the same floppy, with a 64-bit kernel.
 
     The entry path, memory subsystem, interrupts, per-process address
-    spaces, the scheduler, ring-3 entry, the INT 0x80 gate and the ELF64
-    loader are all 64-bit; there is no 64-bit libc or filesystem image yet.
-    The 32-bit kernel is untouched and remains the default image.
+    spaces, the scheduler, ring-3 entry, the six-argument INT 0x80 syscall
+    ABI and the ELF64 loader are all 64-bit; there is no 64-bit libc or
+    filesystem image yet. The 32-bit kernel is untouched and remains the
+    default image.
     """
     cc, linker, label = find_x64_toolchain()
     log(f"x64 toolchain: {label}")
@@ -467,7 +468,8 @@ def build_x64(nasm, py, memory_mb):
                 "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
                 "HAKU64-VM-OK", "HAKU64-PROC-OK", "HAKU64-USER-OK",
                 "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
-                "HAKU64-ELF-REJECT-OK", "HAKU64-SELFTEST-OK"]
+                "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK",
+                "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():

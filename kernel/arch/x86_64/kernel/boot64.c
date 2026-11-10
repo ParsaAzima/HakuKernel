@@ -386,9 +386,10 @@ static int test_tasks(void) {
  *   mov eax, SYS_EXIT  ; xor edi, edi ; int 0x80
  *   jmp $
  *
- * Writing it out byte by byte keeps the userland test free of a second
- * toolchain: the point is the kernel's ring-3 entry and syscall gate, not
- * an ELF loader (which is the next milestone stage). */
+ * Writing it out byte by byte keeps this test free of a second toolchain:
+ * the point is ring-3 entry and the raw INT 0x80 path with three arguments.
+ * The ELF64 test below covers the six-argument ABI and the wider syscall
+ * table. */
 static u32 build_user_program(u8 *code) {
     u32 n = 0;
     u32 i;
@@ -441,6 +442,7 @@ static int test_user(void) {
     while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
         cpu_pause64();
     if (task64_state(id) != K64_TASK_DONE) return 0;
+    if (task64_exit_status(id) != 0) return 0;
     if (sys64_count() < 2) return 0;
 
     /* The task is done and the scheduler is back on the boot context, so
@@ -567,14 +569,27 @@ static int test_elf64(void) {
     while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
         cpu_pause64();
     if (task64_state(id) != K64_TASK_DONE) return 0;
-
-    /* write + exit. The magic word is only in the image's BSS page if the
-     * program actually reached the store, so it proves ring-3 execution
-     * rather than a successful mapping. */
-    if (sys64_count() < before + 2) {
+    if (task64_exit_status(id) != 0) {
+        k64_puts("HAKU64-ELF-RUN-FAIL: exit=");
+        k64_dec(task64_exit_status(id));
+        k64_puts("\r\n");
         elf64_unload(&loaded);
         return 0;
     }
+
+    /* The program makes more than a dozen calls: the success paths for
+     * write, writev, getpid, clock_gettime, mmap and munmap, plus the
+     * error matrix. The mmap bump pointer proves the mapping test ran even
+     * though munmap released the pages again. */
+    if (sys64_count() < before + 10 ||
+        task64_mmap_base(id) != K64_USER_MMAP_BASE + 2 * K64_PAGE_SIZE) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    /* The magic word is only in the image's BSS page if the program
+     * actually reached the store, so it proves ring-3 execution rather
+     * than a successful mapping. */
     phys = paging64_translate_space(loaded.space, loaded.writable);
     if (!phys || *(const volatile u32 *)phys_to_virt64(phys) != 0x48414B55u) {
         elf64_unload(&loaded);
@@ -583,7 +598,7 @@ static int test_elf64(void) {
 
     k64_puts("HAKU64-ELF-RUN-OK: syscalls=");
     k64_dec(sys64_count() - before);
-    k64_puts(" bss=0x48414B55\r\n");
+    k64_puts(" exit=0 bss=0x48414B55\r\n");
 
     /* The task is done and the scheduler is on the boot context again, so
      * its frames and address space can be released. Its kernel stack stays
