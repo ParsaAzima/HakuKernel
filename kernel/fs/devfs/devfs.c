@@ -73,6 +73,14 @@ static int32_t console_write(const void *buffer, uint32_t count,
     return terminal_write_bytes(buffer, count, out_count);
 }
 
+static int name_equal(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
 /* 1 for the entries that are the terminal. A shell opens /dev/tty by path
  * and then asks that descriptor for its termios and foreground process
  * group, so ioctl has to recognise it as a console. */
@@ -93,14 +101,6 @@ static const devfs_entry_t devfs_entries[] = {
 };
 
 #define DEVFS_ENTRY_COUNT (sizeof(devfs_entries) / sizeof(devfs_entries[0]))
-
-static int name_equal(const char *a, const char *b) {
-    while (*a && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
 
 static const devfs_entry_t *entry_lookup(const char *name) {
     for (uint32_t i = 0; i < DEVFS_ENTRY_COUNT; i++)
