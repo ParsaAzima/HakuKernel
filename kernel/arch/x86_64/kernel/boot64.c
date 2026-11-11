@@ -699,13 +699,14 @@ static int test_elf64(void) {
 
     /* The program makes more than a dozen calls: the success paths for
      * write, writev, getpid, clock_gettime, open/read/close/lseek, mmap,
-     * munmap, mkdir, fork and wait4, plus the error matrix. The bump
-     * pointer advanced by the two initial pages, the one-page MAP_SHARED
-     * anonymous mapping, the three file mappings and the page the fork
-     * test shares (MAP_FIXED does not bump), which proves the mapping
-     * tests ran even though munmap released the pages again. */
+     * munmap, mkdir, fork, wait4, clone and futex, plus the error matrix.
+     * The bump pointer advanced by the two initial pages, the one-page
+     * MAP_SHARED anonymous mapping, the three file mappings, the page the
+     * fork test shares, and the two-page thread stack (MAP_FIXED does not
+     * bump), which proves the mapping tests ran even though munmap released
+     * the pages again. */
     if (sys64_count() < before + 10 ||
-        task64_mmap_base(id) != K64_USER_MMAP_BASE + 7 * K64_PAGE_SIZE) {
+        task64_mmap_base(id) != K64_USER_MMAP_BASE + 9 * K64_PAGE_SIZE) {
         elf64_unload(&loaded);
         return 0;
     }

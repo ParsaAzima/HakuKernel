@@ -29,6 +29,7 @@ typedef struct {
     u32 state;
     u32 id;
     int parent;     /* task index that may reap this task, -1 for none */
+    u32 tgid;       /* task index of the thread-group leader (getpid) */
     u64 space;      /* PML4 physical address this task runs under */
     u64 stack_base; /* kernel heap block the 16 KiB stack was carved from */
     u64 stack_top;  /* kernel stack, i.e. TSS.RSP0 while the task runs */
@@ -38,12 +39,22 @@ typedef struct {
     u64 fault_vector; /* non-zero when the task stopped on a ring-3 fault */
     u64 fault_address;
     u64 mmap_next;   /* per-task bump pointer for anonymous mappings */
+    u64 futex_addr;  /* user address a K64_TASK_WAIT task is parked on */
 } task64_t;
 
 static task64_t tasks[K64_TASK_MAX];
 static int current_index = -1;
 static u32 enabled;
 static u64 switch_count;
+
+/* Threads share one address space, so the PML4, the mapping records and the
+ * anonymous bump pointer are owned by one task slot and every thread points
+ * at it. `space_refs[owner]` counts the live users: the space and its frames
+ * are released only when the last one is reaped, and the records move to a
+ * surviving thread if the owner dies first. A task whose space_owner is
+ * itself is an ordinary process. */
+static int space_owner[K64_TASK_MAX];
+static u32 space_refs[K64_TASK_MAX];
 
 /* ------------------------------------------------------- mapping records
  * munmap frees the frames of a mapping it created, but a MAP_SHARED file
@@ -75,6 +86,13 @@ static __declspec(align(16)) u8 fxsave_default[512];
 
 static int valid_id(int id) {
     return id >= 0 && id < (int)K64_TASK_MAX;
+}
+
+/* The slot that owns the address space and mapping records a task uses.
+ * Threads share one, so every space/mapping lookup goes through here. */
+static int as_owner(int id) {
+    if (!valid_id(id) || !valid_id(space_owner[id])) return id;
+    return space_owner[id];
 }
 
 static int find_free(void) {
@@ -114,12 +132,18 @@ void sched64_init(void) {
     current_index = 0;
     switch_count = 0;
 
+    for (u32 i = 0; i < K64_TASK_MAX; i++) {
+        space_owner[i] = (int)i;
+        space_refs[i] = 0;
+    }
+
     enable_sse64();
     fxsave64(fxsave_default);
 
     tasks[0].id = 0;
     tasks[0].state = K64_TASK_RUNNING;
     tasks[0].parent = -1;
+    tasks[0].tgid = 0;
     tasks[0].space = read_cr3_64() & K64_PAGE_MASK;
     tasks[0].stack_base = 0;
     tasks[0].stack_top = 0;        /* ring 0 only, so RSP0 is not used */
@@ -129,6 +153,8 @@ void sched64_init(void) {
     tasks[0].fault_vector = 0;
     tasks[0].fault_address = 0;
     tasks[0].mmap_next = 0;
+    tasks[0].futex_addr = 0;
+    space_refs[0] = 1;
     memcpy(fxsave_areas[0], fxsave_default, sizeof(fxsave_default));
 
     enabled = 1;
@@ -149,6 +175,7 @@ int task64_create_kernel(void (*entry)(void)) {
 
     tasks[id].id = (u32)id;
     tasks[id].parent = -1;
+    tasks[id].tgid = (u32)id;
     tasks[id].space = read_cr3_64() & K64_PAGE_MASK;
     tasks[id].stack_base = (u64)stack;
     tasks[id].stack_top = top;
@@ -158,6 +185,9 @@ int task64_create_kernel(void (*entry)(void)) {
     tasks[id].fault_vector = 0;
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = 0;
+    tasks[id].futex_addr = 0;
+    space_owner[id] = id;
+    space_refs[id] = 1;
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
     return id;
@@ -188,6 +218,7 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
 
     tasks[id].id = (u32)id;
     tasks[id].parent = -1;
+    tasks[id].tgid = (u32)id;
     tasks[id].space = space;
     tasks[id].stack_base = (u64)stack;
     tasks[id].stack_top = top;
@@ -197,6 +228,9 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].fault_vector = 0;
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = K64_USER_MMAP_BASE;
+    tasks[id].futex_addr = 0;
+    space_owner[id] = id;
+    space_refs[id] = 1;
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
     return id;
@@ -324,7 +358,11 @@ u64 task64_kernel_stack(int id) {
 }
 
 u64 sched64_space(int id) {
-    return valid_id(id) ? tasks[id].space : 0;
+    return valid_id(id) ? tasks[as_owner(id)].space : 0;
+}
+
+int sched64_tgid(int id) {
+    return valid_id(id) ? (int)tasks[id].tgid : -1;
 }
 
 u64 task64_exit_status(int id) {
@@ -340,17 +378,20 @@ u64 task64_fault_address(int id) {
 }
 
 u64 task64_mmap_base(int id) {
-    return valid_id(id) ? tasks[id].mmap_next : 0;
+    return valid_id(id) ? tasks[as_owner(id)].mmap_next : 0;
 }
 
 /* Reserve `pages` at the task's bump pointer. The reservation is recorded
  * before the caller maps anything, so a failed mapping does not have to
- * rewind the pointer: the address range is simply never reused. */
+ * rewind the pointer: the address range is simply never reused. Threads
+ * share the pointer through the space owner, so two threads never reserve
+ * the same range. */
 u64 task64_mmap_reserve(int id, u64 pages) {
     u64 base, next;
 
     if (!valid_id(id) || pages == 0 || pages > K64_USER_MMAP_PAGES_MAX)
         return 0;
+    id = as_owner(id);
     base = tasks[id].mmap_next;
     if (base < K64_USER_MMAP_BASE) base = K64_USER_MMAP_BASE;
     next = base + pages * K64_PAGE_SIZE;
@@ -361,6 +402,7 @@ u64 task64_mmap_reserve(int id, u64 pages) {
 
 int task64_map_record(int id, u64 base, u64 pages, int owned, int shared) {
     if (!valid_id(id) || pages == 0) return 0;
+    id = as_owner(id);
     for (u32 i = 0; i < K64_TASK_MAPS; i++) {
         map64_t *map = &mappings[id][i];
 
@@ -378,6 +420,7 @@ int task64_map_record(int id, u64 base, u64 pages, int owned, int shared) {
 /* 1 when `address` falls in a range another space also maps. */
 int task64_map_shared(int id, u64 address) {
     if (!valid_id(id)) return 0;
+    id = as_owner(id);
     for (u32 i = 0; i < K64_TASK_MAPS; i++) {
         map64_t *map = &mappings[id][i];
         u64 end;
@@ -392,6 +435,7 @@ int task64_map_shared(int id, u64 address) {
 /* 1 when munmap may free the frame behind `address`. */
 int task64_map_owned(int id, u64 address) {
     if (!valid_id(id)) return 1;
+    id = as_owner(id);
     for (u32 i = 0; i < K64_TASK_MAPS; i++) {
         map64_t *map = &mappings[id][i];
         u64 end;
@@ -412,6 +456,7 @@ void task64_map_drop(int id, u64 base, u64 length) {
     u64 end = base + length;
 
     if (!valid_id(id) || length == 0 || end < base) return;
+    id = as_owner(id);
     for (u32 i = 0; i < K64_TASK_MAPS; i++) {
         map64_t *map = &mappings[id][i];
         u64 map_end;
@@ -463,6 +508,43 @@ static int exit_keep(u64 virt, void *ctx) {
     return task64_map_shared(id, virt) && !task64_map_owned(id, virt);
 }
 
+/* Drop this task's claim on the address space. The last user frees the
+ * frames (borrowed shared pages survive) and the page tables. If the owner
+ * dies while a thread still runs, the mapping records and the bump pointer
+ * move to that thread, so a later munmap — or the final exit — still sees
+ * them, and no frame is leaked or freed twice. */
+static void space_detach(int id) {
+    int owner = as_owner(id);
+
+    if (owner != id) {
+        if (space_refs[owner] > 0) space_refs[owner]--;
+        return;
+    }
+    if (space_refs[id] > 1) {
+        for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+            if (i == id || tasks[i].state == K64_TASK_UNUSED) continue;
+            if (space_owner[i] != id) continue;
+            memcpy(mappings[i], mappings[id], sizeof(mappings[id]));
+            memset(mappings[id], 0, sizeof(mappings[id]));
+            tasks[i].space = tasks[id].space;
+            tasks[i].mmap_next = tasks[id].mmap_next;
+            space_owner[i] = i;
+            for (int j = 1; j < (int)K64_TASK_MAX; j++)
+                if (j != i && space_owner[j] == id) space_owner[j] = i;
+            space_refs[i] = space_refs[id] - 1;
+            space_refs[id] = 0;
+            space_owner[id] = id;
+            return;
+        }
+    }
+    if (tasks[id].space && space_refs[id] > 0) {
+        paging64_free_space_frames(tasks[id].space, exit_keep,
+                                   (void *)(u64)id);
+        paging64_destroy_space(tasks[id].space);
+    }
+    space_refs[id] = 0;
+}
+
 /* Release everything a reaped task owns: descriptors, the user frames it
  * did not share with another space, its page tables and kernel stack. */
 static void finalize_task(int id) {
@@ -470,15 +552,13 @@ static void finalize_task(int id) {
 
     if (!valid_id(id) || id == 0) return;
     fs64_task_cleanup(id);
-    if (tasks[id].space) {
-        paging64_free_space_frames(tasks[id].space, exit_keep,
-                                   (void *)(u64)id);
-        paging64_destroy_space(tasks[id].space);
-    }
+    space_detach(id);
     stack = tasks[id].stack_base;
     if (stack) kfree64((void *)stack);
     memset(&mappings[id], 0, sizeof(mappings[id]));
     memset(&tasks[id], 0, sizeof(tasks[id]));
+    space_owner[id] = id;
+    space_refs[id] = 0;
     tasks[id].state = K64_TASK_UNUSED;
 }
 
@@ -529,6 +609,7 @@ regs64_t *sched64_fork(regs64_t *frame) {
 
     tasks[child].id = (u32)child;
     tasks[child].parent = parent;
+    tasks[child].tgid = tasks[parent].tgid;
     tasks[child].space = space;
     tasks[child].stack_base = (u64)stack;
     tasks[child].stack_top = top;
@@ -538,6 +619,9 @@ regs64_t *sched64_fork(regs64_t *frame) {
     tasks[child].fault_vector = 0;
     tasks[child].fault_address = 0;
     tasks[child].mmap_next = tasks[parent].mmap_next;
+    tasks[child].futex_addr = 0;
+    space_owner[child] = child;
+    space_refs[child] = 1;
 
     /* Inherit the mapping table. A shared range becomes borrow-only in the
      * child, because the frames belong to the original mapping or to the
@@ -555,13 +639,145 @@ regs64_t *sched64_fork(regs64_t *frame) {
     return frame;
 }
 
+/* clone() with CLONE_VM: a second task in the same address space. Nothing
+ * is copied — not the page tables, not the mapping records, not the bump
+ * pointer — so a store in either task is visible to the other, which is what
+ * makes this a thread instead of a process. The child resumes at the same
+ * RIP as the caller (right after the syscall) with RAX=0 and the caller's
+ * requested stack. It is reapable by the task that created it. */
+regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
+    int parent = current_index;
+    int child, owner;
+    u8 *stack;
+    u64 top;
+    regs64_t *child_frame;
+
+    if (!(flags & K64_CLONE_VM)) return sched64_fork(frame);
+
+    if (!enabled || parent <= 0 || tasks[parent].state != K64_TASK_RUNNING ||
+        !tasks[parent].space || !child_stack ||
+        child_stack < K64_USER_BASE || child_stack >= K64_USER_END ||
+        (child_stack & 15ull) ||
+        (flags & ~(u64)K64_CLONE_SUPPORTED)) {
+        frame->rax = (u64)0 - 22;          /* EINVAL */
+        return frame;
+    }
+    if ((flags & K64_CLONE_THREAD) && !valid_id((int)tasks[parent].tgid)) {
+        frame->rax = (u64)0 - 22;
+        return frame;
+    }
+
+    child = find_free();
+    if (child < 0) {
+        frame->rax = (u64)0 - 11;          /* EAGAIN */
+        return frame;
+    }
+
+    stack = (u8 *)kmalloc64(K64_TASK_STACK_SIZE);
+    if (!stack) {
+        frame->rax = (u64)0 - 12;          /* ENOMEM */
+        return frame;
+    }
+    top = ((u64)stack + K64_TASK_STACK_SIZE) & ~15ull;
+
+    child_frame = frame_on_stack(top, frame->rip);
+    *child_frame = *frame;
+    child_frame->rax = 0;                  /* clone() returns 0 in the child */
+    child_frame->rsp = child_stack;
+
+    /* The XMM state belongs to the new thread too: it starts where the
+     * caller is right now. */
+    fxsave64(fxsave_areas[parent]);
+    memcpy(fxsave_areas[child], fxsave_areas[parent], sizeof(fxsave_default));
+
+    owner = as_owner(parent);
+    tasks[child].id = (u32)child;
+    tasks[child].parent = parent;
+    tasks[child].tgid = (flags & K64_CLONE_THREAD) ? tasks[parent].tgid
+                                                   : (u32)child;
+    tasks[child].space = tasks[owner].space;
+    tasks[child].stack_base = (u64)stack;
+    tasks[child].stack_top = top;
+    tasks[child].frame = child_frame;
+    tasks[child].exit_status = 0;
+    tasks[child].term_signal = 0;
+    tasks[child].fault_vector = 0;
+    tasks[child].fault_address = 0;
+    tasks[child].futex_addr = 0;
+    /* The space, its mapping records and the bump pointer stay with the
+     * owner; the new thread is one more user until it is reaped. */
+    space_owner[child] = owner;
+    space_refs[owner]++;
+
+    if (flags & K64_CLONE_FILES)
+        fs64_share_fds(parent, child);
+    else
+        fs64_fork_fds(parent, child);
+
+    tasks[child].state = K64_TASK_READY;
+    frame->rax = (u64)(child + 1);
+    return frame;
+}
+
+/* Park the caller on a futex word. The value check already happened in the
+ * syscall, so this only has to record where the task sleeps, complete the
+ * syscall (RAX=0) and switch away. The frame is saved *before* the state
+ * changes, because the task is not RUNNING any more when switch_to looks at
+ * it, yet a wake must resume it through that exact frame. */
+regs64_t *sched64_futex_wait(regs64_t *frame, u64 address) {
+    int id = current_index;
+    int next;
+
+    if (!enabled || id <= 0) {
+        frame->rax = (u64)0 - 22;          /* EINVAL */
+        return frame;
+    }
+
+    fxsave64(fxsave_areas[id]);
+    frame->rax = 0;
+    tasks[id].frame = frame;
+    tasks[id].futex_addr = address;
+    tasks[id].state = K64_TASK_WAIT;
+
+    next = pick_ready();
+    if (next < 0) {
+        /* Nobody can ever wake this task: report the deadlock instead of
+         * spinning. The boot test never takes this path. */
+        k64_puts("HAKU64-TASK-HALT: every task is blocked on a futex\r\n");
+        cli64();
+        for (;;) cpu_halt64();
+    }
+    return switch_to(next, 0);
+}
+
+/* Wake up to `count` tasks parked on `address`. The match is on the virtual
+ * address alone, not on the address space: a futex on a MAP_SHARED page is
+ * the same word in two processes, and a spurious wakeup is allowed by the
+ * contract (the waiter re-checks the word) while a missed one deadlocks. */
+int sched64_futex_wake(int id, u64 address, int count) {
+    int woken = 0;
+
+    if (!valid_id(id) || count <= 0) return 0;
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (tasks[i].state != K64_TASK_WAIT) continue;
+        if (tasks[i].futex_addr != address) continue;
+        tasks[i].futex_addr = 0;
+        tasks[i].state = K64_TASK_READY;
+        if (++woken >= count) break;
+    }
+    return woken;
+}
+
 /* execve's hand-off: the caller has just loaded a fresh image, so the old
  * space is unreachable from ring 3 and is released here (aliased shared
  * pages survive, exactly as they do at exit). The mapping table belongs to
  * the old image and is cleared; the new image starts with an empty anonymous
- * window. The caller is responsible for RIP/RSP and for switching CR3. */
+ * window. The caller is responsible for RIP/RSP and for switching CR3.
+ * Replacing a shared space is refused: there is no way to stop the other
+ * threads, so execve from a thread fails instead of leaving them behind. */
 int task64_exec(int id, u64 space) {
     if (!valid_id(id) || id == 0 || !space) return 0;
+    if (as_owner(id) != id || space_refs[id] > 1) return 0;
     if (tasks[id].space && tasks[id].space != space) {
         paging64_free_space_frames(tasks[id].space, exit_keep,
                                    (void *)(u64)id);

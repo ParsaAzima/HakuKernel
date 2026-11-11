@@ -3,19 +3,22 @@
 
 Usage:
     mkelf64.py code.bin out.elf [--base 0x8000400000] [--data-size 0x1000]
+                                [--data-offset 0x1000]
 
 The output is an ET_EXEC / EM_X86_64 executable with two PT_LOAD segments:
 
-    0x1000  code  R+X  the whole flat binary, memsz rounded up to a page
-    base+0x1000  BSS  R+W  filesz 0, memsz --data-size
+    0x1000              code  R+X  the whole flat binary, memsz rounded up
+    base+data_offset    BSS   R+W  filesz 0, memsz --data-size
 
 Both are page aligned and congruent, which is what the kernel loader checks
 before it maps anything. The image has no section table and no dynamic
 linking, matching the loader's supported subset.
 
-Because the code segment is placed at a file offset of 0x1000 and the BSS
-segment one page above the load base, the flat binary has to fit in one page.
-That keeps this tool small; a larger test program would use more segments.
+The code segment is placed at a file offset of 0x1000 and the BSS segment at
+`data_offset` from the load base, so the flat binary must stay below that
+offset (one page by default, two when the caller asks for 0x2000). The
+default keeps this tool small; a test program that grows past a page raises
+`data_offset` and computes its BSS addresses from the same value.
 
 Exit codes: 0 = ok, 1 = usage error, 2 = input not usable.
 """
@@ -67,14 +70,17 @@ def parse_args(argv):
     code_path, out_path = argv[1], argv[2]
     base = DEFAULT_BASE
     data_size = PAGE
+    data_offset = PAGE
     for arg in argv[3:]:
         if arg.startswith("--base="):
             base = parse_int(arg.split("=", 1)[1], "--base")
         elif arg.startswith("--data-size="):
             data_size = parse_int(arg.split("=", 1)[1], "--data-size")
+        elif arg.startswith("--data-offset="):
+            data_offset = parse_int(arg.split("=", 1)[1], "--data-offset")
         else:
             die(f"unknown argument: {arg}", 1)
-    return code_path, out_path, base, data_size
+    return code_path, out_path, base, data_size, data_offset
 
 
 def align_up(value, alignment):
@@ -82,7 +88,7 @@ def align_up(value, alignment):
 
 
 def main():
-    code_path, out_path, base, data_size = parse_args(sys.argv)
+    code_path, out_path, base, data_size, data_offset = parse_args(sys.argv)
     with open(code_path, "rb") as f:
         code = f.read()
 
@@ -92,11 +98,14 @@ def main():
         die(f"load base {base:#x} must be page aligned and non-zero")
     if data_size == 0 or data_size % PAGE:
         die(f"data size {data_size:#x} must be a non-zero page multiple")
-    if len(code) > PAGE:
+    if data_offset < PAGE or data_offset % PAGE:
+        die(f"data offset {data_offset:#x} must be a non-zero page multiple")
+    if align_up(len(code), PAGE) > data_offset:
         die(f"code is {len(code)} bytes; the BSS segment starts at "
-            f"base+{PAGE:#x}, so the code segment is limited to {PAGE} bytes")
+            f"base+{data_offset:#x}, so the code segment is limited to "
+            f"{data_offset} bytes")
 
-    data_vaddr = base + PAGE
+    data_vaddr = base + data_offset
     code_memsz = align_up(len(code), PAGE)
 
     ident = bytearray(16)

@@ -9,12 +9,14 @@
 ; unknown number, a W+X mapping, a bad mmap descriptor/offset and an
 ; unaligned munmap. It prints HAKU64-FILE-OK by reading the disk, proves the
 ; write path with HAKU64-DISK-OK, observes a MAP_SHARED page through a
-; forked child and prints HAKU64-FORK-OK, stores a magic word in its
+; forked child and prints HAKU64-FORK-OK, runs a clone()d thread that shares
+; the address space and the descriptor table, sleeps on a futex until the
+; thread wakes it and prints HAKU64-THREAD-OK, stores a magic word in its
 ; zero-filled BSS page and exits with status 0; the kernel reads both back,
 ; which proves the image ran in ring 3 instead of merely being mapped. A
 ; failure exits with the number of the step that failed (the early ABI tests
-; leave 1, the disk, fork, dup, sleep and exec steps use 20-56), which the
-; kernel prints as HAKU64-ELF-RUN-FAIL: exit=N.
+; leave 1, the disk, fork, dup, sleep, exec and thread steps use 20-70), which
+; the kernel prints as HAKU64-ELF-RUN-FAIL: exit=N.
 ;
 ; The code is position independent (RIP-relative operands only), so the flat
 ; binary does not need a linker to resolve USER64_BASE: mkelf64.py chooses the
@@ -28,8 +30,12 @@ default rel
 %define USER64_BASE 0x0000008000400000
 %endif
 
-; mkelf64.py puts the read-write PT_LOAD segment one page above the code.
-%define USER64_BSS (USER64_BASE + 0x1000)
+%ifndef USER64_BSS_OFFSET
+%define USER64_BSS_OFFSET 0x1000
+%endif
+; mkelf64.py puts the read-write PT_LOAD segment at USER64_BSS_OFFSET above
+; the load base; build.py sets both numbers together.
+%define USER64_BSS (USER64_BASE + USER64_BSS_OFFSET)
 
 ; A free page inside the kernel's anonymous mmap window (K64_USER_MMAP_BASE
 ; is 0x8010000000), used to exercise MAP_FIXED.
@@ -43,6 +49,9 @@ default rel
 %define REREAD_BUF (USER64_BSS + 0x500)
 %define EXEC_ARGV  (USER64_BSS + 0x600)
 %define EXEC_ENVP  (USER64_BSS + 0x680)
+%define THREAD_FLAG  (USER64_BSS + 0x700)
+%define THREAD_COUNT (USER64_BSS + 0x708)
+%define THREAD_TIDS  (USER64_BSS + 0x710)
 
 _start:
     mov r15d, 1                     ; step number reported by fail (see top)
@@ -903,6 +912,118 @@ exec_bad:
 
 exec_done:
 
+    ; ---- threads: clone(CLONE_VM|FILES|THREAD|SIGHAND) ----------------
+    ; The child gets its own stack but the same address space, so the words
+    ; it stores below are the words the parent reads: that is what separates
+    ; a thread from fork. The futex make the parent sleep instead of spin.
+    mov r15d, 57
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x2000
+    mov edx, HAKU64_PROT_READ | HAKU64_PROT_WRITE
+    mov r10d, HAKU64_MAP_PRIVATE | HAKU64_MAP_ANONYMOUS
+    mov r8, -1
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle fail
+    add rax, 0x2000                ; top of the thread stack, page aligned
+    mov r13, rax
+
+    ; Start from a known state: BSS is zero, but a re-run would not be.
+    mov rbx, THREAD_FLAG
+    mov qword [rbx], 0
+    mov qword [rbx + 8], 0         ; THREAD_COUNT
+    mov qword [rbx + 16], 0        ; THREAD_TIDS[0]
+    mov qword [rbx + 24], 0        ; THREAD_TIDS[1]
+
+    mov r15d, 58
+    mov eax, HAKU64_SYS_CLONE
+    mov edi, HAKU64_CLONE_VM | HAKU64_CLONE_FILES | HAKU64_CLONE_SIGHAND | HAKU64_CLONE_THREAD
+    mov rsi, r13
+    xor edx, edx
+    xor r10d, r10d
+    xor r8d, r8d
+    syscall
+    test rax, rax
+    js fail
+    jz thread_child
+    mov r13, rax                   ; the child's tid
+
+    ; Wait for the child's flag, asleep. A wake races with the check, so the
+    ; loop re-reads the word and tolerates EAGAIN, like real futex users.
+    mov r15d, 59
+    mov rbx, THREAD_FLAG
+.thread_wait:
+    mov rax, [rbx]
+    test rax, rax
+    jnz .thread_awake
+    mov rdi, rbx
+    mov eax, HAKU64_SYS_FUTEX
+    mov esi, HAKU64_FUTEX_WAIT
+    xor edx, edx
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    je .thread_wait
+    cmp rax, -HAKU64_EAGAIN
+    je .thread_wait
+    jmp fail
+.thread_awake:
+
+    ; The child's locked increment landed in the shared page.
+    mov r15d, 60
+    mov rbx, THREAD_TIDS
+    cmp qword [rbx - 8], 1
+    jne fail
+
+    ; gettid() in the child is the tid clone() returned.
+    mov r15d, 61
+    mov rax, [rbx]
+    cmp rax, r13
+    jne fail
+
+    ; getpid() is the same process id in both tasks (CLONE_THREAD).
+    mov r15d, 62
+    mov eax, HAKU64_SYS_GETPID
+    syscall
+    cmp rax, [rbx + 8]
+    jne fail
+
+    ; CLONE_FILES: the child's dup2(1, 9) is visible here, in the parent's
+    ; own descriptor table, and fd 9 is the console.
+    mov r15d, 63
+    mov eax, HAKU64_SYS_WRITE
+    mov edi, 9
+    lea rsi, [msg_thread]
+    mov edx, msg_thread_end - msg_thread
+    syscall
+    cmp rax, msg_thread_end - msg_thread
+    jne fail
+    mov eax, HAKU64_SYS_CLOSE
+    mov edi, 9
+    syscall
+
+    ; The thread is a child like any other: wait4 reaps it and reports its
+    ; status, which is 7 only when its whole sequence ran.
+    mov r15d, 64
+    mov eax, HAKU64_SYS_WAIT4
+    mov rdi, r13
+    mov rsi, STATUS_BUF
+    xor edx, edx
+    syscall
+    cmp rax, r13
+    jne fail
+    mov r15d, 65
+    mov rbx, STATUS_BUF
+    mov rax, [rbx]
+    shr rax, 8
+    and eax, 0xFF
+    cmp eax, 7
+    jne fail
+
     ; The INT 0x80 gate stays available; the error paths below use it so
     ; both entry points run in the same program.
     ; write() to a descriptor other than 1 or 2 is -EBADF.
@@ -1004,6 +1125,60 @@ exec_done:
 .hang:
     jmp .hang
 
+; The clone child: same address space, its own stack, and its own copy of
+; every register except RAX (0) and RSP (the stack clone() was given).
+thread_child:
+    mov r15d, 66
+    mov rbx, THREAD_COUNT
+    lock inc qword [rbx]
+
+    mov r15d, 67
+    mov eax, HAKU64_SYS_GETTID
+    syscall
+    test rax, rax
+    jle thread_bad
+    mov rbx, THREAD_TIDS
+    mov [rbx], rax
+
+    mov r15d, 68
+    mov eax, HAKU64_SYS_GETPID
+    syscall
+    test rax, rax
+    jle thread_bad
+    mov [rbx + 8], rax
+
+    ; CLONE_FILES: this dup2 updates the table the parent is using too.
+    mov r15d, 69
+    mov eax, HAKU64_SYS_DUP2
+    mov edi, 1
+    mov esi, 9
+    syscall
+    cmp rax, 9
+    jne thread_bad
+
+    ; Publish the word the parent is asleep on, then wake it.
+    mov r15d, 70
+    mov rbx, THREAD_FLAG
+    mov qword [rbx], 1
+    mov rdi, rbx
+    mov eax, HAKU64_SYS_FUTEX
+    mov esi, HAKU64_FUTEX_WAKE
+    mov edx, 1
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+
+    mov eax, HAKU64_SYS_EXIT
+    mov edi, 7
+    syscall
+
+thread_bad:
+    mov rdi, r15
+    mov eax, HAKU64_SYS_EXIT
+    syscall
+    jmp $
+
 ; R15 holds the step number from the header; exiting with it names the check
 ; that failed. The INT 0x80 gate is used so this path exercises both entry
 ; points even when the fast path is what broke.
@@ -1040,6 +1215,10 @@ msg_dup_end:
 msg_exec:
     db 'HAKU64-EXEC-OK', 13, 10
 msg_exec_end:
+
+msg_thread:
+    db 'HAKU64-THREAD-OK', 13, 10
+msg_thread_end:
 
 path_hello:
     db '/hello.txt', 0

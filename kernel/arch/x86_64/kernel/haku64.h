@@ -134,6 +134,7 @@ typedef signed long long s64;
 #define K64_SYS_DUP2          33u
 #define K64_SYS_NANOSLEEP     35u
 #define K64_SYS_GETPID        39u
+#define K64_SYS_CLONE         56u
 #define K64_SYS_FORK          57u
 #define K64_SYS_EXECVE        59u
 #define K64_SYS_EXIT          60u
@@ -141,8 +142,39 @@ typedef signed long long s64;
 #define K64_SYS_KILL          62u
 #define K64_SYS_MKDIR         83u
 #define K64_SYS_GETPPID       110u
+#define K64_SYS_GETTID        186u
+#define K64_SYS_FUTEX         202u
 #define K64_SYS_CLOCK_GETTIME 228u
 #define K64_SYS_EXIT_GROUP    231u
+
+/* clone() flags, with the Linux numbering. Only these are honoured; the
+ * rest are refused so a caller never believes it got a guarantee (thread
+ * TLS, for example, is not implemented). CLONE_VM and CLONE_THREAD are the
+ * two that make a thread: one address space, one process id. CLONE_FS and
+ * CLONE_SYSVSEM are accepted as no-ops because there is no per-task cwd,
+ * umask or semaphore undo list to share yet, so "shared" is the only
+ * truthful answer. */
+#define K64_CLONE_VM              0x00000100u
+#define K64_CLONE_FS              0x00000200u
+#define K64_CLONE_FILES           0x00000400u
+#define K64_CLONE_SIGHAND         0x00000800u
+#define K64_CLONE_THREAD          0x00010000u
+#define K64_CLONE_SYSVSEM         0x00040000u
+#define K64_CLONE_PARENT_SETTID   0x00100000u
+#define K64_CLONE_CHILD_CLEARTID  0x00200000u
+#define K64_CLONE_SETTLS          0x00080000u
+#define K64_CLONE_CHILD_SETTID    0x01000000u
+#define K64_CLONE_SUPPORTED \
+    (K64_CLONE_VM | K64_CLONE_FS | K64_CLONE_FILES | K64_CLONE_SIGHAND | \
+     K64_CLONE_THREAD | K64_CLONE_SYSVSEM | K64_CLONE_PARENT_SETTID)
+
+/* futex(): op is the low seven bits. FUTEX_PRIVATE_FLAG is accepted and
+ * treated like the plain op, because a waiter is matched on the address it
+ * parked on, which is the private case. WAIT without a timeout only. */
+#define K64_FUTEX_WAIT          0u
+#define K64_FUTEX_WAKE          1u
+#define K64_FUTEX_PRIVATE_FLAG  128u
+#define K64_FUTEX_OP_MASK       127u
 
 /* PROT_* and MAP_* as Linux spells them. mmap takes either an anonymous
  * range (fd must be -1) or an open descriptor from fs64.c. MAP_SHARED
@@ -421,6 +453,9 @@ enum {
     K64_TASK_UNUSED = 0,
     K64_TASK_READY,
     K64_TASK_RUNNING,
+    /* Blocked in futex(FUTEX_WAIT). The saved frame is the syscall frame
+     * with RAX=0, so a wake resumes the task as if the call had returned. */
+    K64_TASK_WAIT,
     K64_TASK_DONE
 };
 
@@ -463,6 +498,21 @@ void task64_map_drop(int id, u64 base, u64 length);
  * parent blocks in wait4 until the child is DONE, then the child's space,
  * frames and kernel stack are released. */
 regs64_t *sched64_fork(regs64_t *frame);
+/* clone(): with CLONE_VM the child runs in the caller's address space on
+ * `child_stack` (16-byte aligned, inside the user half), shares the space's
+ * frames and mapping records, and returns 0 in the child. CLONE_THREAD keeps
+ * the caller's process id (getpid) while gettid differs; CLONE_FILES shares
+ * the descriptor table, otherwise the child gets a copy. The child is
+ * reapable by the task that created it. */
+regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack);
+/* Process id of the thread group `id` belongs to, as a task index. */
+int sched64_tgid(int id);
+/* futex blocking: park the caller on `address` (already checked against the
+ * expected value) and switch away; returns the frame to resume the next
+ * task with. `sched64_futex_wake` makes up to `count` waiters on the same
+ * address runnable again and answers how many it woke. */
+regs64_t *sched64_futex_wait(regs64_t *frame, u64 address);
+int sched64_futex_wake(int id, u64 address, int count);
 /* end the caller on a signal (no handlers exist, so this is exit-by-signal) */
 regs64_t *sched64_terminate(regs64_t *frame, u32 signal);
 /* reap a DONE child of `parent`; returns the child id or a negative errno */
@@ -499,6 +549,10 @@ int fs64_fd_dup2(int task, int fd, int target);
 int fs64_fd_console(int task, int fd);
 void fs64_fd_close(int task, int fd);
 void fs64_fork_fds(int parent, int child);
+/* clone(CLONE_FILES): the child uses the parent's table, so a descriptor one
+ * thread opens, closes or dup2s is visible to the other. The table is closed
+ * only when the last user is reaped. */
+void fs64_share_fds(int parent, int child);
 void fs64_task_cleanup(int task);
 
 /* syscall64.c: SYSCALL/SYSRET dispatch */

@@ -20,6 +20,7 @@
 %define HAKU64_SYS_DUP2          33
 %define HAKU64_SYS_NANOSLEEP     35
 %define HAKU64_SYS_GETPID        39
+%define HAKU64_SYS_CLONE         56
 %define HAKU64_SYS_FORK          57
 %define HAKU64_SYS_EXECVE        59
 %define HAKU64_SYS_EXIT          60
@@ -27,8 +28,24 @@
 %define HAKU64_SYS_KILL          62
 %define HAKU64_SYS_MKDIR         83
 %define HAKU64_SYS_GETPPID       110
+%define HAKU64_SYS_GETTID        186
+%define HAKU64_SYS_FUTEX         202
 %define HAKU64_SYS_CLOCK_GETTIME 228
 %define HAKU64_SYS_EXIT_GROUP    231
+
+; clone() flags; the kernel honours exactly this subset.
+%define HAKU64_CLONE_VM            0x00000100
+%define HAKU64_CLONE_FS            0x00000200
+%define HAKU64_CLONE_FILES         0x00000400
+%define HAKU64_CLONE_SIGHAND       0x00000800
+%define HAKU64_CLONE_THREAD        0x00010000
+%define HAKU64_CLONE_SYSVSEM       0x00040000
+%define HAKU64_CLONE_PARENT_SETTID 0x00100000
+
+; futex() operations; FUTEX_PRIVATE_FLAG is accepted and ignored.
+%define HAKU64_FUTEX_WAIT         0
+%define HAKU64_FUTEX_WAKE         1
+%define HAKU64_FUTEX_PRIVATE_FLAG 128
 
 %define HAKU64_O_RDONLY 0
 %define HAKU64_O_WRONLY 1
@@ -58,6 +75,7 @@
 %define HAKU64_ENOENT 2
 %define HAKU64_ENOEXEC 8
 %define HAKU64_EBADF  9
+%define HAKU64_EAGAIN 11
 %define HAKU64_ENOMEM 12
 %define HAKU64_EFAULT 14
 %define HAKU64_EEXIST 17

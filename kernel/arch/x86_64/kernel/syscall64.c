@@ -39,6 +39,7 @@
 #define SYS64_ENOMEM 12ull
 #define SYS64_EACCES 13ull
 #define SYS64_EFAULT 14ull
+#define SYS64_EAGAIN 11ull
 #define SYS64_EINVAL 22ull
 #define SYS64_ENOSPC 28ull
 #define SYS64_ENOSYS 38ull
@@ -730,18 +731,102 @@ static u64 sys64_lseek(u64 fd, u64 offset, u64 whence) {
     return (u64)pos;
 }
 
-/* getpid(): task index + 1, so a process never sees pid 0. */
+/* getpid(): the thread group's pid, which is task index + 1, so a process
+ * never sees pid 0 and a thread sees the same value as its creator. */
 static u64 sys64_getpid(void) {
+    int id = sched64_tgid(sched64_current());
+
+    return id < 0 ? 1 : (u64)(id + 1);
+}
+
+/* getppid(): the parent process's pid, or 0 for a task the boot context
+ * created. A thread answers with its group leader's parent, like Linux. */
+static u64 sys64_getppid(void) {
+    int leader = sched64_tgid(sched64_current());
+    int parent = leader < 0 ? -1 : task64_parent(leader);
+
+    if (parent >= 0) parent = sched64_tgid(parent);
+    return parent < 0 ? 0 : (u64)(parent + 1);
+}
+
+/* gettid(): this task's own id, distinct from getpid() inside a thread
+ * group and equal to it for a single-threaded process. */
+static u64 sys64_gettid(void) {
     int id = sched64_current();
 
     return id < 0 ? 1 : (u64)(id + 1);
 }
 
-/* getppid(): the parent's pid, or 0 for a task the boot context created. */
-static u64 sys64_getppid(void) {
-    int parent = task64_parent(sched64_current());
+/* clone(flags, child_stack, parent_tid, child_tid, tls): CLONE_VM is what
+ * makes this a thread, because the child then runs in the caller's address
+ * space with its own stack. Without CLONE_VM the call degrades to a fork, so
+ * a caller that asks for a process still gets one. The unsupported flags are
+ * refused instead of ignored: a task must not believe it got TLS or a
+ * clear-on-exit child TID when the kernel does not implement them. */
+static regs64_t *sys64_clone(regs64_t *frame) {
+    u64 flags = frame->rdi;
+    u64 parent_tid = frame->rdx;
+    u64 space = current_space();
 
-    return parent < 0 ? 0 : (u64)(parent + 1);
+    if (flags & ~(u64)K64_CLONE_SUPPORTED) {
+        frame->rax = (u64)0 - SYS64_EINVAL;
+        return frame;
+    }
+    if ((flags & K64_CLONE_PARENT_SETTID) &&
+        !user_page64(space, parent_tid, 0, 1)) {
+        frame->rax = (u64)0 - SYS64_EFAULT;
+        return frame;
+    }
+
+    frame = sched64_clone(frame, flags, frame->rsi);
+    if ((s64)frame->rax > 0 && (flags & K64_CLONE_PARENT_SETTID)) {
+        u32 pid = (u32)frame->rax;
+
+        /* The parent's space is still current: clone() never switched. */
+        if (!copy_to_user64(space, parent_tid, &pid, 4))
+            frame->rax = (u64)0 - SYS64_EFAULT;
+    }
+    return frame;
+}
+
+/* futex(uaddr, op, val, timeout, uaddr2, val3): only WAIT and WAKE exist,
+ * and WAIT has no timeout, so `timeout` is never read. FUTEX_PRIVATE_FLAG is
+ * accepted because the address check is always against one address space.
+ * WAIT compares the word once; a different value means the wake happened
+ * first and is reported as -EAGAIN rather than sleeping through it. A real
+ * wait returns the next task's frame from the scheduler, so the caller's
+ * frame is never resumed twice. */
+static regs64_t *sys64_futex(regs64_t *frame) {
+    u64 uaddr = frame->rdi;
+    u64 op = frame->rsi;
+    u32 word;
+
+    if (op & ~(u64)(K64_FUTEX_OP_MASK | K64_FUTEX_PRIVATE_FLAG)) {
+        frame->rax = (u64)0 - SYS64_EINVAL;
+        return frame;
+    }
+
+    switch (op & K64_FUTEX_OP_MASK) {
+    case K64_FUTEX_WAKE:
+        frame->rax = (u64)sched64_futex_wake(sched64_current(), uaddr,
+                                             (int)frame->rdx);
+        return frame;
+
+    case K64_FUTEX_WAIT:
+        if (!copy_from_user64(current_space(), &word, uaddr, 4)) {
+            frame->rax = (u64)0 - SYS64_EFAULT;
+            return frame;
+        }
+        if (word != (u32)frame->rdx) {
+            frame->rax = (u64)0 - SYS64_EAGAIN;
+            return frame;
+        }
+        return sched64_futex_wait(frame, uaddr);
+
+    default:
+        frame->rax = (u64)0 - SYS64_EINVAL;
+        return frame;
+    }
 }
 
 /* wait4(pid, status, options): block until one child is DONE, write its
@@ -922,6 +1007,12 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
     case K64_SYS_FORK:
         return sched64_fork(frame);
 
+    case K64_SYS_CLONE:
+        return sys64_clone(frame);
+
+    case K64_SYS_FUTEX:
+        return sys64_futex(frame);
+
     case K64_SYS_EXECVE:
         return sys64_execve(frame);
 
@@ -939,6 +1030,10 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     case K64_SYS_GETPID:
         result = sys64_getpid();
+        break;
+
+    case K64_SYS_GETTID:
+        result = sys64_gettid();
         break;
 
     case K64_SYS_GETPPID:

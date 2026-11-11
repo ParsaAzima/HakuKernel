@@ -63,8 +63,12 @@ typedef struct {
 
 /* One descriptor table per task: an index into the description table. -1 is
  * a free descriptor, and for 0..2 it is also the implicit console every task
- * starts with (see fs64_fd_console). */
+ * starts with (see fs64_fd_console). Threads cloned with CLONE_FILES share a
+ * table, so a row is owned by one task slot and the others point at it;
+ * `fd_users` counts the live users and only the last one closes them. */
 static int fd_desc[K64_TASK_MAX][FS64_FD_MAX];
+static int fd_owner[K64_TASK_MAX];
+static u32 fd_users[K64_TASK_MAX];
 static fs64_desc_t descs[FS64_DESC_MAX];
 
 /* Linux errno numbers, returned as negative ints by the helpers below. */
@@ -305,9 +309,12 @@ int fs64_init(void) {
         memset(&cache[i], 0, sizeof(cache[i]));
     for (u32 i = 0; i < FS64_DESC_MAX; i++)
         memset(&descs[i], 0, sizeof(descs[i]));
-    for (u32 task = 0; task < K64_TASK_MAX; task++)
+    for (u32 task = 0; task < K64_TASK_MAX; task++) {
         for (u32 fd = 0; fd < FS64_FD_MAX; fd++)
             fd_desc[task][fd] = -1;
+        fd_owner[task] = (int)task;
+        fd_users[task] = 1;
+    }
 
     if (fat12_mount() != 1) return 0;
     return 1;
@@ -447,6 +454,14 @@ static int valid_fd(int task, int fd) {
            fd >= 0 && fd < (int)FS64_FD_MAX;
 }
 
+/* The row that actually holds this task's descriptors: itself for a process,
+ * the row of the task it was cloned from after CLONE_FILES. */
+static int fd_task(int task) {
+    if (!valid_fd(task, 0)) return task;
+    if (!valid_fd(fd_owner[task], 0)) return task;
+    return fd_owner[task];
+}
+
 /* The description a descriptor refers to, or 0 for a free descriptor. The
  * console descriptors 0..2 are implicit: they only get a description once
  * something duplicates them or redirects one onto a file. */
@@ -481,6 +496,7 @@ static int desc_index(fs64_desc_t *desc) {
 int fs64_fd_console(int task, int fd) {
     fs64_desc_t *desc;
 
+    task = fd_task(task);
     if (!valid_fd(task, fd)) return 0;
     desc = fd_get(task, fd);
     if (!desc) return fd <= 2;
@@ -502,6 +518,7 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
         if (error) *error = -FS64_EINVAL;
         return -1;
     }
+    task = fd_task(task);
     if (flags & ~(u64)(K64_O_RDONLY | K64_O_WRONLY | K64_O_RDWR |
                        K64_O_CREAT | K64_O_EXCL | K64_O_TRUNC |
                        K64_O_APPEND) ||
@@ -546,20 +563,20 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
 /* The cache slot behind `fd`, or a negative value: -1 for a free or console
  * descriptor, -2 for a duplicated console descriptor. */
 int fs64_fd_file(int task, int fd) {
-    fs64_desc_t *desc = fd_get(task, fd);
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
     if (!desc) return -1;
     return desc->slot;
 }
 
 u64 fs64_fd_pos(int task, int fd) {
-    fs64_desc_t *desc = fd_get(task, fd);
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
     return desc ? desc->pos : 0;
 }
 
 int fs64_fd_seek(int task, int fd, u64 pos) {
-    fs64_desc_t *desc = fd_get(task, fd);
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
     if (!desc || desc->slot < 0) return 0;
     desc->pos = pos;
@@ -568,7 +585,7 @@ int fs64_fd_seek(int task, int fd, u64 pos) {
 
 /* 0 = read-only, 1 = write-only, 2 = read-write, -1 = not a file. */
 int fs64_fd_access(int task, int fd) {
-    fs64_desc_t *desc = fd_get(task, fd);
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
     if (!desc || desc->slot < 0) return -1;
     return (int)desc->flags;
@@ -582,6 +599,7 @@ int fs64_fd_dup2(int task, int fd, int target) {
     fs64_desc_t *old;
     int fresh = 0;
 
+    task = fd_task(task);
     if (!valid_fd(task, fd) || !valid_fd(task, target)) return -FS64_EBADF;
     if (fd == target) return fd_get(task, fd) || fd <= 2 ? target : -FS64_EBADF;
     desc = fd_get(task, fd);
@@ -607,6 +625,7 @@ int fs64_fd_dup(int task, int fd, int minimum) {
     int target;
 
     if (task < 0 || task >= (int)K64_TASK_MAX) return -FS64_EBADF;
+    task = fd_task(task);
     if (minimum < 0) minimum = 0;
     for (target = minimum; target < (int)FS64_FD_MAX; target++)
         if (fd_desc[task][target] < 0) break;
@@ -620,6 +639,7 @@ void fs64_fd_close(int task, int fd) {
     int slot_index;
 
     if (!valid_fd(task, fd)) return;
+    task = fd_task(task);
     desc = fd_get(task, fd);
     if (!desc) return;
 
@@ -649,25 +669,87 @@ void fs64_fd_close(int task, int fd) {
 
 /* fork inherits the descriptors, and since a descriptor is only an index
  * into the description table both tasks then share offsets and cache entry,
- * which is what POSIX requires of a forked child. */
+ * which is what POSIX requires of a forked child. The table itself is a
+ * private copy: opening or closing in one task must not be seen in the
+ * other, only the underlying description is shared. */
 void fs64_fork_fds(int parent, int child) {
+    int source;
+
     if (parent < 0 || child < 0 || parent >= (int)K64_TASK_MAX ||
         child >= (int)K64_TASK_MAX)
         return;
+    source = fd_task(parent);
     for (u32 fd = 0; fd < FS64_FD_MAX; fd++) {
         fs64_desc_t *desc;
 
-        fd_desc[child][fd] = fd_desc[parent][fd];
-        desc = fd_get(child, (int)fd);
+        fd_desc[child][fd] = fd_desc[source][fd];
+        desc = fd_get(source, (int)fd);
         if (!desc) continue;
         desc->refs++;
         if (desc->slot >= 0) cache[desc->slot].refs++;
     }
+    fd_owner[child] = child;
+    fd_users[child] = 1;
+}
+
+/* clone(CLONE_FILES): the child has no table of its own, it uses the
+ * parent's, so an open, close or dup2 in either thread is visible to the
+ * other. The row is closed only when the last user is reaped. */
+void fs64_share_fds(int parent, int child) {
+    int owner;
+
+    if (parent < 0 || child < 0 || parent >= (int)K64_TASK_MAX ||
+        child >= (int)K64_TASK_MAX)
+        return;
+    owner = fd_task(parent);
+    for (u32 fd = 0; fd < FS64_FD_MAX; fd++)
+        fd_desc[child][fd] = -1;
+    fd_owner[child] = owner;
+    fd_users[owner]++;
 }
 
 void fs64_task_cleanup(int task) {
+    int owner;
+
     if (task < 0 || task >= (int)K64_TASK_MAX) return;
+    owner = fd_task(task);
+
+    if (owner != task) {
+        /* A thread sharing CLONE_FILES leaves; the row stays with the owner
+         * (which is alive, so the count cannot reach zero here). */
+        if (fd_users[owner] > 0) fd_users[owner]--;
+        for (u32 fd = 0; fd < FS64_FD_MAX; fd++)
+            fd_desc[task][fd] = -1;
+        fd_owner[task] = task;
+        fd_users[task] = 1;
+        return;
+    }
+
+    /* The owner is going away. If a thread still shares the table, hand the
+     * row over instead of closing it: the descriptors stay open, exactly as
+     * they do when any other thread exits. */
+    if (fd_users[task] > 1) {
+        for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+            if (i == task || task64_state(i) == K64_TASK_UNUSED) continue;
+            if (fd_owner[i] != task) continue;
+            for (u32 fd = 0; fd < FS64_FD_MAX; fd++)
+                fd_desc[i][fd] = fd_desc[task][fd];
+            /* Every other sharer now points at the new owner. */
+            for (int j = 1; j < (int)K64_TASK_MAX; j++)
+                if (fd_owner[j] == task) fd_owner[j] = i;
+            fd_users[i] = fd_users[task] - 1;
+            fd_users[task] = 1;
+            for (u32 fd = 0; fd < FS64_FD_MAX; fd++)
+                fd_desc[task][fd] = -1;
+            return;
+        }
+    }
+
     for (u32 fd = 0; fd < FS64_FD_MAX; fd++)
         if (fd_desc[task][fd] >= 0) fs64_fd_close(task, (int)fd);
+    /* A free slot keeps the invariant every live task has: its own row with
+     * a single user, so a later CLONE_FILES from that slot starts at one. */
+    fd_users[task] = 1;
+    fd_owner[task] = task;
 }
 

@@ -451,12 +451,16 @@ def build_x64(nasm, py, memory_mb):
     log(f"{len(objects)} x64 C objects built")
 
     # 2. the ring-3 test program: flat binary -> static ELF64 -> embedded
-    #    .rdata object. mkelf64.py also refuses a program too large for the
-    #    one-page code segment the layout promises.
+    #    .rdata object. The program outgrew one code page, so it carries its
+    #    BSS two pages above the base; mkelf64.py and the assembler get the
+    #    same number, and mkelf64.py still refuses a program that overflows.
+    user_bss = 0x2000
     run([nasm, "-I" + os.path.join(ROOT, "include"), "-f", "bin",
-         f"-DUSER64_BASE={user_base:#x}", user_src, "-o", user_flat])
+         f"-DUSER64_BASE={user_base:#x}", f"-DUSER64_BSS_OFFSET={user_bss:#x}",
+         user_src, "-o", user_flat])
     run([py, os.path.join(ROOT, "tools", "mkelf64.py"),
-         user_flat, user_elf, f"--base={user_base:#x}"])
+         user_flat, user_elf, f"--base={user_base:#x}",
+         f"--data-offset={user_bss:#x}"])
     embedded = user_elf.replace("/", "\\")
     run([nasm, "-f", "win64", f"-DUSER64_IMAGE={embedded}",
          user_image_asm, "-o", user_image_obj])
@@ -529,7 +533,7 @@ def build_x64(nasm, py, memory_mb):
                 "HAKU64-RTC-OK", "HAKU64-SYSCALL64-OK", "HAKU64-FS-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",
-                "HAKU64-SELFTEST-OK"]
+                "HAKU64-THREAD-OK", "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():
