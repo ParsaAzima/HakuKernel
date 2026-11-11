@@ -39,7 +39,10 @@ typedef struct {
     u64 fault_vector; /* non-zero when the task stopped on a ring-3 fault */
     u64 fault_address;
     u64 mmap_next;   /* per-task bump pointer for anonymous mappings */
+    u64 brk;         /* program break; 0 until the first brk() call */
     u64 futex_addr;  /* user address a K64_TASK_WAIT task is parked on */
+    char cwd[K64_FS_PATH_MAX + 1]; /* working directory, canonical and absolute */
+    char comm[16];   /* prctl(PR_SET_NAME) name, NUL-terminated */
 } task64_t;
 
 static task64_t tasks[K64_TASK_MAX];
@@ -101,6 +104,18 @@ static int find_free(void) {
     return -1;
 }
 
+/* PR_SET_NAME/PR_GET_NAME storage: at most 15 bytes plus the terminator,
+ * like Linux's TASK_COMM_LEN. */
+static void comm_set(int id, const char *name) {
+    u32 i = 0;
+
+    while (name && name[i] && i < sizeof(tasks[id].comm) - 1u) {
+        tasks[id].comm[i] = name[i];
+        i++;
+    }
+    tasks[id].comm[i] = 0;
+}
+
 /* The frame is placed so that the IRETQ path leaves RSP 8 mod 16 at the
  * entry point, the same alignment a CALL would produce: the compiler is
  * allowed to assume it. A frame is 176 bytes, so `top - 8 - 176` aligned
@@ -154,6 +169,10 @@ void sched64_init(void) {
     tasks[0].fault_address = 0;
     tasks[0].mmap_next = 0;
     tasks[0].futex_addr = 0;
+    tasks[0].brk = 0;
+    tasks[0].cwd[0] = '/';
+    tasks[0].cwd[1] = 0;
+    comm_set(0, "kernel");
     space_refs[0] = 1;
     memcpy(fxsave_areas[0], fxsave_default, sizeof(fxsave_default));
 
@@ -186,6 +205,10 @@ int task64_create_kernel(void (*entry)(void)) {
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = 0;
     tasks[id].futex_addr = 0;
+    tasks[id].brk = 0;
+    tasks[id].cwd[0] = '/';
+    tasks[id].cwd[1] = 0;
+    comm_set(id, "kthread");
     space_owner[id] = id;
     space_refs[id] = 1;
     prepare_sse(id);
@@ -229,6 +252,10 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = K64_USER_MMAP_BASE;
     tasks[id].futex_addr = 0;
+    tasks[id].brk = 0;
+    tasks[id].cwd[0] = '/';
+    tasks[id].cwd[1] = 0;
+    comm_set(id, "user");
     space_owner[id] = id;
     space_refs[id] = 1;
     prepare_sse(id);
@@ -275,6 +302,20 @@ regs64_t *sched64_tick(regs64_t *frame) {
 
     next = pick_ready();
     if (next < 0) return frame;     /* nothing else to run: stay here */
+    return switch_to(next, 1);
+}
+
+/* sched_yield(): give another READY task the CPU and resume at the caller's
+ * syscall return. With no other runnable task the caller simply continues,
+ * which is what POSIX allows. */
+regs64_t *sched64_yield(regs64_t *frame) {
+    int next;
+
+    if (!enabled || current_index < 0) return frame;
+    if (tasks[current_index].state == K64_TASK_RUNNING)
+        tasks[current_index].frame = frame;
+    next = pick_ready();
+    if (next < 0) return frame;
     return switch_to(next, 1);
 }
 
@@ -379,6 +420,67 @@ u64 task64_fault_address(int id) {
 
 u64 task64_mmap_base(int id) {
     return valid_id(id) ? tasks[as_owner(id)].mmap_next : 0;
+}
+
+/* The program break lives with the address space, like the bump pointer:
+ * a thread sees the break its process set. */
+u64 task64_get_brk(int id) {
+    return valid_id(id) ? tasks[as_owner(id)].brk : 0;
+}
+
+void task64_set_brk(int id, u64 value) {
+    if (valid_id(id)) tasks[as_owner(id)].brk = value;
+}
+
+/* Working-directory accessors. The path is stored canonical and absolute
+ * ("/" at the volume root), so getcwd only has to copy it and a relative
+ * path is the stored prefix plus the user's name. Threads resolve through
+ * the space owner (CLONE_FS semantics): a chdir in one thread moves the
+ * whole group, which is what a process with threads expects. */
+int task64_get_cwd(int id, char *out, u64 size) {
+    int owner;
+    u64 length = 0;
+
+    if (!valid_id(id)) return -3;                 /* ESRCH */
+    owner = as_owner(id);
+    while (tasks[owner].cwd[length]) length++;
+    if (size < length + 1) return -34;            /* ERANGE */
+    for (u64 i = 0; i <= length; i++) out[i] = tasks[owner].cwd[i];
+    return 0;
+}
+
+int task64_set_cwd(int id, const char *path) {
+    int owner;
+    u64 length = 0;
+
+    if (!valid_id(id) || !path || path[0] != '/') return -22;   /* EINVAL */
+    while (path[length]) {
+        if (length >= (u64)K64_FS_PATH_MAX) return -36;         /* ENAMETOOLONG */
+        length++;
+    }
+    owner = as_owner(id);
+    for (u64 i = 0; i <= length; i++) tasks[owner].cwd[i] = path[i];
+    return 0;
+}
+
+int task64_set_name(int id, const char *name) {
+    if (!valid_id(id) || !name) return -22;                     /* EINVAL */
+    comm_set(id, name);
+    return 0;
+}
+
+void task64_get_name(int id, char out[16]) {
+    int i = 0;
+
+    if (!valid_id(id)) {
+        out[0] = 0;
+        return;
+    }
+    while (i < 15 && tasks[id].comm[i]) {
+        out[i] = tasks[id].comm[i];
+        i++;
+    }
+    out[i] = 0;
 }
 
 /* Reserve `pages` at the task's bump pointer. The reservation is recorded
@@ -528,6 +630,14 @@ static void space_detach(int id) {
             memset(mappings[id], 0, sizeof(mappings[id]));
             tasks[i].space = tasks[id].space;
             tasks[i].mmap_next = tasks[id].mmap_next;
+            {
+                u64 k = 0;
+                while (tasks[id].cwd[k] && k < K64_FS_PATH_MAX) {
+                    tasks[i].cwd[k] = tasks[id].cwd[k];
+                    k++;
+                }
+                tasks[i].cwd[k] = 0;
+            }
             space_owner[i] = i;
             for (int j = 1; j < (int)K64_TASK_MAX; j++)
                 if (j != i && space_owner[j] == id) space_owner[j] = i;
@@ -620,6 +730,20 @@ regs64_t *sched64_fork(regs64_t *frame) {
     tasks[child].fault_address = 0;
     tasks[child].mmap_next = tasks[parent].mmap_next;
     tasks[child].futex_addr = 0;
+    tasks[child].brk = 0;
+    tasks[child].cwd[0] = '/';
+    tasks[child].cwd[1] = 0;
+    {
+        int owner = as_owner(parent);
+        u64 i = 0;
+        tasks[child].brk = tasks[owner].brk;
+        while (tasks[owner].cwd[i] && i < K64_FS_PATH_MAX) {
+            tasks[child].cwd[i] = tasks[owner].cwd[i];
+            i++;
+        }
+        tasks[child].cwd[i] = 0;
+        comm_set(child, tasks[owner].comm);
+    }
     space_owner[child] = child;
     space_refs[child] = 1;
 
@@ -704,6 +828,17 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
     tasks[child].fault_vector = 0;
     tasks[child].fault_address = 0;
     tasks[child].futex_addr = 0;
+    tasks[child].brk = 0;
+    {
+        int source = as_owner(parent);
+        u64 i = 0;
+        while (tasks[source].cwd[i] && i < K64_FS_PATH_MAX) {
+            tasks[child].cwd[i] = tasks[source].cwd[i];
+            i++;
+        }
+        tasks[child].cwd[i] = 0;
+        comm_set(child, tasks[source].comm);
+    }
     /* The space, its mapping records and the bump pointer stay with the
      * owner; the new thread is one more user until it is reaped. */
     space_owner[child] = owner;
@@ -762,6 +897,7 @@ int sched64_futex_wake(int id, u64 address, int count) {
         if (tasks[i].state != K64_TASK_WAIT) continue;
         if (tasks[i].futex_addr != address) continue;
         tasks[i].futex_addr = 0;
+        tasks[i].brk = 0;
         tasks[i].state = K64_TASK_READY;
         if (++woken >= count) break;
     }

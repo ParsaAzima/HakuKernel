@@ -283,6 +283,28 @@ int paging64_query_space(u64 space, u64 virt, u64 *phys, int *writable,
     return 1;
 }
 
+/* Change the protection of one mapped user page (mprotect). Returns 0 when
+ * the page is absent or not a user leaf. NX is the inverse of `executable`,
+ * so clearing it makes the page executable again. */
+int paging64_protect_space(u64 space, u64 virt, int writable, int executable) {
+    u64 *entry;
+
+    if (!space || !user_address(virt)) return 0;
+    entry = space_leaf(space, virt);
+    if (!entry || !(*entry & PAGE_PRESENT)) return 0;
+    if (!(*entry & PAGE_USER)) return 0;
+    if (writable)
+        *entry |= PAGE_WRITABLE;
+    else
+        *entry &= ~PAGE_WRITABLE;
+    if (executable)
+        *entry &= ~PAGE_NX;
+    else
+        *entry |= PAGE_NX;
+    invlpg64(virt);
+    return 1;
+}
+
 u64 paging64_unmap_space(u64 space, u64 virt) {
     u64 *entry;
     u64 phys;

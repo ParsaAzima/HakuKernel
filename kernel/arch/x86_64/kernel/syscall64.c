@@ -122,6 +122,670 @@ static int copy_from_user64(u64 space, void *dst, u64 address, u64 length) {
     return 1;
 }
 
+/* ------------------------------------------------------------------ *
+ * Paths, metadata and the newer file calls.
+ *
+ * The 64-bit layer keeps a canonical absolute working directory per process
+ * ("/" at the volume root), so every relative path is joined to it before
+ * FAT12 ever sees a name. FAT12 itself resolves from the root when a path
+ * starts with '/', which is exactly what this canonical form guarantees.
+ * ------------------------------------------------------------------ */
+
+#define SYS64_ENOTDIR      20ull
+#define SYS64_EISDIR       21ull
+#define SYS64_ENOTTY       25ull
+#define SYS64_ESPIPE       29ull
+#define SYS64_EPIPE        32ull
+#define SYS64_ERANGE       34ull
+#define SYS64_ENAMETOOLONG 36ull
+#define SYS64_ENOTEMPTY    39ull
+#define SYS64_EEXIST       17ull
+#define SYS64_EOVERFLOW    75ull
+#define SYS64_EOPNOTSUPP   95ull
+
+/* x86-64 Linux "struct stat": 144 bytes, all fields naturally aligned. */
+typedef struct {
+    u64 st_dev;
+    u64 st_ino;
+    u64 st_nlink;
+    u32 st_mode;
+    u32 st_uid;
+    u32 st_gid;
+    u32 __pad0;
+    u64 st_rdev;
+    s64 st_size;
+    s64 st_blksize;
+    s64 st_blocks;
+    s64 st_atime_sec;
+    s64 st_atime_nsec;
+    s64 st_mtime_sec;
+    s64 st_mtime_nsec;
+    s64 st_ctime_sec;
+    s64 st_ctime_nsec;
+    s64 __unused[3];
+} sys64_stat_t;
+
+typedef char sys64_stat_must_be_144_bytes[
+    (sizeof(sys64_stat_t) == 144u) ? 1 : -1];
+
+/* x86-64 "struct statx": 256 bytes. */
+typedef struct {
+    s64 tv_sec;
+    u32 tv_nsec;
+    int reserved;
+} sys64_statx_time_t;
+
+typedef struct {
+    u32 stx_mask;
+    u32 stx_blksize;
+    u64 stx_attributes;
+    u32 stx_nlink;
+    u32 stx_uid;
+    u32 stx_gid;
+    u16 stx_mode;
+    u16 __spare0;
+    u64 stx_ino;
+    u64 stx_size;
+    u64 stx_blocks;
+    u64 stx_attributes_mask;
+    sys64_statx_time_t stx_atime;
+    sys64_statx_time_t stx_btime;
+    sys64_statx_time_t stx_ctime;
+    sys64_statx_time_t stx_mtime;
+    u32 stx_rdev_major;
+    u32 stx_rdev_minor;
+    u32 stx_dev_major;
+    u32 stx_dev_minor;
+    u64 stx_mnt_id;
+    u32 stx_dio_mem_align;
+    u32 stx_dio_offset_align;
+    u64 __spare3[12];
+} sys64_statx_t;
+
+typedef char sys64_statx_must_be_256_bytes[
+    (sizeof(sys64_statx_t) == 256u) ? 1 : -1];
+
+#define SYS64_STATX_BASIC 0x7ffu
+#define SYS64_S_IFREG 0x8000u
+#define SYS64_S_IFDIR 0x4000u
+#define SYS64_S_IFCHR 0x2000u
+#define SYS64_DT_CHR  2u
+#define SYS64_DT_DIR  4u
+#define SYS64_DT_REG  8u
+
+/* Copy one NUL-terminated path out of user memory, one page at a time.
+ * Returns the byte length (without the terminator) or a negative errno. */
+static s64 copy_user_path64(u64 space, u64 address,
+                            char out[K64_PATH_MAX + 1]) {
+    u32 done = 0;
+
+    while (done <= K64_PATH_MAX) {
+        u64 page = K64_PAGE_SIZE - ((address + done) & (K64_PAGE_SIZE - 1));
+        u32 chunk = K64_PATH_MAX + 1u - done;
+
+        if (page < chunk) chunk = (u32)page;
+        if (!copy_from_user64(space, out + done, address + done, chunk))
+            return (s64)0 - (s64)SYS64_EFAULT;
+        for (u32 i = 0; i < chunk; i++)
+            if (out[done + i] == '\0') return (s64)(done + i);
+        done += chunk;
+    }
+    return (s64)0 - (s64)SYS64_ENAMETOOLONG;
+}
+
+/* Collapse `base` (absolute) plus `path` into a canonical absolute path:
+ * leading slash, no "." or ".." components, no trailing slash, and "/" for
+ * the volume root. Returns 0 or a negative errno. O(total path length). */
+static int path64_normalize(const char *base, const char *path,
+                            char out[K64_PATH_MAX + 1]) {
+    char work[(K64_PATH_MAX + 1) * 2];
+    u64 length = 0, out_length = 1;
+    const char *cursor;
+
+    if (!path) return -(int)SYS64_EINVAL;
+    if (path[0] != '/' && base && base[0]) {
+        while (base[length]) {
+            if (length >= sizeof(work)) return -(int)SYS64_ENAMETOOLONG;
+            work[length] = base[length];
+            length++;
+        }
+        if (length && work[length - 1u] != '/') {
+            if (length >= sizeof(work)) return -(int)SYS64_ENAMETOOLONG;
+            work[length++] = '/';
+        }
+    }
+    for (const char *p = path; *p; p++) {
+        if (length + 1u >= sizeof(work)) return -(int)SYS64_ENAMETOOLONG;
+        work[length++] = *p;
+    }
+    work[length] = 0;
+
+    out[0] = '/';
+    out[1] = 0;
+    cursor = work;
+    while (*cursor) {
+        const char *start;
+        u64 component;
+
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+        start = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        component = (u64)(cursor - start);
+        if (component == 1u && start[0] == '.') continue;
+        if (component == 2u && start[0] == '.' && start[1] == '.') {
+            while (out_length > 1u && out[out_length - 1u] != '/') out_length--;
+            if (out_length > 1u) out_length--;
+            out[out_length] = 0;
+            continue;
+        }
+        if (out_length + component + 2u > K64_PATH_MAX + 1u)
+            return -(int)SYS64_ENAMETOOLONG;
+        if (out_length > 1u) out[out_length++] = '/';
+        memcpy(out + out_length, start, component);
+        out_length += component;
+        out[out_length] = 0;
+    }
+    return 0;
+}
+
+/* Resolve a user path against dirfd (or the working directory). */
+static int resolve64_path(int id, int dirfd, u64 space, u64 user_path,
+                          char out[K64_PATH_MAX + 1]) {
+    char raw[K64_PATH_MAX + 1];
+    char base[K64_PATH_MAX + 1];
+    s64 copied;
+    int result;
+
+    copied = copy_user_path64(space, user_path, raw);
+    if (copied < 0) return (int)copied;
+    if (raw[0] == 0) return -(int)SYS64_ENOENT;
+    base[0] = 0;
+    if (raw[0] != '/') {
+        if (dirfd == K64_AT_FDCWD) {
+            if (task64_get_cwd(id, base, sizeof(base)) < 0) base[0] = 0;
+        } else {
+            result = fs64_fd_dir_path(id, dirfd, base);
+            if (result < 0) return result;
+        }
+    }
+    return path64_normalize(base, raw, out);
+}
+
+static void sys64_fill_stat(sys64_stat_t *st, u64 size, u32 ino, int kind) {
+    memset(st, 0, sizeof(*st));
+    st->st_dev = 1;
+    st->st_ino = ino;
+    st->st_nlink = (kind == FS64_KIND_DIR) ? 2 : 1;
+    if (kind == FS64_KIND_DIR)
+        st->st_mode = SYS64_S_IFDIR | 0755u;
+    else if (kind == FS64_KIND_CHAR)
+        st->st_mode = SYS64_S_IFCHR | 0666u;
+    else
+        st->st_mode = SYS64_S_IFREG | 0644u;
+    st->st_blksize = 512;
+    st->st_size = (s64)size;
+    st->st_blocks = (s64)((size + 511u) / 512u);
+}
+
+/* stat/lstat/newfstatat. `dirfd` is resolved through the descriptor table;
+ * symlinks do not exist, so AT_SYMLINK_NOFOLLOW changes nothing. */
+static u64 sys64_stat_path(int id, int dirfd, u64 user_path, u64 user_buf,
+                           u64 flags) {
+    char path[K64_PATH_MAX + 1];
+    sys64_stat_t st;
+    u64 size, space = current_space();
+    u32 ino;
+    int kind, result;
+
+    if (flags & ~(u64)(K64_AT_SYMLINK_NOFOLLOW | K64_AT_EMPTY_PATH))
+        return (u64)0 - SYS64_EINVAL;
+    if (flags & K64_AT_EMPTY_PATH) {
+        if (copy_user_path64(space, user_path, path) != 0)
+            return (u64)0 - SYS64_EINVAL;
+        result = fs64_stat_fd(id, dirfd, &size, &ino, &kind);
+    } else {
+        result = resolve64_path(id, dirfd, space, user_path, path);
+        if (result < 0) return (u64)result;
+        result = fs64_stat_path(path, &size, &ino, &kind);
+    }
+    if (result < 0) return (u64)result;
+
+    sys64_fill_stat(&st, size, ino, kind);
+    if (!copy_to_user64(space, user_buf, &st, sizeof(st)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
+static u64 sys64_fstat(int id, u64 fd, u64 user_buf) {
+    sys64_stat_t st;
+    u64 size;
+    u32 ino;
+    int kind, result;
+
+    result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
+    if (result < 0) return (u64)result;
+    sys64_fill_stat(&st, size, ino, kind);
+    if (!copy_to_user64(current_space(), user_buf, &st, sizeof(st)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
+/* statx(dirfd, path, flags, mask, buf): the same metadata in the modern
+ * 256-byte layout. */
+static u64 sys64_statx(int id, int dirfd, u64 user_path, u64 flags,
+                       u64 mask, u64 user_buf) {
+    char path[K64_PATH_MAX + 1];
+    sys64_statx_t out;
+    u64 size, space = current_space();
+    u32 ino;
+    int kind, result;
+
+    if (flags & ~(u64)(K64_AT_SYMLINK_NOFOLLOW | K64_AT_EMPTY_PATH))
+        return (u64)0 - SYS64_EINVAL;
+    if (flags & K64_AT_EMPTY_PATH) {
+        if (copy_user_path64(space, user_path, path) != 0)
+            return (u64)0 - SYS64_EINVAL;
+        result = fs64_stat_fd(id, dirfd, &size, &ino, &kind);
+    } else {
+        result = resolve64_path(id, dirfd, space, user_path, path);
+        if (result < 0) return (u64)result;
+        result = fs64_stat_path(path, &size, &ino, &kind);
+    }
+    if (result < 0) return (u64)result;
+
+    memset(&out, 0, sizeof(out));
+    out.stx_mask = (u32)(mask & SYS64_STATX_BASIC);
+    out.stx_blksize = 512;
+    out.stx_nlink = (kind == FS64_KIND_DIR) ? 2 : 1;
+    out.stx_uid = 0;
+    out.stx_gid = 0;
+    out.stx_mode = (u16)((kind == FS64_KIND_DIR)
+                             ? (SYS64_S_IFDIR | 0755u)
+                             : (kind == FS64_KIND_CHAR)
+                                   ? (SYS64_S_IFCHR | 0666u)
+                                   : (SYS64_S_IFREG | 0644u));
+    out.stx_ino = ino;
+    out.stx_size = size;
+    out.stx_blocks = (size + 511u) / 512u;
+    out.stx_dev_major = 1;
+    out.stx_dev_minor = 0;
+    if (!copy_to_user64(space, user_buf, &out, sizeof(out)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
+/* access(2)/faccessat(2): FAT12 has no permission bits, so existence is the
+ * only real question; X_OK is refused on regular files because nothing here
+ * is marked executable. */
+static u64 sys64_access(int id, int dirfd, u64 user_path, u64 mode) {
+    char path[K64_PATH_MAX + 1];
+    u64 size;
+    u32 ino;
+    int kind, result;
+
+    if (mode & ~(u64)(K64_R_OK | K64_W_OK | K64_X_OK))
+        return (u64)0 - SYS64_EINVAL;
+    result = resolve64_path(id, dirfd, current_space(), user_path, path);
+    if (result < 0) return (u64)result;
+    result = fs64_stat_path(path, &size, &ino, &kind);
+    if (result < 0) return (u64)result;
+    if ((mode & K64_X_OK) && kind != FS64_KIND_DIR)
+        return (u64)0 - SYS64_EACCES;
+    return 0;
+}
+
+/* chdir/fchdir/getcwd. */
+static u64 sys64_chdir(int id, u64 user_path) {
+    char path[K64_PATH_MAX + 1];
+    u64 size;
+    u32 ino;
+    int kind, result;
+
+    result = resolve64_path(id, K64_AT_FDCWD, current_space(), user_path, path);
+    if (result < 0) return (u64)result;
+    result = fs64_stat_path(path, &size, &ino, &kind);
+    if (result < 0) return (u64)result;
+    if (kind != FS64_KIND_DIR) return (u64)0 - SYS64_ENOTDIR;
+    result = task64_set_cwd(id, path);
+    return result < 0 ? (u64)result : 0;
+}
+
+static u64 sys64_fchdir(int id, u64 fd) {
+    char path[K64_PATH_MAX + 1];
+    int result = fs64_fd_dir_path(id, (int)fd, path);
+
+    if (result < 0) return (u64)result;
+    result = task64_set_cwd(id, path);
+    return result < 0 ? (u64)result : 0;
+}
+
+static u64 sys64_getcwd(int id, u64 user_buf, u64 size) {
+    char cwd[K64_PATH_MAX + 1];
+    u64 length = 0, total;
+
+    if (task64_get_cwd(id, cwd, sizeof(cwd)) < 0)
+        return (u64)0 - SYS64_EINVAL;
+    while (cwd[length]) length++;
+    total = length + 1u;
+    if (size < total) return (u64)0 - SYS64_ERANGE;
+    if (!copy_to_user64(current_space(), user_buf, cwd, total))
+        return (u64)0 - SYS64_EFAULT;
+    return user_buf;                     /* Linux returns the buffer address */
+}
+
+/* getdents64: pack linux_dirent64 records from the directory cursor. The
+ * cursor is the entry ordinal kept in the description, so two threads that
+ * share CLONE_FILES read different entries without extra state. */
+static u64 sys64_getdents64(int id, u64 fd, u64 user_buffer, u64 count) {
+    u8 record[40];
+    u8 stage[256];
+    u64 space = current_space();
+    u64 index, copied = 0, staged = 0;
+
+    if (!fs64_fd_is_dir(id, (int)fd))
+        return (u64)0 - (fs64_fd_file(id, (int)fd) < 0 ? SYS64_EBADF
+                                                       : SYS64_ENOTDIR);
+    if (count < 32u) return (u64)0 - SYS64_EINVAL;
+    if (count > 0x100000u) count = 0x100000u;
+    index = fs64_fd_pos(id, (int)fd);
+
+    for (;;) {
+        char name[13];
+        u32 ino, next, namelen, reclen;
+        int is_dir, got;
+
+        got = fs64_fd_entry(id, (int)fd, (u32)index, name, &ino, &is_dir,
+                            &next);
+        if (got < 0) {
+            if (staged) break;
+            return (u64)got;
+        }
+        if (got == 0) break;
+
+        namelen = 0;
+        while (name[namelen]) namelen++;
+        reclen = (19u + namelen + 1u + 7u) & ~7u;
+        if (copied + staged + reclen > count) {
+            if (!staged) break;
+            if (!copy_to_user64(space, user_buffer + copied, stage, staged))
+                return copied ? copied : (u64)0 - SYS64_EFAULT;
+            copied += staged;
+            staged = 0;
+            if (copied + reclen > count) break;
+        }
+        if (staged + reclen > sizeof(stage)) {
+            if (!copy_to_user64(space, user_buffer + copied, stage, staged))
+                return copied ? copied : (u64)0 - SYS64_EFAULT;
+            copied += staged;
+            staged = 0;
+        }
+
+        memset(record, 0, reclen);
+        memcpy(record, &ino, 4);          /* ino is u32 */
+        *(s64 *)(record + 8) = (s64)next;
+        *(u16 *)(record + 16) = (u16)reclen;
+        record[18] = (u8)(is_dir ? SYS64_DT_DIR : SYS64_DT_REG);
+        memcpy(record + 19, name, namelen + 1u);
+        memcpy(stage + staged, record, reclen);
+        staged += reclen;
+        index = next;
+        (void)fs64_fd_seek(id, (int)fd, index);
+    }
+
+    if (staged) {
+        if (!copy_to_user64(space, user_buffer + copied, stage, staged))
+            return copied ? copied : (u64)0 - SYS64_EFAULT;
+        copied += staged;
+    }
+    return copied;
+}
+
+/* unlink/rmdir/unlinkat, rename/renameat/renameat2. */
+static u64 sys64_unlinkat(int id, int dirfd, u64 user_path, u64 flags) {
+    char path[K64_PATH_MAX + 1];
+    int result;
+
+    if (flags & ~(u64)K64_AT_REMOVEDIR) return (u64)0 - SYS64_EINVAL;
+    result = resolve64_path(id, dirfd, current_space(), user_path, path);
+    if (result < 0) return (u64)result;
+    result = (flags & K64_AT_REMOVEDIR) ? fs64_rmdir(path) : fs64_unlink(path);
+    return result < 0 ? (u64)result : 0;
+}
+
+static u64 sys64_renameat(int id, int olddirfd, u64 user_old, int newdirfd,
+                          u64 user_new, u64 flags) {
+    char oldpath[K64_PATH_MAX + 1];
+    char newpath[K64_PATH_MAX + 1];
+    u64 space = current_space();
+    int result;
+
+    if (flags) return (u64)0 - SYS64_EINVAL;
+    result = resolve64_path(id, olddirfd, space, user_old, oldpath);
+    if (result < 0) return (u64)result;
+    result = resolve64_path(id, newdirfd, space, user_new, newpath);
+    if (result < 0) return (u64)result;
+    result = fs64_rename(oldpath, newpath);
+    return result < 0 ? (u64)result : 0;
+}
+
+/* truncate/ftruncate. Both go through the page cache, so the new length is
+ * visible to every descriptor of the same path at once. */
+static u64 sys64_truncate(int id, u64 user_path, u64 length) {
+    char path[K64_PATH_MAX + 1];
+    int fd, error = 0, file, result;
+
+    result = resolve64_path(id, K64_AT_FDCWD, current_space(), user_path,
+                            path);
+    if (result < 0) return (u64)result;
+    fd = fs64_open_fd(id, path, K64_O_WRONLY, &error);
+    if (fd < 0) return (u64)error;
+    file = fs64_fd_file(id, fd);
+    if (file < 0) {
+        fs64_fd_close(id, fd);
+        return (u64)0 - SYS64_EISDIR;
+    }
+    result = fs64_truncate(file, length);
+    fs64_fd_close(id, fd);               /* flushes the new length */
+    return result < 0 ? (u64)result : 0;
+}
+
+static u64 sys64_ftruncate(int id, u64 fd, u64 length) {
+    int file = fs64_fd_file(id, (int)fd);
+
+    if (file < 0) return (u64)0 - SYS64_EBADF;
+    if (fs64_fd_access(id, (int)fd) == 0) return (u64)0 - SYS64_EINVAL;
+    return fs64_truncate(file, length) < 0 ? (u64)0 - SYS64_ENOSPC : 0;
+}
+
+/* chmod/chown family: FAT12 stores neither mode bits nor owners, so the
+ * call succeeds when the target exists and changes nothing. */
+static u64 sys64_chmod_path(int id, int dirfd, u64 user_path) {
+    char path[K64_PATH_MAX + 1];
+    u64 size;
+    u32 ino;
+    int kind, result;
+
+    result = resolve64_path(id, dirfd, current_space(), user_path, path);
+    if (result < 0) return (u64)result;
+    result = fs64_stat_path(path, &size, &ino, &kind);
+    return result < 0 ? (u64)result : 0;
+}
+
+static u64 sys64_chmod_fd(int id, u64 fd) {
+    u64 size;
+    u32 ino;
+    int kind, result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
+
+    return result < 0 ? (u64)result : 0;
+}
+
+/* utimensat(dirfd, path, times, flags): timestamps are not stored, but the
+ * arguments are validated and the call reports success, so touch and cp -p
+ * work. A null path is the futimens(fd, times) form. */
+static u64 sys64_utimensat(int id, int dirfd, u64 user_path, u64 user_times,
+                           u64 flags) {
+    char path[K64_PATH_MAX + 1];
+    u64 size;
+    u32 ino;
+    int kind, result;
+
+    if (flags & ~(u64)K64_AT_SYMLINK_NOFOLLOW) return (u64)0 - SYS64_EINVAL;
+    if (user_times && !user_page64(current_space(), user_times, 0, 0))
+        return (u64)0 - SYS64_EFAULT;
+    if (!user_path) {
+        result = fs64_stat_fd(id, dirfd, &size, &ino, &kind);
+        return result < 0 ? (u64)result : 0;
+    }
+    result = resolve64_path(id, dirfd, current_space(), user_path, path);
+    if (result < 0) return (u64)result;
+    result = fs64_stat_path(path, &size, &ino, &kind);
+    return result < 0 ? (u64)result : 0;
+}
+
+/* dup3(fd, target, flags). */
+static u64 sys64_dup3(int id, u64 fd, u64 target, u64 flags) {
+    int result;
+
+    if (flags & ~(u64)K64_O_CLOEXEC) return (u64)0 - SYS64_EINVAL;
+    if (fd == target) return (u64)0 - SYS64_EINVAL;
+    result = fs64_fd_dup2(id, (int)fd, (int)target);
+    if (result < 0) return (u64)result;
+    return target;
+}
+
+/* fcntl(fd, command, argument): the subset libc and a shell use. */
+static u64 sys64_fcntl(int id, u64 fd, u64 command, u64 argument) {
+    u64 size;
+    u32 ino;
+    int kind, result;
+
+    switch (command) {
+    case K64_F_DUPFD:
+    case K64_F_DUPFD_CLOEXEC:
+        result = fs64_fd_dup(id, (int)fd, (int)argument);
+        return result < 0 ? (u64)result : (u64)result;
+
+    case K64_F_GETFD:
+    case K64_F_SETFD:
+        result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
+        return result < 0 ? (u64)result : 0;
+
+    case K64_F_GETFL:
+        result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
+        if (result < 0) return (u64)result;
+        if (kind == FS64_KIND_CHAR) return K64_O_RDWR;
+        if (kind == FS64_KIND_DIR) return K64_O_RDONLY | K64_O_DIRECTORY;
+        result = fs64_fd_access(id, (int)fd);
+        return result < 0 ? 0 : (u64)(u32)result;
+
+    case K64_F_SETFL:
+        return 0;
+
+    case K64_F_GETLK: {
+        u8 lock[32];
+
+        result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
+        if (result < 0) return (u64)result;
+        memset(lock, 0, sizeof(lock));
+        *(u16 *)lock = K64_F_UNLCK;
+        if (!copy_to_user64(current_space(), argument, lock, sizeof(lock)))
+            return (u64)0 - SYS64_EFAULT;
+        return 0;
+    }
+
+    case K64_F_SETLK:
+    case K64_F_SETLKW:
+        result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
+        return result < 0 ? (u64)result : 0;
+
+    default:
+        return (u64)0 - SYS64_EINVAL;
+    }
+}
+
+/* ioctl(2): the console answers the termios and window-size requests a
+ * program probes for. A 36-byte kernel termios is what the x86-64 ABI
+ * passes to the driver; glibc translates it into its own layout. */
+static u64 sys64_ioctl(int id, u64 fd, u64 request, u64 argument) {
+    u8 termios[36];
+    u16 winsize[4];
+
+    if (!fs64_fd_console(id, (int)fd)) {
+        u64 size;
+        u32 ino;
+        int kind, result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
+
+        if (result < 0) return (u64)result;
+        return (u64)0 - SYS64_ENOTTY;
+    }
+
+    switch (request) {
+    case 0x5401u: {                       /* TCGETS */
+        memset(termios, 0, sizeof(termios));
+        *(u32 *)(termios + 0) = 0x500u;   /* ICRNL | IXON */
+        *(u32 *)(termios + 4) = 0x5u;     /* OPOST | ONLCR */
+        *(u32 *)(termios + 8) = 0xBFu;    /* CS8 | CREAD */
+        *(u32 *)(termios + 12) = 0x3Bu;   /* ISIG|ICANON|ECHO|ECHOE|ECHOK */
+        termios[16] = 0;                  /* c_line */
+        termios[17 + 0] = 0x03;           /* VINTR */
+        termios[17 + 2] = 0x7F;           /* VERASE */
+        termios[17 + 4] = 0x04;           /* VEOF */
+        termios[17 + 6] = 1;              /* VMIN */
+        if (!copy_to_user64(current_space(), argument, termios,
+                            sizeof(termios)))
+            return (u64)0 - SYS64_EFAULT;
+        return 0;
+    }
+    case 0x5402u:                         /* TCSETS */
+    case 0x5403u:                         /* TCSETSW */
+    case 0x5404u:                         /* TCSETSF */
+        if (!copy_from_user64(current_space(), termios, argument,
+                              sizeof(termios)))
+            return (u64)0 - SYS64_EFAULT;
+        return 0;
+
+    case 0x5413u:                         /* TIOCGWINSZ */
+        winsize[0] = 25;
+        winsize[1] = 80;
+        winsize[2] = 0;
+        winsize[3] = 0;
+        if (!copy_to_user64(current_space(), argument, winsize,
+                            sizeof(winsize)))
+            return (u64)0 - SYS64_EFAULT;
+        return 0;
+
+    case 0x541Bu: {                       /* FIONREAD */
+        u32 pending = 0;
+
+        if (!copy_to_user64(current_space(), argument, &pending, 4))
+            return (u64)0 - SYS64_EFAULT;
+        return 0;
+    }
+
+    case 0x540Fu: {                       /* TIOCGPGRP */
+        int pgrp = sched64_current() + 1;
+
+        if (!copy_to_user64(current_space(), argument, &pgrp, 4))
+            return (u64)0 - SYS64_EFAULT;
+        return 0;
+    }
+    case 0x5410u: {                       /* TIOCSPGRP */
+        int pgrp;
+
+        if (!copy_from_user64(current_space(), &pgrp, argument, 4))
+            return (u64)0 - SYS64_EFAULT;
+        if (pgrp <= 0) return (u64)0 - SYS64_EINVAL;
+        return 0;
+    }
+    case 0x540Eu:                         /* TIOCNOTTY */
+        return 0;
+    default:
+        return (u64)0 - SYS64_ENOTTY;
+    }
+}
+
+
 static void note_write(u64 count) {
     if (syscall_ok_seen || count == 0) return;
     syscall_ok_seen = 1;
@@ -376,36 +1040,58 @@ static u64 sys64_munmap(u64 address, u64 length) {
  * so nothing here can run off the end of a name. O_CREAT/O_EXCL/O_TRUNC/
  * O_APPEND and the three access modes are the accepted set. */
 static u64 sys64_open(u64 path, u64 flags, u64 mode) {
-    char name[K64_FS_PATH_MAX + 1];
-    u64 space = current_space();
-    int fd, error = 0;
+    char name[K64_PATH_MAX + 1];
+    int id = sched64_current();
+    int fd, error = 0, result;
 
     (void)mode;
 
-    for (u64 i = 0; i <= (u64)K64_FS_PATH_MAX; i++) {
-        if (!copy_from_user64(space, &name[i], path + i, 1))
-            return (u64)0 - SYS64_EFAULT;
-        if (name[i] == '\0') break;
-        if (i == (u64)K64_FS_PATH_MAX) return (u64)0 - SYS64_EINVAL;
-    }
+    /* The flags FAT12 has no use for are dropped rather than refused: a libc
+     * opens with O_CLOEXEC and O_LARGEFILE as a matter of course. */
+    flags &= ~(u64)(K64_O_CLOEXEC | K64_O_LARGEFILE | K64_O_NOFOLLOW |
+                    K64_O_NOCTTY | K64_O_NONBLOCK);
 
-    fd = fs64_open_fd(sched64_current(), name, flags, &error);
+    result = resolve64_path(id, K64_AT_FDCWD, current_space(), path, name);
+    if (result < 0) return (u64)result;
+
+    fd = fs64_open_fd(id, name, flags, &error);
     if (fd < 0) return (u64)error;
     return (u64)fd;
 }
 
 /* mkdir(path, mode): one directory, 8.3 name, parent must exist. */
 static u64 sys64_mkdir(u64 path, u64 mode) {
-    char name[K64_FS_PATH_MAX + 1];
-    u64 space = current_space();
+    char name[K64_PATH_MAX + 1];
+    int result;
 
     (void)mode;
-    for (u64 i = 0; i <= (u64)K64_FS_PATH_MAX; i++) {
-        if (!copy_from_user64(space, &name[i], path + i, 1))
-            return (u64)0 - SYS64_EFAULT;
-        if (name[i] == '\0') break;
-        if (i == (u64)K64_FS_PATH_MAX) return (u64)0 - SYS64_EINVAL;
-    }
+    result = resolve64_path(sched64_current(), K64_AT_FDCWD, current_space(),
+                            path, name);
+    if (result < 0) return (u64)result;
+    return (u64)fs64_create_dir(name);
+}
+
+/* openat(dirfd, path, flags, mode): the same call with a directory base. */
+static u64 sys64_openat(int id, int dirfd, u64 path, u64 flags, u64 mode) {
+    char name[K64_PATH_MAX + 1];
+    int fd, error = 0, result;
+
+    (void)mode;
+    flags &= ~(u64)(K64_O_CLOEXEC | K64_O_LARGEFILE | K64_O_NOFOLLOW |
+                    K64_O_NOCTTY | K64_O_NONBLOCK);
+    result = resolve64_path(id, dirfd, current_space(), path, name);
+    if (result < 0) return (u64)result;
+    fd = fs64_open_fd(id, name, flags, &error);
+    if (fd < 0) return (u64)error;
+    return (u64)fd;
+}
+
+static u64 sys64_mkdirat(int id, int dirfd, u64 path) {
+    char name[K64_PATH_MAX + 1];
+    int result;
+
+    result = resolve64_path(id, dirfd, current_space(), path, name);
+    if (result < 0) return (u64)result;
     return (u64)fs64_create_dir(name);
 }
 
@@ -612,7 +1298,7 @@ static int build_exec_stack64(loaded_elf64_t *loaded,
  * space. Descriptors survive execve because there is no O_CLOEXEC. On
  * failure nothing has changed and the caller continues normally. */
 static regs64_t *sys64_execve(regs64_t *frame) {
-    char name[K64_FS_PATH_MAX + 1];
+    char name[K64_PATH_MAX + 1];
     exec_vector64_t argv, envp;
     loaded_elf64_t loaded;
     u64 space = current_space();
@@ -620,16 +1306,10 @@ static regs64_t *sys64_execve(regs64_t *frame) {
     u8 *buffer;
     int error, id = sched64_current(), file;
 
-    for (u64 i = 0; i <= (u64)K64_FS_PATH_MAX; i++) {
-        if (!copy_from_user64(space, &name[i], frame->rdi + i, 1)) {
-            frame->rax = (u64)0 - SYS64_EFAULT;
-            return frame;
-        }
-        if (name[i] == '\0') break;
-        if (i == (u64)K64_FS_PATH_MAX) {
-            frame->rax = (u64)0 - SYS64_EINVAL;
-            return frame;
-        }
+    error = resolve64_path(id, K64_AT_FDCWD, space, frame->rdi, name);
+    if (error < 0) {
+        frame->rax = (u64)(s64)error;
+        return frame;
     }
 
     error = capture_vector64(space, frame->rsi, &argv);
@@ -931,6 +1611,571 @@ static u64 sys64_nanosleep(u64 request, u64 remaining) {
     return 0;
 }
 
+/* --------------------------------------------------------------- process
+ * identity, limits and time
+ * ---------------------------------------------------------------
+ * There is one user in this system: every identity call reports uid 0/gid 0
+ * and every ownership change is accepted without storing anything.
+ */
+
+static u64 sys64_getuid(void) {
+    return 0;
+}
+
+/* uname(buf): the 6 x 65-byte utsname. The strings are short and the host
+ * name is fixed, so the layout is filled once and copied as one block. */
+static u64 sys64_uname(u64 buf) {
+    char out[6][65];
+
+    memset(out, 0, sizeof(out));
+    memcpy(out[0], "Haku", 5);
+    memcpy(out[1], "haku64", 7);
+    memcpy(out[2], "1.0", 4);
+    memcpy(out[3], "x86_64", 7);
+    if (!copy_to_user64(current_space(), buf, out, sizeof(out)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
+/* gettimeofday(timeval, timezone): the timezone is not stored, so a non-null
+ * pointer receives UTC (both fields zero), which is what Linux reports for
+ * an unset timezone too. */
+static u64 sys64_gettimeofday(u64 tv, u64 tz) {
+    u64 ticks = timer64_ticks();
+    u64 hz = timer64_hz();
+    u64 seconds, usec, timeval[2];
+    u64 zone[2] = { 0, 0 };
+
+    if (hz == 0) return (u64)0 - SYS64_EINVAL;
+    seconds = rtc64_realtime(ticks, hz);
+    if (seconds == 0) seconds = ticks / hz;
+    usec = (ticks % hz) * (1000000ull / hz);
+    timeval[0] = seconds;
+    timeval[1] = usec;
+    if (tv && !copy_to_user64(current_space(), tv, timeval, sizeof(timeval)))
+        return (u64)0 - SYS64_EFAULT;
+    if (tz && !copy_to_user64(current_space(), tz, zone, sizeof(zone)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
+/* time(tloc) is the same second count gettimeofday reports. */
+static u64 sys64_time(u64 tloc) {
+    u64 ticks = timer64_ticks();
+    u64 hz = timer64_hz();
+    u64 seconds;
+
+    if (hz == 0) return (u64)0 - SYS64_EINVAL;
+    seconds = rtc64_realtime(ticks, hz);
+    if (seconds == 0) seconds = ticks / hz;
+    if (tloc && !copy_to_user64(current_space(), tloc, &seconds, 8))
+        return (u64)0 - SYS64_EFAULT;
+    return seconds;
+}
+
+/* times(buf): the 4-element struct tms counts in clock ticks. The kernel
+ * groups every task into one bucket, which is the honest answer for a
+ * single-user kernel without per-task accounting. */
+static u64 sys64_times(u64 buf) {
+    u64 tms[4];
+    u64 ticks = timer64_ticks();
+
+    tms[0] = ticks;    /* tms_utime */
+    tms[1] = 0;        /* tms_stime */
+    tms[2] = 0;        /* tms_cutime */
+    tms[3] = 0;        /* tms_cstime */
+    if (buf && !copy_to_user64(current_space(), buf, tms, sizeof(tms)))
+        return (u64)0 - SYS64_EFAULT;
+    return ticks;      /* elapsed real time since boot, in ticks */
+}
+
+/* getrusage(who, buf): 144 bytes, all counters zero. The call exists so
+ * programs that sample resource usage keep working. */
+static u64 sys64_getrusage(u64 who, u64 buf) {
+    u8 usage[144];
+
+    (void)who;
+    memset(usage, 0, sizeof(usage));
+    if (buf && !copy_to_user64(current_space(), buf, usage, sizeof(usage)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
+/* clock_getres. The timer resolution is one tick. */
+static u64 sys64_clock_getres(u64 clock_id, u64 tp) {
+    u64 timespec[2];
+    u64 hz = timer64_hz();
+
+    if (clock_id != K64_CLOCK_REALTIME && clock_id != K64_CLOCK_MONOTONIC)
+        return (u64)0 - SYS64_EINVAL;
+    if (hz == 0) return (u64)0 - SYS64_EINVAL;
+    timespec[0] = 0;
+    timespec[1] = 1000000000ull / hz;
+    if (tp && !copy_to_user64(current_space(), tp, timespec, sizeof(timespec)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
+/* The rlimit pairs this port reports: stack and descriptor counts are real,
+ * everything else is "unlimited". RLIMIT numbers are the Linux ones. */
+static u64 sys64_rlimit_value(u64 resource) {
+    switch (resource) {
+    case 3u: return 8ull * 1024u * 1024u;   /* RLIMIT_STACK */
+    case 7u: return K64_FS_FDS;             /* RLIMIT_NOFILE */
+    default: return ~0ull;
+    }
+}
+
+static u64 sys64_getrlimit(u64 resource, u64 buf) {
+    u64 limit[2];
+
+    if (resource > 15u) return (u64)0 - SYS64_EINVAL;
+    limit[0] = sys64_rlimit_value(resource);
+    limit[1] = limit[0];
+    if (!copy_to_user64(current_space(), buf, limit, sizeof(limit)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
+/* setrlimit/prlimit64: the limits are fixed, so a request is accepted when
+ * the resource is known and nothing is stored. */
+static u64 sys64_setrlimit(u64 resource) {
+    return resource > 15u ? (u64)0 - SYS64_EINVAL : 0;
+}
+
+static u64 sys64_prlimit64(u64 pid, u64 resource, u64 new_limit, u64 old_limit) {
+    u64 limit[2];
+
+    (void)pid;
+    if (resource > 15u) return (u64)0 - SYS64_EINVAL;
+    if (new_limit && !user_page64(current_space(), new_limit, 0, 0))
+        return (u64)0 - SYS64_EFAULT;
+    if (old_limit) {
+        limit[0] = sys64_rlimit_value(resource);
+        limit[1] = limit[0];
+        if (!copy_to_user64(current_space(), old_limit, limit, sizeof(limit)))
+            return (u64)0 - SYS64_EFAULT;
+    }
+    return 0;
+}
+
+/* umask(2): no mode bits are stored, but the previous mask is reported. */
+static u32 sys64_umask_current = 022u;
+
+static u64 sys64_umask(u64 mask) {
+    u32 old = sys64_umask_current;
+
+    sys64_umask_current = (u32)mask & 0777u;
+    return old;
+}
+
+/* getrandom(buf, len, flags): a deterministic xorshift stream seeded from the
+ * timer tick, so two processes do not get the same bytes at the same instant.
+ * This is a portability stub, not a cryptographic generator, and the docs
+ * say so. */
+static u64 sys64_random_state = 0x9E3779B97F4A7C15ull;
+
+static u64 sys64_random_next(void) {
+    u64 x = sys64_random_state;
+
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    sys64_random_state = x;
+    return x;
+}
+
+static u64 sys64_getrandom(u64 buf, u64 length, u64 flags) {
+    u8 block[64];
+    u64 space = current_space(), done = 0;
+
+    if (flags & ~7ull) return (u64)0 - SYS64_EINVAL;
+    if (length > 0x100000ull) length = 0x100000ull;
+    if (sys64_random_state == 0x9E3779B97F4A7C15ull)
+        sys64_random_state ^= timer64_ticks() * 0x2545F4914F6CDD1Dull;
+    while (done < length) {
+        u64 n = length - done;
+
+        if (n > sizeof(block)) n = sizeof(block);
+        for (u64 i = 0; i < n; i += 8) {
+            u64 word = sys64_random_next();
+
+            for (u64 j = 0; j < 8 && i + j < n; j++)
+                block[i + j] = (u8)(word >> (j * 8));
+        }
+        if (!copy_to_user64(space, buf + done, block, n))
+            return done ? done : (u64)0 - SYS64_EFAULT;
+        done += n;
+    }
+    return done;
+}
+
+/* prctl(option, arg2..arg5). Only the name pair is meaningful here; the
+ * rest are accepted so programs that set process attributes do not fail. */
+static u64 sys64_prctl(u64 option, u64 arg2, u64 arg3, u64 arg4, u64 arg5) {
+    int id = sched64_current();
+
+    (void)arg3; (void)arg4; (void)arg5;
+    switch (option) {
+    case K64_PR_SET_NAME: {
+        char name[K64_PATH_MAX + 1];
+        s64 length = copy_user_path64(current_space(), arg2, name);
+
+        if (length <= 0) return (u64)0 - SYS64_EFAULT;
+        return (u64)(s64)task64_set_name(id, name);
+    }
+    case K64_PR_GET_NAME: {
+        char name[16];
+        u64 out[2] = { 0, 0 };
+
+        task64_get_name(id, name);
+        memcpy(out, name, sizeof(out));
+        if (!copy_to_user64(current_space(), arg2, out, sizeof(out)))
+            return (u64)0 - SYS64_EFAULT;
+        return 0;
+    }
+    case K64_PR_SET_PDEATHSIG:
+        return arg2 <= 64u ? 0 : (u64)0 - SYS64_EINVAL;
+    case K64_PR_GET_DUMPABLE:
+        return 1;
+    case K64_PR_SET_DUMPABLE:
+        return arg2 <= 1u ? 0 : (u64)0 - SYS64_EINVAL;
+    default:
+        return 0;
+    }
+}
+
+/* --------------------------------------------------------- memory mapping
+ */
+
+/* mprotect(address, length, prot): rewrite the leaf bits of every mapped
+ * page in the range. A hole is reported as ENOMEM, like Linux does. */
+static u64 sys64_mprotect(u64 address, u64 length, u64 prot) {
+    int id = sched64_current();
+    u64 space = current_space();
+    u64 pages;
+
+    if (prot & ~(u64)(K64_PROT_READ | K64_PROT_WRITE | K64_PROT_EXEC))
+        return (u64)0 - SYS64_EINVAL;
+    if ((address & (K64_PAGE_SIZE - 1)) != 0) return (u64)0 - SYS64_EINVAL;
+    if (length == 0) return 0;
+    if (address < K64_USER_BASE || length > K64_USER_END - address)
+        return (u64)0 - SYS64_EINVAL;
+
+    pages = (length + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
+    for (u64 i = 0; i < pages; i++) {
+        u64 virt = address + i * K64_PAGE_SIZE;
+
+        if (!paging64_query_space(space, virt, 0, 0, 0))
+            return (u64)0 - SYS64_ENOMEM;
+        (void)paging64_protect_space(space, virt,
+                                     (prot & K64_PROT_WRITE) != 0,
+                                     (prot & K64_PROT_EXEC) != 0);
+    }
+    (void)id;
+    return 0;
+}
+
+/* madvise(address, length, advice): the pages stay mapped and the advice is
+ * ignored; only the range is validated. */
+static u64 sys64_madvise(u64 address, u64 length, u64 advice) {
+    (void)advice;
+    if ((address & (K64_PAGE_SIZE - 1)) != 0) return (u64)0 - SYS64_EINVAL;
+    if (length > K64_USER_END - address) return (u64)0 - SYS64_EINVAL;
+    return 0;
+}
+
+/* brk(value): grow or shrink the heap window with zeroed pages. The break
+ * starts at K64_USER_BRK_BASE on the first call and brk(0) only reports it.
+ * A grow that cannot allocate keeps the old break and frees what it mapped;
+ * a shrink unmaps the pages above the new break. */
+static u64 sys64_brk(u64 value) {
+    int id = sched64_current();
+    u64 space = current_space();
+    u64 current = task64_get_brk(id);
+
+    if (current == 0) {
+        current = K64_USER_BRK_BASE;
+        task64_set_brk(id, current);
+    }
+    if (value == 0) return current;
+    if (value < K64_USER_BRK_BASE || value >= K64_USER_BRK_LIMIT)
+        return current;
+
+    if (value > current) {
+        u64 from = (current + K64_PAGE_SIZE - 1) & K64_PAGE_MASK;
+        u64 to = (value + K64_PAGE_SIZE - 1) & K64_PAGE_MASK;
+        u64 virt;
+
+        for (virt = from; virt < to; virt += K64_PAGE_SIZE) {
+            u64 frame;
+
+            if (paging64_query_space(space, virt, 0, 0, 0)) continue;
+            frame = frame64_alloc();
+            if (!frame) goto grow_fail;
+            memset(phys_to_virt64(frame), 0, K64_PAGE_SIZE);
+            if (!paging64_map_space(space, virt, frame, 1, 1, 0)) {
+                frame64_free(frame);
+                goto grow_fail;
+            }
+        }
+        task64_set_brk(id, value);
+        return value;
+
+    grow_fail:
+        for (u64 undo = from; undo < virt; undo += K64_PAGE_SIZE)
+            if (paging64_query_space(space, undo, 0, 0, 0)) {
+                u64 phys = paging64_unmap_space(space, undo);
+
+                if (phys) frame64_free(phys);
+            }
+        return task64_get_brk(id);
+    }
+
+    if (value < current) {
+        u64 from = (value + K64_PAGE_SIZE - 1) & K64_PAGE_MASK;
+        u64 to = (current + K64_PAGE_SIZE - 1) & K64_PAGE_MASK;
+
+        for (u64 virt = from; virt < to; virt += K64_PAGE_SIZE) {
+            u64 phys = paging64_unmap_space(space, virt);
+
+            if (phys) frame64_free(phys);
+        }
+        task64_set_brk(id, value);
+    }
+    return value;
+}
+
+/* pread64/pwrite64: the same page cache I/O as read/write, but at an
+ * explicit offset and without moving the description's position. */
+static u64 sys64_pread64(u64 fd, u64 buffer, u64 count, u64 offset) {
+    int id = sched64_current(), file;
+    u64 space, size, done = 0;
+    u8 chunk[64];
+
+    file = fs64_fd_file(id, (int)fd);
+    if (file < 0) return (u64)0 - SYS64_EBADF;
+    if (fs64_fd_access(id, (int)fd) == 1) return (u64)0 - SYS64_EBADF;
+    if (count == 0) return 0;
+    if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+
+    size = fs64_size(file);
+    if (offset >= size) return 0;
+    if (count > size - offset) count = size - offset;
+
+    space = current_space();
+    while (done < count) {
+        u64 n = count - done;
+
+        if (n > sizeof(chunk)) n = sizeof(chunk);
+        n = fs64_read(file, offset + done, chunk, n);
+        if (n == 0) break;
+        if (!copy_to_user64(space, buffer + done, chunk, n)) {
+            if (done) break;
+            return (u64)0 - SYS64_EFAULT;
+        }
+        done += n;
+    }
+    return done;
+}
+
+static u64 sys64_pwrite64(u64 fd, u64 buffer, u64 count, u64 offset) {
+    int id = sched64_current(), file;
+    u64 space, done = 0;
+    u8 chunk[64];
+
+    file = fs64_fd_file(id, (int)fd);
+    if (file < 0) return (u64)0 - SYS64_EBADF;
+    if (fs64_fd_access(id, (int)fd) == 0) return (u64)0 - SYS64_EBADF;
+    if (count == 0) return 0;
+    if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+
+    space = current_space();
+    while (done < count) {
+        u64 n = count - done;
+
+        if (n > sizeof(chunk)) n = sizeof(chunk);
+        if (!copy_from_user64(space, chunk, buffer + done, n)) {
+            if (done) break;
+            return (u64)0 - SYS64_EFAULT;
+        }
+        n = fs64_write(file, offset + done, chunk, n);
+        if (n == 0) break;
+        done += n;
+    }
+    return done;
+}
+
+/* fsync/fdatasync/sync: the page cache is the only buffering layer, so a
+ * per-descriptor flush is the whole job. */
+static u64 sys64_fsync(u64 fd) {
+    int result = fs64_fd_sync(sched64_current(), (int)fd);
+
+    return result < 0 ? (u64)result : 0;
+}
+
+/* --------------------------------------------------------- polling
+ *
+ * poll() answers from the descriptor table without a wait queue: the console
+ * is always readable and writable, a regular file is readable while its
+ * position is below the size, and every open descriptor is writable. A
+ * positive timeout is spent with interrupts enabled in tick slices, which is
+ * the same technique nanosleep uses.
+ */
+
+#define SYS64_POLLIN   0x0001u
+#define SYS64_POLLOUT  0x0004u
+#define SYS64_POLLERR  0x0008u
+#define SYS64_POLLHUP  0x0010u
+#define SYS64_POLLNVAL 0x0020u
+
+static u32 sys64_poll_events(int id, int fd, u16 requested) {
+    u64 size;
+    u32 ino;
+    int kind, file;
+
+    if (fd < 0) return SYS64_POLLNVAL;
+    file = fs64_fd_file(id, fd);
+    if (file < 0) {
+        if (fs64_fd_console(id, fd) || fd <= 2)
+            return (u32)(requested & (u16)(SYS64_POLLIN | SYS64_POLLOUT));
+        return SYS64_POLLNVAL;
+    }
+    if (fs64_stat_fd(id, fd, &size, &ino, &kind) < 0) return SYS64_POLLNVAL;
+    {
+        u32 ready = 0;
+
+        if (requested & SYS64_POLLIN) {
+            if (fs64_fd_pos(id, fd) < fs64_size(file)) ready |= SYS64_POLLIN;
+        }
+        if ((requested & SYS64_POLLOUT) && fs64_fd_access(id, fd) != 0)
+            ready |= SYS64_POLLOUT;
+        return ready;
+    }
+}
+
+/* struct pollfd is { int fd; short events; short revents; } (8 bytes). */
+static u64 sys64_poll(u64 fds, u64 nfds, u64 timeout_ms) {
+    int id = sched64_current();
+    u64 space = current_space();
+    u64 ready = 0;
+
+    if (nfds > 256u) return (u64)0 - SYS64_EINVAL;
+    if (nfds && !user_page64(space, fds, 0, 0))
+        return (u64)0 - SYS64_EFAULT;
+
+    for (;;) {
+        u8 entry[8];
+
+        ready = 0;
+        for (u64 i = 0; i < nfds; i++) {
+            u16 events;
+            u32 revents;
+
+            if (!copy_from_user64(space, entry, fds + i * 8, sizeof(entry)))
+                return (u64)0 - SYS64_EFAULT;
+            events = *(u16 *)(entry + 4);
+            revents = sys64_poll_events(id, *(int *)entry, events);
+            *(u16 *)(entry + 6) = (u16)revents;
+            if (!copy_to_user64(space, fds + i * 8, entry, sizeof(entry)))
+                return (u64)0 - SYS64_EFAULT;
+            if (revents) ready++;
+        }
+        if (ready || timeout_ms == 0) return ready;
+        if (timeout_ms != ~0ull) {
+            /* Spend one 10 ms slice per pass; the timer runs at 100 Hz, so
+             * this is a real wait rather than a busy loop. */
+            u64 hz = timer64_hz();
+            u64 slice = hz / 100u;
+
+            if (slice == 0) slice = 1;
+            {
+                u64 deadline = timer64_ticks() + slice;
+
+                while (timer64_ticks() < deadline) {
+                    sti64();
+                    cpu_halt64();
+                    cli64();
+                }
+            }
+        } else {
+            /* An infinite poll with nothing to wait on would hang the test
+             * image; treat it as "no more work" and return zero. */
+            return 0;
+        }
+    }
+}
+
+/* select(nfds, readfds, writefds, exceptfds, timeout): the same readiness
+ * rules over 1024-bit fd_sets (128 bytes each). */
+static u64 sys64_select(u64 nfds, u64 readfds, u64 writefds, u64 exceptfds,
+                        u64 timeout) {
+    int id = sched64_current();
+    u64 space = current_space();
+    u8 in_read[128], in_write[128], out_read[128], out_write[128];
+    u64 ready = 0, limit;
+
+    if (nfds > 1024u) return (u64)0 - SYS64_EINVAL;
+    limit = nfds;
+    memset(out_read, 0, sizeof(out_read));
+    memset(out_write, 0, sizeof(out_write));
+    if (readfds && !copy_from_user64(space, in_read, readfds, sizeof(in_read)))
+        return (u64)0 - SYS64_EFAULT;
+    if (writefds && !copy_from_user64(space, in_write, writefds,
+                                      sizeof(in_write)))
+        return (u64)0 - SYS64_EFAULT;
+    if (exceptfds && !user_page64(space, exceptfds, 0, 0))
+        return (u64)0 - SYS64_EFAULT;
+    if (timeout) {
+        u64 ts[2];
+
+        if (!copy_from_user64(space, ts, timeout, sizeof(ts)))
+            return (u64)0 - SYS64_EFAULT;
+    }
+
+    for (u64 fd = 0; fd < limit; fd++) {
+        u32 bit = 1u << (fd & 31u);
+        u32 index = (u32)(fd >> 5);
+
+        if (readfds && (*(u32 *)(in_read + index * 4) & bit)) {
+            if (sys64_poll_events(id, (int)fd, SYS64_POLLIN) & SYS64_POLLIN) {
+                *(u32 *)(out_read + index * 4) |= bit;
+                ready++;
+            }
+        }
+        if (writefds && (*(u32 *)(in_write + index * 4) & bit)) {
+            if (sys64_poll_events(id, (int)fd, SYS64_POLLOUT) & SYS64_POLLOUT) {
+                *(u32 *)(out_write + index * 4) |= bit;
+                ready++;
+            }
+        }
+    }
+
+    if (readfds && !copy_to_user64(space, readfds, out_read, sizeof(out_read)))
+        return (u64)0 - SYS64_EFAULT;
+    if (writefds && !copy_to_user64(space, writefds, out_write,
+                                    sizeof(out_write)))
+        return (u64)0 - SYS64_EFAULT;
+    return ready;
+}
+
+/* set_tid_address(tidptr): the kernel does not clear a futex on exit yet, so
+ * the pointer is validated and accepted without being stored. */
+static u64 sys64_set_tid_address(u64 tidptr) {
+    if (tidptr && !user_page64(current_space(), tidptr, 0, 1))
+        return (u64)0 - SYS64_EFAULT;
+    return sys64_gettid();
+}
+
+/* tgkill(tgid, tid, sig): route to the task the tid names. */
+static u64 sys64_tgkill(u64 tgid, u64 tid, u64 signal) {
+    int id = sched64_current();
+
+    (void)tgid;
+    if (tid == 0 || tid > K64_TASK_MAX) return (u64)0 - SYS64_EINVAL;
+    return (u64)task64_signal((int)tid - 1, (u32)signal);
+}
+
 regs64_t *sys64_dispatch(regs64_t *frame) {
     u32 in_user = ((u32)frame->cs & 3u) == 3u;
     u32 wrote = 0;
@@ -963,6 +2208,287 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     case K64_SYS_CLOSE:
         result = sys64_close(frame->rdi);
+        break;
+
+    case K64_SYS_STAT:
+    case K64_SYS_LSTAT:
+        result = sys64_stat_path(sched64_current(), K64_AT_FDCWD, frame->rdi,
+                                 frame->rsi, 0);
+        break;
+
+    case K64_SYS_FSTAT:
+        result = sys64_fstat(sched64_current(), frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_NEWFSTATAT:
+        result = sys64_stat_path(sched64_current(), (int)frame->rdi,
+                                 frame->rsi, frame->rdx, frame->r10);
+        break;
+
+    case K64_SYS_STATX:
+        result = sys64_statx(sched64_current(), (int)frame->rdi, frame->rsi,
+                             frame->rdx, frame->r10, frame->r8);
+        break;
+
+    case K64_SYS_ACCESS:
+        result = sys64_access(sched64_current(), K64_AT_FDCWD, frame->rdi,
+                              frame->rsi);
+        break;
+
+    case K64_SYS_FACCESSAT:
+    case K64_SYS_FACCESSAT2:
+        result = sys64_access(sched64_current(), (int)frame->rdi, frame->rsi,
+                              frame->rdx);
+        break;
+
+    case K64_SYS_CHDIR:
+        result = sys64_chdir(sched64_current(), frame->rdi);
+        break;
+
+    case K64_SYS_FCHDIR:
+        result = sys64_fchdir(sched64_current(), frame->rdi);
+        break;
+
+    case K64_SYS_GETCWD:
+        result = sys64_getcwd(sched64_current(), frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_GETDENTS64:
+        result = sys64_getdents64(sched64_current(), frame->rdi, frame->rsi,
+                                  frame->rdx);
+        break;
+
+    case K64_SYS_UNLINK:
+    case K64_SYS_RMDIR:
+        result = sys64_unlinkat(sched64_current(), K64_AT_FDCWD, frame->rdi,
+                                frame->rax == K64_SYS_RMDIR
+                                    ? K64_AT_REMOVEDIR : 0);
+        break;
+
+    case K64_SYS_UNLINKAT:
+        result = sys64_unlinkat(sched64_current(), (int)frame->rdi, frame->rsi,
+                                frame->rdx);
+        break;
+
+    case K64_SYS_RENAME:
+        result = sys64_renameat(sched64_current(), K64_AT_FDCWD, frame->rdi,
+                                K64_AT_FDCWD, frame->rsi, 0);
+        break;
+
+    case K64_SYS_RENAMEAT:
+        result = sys64_renameat(sched64_current(), (int)frame->rdi, frame->rsi,
+                                (int)frame->rdx, frame->r10, 0);
+        break;
+
+    case K64_SYS_RENAMEAT2:
+        result = sys64_renameat(sched64_current(), (int)frame->rdi, frame->rsi,
+                                (int)frame->rdx, frame->r10, frame->r8);
+        break;
+
+    case K64_SYS_TRUNCATE:
+        result = sys64_truncate(sched64_current(), frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_FTRUNCATE:
+        result = sys64_ftruncate(sched64_current(), frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_CHMOD:
+    case K64_SYS_CHOWN:
+    case K64_SYS_LCHOWN:
+        result = sys64_chmod_path(sched64_current(), K64_AT_FDCWD, frame->rdi);
+        break;
+
+    case K64_SYS_FCHMOD:
+    case K64_SYS_FCHOWN:
+        result = sys64_chmod_fd(sched64_current(), frame->rdi);
+        break;
+
+    case K64_SYS_FCHMODAT:
+    case K64_SYS_FCHOWNAT:
+        result = frame->rsi
+                     ? sys64_chmod_path(sched64_current(), (int)frame->rdi,
+                                        frame->rsi)
+                     : sys64_chmod_fd(sched64_current(), (int)frame->rdi);
+        break;
+
+    case K64_SYS_UTIMENSAT:
+        result = sys64_utimensat(sched64_current(), (int)frame->rdi,
+                                 frame->rsi, frame->rdx, frame->r10);
+        break;
+
+    case K64_SYS_DUP3:
+        result = sys64_dup3(sched64_current(), frame->rdi, frame->rsi,
+                            frame->rdx);
+        break;
+
+    case K64_SYS_FCNTL:
+        result = sys64_fcntl(sched64_current(), frame->rdi, frame->rsi,
+                             frame->rdx);
+        break;
+
+    case K64_SYS_IOCTL:
+        result = sys64_ioctl(sched64_current(), frame->rdi, frame->rsi,
+                             frame->rdx);
+        break;
+
+    case K64_SYS_FSYNC:
+    case K64_SYS_FDATASYNC:
+        result = sys64_fsync(frame->rdi);
+        break;
+
+    case K64_SYS_SYNC:
+        fs64_sync_all();
+        result = 0;
+        break;
+
+    case K64_SYS_MKDIRAT:
+        result = sys64_mkdirat(sched64_current(), (int)frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_OPENAT:
+        result = sys64_openat(sched64_current(), (int)frame->rdi, frame->rsi,
+                              frame->rdx, frame->r10);
+        break;
+
+    case K64_SYS_PREAD64:
+        result = sys64_pread64(frame->rdi, frame->rsi, frame->rdx, frame->r10);
+        break;
+
+    case K64_SYS_PWRITE64:
+        result = sys64_pwrite64(frame->rdi, frame->rsi, frame->rdx,
+                                frame->r10);
+        break;
+
+    case K64_SYS_MPROTECT:
+        result = sys64_mprotect(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
+    case K64_SYS_MADVISE:
+        result = sys64_madvise(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
+    case K64_SYS_BRK:
+        result = sys64_brk(frame->rdi);
+        break;
+
+    case K64_SYS_SCHED_YIELD:
+        /* Yield counts as a success when the task resumes: set the result
+         * before the switch, because the resumed frame is this one. */
+        frame->rax = 0;
+        return sched64_yield(frame);
+
+    case K64_SYS_GETUID:
+    case K64_SYS_GETEUID:
+    case K64_SYS_GETGID:
+    case K64_SYS_GETEGID:
+    case K64_SYS_SETEUID:
+        result = sys64_getuid();
+        break;
+
+    case K64_SYS_GETPGRP:
+        result = (u64)(sched64_current() + 1);
+        break;
+
+    case K64_SYS_GETPGID:
+    case K64_SYS_GETSID:
+        result = (frame->rdi == 0 ||
+                  (s64)frame->rdi == sys64_getpid())
+                     ? (u64)sys64_getpid()
+                     : (u64)0 - SYS64_EINVAL;
+        break;
+
+    case K64_SYS_SETPGID:
+    case K64_SYS_SETSID:
+        result = 0;
+        break;
+
+    case K64_SYS_UNAME:
+        result = sys64_uname(frame->rdi);
+        break;
+
+    case K64_SYS_TIME:
+        result = sys64_time(frame->rdi);
+        break;
+
+    case K64_SYS_GETTIMEOFDAY:
+        result = sys64_gettimeofday(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_TIMES:
+        result = sys64_times(frame->rdi);
+        break;
+
+    case K64_SYS_GETRUSAGE:
+        result = sys64_getrusage(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_CLOCK_GETRES:
+        result = sys64_clock_getres(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_GETRLIMIT:
+        result = sys64_getrlimit(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_SETRLIMIT:
+        result = sys64_setrlimit(frame->rdi);
+        break;
+
+    case K64_SYS_PRLIMIT64:
+        result = sys64_prlimit64(frame->rdi, frame->rsi, frame->rdx,
+                                 frame->r10);
+        break;
+
+    case K64_SYS_UMASK:
+        result = sys64_umask(frame->rdi);
+        break;
+
+    case K64_SYS_PRCTL:
+        result = sys64_prctl(frame->rdi, frame->rsi, frame->rdx, frame->r10,
+                             frame->r8);
+        break;
+
+    case K64_SYS_GETRANDOM:
+        result = sys64_getrandom(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
+    case K64_SYS_POLL:
+        result = sys64_poll(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
+    case K64_SYS_SELECT:
+        result = sys64_select(frame->rdi, frame->rsi, frame->rdx, frame->r10,
+                              frame->r8);
+        break;
+
+    case K64_SYS_PSELECT6:
+        result = sys64_select(frame->rdi, frame->rsi, frame->rdx, frame->r10,
+                              frame->r8);
+        break;
+
+    case K64_SYS_PPOLL: {
+        u64 ts[2];
+
+        if (!frame->rdx) {
+            result = sys64_poll(frame->rdi, frame->rsi, ~0ull);
+        } else if (!copy_from_user64(current_space(), ts, frame->rdx,
+                                     sizeof(ts)) ||
+                   (s64)ts[0] < 0 || (s64)ts[1] < 0 || ts[1] >= 1000000000ull) {
+            result = (u64)0 - SYS64_EINVAL;
+        } else {
+            result = sys64_poll(frame->rdi, frame->rsi,
+                                ts[0] * 1000ull + ts[1] / 1000000ull);
+        }
+        break;
+    }
+
+    case K64_SYS_SET_TID_ADDRESS:
+        result = sys64_set_tid_address(frame->rdi);
+        break;
+
+    case K64_SYS_TGKILL:
+        result = sys64_tgkill(frame->rdi, frame->rsi, frame->rdx);
         break;
 
     case K64_SYS_LSEEK:

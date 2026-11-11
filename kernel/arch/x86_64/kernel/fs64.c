@@ -60,6 +60,9 @@ typedef struct {
 
 #define FS64_DESC_MAX 64u
 #define FS64_CONSOLE  K64_FS_CONSOLE
+/* A descriptor that names a directory: it has no cache slot, it keeps the
+ * path and an entry cursor. */
+#define FS64_DIR      (-3)
 
 /* One descriptor table per task: an index into the description table. -1 is
  * a free descriptor, and for 0..2 it is also the implicit console every task
@@ -70,12 +73,15 @@ static int fd_desc[K64_TASK_MAX][FS64_FD_MAX];
 static int fd_owner[K64_TASK_MAX];
 static u32 fd_users[K64_TASK_MAX];
 static fs64_desc_t descs[FS64_DESC_MAX];
+/* Directory descriptions keep their path here, indexed like `descs`. */
+static char dir_paths[FS64_DESC_MAX][K64_FS_PATH_MAX + 1];
 
 /* Linux errno numbers, returned as negative ints by the helpers below. */
 #define FS64_EPERM    1
 #define FS64_ENOENT   2
 #define FS64_EIO      5
 #define FS64_EBADF    9
+#define FS64_EFAULT   14
 #define FS64_EEXIST   17
 #define FS64_ENOTDIR  20
 #define FS64_EISDIR   21
@@ -142,6 +148,10 @@ static fs64_cache_t *cache_find(const char *key) {
 }
 
 static int cache_flush(fs64_cache_t *slot);
+static int desc_index(fs64_desc_t *desc);
+static fs64_desc_t *fd_get(int task, int fd);
+static int fd_task(int task);
+static int valid_fd(int task, int fd);
 
 /* A free cache slot, evicting an unreferenced one if the table is full. A
  * slot with an open descriptor (or a live mapping, which requires one) is
@@ -449,6 +459,185 @@ int fs64_create_dir(const char *path) {
     return fat_error(fat12_dir_create(path));
 }
 
+/* Flush a cached path and forget its name. An open descriptor keeps the
+ * cache slot (and its handle) alive, so an unlinked-but-open file still
+ * reads and writes; it simply cannot be found by name any more. */
+static void cache_unname(const char *key, int *found) {
+    fs64_cache_t *slot = cache_find(key);
+
+    if (found) *found = slot != 0;
+    if (!slot) return;
+    (void)cache_flush(slot);
+    if (slot->refs > 0) {
+        slot->path[0] = 0;
+        return;
+    }
+    (void)fat12_file_close(&slot->handle);
+    cache_clear(slot);
+}
+
+int fs64_unlink(const char *path) {
+    char key[K64_FS_PATH_MAX + 1];
+    int result;
+
+    if (!cache_key(path, key)) return -FS64_EINVAL;
+    cache_unname(key, 0);
+    result = fat12_file_unlink(path);
+    return fat_error(result);
+}
+
+int fs64_rename(const char *oldpath, const char *newpath) {
+    char oldkey[K64_FS_PATH_MAX + 1];
+    char newkey[K64_FS_PATH_MAX + 1];
+    fs64_cache_t *slot;
+    int result;
+
+    if (!cache_key(oldpath, oldkey) || !cache_key(newpath, newkey))
+        return -FS64_EINVAL;
+    slot = cache_find(oldkey);
+    if (slot && slot->refs == 0) {
+        (void)cache_flush(slot);
+        (void)fat12_file_close(&slot->handle);
+        cache_clear(slot);
+        slot = 0;
+    }
+    result = fat_error(fat12_file_rename(oldpath, newpath));
+    if (result == 0 && slot) {
+        /* The open description follows the new name. */
+        u64 i = 0;
+        while (newkey[i]) { slot->path[i] = newkey[i]; i++; }
+        slot->path[i] = 0;
+    }
+    return result;
+}
+
+int fs64_rmdir(const char *path) {
+    if (!path || !*path) return -FS64_EINVAL;
+    return fat_error(fat12_dir_remove(path));
+}
+
+int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind) {
+    fat12_stat_t st;
+    int result = fat12_file_stat(path, &st);
+
+    if (result != 1) return fat_error(result);
+    if (size) *size = st.size;
+    if (ino) *ino = st.ino;
+    if (kind) *kind = st.is_dir ? FS64_KIND_DIR : FS64_KIND_FILE;
+    return 0;
+}
+
+int fs64_fd_is_dir(int task, int fd) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    return desc && desc->slot == FS64_DIR;
+}
+
+/* The path a directory descriptor was opened with, for the *at calls that
+ * take a dirfd. A regular file or the console is not a directory. */
+int fs64_fd_dir_path(int task, int fd, char out[K64_FS_PATH_MAX + 1]) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+    u64 i = 0;
+
+    if (!desc || desc->slot != FS64_DIR) return -FS64_ENOTDIR;
+    if (!out) return -FS64_EFAULT;
+    while (dir_paths[desc_index(desc)][i] && i < K64_FS_PATH_MAX) {
+        out[i] = dir_paths[desc_index(desc)][i];
+        i++;
+    }
+    out[i] = 0;
+    return 0;
+}
+
+/* Persist every dirty page of one descriptor (fsync/fdatasync). */
+int fs64_fd_sync(int task, int fd) {
+    fs64_desc_t *desc;
+
+    task = fd_task(task);
+    if (!valid_fd(task, fd)) return -FS64_EBADF;
+    desc = fd_get(task, fd);
+    if (!desc) return fd <= 2 ? 0 : -FS64_EBADF;
+    if (desc->slot < 0) return 0;
+    if ((u32)desc->slot >= FS64_CACHE_MAX) return -FS64_EBADF;
+    if (!cache[desc->slot].used) return -FS64_EBADF;
+    return cache_flush(&cache[desc->slot]) ? 0 : -FS64_EIO;
+}
+
+/* Persist the whole cache (sync(2)). */
+void fs64_sync_all(void) {
+    for (u32 i = 0; i < FS64_CACHE_MAX; i++)
+        if (cache[i].used) (void)cache_flush(&cache[i]);
+}
+
+int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
+    fs64_desc_t *desc;
+
+    task = fd_task(task);
+    if (!valid_fd(task, fd)) return -FS64_EBADF;
+    desc = fd_get(task, fd);
+    if (!desc) {
+        /* The implicit console descriptors are the serial port. */
+        if (fd > 2) return -FS64_EBADF;
+        if (size) *size = 0;
+        if (ino) *ino = 0;
+        if (kind) *kind = FS64_KIND_CHAR;
+        return 0;
+    }
+    if (desc->slot == FS64_CONSOLE) {
+        if (size) *size = 0;
+        if (ino) *ino = 0;
+        if (kind) *kind = FS64_KIND_CHAR;
+        return 0;
+    }
+    if (desc->slot == FS64_DIR) {
+        const char *path = dir_paths[desc_index(desc)];
+        fat12_stat_t st;
+        int result = fat12_file_stat(path, &st);
+
+        if (result != 1) return fat_error(result);
+        if (size) *size = 0;
+        if (ino) *ino = st.ino;
+        if (kind) *kind = FS64_KIND_DIR;
+        return 0;
+    }
+    if (desc->slot < 0 || (u32)desc->slot >= FS64_CACHE_MAX) return -FS64_EBADF;
+    {
+        fs64_cache_t *slot = &cache[desc->slot];
+        fat12_stat_t st;
+
+        if (!slot->used) return -FS64_EBADF;
+        if (fat12_file_fstat(&slot->handle, &st) != 1) return -FS64_EIO;
+        if (size) *size = slot->size;
+        if (ino) *ino = st.ino;
+        if (kind) *kind = FS64_KIND_FILE;
+    }
+    return 0;
+}
+
+int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
+                     int *is_dir, u32 *next_index) {
+    fat12_dir_t dir;
+    fat12_stat_t st;
+    int result = fat12_dir_open(path, &dir);
+
+    if (result != 1) return fat_error(result);
+    result = fat12_dir_read(&dir, index, &st, name, next_index);
+    if (result == 0) return 0;
+    if (result != 1) return fat_error(result);
+    if (ino) *ino = st.ino;
+    if (is_dir) *is_dir = st.is_dir;
+    return 1;
+}
+
+int fs64_fd_entry(int task, int fd, u32 index, char name[13], u32 *ino,
+                  int *is_dir, u32 *next_index) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    if (!desc || desc->slot != FS64_DIR) return -FS64_ENOTDIR;
+    return fs64_dir_entries(dir_paths[desc_index(desc)], index, name, ino,
+                            is_dir, next_index);
+}
+
 static int valid_fd(int task, int fd) {
     return task >= 0 && task < (int)K64_TASK_MAX &&
            fd >= 0 && fd < (int)FS64_FD_MAX;
@@ -521,11 +710,50 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     task = fd_task(task);
     if (flags & ~(u64)(K64_O_RDONLY | K64_O_WRONLY | K64_O_RDWR |
                        K64_O_CREAT | K64_O_EXCL | K64_O_TRUNC |
-                       K64_O_APPEND) ||
+                       K64_O_APPEND | K64_O_DIRECTORY) ||
         (access != K64_O_RDONLY && access != K64_O_WRONLY &&
          access != K64_O_RDWR)) {
         if (error) *error = -FS64_EINVAL;
         return -1;
+    }
+
+    if (flags & K64_O_DIRECTORY) {
+        fat12_dir_t dir;
+        int opened;
+
+        if (flags & (K64_O_CREAT | K64_O_TRUNC)) {
+            if (error) *error = -FS64_EINVAL;
+            return -1;
+        }
+        opened = fat12_dir_open(path, &dir);
+        if (opened != 1) {
+            if (error) *error = fat_error(opened);
+            return -1;
+        }
+        for (fd = 3; fd < (int)FS64_FD_MAX; fd++)
+            if (fd_desc[task][fd] < 0) break;
+        if (fd >= (int)FS64_FD_MAX) {
+            if (error) *error = -FS64_ENOSPC;
+            return -1;
+        }
+        desc = desc_alloc();
+        if (!desc) {
+            if (error) *error = -FS64_ENOSPC;
+            return -1;
+        }
+        desc->slot = FS64_DIR;
+        desc->flags = K64_O_RDONLY;
+        desc->pos = 0;
+        {
+            u32 i = 0;
+            while (path[i] && i < K64_FS_PATH_MAX) {
+                dir_paths[desc_index(desc)][i] = path[i];
+                i++;
+            }
+            dir_paths[desc_index(desc)][i] = 0;
+        }
+        fd_desc[task][fd] = desc_index(desc);
+        return fd;
     }
 
     if (flags & K64_O_CREAT) fat_flags |= FAT12_OPEN_CREATE;
@@ -578,7 +806,9 @@ u64 fs64_fd_pos(int task, int fd) {
 int fs64_fd_seek(int task, int fd, u64 pos) {
     fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
-    if (!desc || desc->slot < 0) return 0;
+    /* Directory descriptors keep their entry cursor here too, so seekdir
+     * and getdents64 share one position. */
+    if (!desc || (desc->slot < 0 && desc->slot != FS64_DIR)) return 0;
     desc->pos = pos;
     return 1;
 }

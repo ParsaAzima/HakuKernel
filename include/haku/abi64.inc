@@ -33,6 +33,76 @@
 %define HAKU64_SYS_CLOCK_GETTIME 228
 %define HAKU64_SYS_EXIT_GROUP    231
 
+; The rest of the ported table (x86-64 Linux numbers).
+%define HAKU64_SYS_STAT          4
+%define HAKU64_SYS_FSTAT         5
+%define HAKU64_SYS_LSTAT         6
+%define HAKU64_SYS_POLL          7
+%define HAKU64_SYS_MPROTECT      10
+%define HAKU64_SYS_BRK           12
+%define HAKU64_SYS_IOCTL         16
+%define HAKU64_SYS_PREAD64       17
+%define HAKU64_SYS_PWRITE64      18
+%define HAKU64_SYS_ACCESS        21
+%define HAKU64_SYS_SELECT        23
+%define HAKU64_SYS_SCHED_YIELD   24
+%define HAKU64_SYS_FSYNC         74
+%define HAKU64_SYS_FDATASYNC     75
+%define HAKU64_SYS_TRUNCATE      76
+%define HAKU64_SYS_FTRUNCATE     77
+%define HAKU64_SYS_GETCWD        79
+%define HAKU64_SYS_CHDIR         80
+%define HAKU64_SYS_FCHDIR        81
+%define HAKU64_SYS_RENAME        82
+%define HAKU64_SYS_RMDIR         84
+%define HAKU64_SYS_UNLINK        87
+%define HAKU64_SYS_CHMOD         90
+%define HAKU64_SYS_UMASK         95
+%define HAKU64_SYS_GETTIMEOFDAY  96
+%define HAKU64_SYS_GETRLIMIT     97
+%define HAKU64_SYS_GETRUSAGE     98
+%define HAKU64_SYS_TIMES         100
+%define HAKU64_SYS_GETUID        102
+%define HAKU64_SYS_GETGID        104
+%define HAKU64_SYS_GETEUID       107
+%define HAKU64_SYS_GETEGID       108
+%define HAKU64_SYS_PRCTL         157
+%define HAKU64_SYS_SYNC          162
+%define HAKU64_SYS_UNAME         63
+%define HAKU64_SYS_TIME          201
+%define HAKU64_SYS_GETDENTS64    217
+%define HAKU64_SYS_CLOCK_GETRES  229
+%define HAKU64_SYS_OPENAT        257
+%define HAKU64_SYS_MKDIRAT       258
+%define HAKU64_SYS_NEWFSTATAT    262
+%define HAKU64_SYS_UNLINKAT      263
+%define HAKU64_SYS_RENAMEAT      264
+%define HAKU64_SYS_UTIMENSAT     280
+%define HAKU64_SYS_DUP3          292
+%define HAKU64_SYS_PRLIMIT64     302
+%define HAKU64_SYS_FCNTL         72
+%define HAKU64_SYS_GETRANDOM     318
+%define HAKU64_SYS_STATX         332
+
+; *at flags and access modes.
+%define HAKU64_AT_FDCWD          -100
+%define HAKU64_AT_SYMLINK_NOFOLLOW 0x100
+%define HAKU64_AT_REMOVEDIR      0x200
+%define HAKU64_F_OK 0
+%define HAKU64_X_OK 1
+%define HAKU64_W_OK 2
+%define HAKU64_R_OK 4
+
+%define HAKU64_O_DIRECTORY 0x10000
+
+; fcntl commands, prctl names and poll events used by the tests.
+%define HAKU64_F_GETFD 1
+%define HAKU64_F_GETFL 3
+%define HAKU64_PR_SET_NAME 15
+%define HAKU64_PR_GET_NAME 16
+%define HAKU64_POLLIN  1
+%define HAKU64_POLLOUT 4
+
 ; clone() flags; the kernel honours exactly this subset.
 %define HAKU64_CLONE_VM            0x00000100
 %define HAKU64_CLONE_FS            0x00000200

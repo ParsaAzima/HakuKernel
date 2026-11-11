@@ -11,12 +11,17 @@
 ; write path with HAKU64-DISK-OK, observes a MAP_SHARED page through a
 ; forked child and prints HAKU64-FORK-OK, runs a clone()d thread that shares
 ; the address space and the descriptor table, sleeps on a futex until the
-; thread wakes it and prints HAKU64-THREAD-OK, stores a magic word in its
-; zero-filled BSS page and exits with status 0; the kernel reads both back,
-; which proves the image ran in ring 3 instead of merely being mapped. A
-; failure exits with the number of the step that failed (the early ABI tests
-; leave 1, the disk, fork, dup, sleep, exec and thread steps use 20-70), which
-; the kernel prints as HAKU64-ELF-RUN-FAIL: exit=N.
+; thread wakes it and prints HAKU64-THREAD-OK, walks the rest of the ported
+; table -- stat/fstat/statx, chdir/getcwd and relative names, openat/
+; mkdirat/getdents64/rmdir, create/ftruncate/truncate/rename/unlink, uname/
+; time/times/rlimit/clock_getres, prctl names, getrandom, brk+mprotect,
+; poll/select, sched_yield, dup3/fcntl -- and prints HAKU64-PORT-OK, then
+; stores a magic word in its zero-filled BSS page and exits with status 0;
+; the kernel reads both back, which proves the image ran in ring 3 instead
+; of merely being mapped. A failure exits with the number of the step that
+; failed (the early ABI tests leave 1, the disk, fork, dup, sleep, exec and
+; thread steps use 20-70, the ported table uses 71-117), which the kernel
+; prints as HAKU64-ELF-RUN-FAIL: exit=N.
 ;
 ; The code is position independent (RIP-relative operands only), so the flat
 ; binary does not need a linker to resolve USER64_BASE: mkelf64.py chooses the
@@ -52,6 +57,12 @@ default rel
 %define THREAD_FLAG  (USER64_BSS + 0x700)
 %define THREAD_COUNT (USER64_BSS + 0x708)
 %define THREAD_TIDS  (USER64_BSS + 0x710)
+%define STAT_BUF     (USER64_BSS + 0x780)
+%define CWD_BUF      (USER64_BSS + 0x820)
+%define DIR_BUF      (USER64_BSS + 0x880)
+%define POLL_BUF     (USER64_BSS + 0xAA0)
+%define UNAME_BUF    (USER64_BSS + 0xAC0)
+%define RAND_BUF     (USER64_BSS + 0xC80)
 
 _start:
     mov r15d, 1                     ; step number reported by fail (see top)
@@ -460,9 +471,11 @@ _start:
     syscall
     cmp rax, -HAKU64_ENOENT
     jne fail
+    ; O_LARGEFILE/O_CLOEXEC/O_NOFOLLOW are dropped because a libc sets them
+    ; by default; an unknown flag bit is still -EINVAL.
     mov eax, HAKU64_SYS_OPEN
     lea rdi, [path_hello]
-    mov esi, 0x8000
+    mov esi, 0x200000
     xor edx, edx
     syscall
     cmp rax, -HAKU64_EINVAL
@@ -1024,8 +1037,496 @@ exec_done:
     cmp eax, 7
     jne fail
 
-    ; The INT 0x80 gate stays available; the error paths below use it so
-    ; both entry points run in the same program.
+    ; ---- metadata, paths, directories and the rest of the port ----------
+    ; stat() of a seeded file: a regular 16-byte file (S_IFREG in st_mode).
+    mov r15d, 71
+    mov eax, HAKU64_SYS_STAT
+    lea rdi, [path_hello]
+    mov rsi, STAT_BUF
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, STAT_BUF
+    cmp qword [rbx + 48], 16           ; st_size
+    jne fail
+    mov eax, dword [rbx + 24]          ; st_mode
+    and eax, 0xF000
+    cmp eax, 0x8000
+    jne fail
+
+    ; fstat() on the same file through a descriptor.
+    mov r15d, 72
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_hello]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js fail
+    mov r13, rax
+    mov r15d, 73
+    mov eax, HAKU64_SYS_FSTAT
+    mov rdi, r13
+    mov rsi, STAT_BUF
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, STAT_BUF
+    cmp qword [rbx + 48], 16
+    jne fail
+    mov r15d, 74
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r13
+    syscall
+    test rax, rax
+    jne fail
+
+    ; statx() fills the 256-byte modern layout; access() accepts F_OK|R_OK.
+    mov r15d, 75
+    mov eax, HAKU64_SYS_STATX
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [path_hello]
+    xor edx, edx
+    mov r10d, 0x7FF
+    mov r8, STAT_BUF
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, STAT_BUF
+    cmp qword [rbx + 40], 16           ; stx_size
+    jne fail
+    mov r15d, 76
+    mov eax, HAKU64_SYS_ACCESS
+    lea rdi, [path_hello]
+    mov esi, HAKU64_F_OK | HAKU64_R_OK
+    syscall
+    test rax, rax
+    jne fail
+
+    ; chdir(/TMP), getcwd() reports the canonical path, and a relative name
+    ; now resolves under it.
+    mov r15d, 77
+    mov eax, HAKU64_SYS_CHDIR
+    lea rdi, [path_tmp]
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 78
+    mov eax, HAKU64_SYS_GETCWD
+    mov rdi, CWD_BUF
+    mov esi, 64
+    syscall
+    mov rbx, CWD_BUF
+    cmp rax, rbx
+    jne fail
+    cmp dword [rbx], 0x504D542F        ; "/TMP"
+    jne fail
+    cmp byte [rbx + 4], 0
+    jne fail
+
+    mov r15d, 79
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [name_note]               ; "NOTE.TXT", relative to /TMP
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js fail
+    mov r13, rax
+    mov r15d, 80
+    mov eax, HAKU64_SYS_FSTAT
+    mov rdi, r13
+    mov rsi, STAT_BUF
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, STAT_BUF
+    cmp qword [rbx + 48], 0
+    jle fail
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r13
+    syscall
+
+    ; openat() with AT_FDCWD sees the same working directory.
+    mov r15d, 81
+    mov eax, HAKU64_SYS_OPENAT
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [name_note]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js fail
+    mov r13, rax
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r13
+    syscall
+
+    ; mkdirat + O_DIRECTORY + getdents64 (empty new directory) + rmdir.
+    mov r15d, 82
+    mov eax, HAKU64_SYS_MKDIRAT
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [name_subdir]
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 83
+    mov eax, HAKU64_SYS_OPENAT
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [name_subdir]
+    mov edx, HAKU64_O_RDONLY | HAKU64_O_DIRECTORY
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js fail
+    mov r13, rax
+    mov r15d, 84
+    mov eax, HAKU64_SYS_GETDENTS64
+    mov rdi, r13
+    mov rsi, DIR_BUF
+    mov edx, 512
+    syscall
+    test rax, rax
+    jne fail                            ; "." and ".." are skipped
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r13
+    syscall
+    mov r15d, 85
+    mov eax, HAKU64_SYS_UNLINKAT
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [name_subdir]
+    mov edx, HAKU64_AT_REMOVEDIR
+    syscall
+    test rax, rax
+    jne fail
+
+    ; Create, ftruncate, truncate, rename and unlink a file by relative name.
+    mov r15d, 86
+    mov eax, HAKU64_SYS_OPENAT
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [name_tmpfile]
+    mov edx, HAKU64_O_CREAT | HAKU64_O_RDWR | HAKU64_O_TRUNC
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js fail
+    mov r13, rax
+    mov r15d, 87
+    mov eax, HAKU64_SYS_WRITE
+    mov rdi, r13
+    lea rsi, [msg_abc]
+    mov edx, 3
+    syscall
+    cmp rax, 3
+    jne fail
+    mov r15d, 88
+    mov eax, HAKU64_SYS_FTRUNCATE
+    mov rdi, r13
+    mov esi, 1
+    syscall
+    test rax, rax
+    jne fail
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r13
+    syscall
+    mov r15d, 89
+    mov eax, HAKU64_SYS_TRUNCATE
+    lea rdi, [name_tmpfile]
+    mov esi, 2
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 90
+    mov eax, HAKU64_SYS_NEWFSTATAT
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [name_tmpfile]
+    mov rdx, STAT_BUF
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, STAT_BUF
+    cmp qword [rbx + 48], 2
+    jne fail
+    mov r15d, 91
+    mov eax, HAKU64_SYS_RENAMEAT
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [name_tmpfile]
+    mov edx, HAKU64_AT_FDCWD
+    lea r10, [name_renamed]
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 92
+    mov eax, HAKU64_SYS_STAT
+    lea rdi, [path_tmpfile]            ; /TMP/TMPFILE.TXT is gone
+    mov rsi, STAT_BUF
+    syscall
+    cmp rax, -HAKU64_ENOENT
+    jne fail
+    mov r15d, 93
+    mov eax, HAKU64_SYS_UNLINKAT
+    mov edi, HAKU64_AT_FDCWD
+    lea rsi, [name_renamed]
+    xor edx, edx
+    syscall
+    test rax, rax
+    jne fail
+
+    ; A non-empty directory lists its entry: open /TMP and read one record.
+    mov r15d, 94
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_tmp]
+    mov esi, HAKU64_O_RDONLY | HAKU64_O_DIRECTORY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js fail
+    mov r13, rax
+    mov r15d, 95
+    mov eax, HAKU64_SYS_GETDENTS64
+    mov rdi, r13
+    mov rsi, DIR_BUF
+    mov edx, 512
+    syscall
+    cmp rax, 32
+    jb fail
+    mov rbx, DIR_BUF
+    mov eax, dword [rbx + 16]          ; reclen + type + name
+    shr eax, 16
+    and eax, 0xFF
+    cmp eax, 8                         ; DT_REG for NOTE.TXT
+    jne fail
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r13
+    syscall
+
+    ; Back to the root; getcwd reports "/".
+    mov r15d, 96
+    mov eax, HAKU64_SYS_CHDIR
+    lea rdi, [path_root]
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 97
+    mov eax, HAKU64_SYS_GETCWD
+    mov rdi, CWD_BUF
+    mov esi, 64
+    syscall
+    mov rbx, CWD_BUF
+    cmp byte [rbx], '/'
+    jne fail
+    cmp byte [rbx + 1], 0
+    jne fail
+
+    ; uname, gettimeofday, times, getrlimit and clock_getres.
+    mov r15d, 98
+    mov eax, HAKU64_SYS_UNAME
+    mov rdi, UNAME_BUF
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, UNAME_BUF
+    cmp dword [rbx], 0x756B6148        ; "Haku"
+    jne fail
+
+    mov r15d, 99
+    mov eax, HAKU64_SYS_GETTIMEOFDAY
+    mov rdi, STAT_BUF
+    xor esi, esi
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, STAT_BUF
+    cmp qword [rbx], 0
+    jle fail
+
+    mov r15d, 100
+    mov eax, HAKU64_SYS_TIMES
+    mov rdi, STATUS_BUF
+    syscall
+    test rax, rax
+    js fail
+
+    mov r15d, 101
+    mov eax, HAKU64_SYS_GETRLIMIT
+    mov edi, 7                         ; RLIMIT_NOFILE
+    mov rsi, STAT_BUF
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, STAT_BUF
+    cmp qword [rbx], 16
+    jne fail
+
+    mov r15d, 102
+    mov eax, HAKU64_SYS_CLOCK_GETRES
+    mov edi, HAKU64_CLOCK_MONOTONIC
+    mov rsi, STAT_BUF
+    syscall
+    test rax, rax
+    jne fail
+
+    ; prctl(PR_SET_NAME) then PR_GET_NAME reports the same 5 bytes.
+    mov r15d, 103
+    mov eax, HAKU64_SYS_PRCTL
+    mov edi, HAKU64_PR_SET_NAME
+    lea rsi, [name_ring3]
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 104
+    mov eax, HAKU64_SYS_PRCTL
+    mov edi, HAKU64_PR_GET_NAME
+    mov rsi, STAT_BUF
+    syscall
+    test rax, rax
+    jne fail
+    mov rbx, STAT_BUF
+    cmp dword [rbx], 0x676E6972       ; "ring"
+    jne fail
+    cmp byte [rbx + 4], '3'
+    jne fail
+
+    ; getrandom() fills the buffer and two calls differ.
+    mov r15d, 105
+    mov eax, HAKU64_SYS_GETRANDOM
+    mov rdi, RAND_BUF
+    mov esi, 8
+    xor edx, edx
+    syscall
+    cmp rax, 8
+    jne fail
+    mov rbx, RAND_BUF
+    mov r13, [rbx]
+    mov r15d, 106
+    mov eax, HAKU64_SYS_GETRANDOM
+    mov rdi, RAND_BUF
+    mov esi, 8
+    xor edx, edx
+    syscall
+    cmp rax, 8
+    jne fail
+    mov rbx, RAND_BUF
+    cmp r13, [rbx]
+    je fail
+
+    ; brk(0) reports the base; growing maps zeroed pages, mprotect retunes
+    ; them, and shrinking releases them again.
+    mov r15d, 107
+    mov eax, HAKU64_SYS_BRK
+    xor edi, edi
+    syscall
+    test rax, rax
+    jz fail
+    mov r13, rax
+    lea rdi, [r13 + 0x2000]
+    mov eax, HAKU64_SYS_BRK
+    syscall
+    lea rbx, [r13 + 0x2000]
+    cmp rax, rbx
+    jne fail
+    mov r15d, 108
+    mov qword [r13 + 0x1000], 0x1234
+    cmp qword [r13 + 0x1000], 0x1234
+    jne fail
+    mov r15d, 109
+    mov eax, HAKU64_SYS_MPROTECT
+    mov rdi, r13
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 110
+    mov eax, HAKU64_SYS_BRK
+    mov rdi, r13
+    syscall
+    cmp rax, r13
+    jne fail
+
+    ; poll() on the console reports POLLOUT immediately.
+    mov r15d, 111
+    mov rbx, POLL_BUF
+    mov dword [rbx], 1
+    mov word [rbx + 4], HAKU64_POLLOUT
+    mov word [rbx + 6], 0
+    mov eax, HAKU64_SYS_POLL
+    mov rdi, rbx
+    mov esi, 1
+    xor edx, edx
+    syscall
+    cmp rax, 1
+    jne fail
+    mov ax, [rbx + 6]
+    test ax, HAKU64_POLLOUT
+    jz fail
+
+    ; select() over fd 0 (the console is always readable) returns one ready.
+    mov r15d, 112
+    mov rdi, DIR_BUF
+    xor eax, eax
+    mov ecx, 128
+    rep stosb
+    mov rbx, DIR_BUF
+    mov byte [rbx], 1                  ; bit 0 = fd 0
+    mov eax, HAKU64_SYS_SELECT
+    mov edi, 1
+    mov rsi, rbx
+    xor edx, edx
+    xor r10d, r10d
+    xor r8d, r8d
+    syscall
+    cmp rax, 1
+    jne fail
+    cmp byte [rbx], 1
+    jne fail
+
+    ; sched_yield() returns 0 with no other READY task, which is allowed.
+    mov r15d, 113
+    mov eax, HAKU64_SYS_SCHED_YIELD
+    syscall
+    test rax, rax
+    jne fail
+
+    ; dup3(1, 10) is dup2 with a flag argument; fcntl reports the descriptor.
+    mov r15d, 114
+    mov eax, HAKU64_SYS_DUP3
+    mov edi, 1
+    mov esi, 10
+    xor edx, edx
+    syscall
+    cmp rax, 10
+    jne fail
+    mov r15d, 115
+    mov eax, HAKU64_SYS_WRITE
+    mov edi, 10
+    lea rsi, [msg_port]
+    mov edx, msg_port_end - msg_port
+    syscall
+    cmp rax, msg_port_end - msg_port
+    jne fail
+    mov eax, HAKU64_SYS_CLOSE
+    mov edi, 10
+    syscall
+    mov r15d, 116
+    mov eax, HAKU64_SYS_FCNTL
+    mov edi, 1
+    mov esi, HAKU64_F_GETFD
+    xor edx, edx
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 117
+    mov eax, HAKU64_SYS_FCNTL
+    mov edi, 1
+    mov esi, HAKU64_F_GETFL
+    xor edx, edx
+    syscall
+    test rax, rax
+    js fail
+
+    ; ---- error paths through the INT 0x80 gate -------------------------
     ; write() to a descriptor other than 1 or 2 is -EBADF.
     mov eax, HAKU64_SYS_WRITE
     mov edi, 99
@@ -1219,6 +1720,35 @@ msg_exec_end:
 msg_thread:
     db 'HAKU64-THREAD-OK', 13, 10
 msg_thread_end:
+
+msg_port:
+    db 'HAKU64-PORT-OK', 13, 10
+msg_port_end:
+
+msg_abc:
+    db 'abc'
+
+
+path_root:
+    db '/', 0
+
+name_note:
+    db 'NOTE.TXT', 0
+
+name_subdir:
+    db 'SUBDIR', 0
+
+name_tmpfile:
+    db 'TMPFILE.TXT', 0
+
+name_renamed:
+    db 'RENAMED.TXT', 0
+
+path_tmpfile:
+    db '/TMP/TMPFILE.TXT', 0
+
+name_ring3:
+    db 'ring3', 0
 
 path_hello:
     db '/hello.txt', 0

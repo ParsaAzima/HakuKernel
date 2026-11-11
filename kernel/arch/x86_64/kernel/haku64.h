@@ -65,6 +65,13 @@ typedef signed long long s64;
 #define K64_USER_MMAP_END       K64_USER_STACK_BOTTOM
 #define K64_USER_MMAP_PAGES_MAX 256u
 
+/* The program break gets its own window between the image and the mmap
+ * window, so growing the heap never collides with an anonymous mapping. It
+ * starts page aligned at K64_USER_BRK_BASE and stops at the mmap base. */
+#define K64_USER_BRK_BASE       (K64_USER_BASE + 0x08000000ull)
+#define K64_USER_BRK_LIMIT      K64_USER_MMAP_BASE
+#define K64_USER_BRK_PAGES_MAX  4096u
+
 /* Physical layout this stage reserves (all identity mapped, so a plain
  * pointer works):
  *   0x000000-0x200000  firmware, stage1/stage2, E820 and VBE handover,
@@ -147,6 +154,125 @@ typedef signed long long s64;
 #define K64_SYS_CLOCK_GETTIME 228u
 #define K64_SYS_EXIT_GROUP    231u
 
+/* The rest of the x86-64 Linux table this port answers. They are grouped
+ * the way the kernel implements them: metadata and paths first, then the
+ * process and time calls. */
+#define K64_SYS_STAT          4u
+#define K64_SYS_FSTAT         5u
+#define K64_SYS_LSTAT         6u
+#define K64_SYS_POLL          7u
+#define K64_SYS_MPROTECT      10u
+#define K64_SYS_BRK           12u
+#define K64_SYS_RT_SIGACTION  13u
+#define K64_SYS_RT_SIGPROCMASK 14u
+#define K64_SYS_IOCTL         16u
+#define K64_SYS_PREAD64       17u
+#define K64_SYS_PWRITE64      18u
+#define K64_SYS_ACCESS        21u
+#define K64_SYS_PIPE          22u
+#define K64_SYS_SELECT        23u
+#define K64_SYS_SCHED_YIELD   24u
+#define K64_SYS_MREMAP        25u
+#define K64_SYS_MADVISE       28u
+#define K64_SYS_DUP3          292u
+#define K64_SYS_FCNTL         72u
+#define K64_SYS_FSYNC         74u
+#define K64_SYS_FDATASYNC     75u
+#define K64_SYS_TRUNCATE      76u
+#define K64_SYS_FTRUNCATE     77u
+#define K64_SYS_GETCWD        79u
+#define K64_SYS_CHDIR         80u
+#define K64_SYS_FCHDIR        81u
+#define K64_SYS_RENAME        82u
+#define K64_SYS_RMDIR         84u
+#define K64_SYS_UNLINK        87u
+#define K64_SYS_CHMOD         90u
+#define K64_SYS_FCHMOD        91u
+#define K64_SYS_CHOWN         92u
+#define K64_SYS_FCHOWN        93u
+#define K64_SYS_LCHOWN        94u
+#define K64_SYS_UMASK         95u
+#define K64_SYS_GETTIMEOFDAY  96u
+#define K64_SYS_GETRLIMIT     97u
+#define K64_SYS_GETRUSAGE     98u
+#define K64_SYS_TIMES         100u
+#define K64_SYS_GETUID        102u
+#define K64_SYS_GETGID        104u
+#define K64_SYS_SETEUID       105u
+#define K64_SYS_GETEUID       107u
+#define K64_SYS_GETEGID       108u
+#define K64_SYS_SETPGID       109u
+#define K64_SYS_GETPGRP       111u
+#define K64_SYS_SETSID        112u
+#define K64_SYS_GETPGID       121u
+#define K64_SYS_GETSID        124u
+#define K64_SYS_PRCTL         157u
+#define K64_SYS_SETRLIMIT     160u
+#define K64_SYS_SYNC          162u
+#define K64_SYS_UNAME         63u
+#define K64_SYS_TIME          201u
+#define K64_SYS_GETDENTS64    217u
+#define K64_SYS_SET_TID_ADDRESS 218u
+#define K64_SYS_CLOCK_GETRES  229u
+#define K64_SYS_TGKILL        234u
+#define K64_SYS_OPENAT        257u
+#define K64_SYS_MKDIRAT       258u
+#define K64_SYS_FCHOWNAT      260u
+#define K64_SYS_NEWFSTATAT    262u
+#define K64_SYS_UNLINKAT      263u
+#define K64_SYS_RENAMEAT      264u
+#define K64_SYS_FCHMODAT      268u
+#define K64_SYS_FACCESSAT     269u
+#define K64_SYS_PSELECT6      270u
+#define K64_SYS_PPOLL         271u
+#define K64_SYS_UTIMENSAT     280u
+#define K64_SYS_PIPE2         293u
+#define K64_SYS_PRLIMIT64     302u
+#define K64_SYS_RENAMEAT2     316u
+#define K64_SYS_GETRANDOM     318u
+#define K64_SYS_STATX         332u
+#define K64_SYS_FACCESSAT2    439u
+
+/* *at flags. Haku has no symbolic links, so NOFOLLOW is accepted and
+ * ignored; EMPTY_PATH makes an empty path mean "the dirfd itself". */
+#define K64_AT_SYMLINK_NOFOLLOW 0x100u
+#define K64_AT_REMOVEDIR        0x200u
+#define K64_AT_EMPTY_PATH       0x1000u
+/* access(2) modes. */
+#define K64_F_OK 0u
+#define K64_X_OK 1u
+#define K64_W_OK 2u
+#define K64_R_OK 4u
+/* The extra open flags the syscall layer accepts as no-ops. */
+#define K64_O_NOCTTY   0x100u
+#define K64_O_NONBLOCK 0x800u
+#define K64_O_LARGEFILE 0x8000u
+#define K64_O_NOFOLLOW 0x20000u
+#define K64_O_CLOEXEC  0x80000u
+/* fcntl(2) commands. */
+#define K64_F_DUPFD          0u
+#define K64_F_GETFD          1u
+#define K64_F_SETFD          2u
+#define K64_F_GETFL          3u
+#define K64_F_SETFL          4u
+#define K64_F_GETLK          5u
+#define K64_F_SETLK          6u
+#define K64_F_SETLKW         7u
+#define K64_F_DUPFD_CLOEXEC  1030u
+#define K64_F_UNLCK          2u
+/* prctl(2) subset. */
+#define K64_PR_SET_PDEATHSIG  1u
+#define K64_PR_GET_DUMPABLE   3u
+#define K64_PR_SET_DUMPABLE   4u
+#define K64_PR_SET_NAME       15u
+#define K64_PR_GET_NAME       16u
+/* poll(2) events and clock ids used by the port. */
+#define K64_POLLIN   0x0001u
+#define K64_POLLOUT  0x0004u
+#define K64_POLLERR  0x0008u
+#define K64_POLLHUP  0x0010u
+#define K64_POLLNVAL 0x0020u
+
 /* clone() flags, with the Linux numbering. Only these are honoured; the
  * rest are refused so a caller never believes it got a guarantee (thread
  * TLS, for example, is not implemented). CLONE_VM and CLONE_THREAD are the
@@ -199,6 +325,12 @@ typedef signed long long s64;
 #define K64_O_EXCL   0x80u
 #define K64_O_TRUNC  0x200u
 #define K64_O_APPEND 0x400u
+#define K64_O_DIRECTORY 0x10000u
+
+/* Path resolution. A relative path is joined to the task's working
+ * directory; AT_FDCWD (-100) is the "no dirfd" marker the *at calls use. */
+#define K64_AT_FDCWD (-100)
+#define K64_PATH_MAX  K64_FS_PATH_MAX
 
 /* wait4() options and the status encoding. */
 #define K64_WNOHANG 1u
@@ -346,6 +478,8 @@ int paging64_query_space(u64 space, u64 virt, u64 *phys, int *writable,
                          int *user);
 /* Clear one user leaf and return the frame it mapped, or 0. */
 u64 paging64_unmap_space(u64 space, u64 virt);
+/* Change writable/executable of one mapped user page (mprotect). */
+int paging64_protect_space(u64 space, u64 virt, int writable, int executable);
 void paging64_destroy_space(u64 space);
 /* fork support: clone every user page (shared ranges are aliased, the rest
  * copied) and free a space's frames, keeping the ones `keep` claims. */
@@ -482,6 +616,8 @@ u64 task64_fault_address(int id);
 /* Next anonymous mapping address, and a reservation that fails when the
  * request would reach the stack guard or exceed the page cap. */
 u64 task64_mmap_base(int id);
+u64 task64_get_brk(int id);
+void task64_set_brk(int id, u64 value);
 u64 task64_mmap_reserve(int id, u64 pages);
 /* Mapping records: munmap has to know whether the frames in a range belong
  * to the mapping (anonymous or a private file copy) or to a cache page that
@@ -492,6 +628,15 @@ int task64_map_record(int id, u64 base, u64 pages, int owned, int shared);
 int task64_map_owned(int id, u64 address);
 int task64_map_shared(int id, u64 address);
 void task64_map_drop(int id, u64 base, u64 length);
+
+/* Per-task working directory, kept as a canonical absolute path ("/" at the
+ * volume root). Threads share their group's path through the space owner. */
+int task64_get_cwd(int id, char *out, u64 size);
+int task64_set_cwd(int id, const char *path);
+int task64_set_name(int id, const char *name);
+void task64_get_name(int id, char out[16]);
+/* Yield to another READY task, returning at the same syscall completion. */
+regs64_t *sched64_yield(regs64_t *frame);
 
 /* fork/wait: a child gets a copy of its parent's user pages (shared ranges
  * are aliased, everything else is copied) and of its descriptor table. The
@@ -554,6 +699,30 @@ void fs64_fork_fds(int parent, int child);
  * only when the last user is reaped. */
 void fs64_share_fds(int parent, int child);
 void fs64_task_cleanup(int task);
+
+/* Metadata and path operations on the mounted FAT12 volume. They share the
+ * page cache, so a write through an open descriptor is visible to a stat or
+ * a directory listing once the slot is flushed. All return 0 or a negative
+ * errno. `kind` is FS64_KIND_*. */
+#define FS64_KIND_FILE   0
+#define FS64_KIND_DIR    1
+#define FS64_KIND_CHAR   2
+int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind);
+int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind);
+int fs64_unlink(const char *path);
+int fs64_rename(const char *oldpath, const char *newpath);
+int fs64_rmdir(const char *path);
+int fs64_fd_is_dir(int task, int fd);
+int fs64_fd_dir_path(int task, int fd, char out[K64_FS_PATH_MAX + 1]);
+int fs64_fd_sync(int task, int fd);
+void fs64_sync_all(void);
+/* Entry `index` of the directory open on `fd`, with the cursor advanced in
+ * the description. Returns 1 with the entry filled, 0 at the end, or a
+ * negative errno. */
+int fs64_fd_entry(int task, int fd, u32 index, char name[13], u32 *ino,
+                  int *is_dir, u32 *next_index);
+int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
+                     int *is_dir, u32 *next_index);
 
 /* syscall64.c: SYSCALL/SYSRET dispatch */
 void syscall64_init(void);
