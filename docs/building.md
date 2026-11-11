@@ -68,7 +68,13 @@ image and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS`, and it exited 42) and
 `HAKU64-THREAD-OK` (a `clone`d thread shared the address space and the
 descriptor table, bumped a shared word, woke the parent through a futex, and
 the parent's write through the thread's `dup2` target printed the marker
-before `wait4` reaped the thread with status 7).
+before `wait4` reaped the thread with status 7), and `HAKU64-PORT-OK` (the
+ported table: `stat`/`fstat`/`statx`, `chdir`/`getcwd` with a relative
+open, `openat`/`mkdirat`, `getdents64` on an empty and a seeded directory,
+`ftruncate`/`truncate`/`renameat`/`unlinkat`, `uname`/`times`/
+`getrlimit`/`clock_getres`, `prctl` names, two different `getrandom`
+words, `brk`+`mprotect`, `poll`/`select`, `sched_yield` and `dup3`/
+`fcntl`).
 After QEMU exits, `tools/lsfat12.py --check` verifies the volume the guest
 just wrote. The 32-bit `haku.img` stays the default image.
 

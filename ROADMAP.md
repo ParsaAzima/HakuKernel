@@ -599,8 +599,18 @@ the port is complete.
   `mkdir`, and `.`/`..` handled by FAT12's own path resolver. `open` accepts
   `O_RDONLY`, `O_WRONLY`, `O_RDWR` with `O_CREAT`/`O_EXCL`/`O_TRUNC`/
   `O_APPEND`; dirty pages are written back on last close and on task exit,
-  so the cache is write-back. Limits: 8.3 names, no `unlink`/`rename`/
-  `getdents`, no symlinks, no write-through. `build.py x64` generates
+  so the cache is write-back. The cache also serves metadata and directory
+  calls: `stat`/`lstat`/`fstat`/`newfstatat`/`statx` (synthesized `st_mode`,
+  `st_nlink`, `st_ino` from the directory entry), `mkdir`, `rmdir`,
+  `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `truncate`/
+  `ftruncate`, `access`/`faccessat`, and `getdents64` over a directory
+  descriptor (`O_DIRECTORY`, `FS64_DIR`, `.`/`..` skipped, `DT_REG`/`DT_DIR`
+  from the entry attribute). `fsync`/`fdatasync`/`sync` flush the page cache.
+  A task has a canonical absolute `cwd` that `chdir`/`fchdir` set,
+  `getcwd` reports, and that every path call resolves against; a thread
+  reads its group leader's. Limits: 8.3 names, 65-byte paths, no symlinks,
+  no write-through, no pipes, and modes/owners are accepted but not stored.
+  `build.py x64` generates
   `build/haku64_fs.img` with `tools/mkfat12.py --empty`, seeds `HELLO.TXT`,
   `PATTERN.BIN` and `USER.ELF`, attaches it to QEMU, and verifies the image
   with `tools/lsfat12.py --check` after the run; the ring-3 test creates
@@ -621,11 +631,14 @@ the port is complete.
   `HAKU64-FORK-OK`.
 - [x] Descriptor duplication and sleep: descriptors index a 64-entry
   description table holding the cache slot, access mode and offset, so
-  `dup`, `dup2` and `fork` share one file offset (a `dup2` onto 1 redirects
-  stdout onto a file, and `dup` of the console still writes to COM1). `dup`
-  answers 3 and up because 0..2 are the console; closing a console
-  descriptor that was never duplicated is a no-op; there is no `dup3` or
-  `O_CLOEXEC`. `nanosleep` rounds up to whole ticks and waits with
+  `dup`, `dup2`, `dup3` and `fork` share one file offset (a `dup2` onto 1
+  redirects stdout onto a file, and `dup` of the console still writes to
+  COM1). `dup` answers 3 and up because 0..2 are the console; closing a
+  console descriptor that was never duplicated is a no-op; `dup3` rejects a
+  known descriptor with `-EBUSY` and writes an unknown one. `fcntl` answers
+  `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL`/`F_DUPFD` (`F_SETLK` is accepted and
+  changes nothing) and `ioctl` reports the console `winsize`/`pgrp`.
+  `nanosleep` rounds up to whole ticks and waits with
   interrupts enabled, like `wait4`. The ring-3 test checks the shared
   offset, the redirection and a 10 ms sleep (`HAKU64-DUP-OK`).
 - [x] `execve` from the disk: the whole file is read into a heap buffer and
@@ -669,8 +682,40 @@ the port is complete.
   past one code page. Limits: `exit`/`exit_group` end only the calling task
   (no group exit), `kill` addresses one task id rather than a whole group, and
   `futex` supports `WAIT`/`WAKE` only, with no timeout.
-- [ ] Syscall table: port the i386 number table from `usermode.c` (97 cases)
-  and the wider VFS/process surface onto the 64-bit ABI.
+- [x] Syscall table: the i386 number table from `usermode.c` ported onto the
+  x86-64 ABI, in two groups.
+  *Filesystem and memory:* `stat`/`lstat`/`fstat`/`newfstatat`/`statx`
+  (`sys64_stat_t` is the 144-byte x86-64 `struct stat`; `statx` is the
+  256-byte layout; both sizes are checked at compile time), `access`/
+  `faccessat`/`faccessat2`, `chdir`/`fchdir`/`getcwd`, `openat`/`mkdirat`,
+  `getdents64`, `unlink`/`unlinkat`/`rmdir`, `rename`/`renameat`/
+  `renameat2`, `truncate`/`ftruncate`, `chmod`/`chown`/`fchmod`/`fchown`
+  (accepted, nothing stored), `utimensat` (accepted), `pread64`/`pwrite64`,
+  `fsync`/`fdatasync`/`sync`, `dup3`, `fcntl`, `ioctl`, `mprotect`
+  (`paging64_protect_space` rewrites leaf `W`/`NX` bits), `madvise`, and
+  `brk` with its own window between the image and the anonymous mappings
+  (`K64_USER_BRK_BASE`, 4096-page cap, zeroed frames, shrink unmaps).
+  Paths are copied out once per call through `copy_user_path64` (bounded by
+  `K64_PATH_MAX`), normalized (`.`, `..`, repeated `/`) and resolved against
+  `AT_FDCWD`, a directory descriptor, or the task's `cwd`; FAT12 matches the
+  resulting 8.3 names case-insensitively.
+  *Process, time and misc:* `sched_yield`, uid/gid identity (always 0),
+  `getpgrp`/`getpgid`/`getppid`/`getsid`/`setsid`, `uname`, `time`,
+  `gettimeofday`, `times`, `getrusage`, `clock_getres` (one tick),
+  `getrlimit`/`setrlimit`/`prlimit64` (real `RLIMIT_NOFILE` and
+  `RLIMIT_STACK`, "unlimited" otherwise), `umask`, `prctl`
+  (`PR_SET_NAME`/`PR_GET_NAME` onto the 16-byte `comm`, the dumpable pair,
+  `PR_SET_PDEATHSIG`; anything else is a no-op success), `getrandom` (an
+  xorshift stream seeded from the timer tick — a portability stub, not a
+  CSPRNG), `poll`/`select`/`pselect6`/`ppoll` over console and file
+  readiness, `set_tid_address`, `tgkill`. `open`/`openat` drop
+  `O_CLOEXEC`/`O_LARGEFILE`/`O_NOFOLLOW`/`O_NOCTTY`/`O_NONBLOCK` so a libc
+  call succeeds, and still refuse unknown bits with `-EINVAL`.
+  Limits: there are no pipes (`pipe`/`pipe2` are `-ENOSYS`), `poll`/`select`
+  spend a positive timeout in tick slices rather than using wait queues, an
+  infinite wait with no ready descriptor returns 0 instead of blocking, and
+  `pselect6`'s signal mask is ignored. The ring-3 image drives 47 new steps
+  (71-117) through every group and prints `HAKU64-PORT-OK`.
 - [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a
   per-process space, and run in ring 3. `kernel/arch/x86_64/elf/elf64.c`
   follows the 32-bit loader's checks (ELF class/data, `EM_X86_64`, static

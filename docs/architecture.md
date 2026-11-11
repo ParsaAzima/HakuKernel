@@ -60,13 +60,13 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
-| files | FAT12 on an ATA disk, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
+| files | FAT12 on an ATA disk, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
 | threads | `clone(CLONE_VM)` shares one space and, with `CLONE_FILES`, one descriptor table; a futex hands the flag over | `HAKU64-THREAD-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `clone`, `execve`, `wait4`, `kill`, `futex`, `nanosleep`, `getpid`, `getppid`, `gettid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, process, time, limits, `poll`/`select` (pipes are still missing) | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
@@ -150,15 +150,41 @@ as a DPL-3 fallback, and the test program exercises both entry points.
 
 `sys64_dispatch` implements the x86-64 Linux convention — number in `RAX`,
 arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in `RAX` or a negative
-errno — with the Linux x86-64 numbers for `read`, `write`, `open`, `close`,
-`lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `clone`, `execve`,
-`wait4`, `kill`, `futex`, `dup`, `dup2`, `nanosleep`, `getpid`, `getppid`,
-`gettid`, `clock_gettime` and `exit`/`exit_group`; an unimplemented number
-returns `-ENOSYS`. Every
+errno — with the Linux x86-64 numbers for the ported table; an unimplemented
+number returns `-ENOSYS`. The I/O core is `read`, `write`, `writev`, `open`,
+`openat`, `close`, `lseek`, `pread64`, `pwrite64`, `dup`, `dup2`, `dup3`,
+`fcntl`, `ioctl`, `fsync`/`fdatasync`/`sync` and the descriptor-free
+metadata calls: `stat`/`lstat`/`fstat`/`newfstatat`/`statx`,
+`access`/`faccessat`, `chmod`/`chown` (accepted), `utimensat`, `truncate`,
+`ftruncate`, `unlink`/`unlinkat`, `rmdir`, `rename`/`renameat`/`renameat2`,
+`mkdir`, `mkdirat`, `getdents64` and the `chdir`/`fchdir`/`getcwd` trio.
+Memory is `mmap`, `munmap`, `mprotect` (leaf `W`/`NX` bits),
+`madvise` and `brk`; the program break lives in its own window
+(`K64_USER_BRK_BASE` up to the anonymous base, 4096 pages), so it never
+grows into an `mmap` region, and a shrinking `brk` unmaps and frees.
+Process and time calls are `fork`, `clone`, `execve`, `wait4`, `exit`/
+`exit_group`, `kill`, `tgkill`, `futex`, `nanosleep`, `sched_yield`,
+`getpid`/`getppid`/`gettid`, the uid/gid identity pair, `getpgrp`/`getpgid`/
+`getsid`/`setsid`, `clock_gettime`/`clock_getres`, `time`/`gettimeofday`/
+`times`/`getrusage`, `getrlimit`/`setrlimit`/`prlimit64`, `umask`,
+`prctl`, `getrandom`, `uname`, `set_tid_address`,
+`poll`/`select`/`pselect6`/`ppoll`. Every
 user pointer is resolved through the current space with
 `paging64_query_space` before it is dereferenced, and the copies move through
 the physmap: a ring-0 page fault halts the kernel, so the CPU cannot be
 relied on to reject a bad address.
+
+Paths follow `open`'s rule: `copy_user_path64` copies one NUL-terminated
+name into a `K64_PATH_MAX` buffer (one read per page, so a short string at
+the end of a page is safe), `path64_normalize` collapses `.`, `..` and
+repeated separators into a canonical absolute path, and `resolve64_path`
+joins a relative name onto `AT_FDCWD` (the task's `cwd`),
+a directory descriptor or an explicit `cwd`, so `chdir` and `openat` see
+one consistent view. The task's `cwd` is canonical and absolute, inherited
+by `fork` and shared by a thread group through its owner. `fs64.c` keeps
+the same page cache and answers metadata from the FAT12 directory entry;
+`O_DIRECTORY` descriptors use `FS64_DIR` with a parallel path table and the
+descriptor position as the `getdents64` cursor.
 
 `mmap` accepts anonymous ranges (`fd` must be `-1`) and file-backed ones.
 `MAP_FIXED` places a mapping at a page-aligned address inside the anonymous
@@ -285,8 +311,13 @@ monotonic time. `nanosleep` rounds the request up to whole timer ticks and
 then waits with interrupts enabled, the same way `wait4` does, so other
 READY tasks run during the sleep; there is no sleep queue, the waiter stays
 the current task and is simply resumed, and `remaining` is never written
-because nothing interrupts the sleep. The full i386 number table stays with
-the later userland stage.
+because nothing interrupts the sleep. `poll` and `select` answer from the
+descriptor table instead of wait queues: the console is always readable and
+writable, a file is readable while its position is below the size, and a
+positive timeout is spent in tick slices; an infinite wait with nothing
+ready returns 0 rather than blocking. Pipes, symlinks and real signal
+handlers are still missing; the syscall port that is there covers what the
+tests and a static libc probe need.
 
 The 64-bit path now has an ELF64 loader and a FAT12 data disk, but no
 64-bit libc and no bootable root filesystem image; `haku.img` remains the
@@ -345,7 +376,19 @@ have bumped that word with `lock inc`, stored its `gettid` and `getpid`
 (equal to the parent's), and `dup2`d the console onto 9 in the shared
 descriptor table — the parent proves the last one by writing through 9 and
 printing `HAKU64-THREAD-OK` — before `wait4(tid)` reaps it with status 7.
-Finally it prints `HAKU64-ABI-OK`, stores a magic word in
+Then it walks the rest of the ported table, forty-seven steps numbered 71-117:
+`stat`/`fstat`/`statx` against `/HELLO.TXT` (size and `S_IFREG`),
+`chdir("/TMP")` with `getcwd` reporting the canonical path and a relative
+`NOTE.TXT` open, `openat(AT_FDCWD, ...)`, `mkdirat`/`O_DIRECTORY`/
+`getdents64` on an empty directory followed by `unlinkat(AT_REMOVEDIR)`,
+create/write/`ftruncate`/`truncate`/`renameat`/`stat`-gone/`unlinkat` on a
+relative name, `getdents64` on the non-empty `/TMP` (a 32-byte record typed
+`DT_REG`), `chdir("/")`, `uname`, `gettimeofday`, `times`, `getrlimit` and
+`clock_getres`, `prctl(PR_SET_NAME)`/`PR_GET_NAME`, two differing
+`getrandom` words, `brk(0)` then a two-page grow with a store, `mprotect`,
+and a shrink back, `poll(POLLOUT)` on the console, `select` on fd 0, a
+`sched_yield`, and `dup3(1, 10)` plus `fcntl(F_GETFD)`/`F_GETFL`, printing
+`HAKU64-PORT-OK`. It then prints `HAKU64-ABI-OK`, stores a magic word in
 its BSS page and exits with status 0; every failure exits with the number of
 the step that failed, which is what `HAKU64-ELF-RUN-FAIL: exit=` reports.
 `tools/mkelf64.py` wraps the flat binary in an

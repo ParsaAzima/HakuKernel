@@ -64,9 +64,14 @@ control and pipelines working.
   writes behind a page cache that file-backed `mmap` maps from,
   `fork`/`wait4` with default-action signals, `dup`/`dup2` over a shared file
   description, `nanosleep`, `execve` of an ELF64 file from the disk with
-  `argc`/`argv`/`envp` on the new stack, and threads: `clone` with
-  `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`, `gettid`, and `futex` wait/wake.
-  No copy-on-write, signal handlers, or 64-bit libc yet.
+  `argc`/`argv`/`envp` on the new stack, threads: `clone` with
+  `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`, `gettid`, and `futex` wait/wake,
+  and the ported i386 syscall table on the x86-64 ABI: `stat`/`statx`,
+  `getdents64`, `rename`/`unlink`/`truncate`, `chdir`/`getcwd`/`openat`,
+  `pread`/`pwrite`, `mprotect`/`brk`/`madvise`, `poll`/`select`, `fcntl`/
+  `ioctl`/`dup3`, `uname`/`times`/`getrusage`/`getrlimit` and the identity,
+  `prctl` and `getrandom` calls.
+  No copy-on-write, signal handlers, pipes, or 64-bit libc yet.
 
 ## Quick start
 
