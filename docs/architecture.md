@@ -222,11 +222,16 @@ goes through `exit` so the dispatcher never resumes the frame.
 `execve` reads the whole file into a heap buffer (32 pages is the cache limit),
 runs `elf64_load`, and `task64_exec` releases the caller's old space — aliased
 shared frames survive, as they do at exit — clears the mapping table and
-resets the anonymous window before switching CR3. The caller is then resumed
-at the new entry with the new stack and zeroed registers. `argv`, `envp` and
-the auxiliary vector are ignored, so the new image starts with an empty
-argument area; descriptors survive because there is no `O_CLOEXEC`. A failed
-`execve` returns `-ENOENT`, `-ENOEXEC`, `-EIO` or `-ENOMEM` and leaves the
+resets the anonymous window before switching CR3. `argv` and `envp` are
+captured first, while the old space is still current: each string is copied
+out in page-sized chunks (one page-table walk per page) into an 8-entry,
+128-byte-per-string, 768-byte-total kernel buffer, and a longer vector is
+`-E2BIG` rather than truncated. Once the new space exists, its stack gets
+`argc`, `argv[]`, `NULL`, `envp[]`, `NULL` and an auxiliary vector with
+`AT_PAGESZ` and `AT_ENTRY` (there is no `AT_PHDR` yet), and the task is
+resumed at the new entry with that stack and zeroed registers. Descriptors
+survive execve because there is no `O_CLOEXEC`. A failed call returns
+`-ENOENT`, `-ENOEXEC`, `-EIO`, `-E2BIG`, `-EFAULT` or `-ENOMEM` and leaves the
 caller running unchanged.
 
 `clock_gettime` reports `CLOCK_MONOTONIC` as time since boot and
@@ -278,13 +283,17 @@ parent's word and the parent to see the child's store after `wait4`
 past a `close`, and writes `HAKU64-DUP-OK` through a `dup` of the console
 (`HAKU64-DUP-OK`); `nanosleep` must move `CLOCK_MONOTONIC` forward by at
 least the 10 ms requested, and a nanosecond field of 1e9 is `-EINVAL`. It then
-forks again and the child `execve`s `/USER.ELF`: the parent waits for status
-42, which is the exit code of `kernel/arch/x86_64/user/exec_elf64.asm`, and
-prints `HAKU64-EXEC-OK` only after seeing both the child's `HAKU64-EXEC-PROG`
-line and that status (`HAKU64-EXEC-OK`). `USER.ELF` is seeded on the FAT12
-volume by `build.py` and is not part of the kernel image, so the two markers
-prove the program came off the disk and that `execve` replaced the child's
-address space. Finally it prints `HAKU64-ABI-OK`, stores a magic word in
+forks again and the child first `execve`s a missing path, which must return
+`-ENOENT` with the child still running, and then `/USER.ELF` with
+`argv = {"/USER.ELF", "alpha", "beta"}` and `envp = {"A=1"}`. The exec'd
+program, `kernel/arch/x86_64/user/exec_elf64.asm`, walks that stack image
+([rsp] argc, then argv, NULL, envp, NULL, auxv), prints
+`HAKU64-EXEC-PROG` and `HAKU64-EXEC-ARGS`, and exits 42; the parent requires
+status 42 and then prints `HAKU64-EXEC-OK`. `USER.ELF` is seeded on the FAT12
+volume by `build.py` and is not part of the kernel image, so the three markers
+prove the program came off the disk, that `execve` replaced the child's
+address space, and that the argument vector landed where a startup stub reads
+it. Finally it prints `HAKU64-ABI-OK`, stores a magic word in
 its BSS page and exits with status 0; every failure exits with the number of
 the step that failed, which is what `HAKU64-ELF-RUN-FAIL: exit=` reports.
 `tools/mkelf64.py` wraps the flat binary in an

@@ -63,8 +63,9 @@ control and pipelines working.
   syscall convention, NX enforcement, an ELF64 loader, a FAT12 disk with file
   writes behind a page cache that file-backed `mmap` maps from,
   `fork`/`wait4` with default-action signals, `dup`/`dup2` over a shared file
-  description, `nanosleep`, and `execve` of an ELF64 file from the disk. No
-  threads, copy-on-write, signal handlers, or 64-bit libc yet.
+  description, `nanosleep`, and `execve` of an ELF64 file from the disk with
+  `argc`/`argv`/`envp` on the new stack. No threads, copy-on-write, signal
+  handlers, or 64-bit libc yet.
 
 ## Quick start
 

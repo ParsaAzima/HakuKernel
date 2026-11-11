@@ -62,10 +62,11 @@ matrix, including `mmap`/`munmap`), `HAKU64-DISK-OK` (the program created
 after `close`), `HAKU64-FORK-OK` (a forked child and its parent observed the
 same `MAP_SHARED` page), `HAKU64-DUP-OK` (a duplicated descriptor shared
 one file offset, `dup2` redirected it, and `nanosleep` advanced the monotonic
-clock) and `HAKU64-EXEC-OK` (a child `execve`d `USER.ELF` off the volume,
-printed `HAKU64-EXEC-PROG` and exited 42). After QEMU exits, `tools/lsfat12.py
---check` verifies the volume the guest just wrote. The 32-bit `haku.img`
-stays the default image.
+clock) and `HAKU64-EXEC-OK` (a child `execve`d `USER.ELF` off the volume with
+two arguments and one environment variable, the program checked the stack
+image and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS`, and it exited 42).
+After QEMU exits, `tools/lsfat12.py --check` verifies the volume the guest
+just wrote. The 32-bit `haku.img` stays the default image.
 
 `python build.py shell` boots something else entirely: a real static
 `busybox` (musl, i386) as PID 1, so the guest comes up in `ash` instead of

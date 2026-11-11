@@ -631,13 +631,18 @@ the port is complete.
 - [x] `execve` from the disk: the whole file is read into a heap buffer and
   re-checked by `elf64_load`, `task64_exec` releases the caller's old space
   (aliased shared pages survive), clears the mapping table and resets the
-  anonymous window before CR3 switches; the task is resumed at the new entry
-  with a zeroed register file. `argv`/`envp`/`auxv` are ignored, descriptors
-  survive (no `O_CLOEXEC`), and a failed call returns `-ENOENT`,
-  `-ENOEXEC`, `-EIO` or `-ENOMEM` with the caller untouched. `build.py`
-  seeds `USER.ELF` from `kernel/arch/x86_64/user/exec_elf64.asm`; the ring-3
-  test forks, execs it, requires the child's status 42 and prints
-  `HAKU64-EXEC-OK`.
+  anonymous window before CR3 switches. `argv`/`envp` are captured before the
+  switch in page-sized chunks (8 entries, 128 bytes per string, 768 bytes
+  total, `-E2BIG` past that) and rebuilt on the new stack as
+  `argc, argv[], NULL, envp[], NULL` plus `AT_PAGESZ`/`AT_ENTRY`/`AT_NULL`;
+  the task is resumed at the new entry with a zeroed register file.
+  Descriptors survive (no `O_CLOEXEC`), and a failed call returns `-ENOENT`,
+  `-ENOEXEC`, `-EIO`, `-E2BIG`, `-EFAULT` or `-ENOMEM` with the caller
+  untouched. `build.py` seeds `USER.ELF` from
+  `kernel/arch/x86_64/user/exec_elf64.asm`; the ring-3 test first requires a
+  failed exec to return `-ENOENT` and then forks, execs it with two arguments
+  and one variable, requires the child's status 42 and prints
+  `HAKU64-EXEC-OK` after `HAKU64-EXEC-ARGS`.
 - [ ] Syscall table: port the i386 number table from `usermode.c` (97 cases)
   and the wider VFS/process surface onto the 64-bit ABI.
 - [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a
