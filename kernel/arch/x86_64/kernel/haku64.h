@@ -130,6 +130,9 @@ typedef signed long long s64;
 #define K64_SYS_MMAP          9u
 #define K64_SYS_MUNMAP        11u
 #define K64_SYS_WRITEV        20u
+#define K64_SYS_DUP           32u
+#define K64_SYS_DUP2          33u
+#define K64_SYS_NANOSLEEP     35u
 #define K64_SYS_GETPID        39u
 #define K64_SYS_FORK          57u
 #define K64_SYS_EXIT          60u
@@ -472,6 +475,8 @@ int task64_parent(int id);
  * cached at once. */
 #define K64_FS_FDS      16u
 #define K64_FS_PATH_MAX 64u
+/* fs64_fd_file() result for a duplicated console descriptor. */
+#define K64_FS_CONSOLE  (-2)
 int fs64_init(void);
 int fs64_lookup(const char *path);
 int fs64_create_dir(const char *path);
@@ -486,6 +491,9 @@ int fs64_fd_file(int task, int fd);
 u64 fs64_fd_pos(int task, int fd);
 int fs64_fd_seek(int task, int fd, u64 pos);
 int fs64_fd_access(int task, int fd);
+int fs64_fd_dup(int task, int fd, int minimum);
+int fs64_fd_dup2(int task, int fd, int target);
+int fs64_fd_console(int task, int fd);
 void fs64_fd_close(int task, int fd);
 void fs64_fork_fds(int parent, int child);
 void fs64_task_cleanup(int task);

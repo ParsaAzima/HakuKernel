@@ -126,15 +126,16 @@ static void note_write(u64 count) {
     k64_puts("\r\n");
 }
 
-/* write(fd, buffer, count). Descriptors 1 and 2 go to COM1; a file
- * descriptor from fs64.c writes into the page cache, which is flushed to
- * the FAT12 volume when the file is closed. A bad page after some bytes
- * were written is a short write, which is what write() is allowed to do. */
+/* write(fd, buffer, count). The console descriptors (0..2 until redirected,
+ * and any descriptor dup()ed from them) go to COM1; a file descriptor from
+ * fs64.c writes into the page cache, which is flushed to the FAT12 volume
+ * when the file is closed. A bad page after some bytes were written is a
+ * short write, which is what write() is allowed to do. */
 static u64 sys64_write(u64 fd, u64 buffer, u64 count) {
     int id = sched64_current(), file, access;
     u64 space, written = 0;
 
-    if (fd > 2) {
+    if (!fs64_fd_console(id, (int)fd)) {
         u8 chunk[64];
         u64 pos, done = 0;
 
@@ -166,7 +167,6 @@ static u64 sys64_write(u64 fd, u64 buffer, u64 count) {
         return done;
     }
 
-    if (fd != 1 && fd != 2) return (u64)0 - SYS64_EBADF;
     if (count == 0) return 0;
     if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
 
@@ -188,13 +188,13 @@ static u64 sys64_write(u64 fd, u64 buffer, u64 count) {
     return written;
 }
 
-/* writev(fd, iovec, count). Only the first SYS64_IOV_MAX entries are
+/* writev(fd, iovec, count). Each segment goes through write(), so console
+ * and file descriptors both work. Only the first SYS64_IOV_MAX entries are
  * consumed; a partial write stops the walk like write() does. */
 static u64 sys64_writev(u64 fd, u64 iov, u64 count) {
     u64 space, total = 0;
     u8 entry[SYS64_IOV_SIZE];
 
-    if (fd != 1 && fd != 2) return (u64)0 - SYS64_EBADF;
     if (count == 0) return 0;
     if (count > SYS64_IOV_MAX) count = SYS64_IOV_MAX;
 
@@ -441,13 +441,33 @@ static u64 sys64_read(u64 fd, u64 buffer, u64 count) {
     return done;
 }
 
-/* close(fd): -EBADF for anything that is not an open file descriptor. */
+/* close(fd): -EBADF for anything that is not an open descriptor. Closing a
+ * console descriptor that was never duplicated is a no-op (the implicit
+ * console has no description to release). */
 static u64 sys64_close(u64 fd) {
     int id = sched64_current();
 
-    if (fs64_fd_file(id, (int)fd) < 0) return (u64)0 - SYS64_EBADF;
+    if (fs64_fd_file(id, (int)fd) < 0 && !fs64_fd_console(id, (int)fd))
+        return (u64)0 - SYS64_EBADF;
     fs64_fd_close(id, (int)fd);
     return 0;
+}
+
+/* dup(fd): the lowest free descriptor at or above 3 with one description
+ * shared with fd, so both follow the same file offset. 0..2 are the console
+ * and therefore never handed out by dup(); dup2 can still target them. */
+static u64 sys64_dup(u64 fd) {
+    int result = fs64_fd_dup(sched64_current(), (int)fd, 3);
+
+    return (u64)(s64)result;
+}
+
+/* dup2(fd, target): point `target` at fd's description, closing whatever it
+ * held. This is how a shell redirects stdout onto a file. */
+static u64 sys64_dup2(u64 fd, u64 target) {
+    int result = fs64_fd_dup2(sched64_current(), (int)fd, (int)target);
+
+    return (u64)(s64)result;
 }
 
 /* lseek(fd, offset, whence). The offset is a signed byte count, so a
@@ -558,6 +578,37 @@ static u64 sys64_clock_gettime(u64 clock_id, u64 tp) {
     return 0;
 }
 
+/* nanosleep(request, remaining): sleep for at least the requested interval.
+ * The interval is rounded up to whole timer ticks and the task waits with
+ * interrupts enabled, exactly like wait4's loop, so other READY tasks run
+ * while it waits; there is no sleep queue yet, so the waiter stays the
+ * current task and is simply resumed. `remaining` is never written because
+ * no signal can interrupt the sleep. */
+static u64 sys64_nanosleep(u64 request, u64 remaining) {
+    u64 ts[2], hz, ticks, wait, deadline;
+
+    (void)remaining;
+
+    if (!copy_from_user64(current_space(), ts, request, SYS64_TIMESPEC))
+        return (u64)0 - SYS64_EFAULT;
+    if ((s64)ts[0] < 0 || (s64)ts[1] < 0 || ts[1] >= 1000000000ull)
+        return (u64)0 - SYS64_EINVAL;
+    if (ts[0] > 1000000ull) return (u64)0 - SYS64_EINVAL;
+    hz = timer64_hz();
+    if (hz == 0) return (u64)0 - SYS64_EINVAL;
+
+    /* Round up: sleeping less than asked would be a lie. */
+    wait = ts[0] * hz + (ts[1] * hz + 999999999ull) / 1000000000ull;
+    ticks = timer64_ticks();
+    deadline = ticks + wait;
+    while (timer64_ticks() < deadline) {
+        sti64();
+        cpu_halt64();
+        cli64();
+    }
+    return 0;
+}
+
 regs64_t *sys64_dispatch(regs64_t *frame) {
     u32 in_user = ((u32)frame->cs & 3u) == 3u;
     u32 wrote = 0;
@@ -594,6 +645,18 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     case K64_SYS_LSEEK:
         result = sys64_lseek(frame->rdi, frame->rsi, frame->rdx);
+        break;
+
+    case K64_SYS_DUP:
+        result = sys64_dup(frame->rdi);
+        break;
+
+    case K64_SYS_DUP2:
+        result = sys64_dup2(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_NANOSLEEP:
+        result = sys64_nanosleep(frame->rdi, frame->rsi);
         break;
 
     case K64_SYS_WRITE:

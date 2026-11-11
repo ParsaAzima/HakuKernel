@@ -13,8 +13,8 @@
 ; zero-filled BSS page and exits with status 0; the kernel reads both back,
 ; which proves the image ran in ring 3 instead of merely being mapped. A
 ; failure exits with the number of the step that failed (the early ABI tests
-; leave 1, the disk and fork steps use 20-37), which the kernel prints as
-; HAKU64-ELF-RUN-FAIL: exit=N.
+; leave 1, the disk, fork, dup and sleep steps use 20-50), which the kernel
+; prints as HAKU64-ELF-RUN-FAIL: exit=N.
 ;
 ; The code is position independent (RIP-relative operands only), so the flat
 ; binary does not need a linker to resolve USER64_BASE: mkelf64.py chooses the
@@ -664,6 +664,164 @@ child_proc:
 
 fork_done:
 
+    ; ---- dup: two descriptors, one description ------------------------
+    ; HELLO.TXT starts with "HAKU64-FILE-OK\r\n". Read 4 bytes, dup the
+    ; descriptor, then read the next 4 through the duplicate: they are
+    ; "64-F" only if both descriptors share one file offset.
+    mov r15d, 38
+    mov eax, HAKU64_SYS_OPEN
+    lea rdi, [path_hello]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    jle fail
+    mov r14, rax
+    mov r15d, 39
+    mov rbx, FILE_BUF
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r14
+    mov rsi, rbx
+    mov edx, 4
+    syscall
+    cmp rax, 4
+    jne fail
+    cmp dword [rbx], 0x554B4148            ; "HAKU"
+    jne fail
+
+    mov r15d, 40
+    mov eax, HAKU64_SYS_DUP
+    mov rdi, r14
+    syscall
+    test rax, rax
+    jle fail
+    mov r13, rax
+    mov r15d, 41
+    mov rbx, REREAD_BUF
+    mov eax, HAKU64_SYS_READ
+    mov rdi, r13
+    mov rsi, rbx
+    mov edx, 4
+    syscall
+    cmp rax, 4
+    jne fail
+    cmp dword [rbx], 0x462D3436            ; "64-F"
+    jne fail
+
+    ; dup2 puts the same description on a chosen descriptor, and the offset
+    ; stays shared after the original is closed.
+    mov r15d, 42
+    mov eax, HAKU64_SYS_DUP2
+    mov rdi, r14
+    mov esi, 9
+    syscall
+    cmp rax, 9
+    jne fail
+    mov r15d, 43
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r14
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 44
+    mov rbx, FILE_BUF
+    mov eax, HAKU64_SYS_READ
+    mov edi, 9
+    mov rsi, rbx
+    mov edx, 3
+    syscall
+    cmp rax, 3
+    jne fail
+    cmp byte [rbx], 0x49                   ; "ILE" follows "HAKU64-F"
+    jne fail
+    cmp byte [rbx + 1], 0x4C
+    jne fail
+    cmp byte [rbx + 2], 0x45
+    jne fail
+    mov r15d, 45
+    mov eax, HAKU64_SYS_CLOSE
+    mov edi, 9
+    syscall
+    test rax, rax
+    jne fail
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r13
+    syscall
+    test rax, rax
+    jne fail
+
+    ; dup() of the console hands out a descriptor that still writes to COM1,
+    ; so the marker below is itself the proof.
+    mov r15d, 46
+    mov eax, HAKU64_SYS_DUP
+    mov edi, 1
+    syscall
+    test rax, rax
+    jle fail
+    mov r13, rax
+    mov eax, HAKU64_SYS_WRITE
+    mov rdi, r13
+    lea rsi, [msg_dup]
+    mov edx, msg_dup_end - msg_dup
+    syscall
+    cmp rax, msg_dup_end - msg_dup
+    jne fail
+    mov eax, HAKU64_SYS_CLOSE
+    mov rdi, r13
+    syscall
+    test rax, rax
+    jne fail
+
+    ; ---- nanosleep advances CLOCK_MONOTONIC by at least the request ----
+    mov rdx, STATUS_BUF
+    mov r15d, 47
+    mov eax, HAKU64_SYS_CLOCK_GETTIME
+    mov edi, HAKU64_CLOCK_MONOTONIC
+    mov rsi, rdx
+    syscall
+    test rax, rax
+    jne fail
+    mov r12, [rdx]                         ; seconds
+    mov rax, 1000000000
+    imul r12, rax
+    add r12, [rdx + 8]                     ; nanoseconds
+
+    mov r15d, 48
+    mov dword [rdx], 0                     ; 10 ms requested
+    mov dword [rdx + 4], 0
+    mov dword [rdx + 8], 10000000
+    mov dword [rdx + 12], 0
+    mov eax, HAKU64_SYS_NANOSLEEP
+    mov rdi, rdx
+    xor esi, esi
+    syscall
+    test rax, rax
+    jne fail
+    mov r15d, 49
+    mov eax, HAKU64_SYS_CLOCK_GETTIME
+    mov edi, HAKU64_CLOCK_MONOTONIC
+    mov rsi, rdx
+    syscall
+    test rax, rax
+    jne fail
+    mov r13, [rdx]
+    mov rax, 1000000000
+    imul r13, rax
+    add r13, [rdx + 8]
+    sub r13, r12
+    cmp r13, 10000000
+    jb fail
+
+    ; A nanosecond field outside [0, 1e9) is -EINVAL.
+    mov r15d, 50
+    mov dword [rdx + 8], 1000000000
+    mov eax, HAKU64_SYS_NANOSLEEP
+    mov rdi, rdx
+    xor esi, esi
+    syscall
+    cmp rax, -HAKU64_EINVAL
+    jne fail
+
     ; The INT 0x80 gate stays available; the error paths below use it so
     ; both entry points run in the same program.
     ; write() to a descriptor other than 1 or 2 is -EBADF.
@@ -793,6 +951,10 @@ msg_disk_end:
 msg_fork:
     db 'HAKU64-FORK-OK', 13, 10
 msg_fork_end:
+
+msg_dup:
+    db 'HAKU64-DUP-OK', 13, 10
+msg_dup_end:
 
 path_hello:
     db '/hello.txt', 0

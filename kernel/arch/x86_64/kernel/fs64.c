@@ -46,10 +46,26 @@ typedef struct {
 
 static fs64_cache_t cache[FS64_CACHE_MAX];
 
-/* One descriptor table per task: cache slot, access mode, position. */
-static int fd_file[K64_TASK_MAX][FS64_FD_MAX];
-static u64 fd_pos[K64_TASK_MAX][FS64_FD_MAX];
-static u32 fd_flags[K64_TASK_MAX][FS64_FD_MAX];
+/* A file description: what a descriptor points at. Descriptors of one
+ * description share the cache slot, the access mode and the file offset,
+ * which is what dup() and fork() are supposed to give them. `slot` is a
+ * cache index, or FS64_CONSOLE for a duplicated console descriptor. */
+typedef struct {
+    u32 used;
+    u32 refs;
+    int slot;
+    u32 flags;                     /* 0 read, 1 write, 2 read-write */
+    u64 pos;
+} fs64_desc_t;
+
+#define FS64_DESC_MAX 64u
+#define FS64_CONSOLE  K64_FS_CONSOLE
+
+/* One descriptor table per task: an index into the description table. -1 is
+ * a free descriptor, and for 0..2 it is also the implicit console every task
+ * starts with (see fs64_fd_console). */
+static int fd_desc[K64_TASK_MAX][FS64_FD_MAX];
+static fs64_desc_t descs[FS64_DESC_MAX];
 
 /* Linux errno numbers, returned as negative ints by the helpers below. */
 #define FS64_EPERM    1
@@ -287,12 +303,11 @@ static fs64_cache_t *cache_open(const char *path, u8 flags, int *error) {
 int fs64_init(void) {
     for (u32 i = 0; i < FS64_CACHE_MAX; i++)
         memset(&cache[i], 0, sizeof(cache[i]));
+    for (u32 i = 0; i < FS64_DESC_MAX; i++)
+        memset(&descs[i], 0, sizeof(descs[i]));
     for (u32 task = 0; task < K64_TASK_MAX; task++)
-        for (u32 fd = 0; fd < FS64_FD_MAX; fd++) {
-            fd_file[task][fd] = -1;
-            fd_pos[task][fd] = 0;
-            fd_flags[task][fd] = 0;
-        }
+        for (u32 fd = 0; fd < FS64_FD_MAX; fd++)
+            fd_desc[task][fd] = -1;
 
     if (fat12_mount() != 1) return 0;
     return 1;
@@ -412,13 +427,55 @@ int fs64_create_dir(const char *path) {
 
 static int valid_fd(int task, int fd) {
     return task >= 0 && task < (int)K64_TASK_MAX &&
-           fd >= 3 && fd < (int)FS64_FD_MAX;
+           fd >= 0 && fd < (int)FS64_FD_MAX;
+}
+
+/* The description a descriptor refers to, or 0 for a free descriptor. The
+ * console descriptors 0..2 are implicit: they only get a description once
+ * something duplicates them or redirects one onto a file. */
+static fs64_desc_t *fd_get(int task, int fd) {
+    int index;
+
+    if (!valid_fd(task, fd)) return 0;
+    index = fd_desc[task][fd];
+    if (index < 0 || index >= (int)FS64_DESC_MAX) return 0;
+    if (!descs[index].used) return 0;
+    return &descs[index];
+}
+
+static fs64_desc_t *desc_alloc(void) {
+    for (u32 i = 0; i < FS64_DESC_MAX; i++) {
+        if (descs[i].used) continue;
+        memset(&descs[i], 0, sizeof(descs[i]));
+        descs[i].used = 1;
+        descs[i].refs = 1;
+        descs[i].slot = -1;
+        return &descs[i];
+    }
+    return 0;
+}
+
+static int desc_index(fs64_desc_t *desc) {
+    return desc ? (int)(desc - descs) : -1;
+}
+
+/* 1 when `fd` writes to the console: descriptors 0..2 until something
+ * replaces them, and any descriptor opened by dup() on the console. */
+int fs64_fd_console(int task, int fd) {
+    fs64_desc_t *desc;
+
+    if (!valid_fd(task, fd)) return 0;
+    desc = fd_get(task, fd);
+    if (!desc) return fd <= 2;
+    return desc->slot == FS64_CONSOLE;
 }
 
 /* open(path, flags) for one task. Only O_RDONLY/O_WRONLY/O_RDWR plus
- * O_CREAT/O_EXCL/O_TRUNC/O_APPEND are accepted. */
+ * O_CREAT/O_EXCL/O_TRUNC/O_APPEND are accepted. New descriptors start at 3
+ * because 0..2 are the console. */
 int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     fs64_cache_t *slot;
+    fs64_desc_t *desc;
     int fd, resolved;
     u8 fat_flags = FAT12_OPEN_READ | FAT12_OPEN_WRITE;
     u32 access = (u32)(flags & 3u);
@@ -449,49 +506,116 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     }
 
     for (fd = 3; fd < (int)FS64_FD_MAX; fd++)
-        if (fd_file[task][fd] < 0) break;
+        if (fd_desc[task][fd] < 0) break;
     if (fd >= (int)FS64_FD_MAX) {
         if (error) *error = -FS64_ENOSPC;
         return -1;
     }
 
-    fd_file[task][fd] = (int)(slot - cache);
-    fd_pos[task][fd] = (flags & K64_O_APPEND) ? slot->size : 0;
-    fd_flags[task][fd] = access;
+    desc = desc_alloc();
+    if (!desc) {
+        if (error) *error = -FS64_ENOSPC;
+        return -1;
+    }
+    desc->slot = (int)(slot - cache);
+    desc->flags = access;
+    desc->pos = (flags & K64_O_APPEND) ? slot->size : 0;
+
+    fd_desc[task][fd] = desc_index(desc);
     slot->refs++;
     return fd;
 }
 
+/* The cache slot behind `fd`, or a negative value: -1 for a free or console
+ * descriptor, -2 for a duplicated console descriptor. */
 int fs64_fd_file(int task, int fd) {
-    if (!valid_fd(task, fd)) return -1;
-    return fd_file[task][fd];
+    fs64_desc_t *desc = fd_get(task, fd);
+
+    if (!desc) return -1;
+    return desc->slot;
 }
 
 u64 fs64_fd_pos(int task, int fd) {
-    if (!valid_fd(task, fd)) return 0;
-    return fd_pos[task][fd];
+    fs64_desc_t *desc = fd_get(task, fd);
+
+    return desc ? desc->pos : 0;
 }
 
 int fs64_fd_seek(int task, int fd, u64 pos) {
-    if (!valid_fd(task, fd) || fd_file[task][fd] < 0) return 0;
-    fd_pos[task][fd] = pos;
+    fs64_desc_t *desc = fd_get(task, fd);
+
+    if (!desc || desc->slot < 0) return 0;
+    desc->pos = pos;
     return 1;
 }
 
-/* 0 = read-only, 1 = write-only, 2 = read-write. */
+/* 0 = read-only, 1 = write-only, 2 = read-write, -1 = not a file. */
 int fs64_fd_access(int task, int fd) {
-    if (!valid_fd(task, fd) || fd_file[task][fd] < 0) return -1;
-    return (int)fd_flags[task][fd];
+    fs64_desc_t *desc = fd_get(task, fd);
+
+    if (!desc || desc->slot < 0) return -1;
+    return (int)desc->flags;
+}
+
+/* Move `fd` to `target`: close whatever target held, then point it at the
+ * same description. The description is shared, so both descriptors follow
+ * one file offset from here on. */
+int fs64_fd_dup2(int task, int fd, int target) {
+    fs64_desc_t *desc;
+    fs64_desc_t *old;
+    int fresh = 0;
+
+    if (!valid_fd(task, fd) || !valid_fd(task, target)) return -FS64_EBADF;
+    if (fd == target) return fd_get(task, fd) || fd <= 2 ? target : -FS64_EBADF;
+    desc = fd_get(task, fd);
+    if (!desc) {
+        /* Duplicating an implicit console descriptor creates one. */
+        if (fd > 2) return -FS64_EBADF;
+        desc = desc_alloc();
+        if (!desc) return -FS64_ENOSPC;
+        desc->slot = FS64_CONSOLE;
+        desc->flags = 2;
+        fresh = 1;
+    }
+    old = fd_get(task, target);
+    if (old) fs64_fd_close(task, target);
+    if (!fresh) desc->refs++;
+    fd_desc[task][target] = desc_index(desc);
+    return target;
+}
+
+/* dup(fd) is the same thing onto the lowest free descriptor at or above
+ * `minimum` (0 for dup, 3 for a call that must stay a file descriptor). */
+int fs64_fd_dup(int task, int fd, int minimum) {
+    int target;
+
+    if (task < 0 || task >= (int)K64_TASK_MAX) return -FS64_EBADF;
+    if (minimum < 0) minimum = 0;
+    for (target = minimum; target < (int)FS64_FD_MAX; target++)
+        if (fd_desc[task][target] < 0) break;
+    if (target >= (int)FS64_FD_MAX) return -FS64_ENOSPC;
+    return fs64_fd_dup2(task, fd, target);
 }
 
 void fs64_fd_close(int task, int fd) {
+    fs64_desc_t *desc;
     fs64_cache_t *slot;
+    int slot_index;
 
-    if (!valid_fd(task, fd) || fd_file[task][fd] < 0) return;
-    slot = &cache[fd_file[task][fd]];
-    fd_file[task][fd] = -1;
-    fd_pos[task][fd] = 0;
-    fd_flags[task][fd] = 0;
+    if (!valid_fd(task, fd)) return;
+    desc = fd_get(task, fd);
+    if (!desc) return;
+
+    fd_desc[task][fd] = -1;
+    slot_index = desc->slot;
+    desc->refs--;
+    if (desc->refs == 0) {
+        desc->used = 0;
+        desc->slot = -1;
+    }
+    if (slot_index < 0) return;
+
+    slot = &cache[slot_index];
     if (!slot->used) return;
 
     /* Persist on every close so a later open sees the bytes on disk even
@@ -506,23 +630,27 @@ void fs64_fd_close(int task, int fd) {
     }
 }
 
-/* fork inherits the descriptors; both tasks then share the cache entry and
- * therefore see each other's writes through it. */
+/* fork inherits the descriptors, and since a descriptor is only an index
+ * into the description table both tasks then share offsets and cache entry,
+ * which is what POSIX requires of a forked child. */
 void fs64_fork_fds(int parent, int child) {
     if (parent < 0 || child < 0 || parent >= (int)K64_TASK_MAX ||
         child >= (int)K64_TASK_MAX)
         return;
     for (u32 fd = 0; fd < FS64_FD_MAX; fd++) {
-        fd_file[child][fd] = fd_file[parent][fd];
-        fd_pos[child][fd] = fd_pos[parent][fd];
-        fd_flags[child][fd] = fd_flags[parent][fd];
-        if (fd >= 3 && fd_file[child][fd] >= 0)
-            cache[fd_file[child][fd]].refs++;
+        fs64_desc_t *desc;
+
+        fd_desc[child][fd] = fd_desc[parent][fd];
+        desc = fd_get(child, (int)fd);
+        if (!desc) continue;
+        desc->refs++;
+        if (desc->slot >= 0) cache[desc->slot].refs++;
     }
 }
 
 void fs64_task_cleanup(int task) {
     if (task < 0 || task >= (int)K64_TASK_MAX) return;
-    for (u32 fd = 3; fd < FS64_FD_MAX; fd++)
-        if (fd_file[task][fd] >= 0) fs64_fd_close(task, (int)fd);
+    for (u32 fd = 0; fd < FS64_FD_MAX; fd++)
+        if (fd_desc[task][fd] >= 0) fs64_fd_close(task, (int)fd);
 }
+

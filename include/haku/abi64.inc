@@ -16,6 +16,9 @@
 %define HAKU64_SYS_MMAP          9
 %define HAKU64_SYS_MUNMAP        11
 %define HAKU64_SYS_WRITEV        20
+%define HAKU64_SYS_DUP           32
+%define HAKU64_SYS_DUP2          33
+%define HAKU64_SYS_NANOSLEEP     35
 %define HAKU64_SYS_GETPID        39
 %define HAKU64_SYS_FORK          57
 %define HAKU64_SYS_EXIT          60
