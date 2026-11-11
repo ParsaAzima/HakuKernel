@@ -35,6 +35,26 @@ required tools and troubleshooting.
 For documentation-only changes, verify links and spelling; a kernel build is
 not required.
 
+## Algorithm and Efficiency Rules
+
+- Use the most efficient algorithm and data structure that fits the problem,
+  and keep the complexity honest: no accidental O(n²) work over
+  user-controlled sizes, no repeated linear scans where one pass or an index
+  will do, and no per-byte or per-field copies when a page- or block-sized
+  copy is available.
+- Say the complexity out loud when it is not obvious. A deliberate linear
+  scan over a fixed, tiny table (8 cache slots, 16 descriptors) is fine, but
+  the comment must make that a choice rather than an oversight.
+- Prefer caller-owned buffers and existing caches over new allocations, and
+  bound every loop by an explicit constant so hostile input cannot turn it
+  into unbounded work.
+- Validate user pointers once per page and copy in page-sized chunks, as
+  `copy_from_user64`/`copy_to_user64` do; a syscall must not call the page
+  walker once per byte.
+- Efficiency never buys its way out of the safety rules above: validation,
+  `-errno` behavior, and the privilege boundaries stay intact. Keep the
+  headless and x64 self-tests green and measure before claiming a speedup.
+
 ## Change Guidelines
 
 - Make focused changes and follow existing naming, formatting, and error
