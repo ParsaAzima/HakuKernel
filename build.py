@@ -1056,6 +1056,7 @@ def main():
             "USER-SIGNAL-OK", # kill/tkill/tgkill/sigaction/sigprocmask delivery
             "USER-MMAP-OK",  # mmap2/mprotect/mremap/madvise/set_thread_area
             "USER-FUTEX-OK", # futex wait/wake with a timeout
+            "USER-THREAD-OK", # clone shares space/files, distinct tid, same pid
             "USER-FS-ABI-OK", # openat/getdents64/chdir/pipe/poll/fcntl/termios
             "USER-ERRNO-OK", # error matrix: bad fd/pointer/path/argument
             "USER-INITRAMFS-OK", # ramfs root, long names, symlinks, devfs, procfs

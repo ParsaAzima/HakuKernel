@@ -135,3 +135,40 @@ _haku_syscall6:
     pop esi
     pop ebx
     ret
+
+; thread_create(int (*fn)(void *), void *arg, void *stack_top)
+; Creates a thread that shares the caller's address space and descriptors.
+; The clone returns twice: the parent resumes with the new tid in eax, while
+; the child starts on the caller-supplied stack with eax = 0 and calls
+; fn(arg). The child never returns from this function: it exits the thread.
+; ebp and esi carry fn/arg across the syscall, because the kernel copies the
+; register frame into the child.
+global _haku_thread_create
+_haku_thread_create:
+    push ebx
+    push esi
+    push edi
+    push ebp
+    mov ebp, [esp + 20]          ; fn
+    mov esi, [esp + 24]          ; arg
+    mov ecx, [esp + 28]          ; stack_top becomes the child's esp
+    mov ebx, HAKU_CLONE_VM | HAKU_CLONE_FS | HAKU_CLONE_FILES | HAKU_CLONE_SIGHAND | HAKU_CLONE_SYSVSEM | HAKU_CLONE_THREAD
+    xor edx, edx                 ; parent_tid
+    xor edi, edi                 ; tls
+    mov eax, HAKU_SYS_CLONE
+    int 0x80
+    test eax, eax
+    jnz .parent
+    ; Child: the kernel already switched esp to stack_top.
+    push esi
+    call ebp
+    mov ebx, eax                 ; fn's return value is the exit status
+    mov eax, HAKU_SYS_EXIT
+    int 0x80
+    hlt
+.parent:
+    pop ebp
+    pop edi
+    pop esi
+    pop ebx
+    ret

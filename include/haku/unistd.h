@@ -55,6 +55,9 @@ int personality(unsigned int persona);
 #define PER_LINUX HAKU_PER_LINUX
 #define PER_QUERY HAKU_PER_QUERY
 int getpid(void);
+/* gettid(2): the calling thread's id. A process's first thread has the same
+ * id as the process; a created thread gets its own. */
+int gettid(void);
 int getppid(void);
 /* Process groups and sessions: a process is its own group and session,
  * so each of these reports or accepts the caller's pid. */
@@ -73,6 +76,12 @@ int fork(void);
  * syscall.asm so the pending return address is not left where the child
  * would overwrite it. */
 int vfork(void);
+/* thread_create: run fn(arg) on a new thread sharing the caller's address
+ * space, descriptors and current working directory. stack_top is the
+ * initial stack pointer (it grows down); the thread runs until fn returns
+ * and then exits with fn's value. Returns the thread id, whose exit can be
+ * collected with waitpid(tid). */
+int thread_create(int (*fn)(void *), void *arg, void *stack_top);
 int waitpid(int pid, int *status, int options);
 int spawn(const char *path);
 int execve(const char *path, char *const argv[], char *const envp[]);

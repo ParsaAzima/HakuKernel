@@ -68,6 +68,10 @@ int getpid(void) {
     return haku_syscall0(HAKU_SYS_GETPID);
 }
 
+int gettid(void) {
+    return haku_syscall0(HAKU_SYS_GETTID);
+}
+
 int getppid(void) {
     return haku_syscall0(HAKU_SYS_GETPPID);
 }
@@ -118,6 +122,10 @@ int fork(void) {
         return -1;
     }
     return result;
+}
+
+int thread_create(int (*fn)(void *), void *arg, void *stack_top) {
+    return haku_errno_check(haku_thread_create(fn, arg, stack_top));
 }
 
 /* waitpid(2) goes through the Linux wait4(114) call, so WNOHANG and the
@@ -212,8 +220,8 @@ void _exit(int status) {
 }
 
 void exit(int status) {
-    /* exit_group(252) ends the whole process, like a Linux libc does;
-     * Haku runs one thread per process, so it ends this task. */
+    /* exit_group(252) ends the whole process, like a Linux libc does: the
+     * other threads go away with it. */
     haku_syscall1(HAKU_SYS_EXIT_GROUP, status);
     for (;;) {
     }

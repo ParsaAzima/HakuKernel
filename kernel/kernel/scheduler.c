@@ -39,6 +39,11 @@ typedef struct {
     uint32_t parent_pid;
     uint32_t pgrp;          /* process group (a session leader's pid) */
     uint32_t sid;           /* session id */
+    uint32_t tgid;          /* thread group id: the group leader's pid */
+    uint32_t space_owner;   /* pid of the task holding the heap/mmap table */
+    uint32_t space_users;   /* live tasks sharing the owned address space */
+    uint32_t is_thread;     /* created by clone(CLONE_THREAD) */
+    uint32_t clear_child_tid; /* CLONE_CHILD_CLEARTID word, 0 when unused */
     task_state_t state;
     loaded_elf_t program;
     uint32_t kernel_stack;
@@ -117,8 +122,37 @@ static void inherit_task_identity(task_t *child, const task_t *parent) {
  * passes the signal number the way Linux reports it. */
 static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status);
 
+/* The task with that pid, or 0. A linear scan over the (four) slots is
+ * cheaper than maintaining an index for a table this small; a zombie slot
+ * still answers, because a thread group looks up a dead owner's ledger. */
+static task_t *task_by_pid(uint32_t pid) {
+    if (pid == 0u) return 0;
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *task = &tasks[i];
+        if (task->state != TASK_UNUSED && task->pid == pid) return task;
+    }
+    return 0;
+}
+
+/* The slot that owns the heap break and the mmap ledger of an address
+ * space. A thread group has exactly one (the leader, or the surviving
+ * thread the owner role moved to); a thread reads that slot instead of a
+ * stale copy, so brk/mmap/mprotect in one thread are seen by all of them. */
+static task_t *space_state(task_t *task) {
+    task_t *owner;
+    if (task->space_owner == 0u || task->space_owner == task->pid)
+        return task;
+    owner = task_by_pid(task->space_owner);
+    return owner ? owner : task;
+}
+
 /* Drops a task from the futex it waits on (see the futex section). */
 static void futex_remove_waiter(task_t *task);
+
+/* Thread-group teardown (see the thread-group section). */
+static void clear_child_tid_word(task_t *task);
+static void detach_from_group(task_t *task);
+static void end_task_thread(task_t *task, uint32_t wait_status);
 
 int scheduler_user_tasks_done(void) {
     if (!scheduler_started) return 0;
@@ -261,8 +295,15 @@ static void activate_task(int selected_index) {
 }
 
 static void release_task_resources(task_t *task) {
-    if (task->program.address_space.directory_phys)
-        paging_destroy_user_space(&task->program.address_space);
+    if (task->program.address_space.directory_phys) {
+        /* Only the slot that owns the address space frees it. A thread
+         * never does, and an owner whose role already moved to a survivor
+         * has a zeroed copy by then; a vfork borrower is marked shared and
+         * paging_destroy_user_space leaves the frames to the parent. */
+        if (task->space_owner == task->pid)
+            paging_destroy_user_space(&task->program.address_space);
+        task->program.address_space.directory_phys = 0;
+    }
     if (task->kernel_stack) {
         frame_free_pages((void *)task->kernel_stack,
                          TASK_KERNEL_STACK_PAGES);
@@ -303,6 +344,38 @@ static void reap_completed_tasks(void) {
     }
 }
 
+/* Reserve an empty slot for a child of `parent` and give it a pid and the
+ * identity a fork/clone inherits. Returns 0 when the table is full. The
+ * caller builds the rest (address space, stack, descriptors) with
+ * interrupts enabled; until it flips the state to RUNNABLE the scheduler
+ * ignores the slot. */
+static task_t *reserve_task_slot(const task_t *parent) {
+    irqflags_t flags;
+    task_t *child = 0;
+
+    flags = irq_lock();
+    release_reaped_slots();
+    for (uint32_t slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
+        if (tasks[slot].state == TASK_UNUSED) {
+            child = &tasks[slot];
+            break;
+        }
+    }
+    if (child) {
+        uint32_t pid = (uint32_t)(child - tasks) + 1u;
+        memset(child, 0, sizeof(*child));
+        child->pid = pid;
+        child->parent_pid = parent->pid;
+        child->tgid = pid;
+        child->space_owner = pid;
+        child->space_users = 1;
+        child->state = TASK_STARTING;
+        inherit_task_identity(child, parent);
+    }
+    irq_unlock(flags);
+    return child;
+}
+
 int scheduler_init(loaded_elf_t *initial_program) {
     if (!initial_program || !initial_program->address_space.directory_phys ||
         !initial_program->entry || !initial_program->user_stack)
@@ -319,6 +392,9 @@ int scheduler_init(loaded_elf_t *initial_program) {
     tasks[0].parent_pid = 0;
     tasks[0].pgrp = 1;
     tasks[0].sid = 1;
+    tasks[0].tgid = 1;
+    tasks[0].space_owner = 1;
+    tasks[0].space_users = 1;
     tasks[0].state = TASK_RUNNABLE;
     tasks[0].program = *initial_program;
     init_task_identity(&tasks[0]);
@@ -460,6 +536,140 @@ static void wake_vfork_parent(uint32_t child_pid) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Thread groups                                                      */
+/* ------------------------------------------------------------------ */
+
+/* CLONE_CHILD_CLEARTID: zero the word a joiner waits on and wake it, the
+ * way a thread's exit does under Linux (pthread_join sleeps there). */
+static void clear_child_tid_word(task_t *task) {
+    uint32_t zero = 0;
+    uint32_t address = task->clear_child_tid;
+    address_space_t *space = &task->program.address_space;
+
+    if (!address) return;
+    task->clear_child_tid = 0;
+    if (space->directory_phys)
+        (void)paging_copy_to_user_space(space, address, &zero, sizeof(zero));
+    /* The joiner may have used either futex form, so wake both queues. */
+    scheduler_futex_wake(address, 0x7FFFFFFFu, 0u, 1u);
+    scheduler_futex_wake(address, 0x7FFFFFFFu, 0u, 0u);
+}
+
+/* Drop a task out of its thread group. The heap/mmap ledger and the
+ * address space live in the group's owner slot; when the owner is the one
+ * leaving, a surviving thread inherits both (and the group id moves with
+ * them) so the space outlives the leader. The last user keeps them and
+ * frees them on release. */
+static void detach_from_group(task_t *exiting) {
+    task_t *owner;
+    task_t *heir = 0;
+
+    if (exiting->space_owner == 0u) return;
+    owner = task_by_pid(exiting->space_owner);
+    if (!owner) return;
+    if (owner != exiting) {
+        if (owner->space_users > 0u) owner->space_users--;
+        exiting->program.address_space.directory_phys = 0;
+        return;
+    }
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *peer = &tasks[i];
+        if (peer == exiting || peer->space_owner != exiting->pid) continue;
+        if (peer->state == TASK_UNUSED || peer->state == TASK_ZOMBIE ||
+            peer->state == TASK_REAP_PENDING)
+            continue;
+        heir = peer;
+        break;
+    }
+    if (!heir) {
+        exiting->space_users = 0;
+        /* Last user: release must free the directory and frames, so the
+         * space is not a borrowed view any more. */
+        exiting->program.address_space.shared = 0;
+        return;
+    }
+    heir->program.address_space = exiting->program.address_space;
+    /* The survivor keeps the space, so it is no longer a borrowed view:
+     * the last user must free the directory and frames. */
+    heir->program.address_space.shared = 0;
+    heir->heap_brk = exiting->heap_brk;
+    heir->heap_top = exiting->heap_top;
+    heir->mmap_region_count = exiting->mmap_region_count;
+    memcpy(heir->mmap_regions, exiting->mmap_regions,
+           sizeof(heir->mmap_regions));
+    heir->space_owner = heir->pid;
+    heir->space_users = exiting->space_users > 1u
+                            ? exiting->space_users - 1u : 1u;
+    heir->tgid = heir->pid;
+    heir->is_thread = 0;
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *peer = &tasks[i];
+        if (peer != exiting && peer->space_owner == exiting->pid) {
+            peer->space_owner = heir->pid;
+            peer->tgid = heir->pid;
+        }
+    }
+    exiting->space_owner = 0;
+    exiting->space_users = 0;
+    exiting->program.address_space.directory_phys = 0;
+}
+
+/* End one peer of a group exit: it never runs again, so its resources are
+ * released with the rest of the exit path on the next timer tick. The peer
+ * is not waited on individually (only the process as a whole is), so the
+ * slot goes to TASK_REAP_PENDING. Called with interrupts enabled
+ * (vfs_close_all takes the VFS lock). */
+static void end_task_thread(task_t *task, uint32_t wait_status) {
+    futex_remove_waiter(task);
+    clear_child_tid_word(task);
+    vfs_close_all(task->pid);
+    task->program.address_space.directory_phys = 0;
+    task->exit_status = wait_status;
+    task->state = TASK_REAP_PENDING;
+    if (task->vfork_child) {
+        wake_vfork_parent(task->pid);
+        task->vfork_child = 0;
+    }
+    if (task->vfork_parent) {
+        wake_vfork_parent(task->pid);
+        task->vfork_parent = 0;
+    }
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *child = &tasks[i];
+        if (child->state == TASK_UNUSED || child->parent_pid != task->pid)
+            continue;
+        child->parent_pid = task->pid == 1u ? 0u : 1u;
+    }
+}
+
+/* End every live peer of `current`'s thread group: a group exit and a
+ * fatal signal (which takes the whole process, as on Linux) both do this.
+ * Called with interrupts enabled. Returns 1 when the caller owns the
+ * group's address space and must act as its last user; a task that merely
+ * borrowed the space (a vfork child) is left to the ordinary exit path. */
+static int end_group_peers(task_t *current, uint32_t wait_status) {
+    int owns_space = current->is_thread || current->space_owner == current->pid;
+
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *peer = &tasks[i];
+        if (peer == current || peer->state == TASK_UNUSED) continue;
+        if (peer->tgid != current->tgid) continue;
+        /* The group leader is usually the creator and therefore the
+         * caller's parent: when it dies, the caller belongs to init. */
+        if (peer->pid == current->parent_pid)
+            current->parent_pid = current->pid == 1u ? 0u : 1u;
+        end_task_thread(peer, wait_status);
+    }
+    if (!owns_space) return 0;
+    current->space_owner = current->pid;
+    current->space_users = 1;
+    current->tgid = current->pid;
+    current->is_thread = 0;
+    current->program.address_space.shared = 0;
+    return 1;
+}
+
 address_space_t *scheduler_current_space(void) {
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
         return 0;
@@ -468,6 +678,63 @@ address_space_t *scheduler_current_space(void) {
 
 regs_t *scheduler_exit_current(regs_t *frame) {
     return exit_current_with_status(frame, (frame->ebx & 0xFFu) << 8);
+}
+
+/* exit_group(2): every thread of the calling group ends. The peers are
+ * marked zombies whole and never run again; the caller then takes the
+ * last-user role so the ordinary exit path frees the shared space. */
+regs_t *scheduler_exit_group(regs_t *frame) {
+    task_t *current;
+    uint32_t status;
+
+    if (!scheduler_started || !frame || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX)
+        return frame;
+    current = &tasks[current_task];
+    status = (frame->ebx & 0xFFu) << 8;
+    /* A vfork child borrowed the parent's space and must only detach; a
+     * thread (or its leader) owns the group's space, so it takes the
+     * last-user role and frees it. */
+    (void)end_group_peers(current, status);
+    return exit_current_with_status(frame, status);
+}
+
+/* execve from a thread: Linux ends the other threads of the group. This
+ * runs before the image swap, with interrupts enabled, and leaves the
+ * caller owning the old address space so the swap can free it. */
+void scheduler_exec_detach_threads(void) {
+    task_t *current;
+    int has_peer = 0;
+
+    if (!scheduler_started || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX)
+        return;
+    current = &tasks[current_task];
+    /* The leader is not a thread, but its group may hold some. Look for a
+     * live peer before doing anything so a normal exec is untouched. */
+    if (!current->is_thread) {
+        for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+            task_t *peer = &tasks[i];
+            if (peer == current || peer->state == TASK_UNUSED) continue;
+            if (peer->tgid != current->tgid) continue;
+            has_peer = 1;
+            break;
+        }
+        if (!has_peer) return;
+    }
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *peer = &tasks[i];
+        if (peer == current || peer->state == TASK_UNUSED) continue;
+        if (peer->tgid != current->tgid) continue;
+        if (peer->pid == current->parent_pid)
+            current->parent_pid = current->pid == 1u ? 0u : 1u;
+        end_task_thread(peer, 0u);
+    }
+    current->space_owner = current->pid;
+    current->space_users = 1;
+    current->tgid = current->pid;
+    current->is_thread = 0;
+    current->program.address_space.shared = 0;
 }
 
 static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status) {
@@ -482,6 +749,11 @@ static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status) {
     /* A task that dies while waiting on a futex must not stay in the
      * queue: a later wake would find a stale waiter. */
     futex_remove_waiter(exiting);
+    /* Zero the join word while the address space is still mapped, then
+     * hand the space state to a surviving thread (or keep it when this is
+     * the last user). */
+    clear_child_tid_word(exiting);
+    detach_from_group(exiting);
     /* Closing descriptors takes the task-context VFS lock, so it must run
      * with interrupts enabled. The task-state transition below is then
      * committed under the scheduler's IRQ-save rule: interrupts stay off
@@ -613,6 +885,10 @@ static regs_t *exit_current_for_signal(regs_t *frame, uint32_t sig) {
     __asm {
         sti
     }
+    /* A fatal signal takes the whole thread group, exactly like Linux: the
+     * remaining threads never return to user mode. */
+    if (current_task >= 0 && current_task < SCHEDULER_IDLE_INDEX)
+        (void)end_group_peers(&tasks[current_task], sig & 0x7Fu);
     next = exit_current_with_status(frame, sig & 0x7Fu);
     __asm {
         cli
@@ -690,12 +966,15 @@ int32_t scheduler_kill_pgrp(uint32_t pgid, uint32_t sig) {
 }
 
 int32_t scheduler_tkill(uint32_t tid, uint32_t sig) {
-    /* Haku runs one thread per process, so a thread id is a process id. */
+    /* tkill names one task: a thread id signals that thread, not its
+     * group (tgkill additionally validates the group). */
     return scheduler_kill_pid(tid, sig);
 }
 
 int32_t scheduler_tgkill(uint32_t tgid, uint32_t tid, uint32_t sig) {
-    if (tgid != tid) return -(int32_t)HAKU_ESRCH;
+    task_t *task = task_by_pid(tid);
+    if (!task || (task->tgid ? task->tgid : task->pid) != tgid)
+        return -(int32_t)HAKU_ESRCH;
     return scheduler_kill_pid(tid, sig);
 }
 
@@ -928,7 +1207,14 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     paging_activate_user_space(&task->program.address_space);
     if (previous.address_space.shared) {
         /* The replaced image was the parent's address space (vfork): it is
-         * still in use, so only detach from it and release the parent. */
+         * still in use, so only detach from it and release the parent. The
+         * new image belongs to this task alone. */
+        if (task->space_owner && task->space_owner != task->pid) {
+            task_t *owner = task_by_pid(task->space_owner);
+            if (owner && owner->space_users > 0u) owner->space_users--;
+        }
+        task->space_owner = task->pid;
+        task->space_users = 1;
         if (task->vfork_parent) {
             wake_vfork_parent(task->pid);
             task->vfork_parent = 0;
@@ -951,9 +1237,34 @@ uint32_t scheduler_current_pid(void) {
     return tasks[current_task].pid;
 }
 
-uint32_t scheduler_parent_pid(void) {
+/* getpid(2): a thread reports the group id, not its own thread id. */
+uint32_t scheduler_current_tgid(void) {
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
         return 0;
+    return tasks[current_task].tgid ? tasks[current_task].tgid
+                                    : tasks[current_task].pid;
+}
+
+/* set_tid_address(2): the kernel clears this word when the calling thread
+ * exits (and wakes anyone waiting on it). */
+uint32_t scheduler_set_tid_address(uint32_t user_tidptr) {
+    task_t *task;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0;
+    task = &tasks[current_task];
+    task->clear_child_tid = user_tidptr;
+    return task->pid;
+}
+
+uint32_t scheduler_parent_pid(void) {
+    task_t *owner;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0;
+    /* A thread's getppid is the parent of its process, not its creator. */
+    if (tasks[current_task].is_thread) {
+        owner = task_by_pid(tasks[current_task].space_owner);
+        if (owner) return owner->parent_pid;
+    }
     return tasks[current_task].parent_pid;
 }
 
@@ -1104,10 +1415,10 @@ int scheduler_get_usage(haku_usage_t *usage) {
         current_task >= SCHEDULER_IDLE_INDEX)
         return -(int32_t)HAKU_EINVAL;
 
-    task = &tasks[current_task];
+    task = space_state(&tasks[current_task]);
     space = &task->program.address_space;
     memset(usage, 0, sizeof(*usage));
-    usage->pid = task->pid;
+    usage->pid = tasks[current_task].pid;
     usage->user_ticks = task->user_ticks;
     usage->kernel_ticks = task->kernel_ticks;
     usage->syscalls = task->syscall_count;
@@ -1287,8 +1598,7 @@ static int initialize_fork_stack(task_t *task, const regs_t *parent_frame) {
 int32_t scheduler_fork(regs_t *frame) {
     irqflags_t flags;
     uint32_t parent_pid;
-    uint32_t slot;
-    task_t *child = 0;
+    task_t *child;
     task_t *parent;
 
     if (!scheduler_started || !frame || current_task < 0 ||
@@ -1298,27 +1608,12 @@ int32_t scheduler_fork(regs_t *frame) {
         return -(int32_t)HAKU_EINVAL;
     parent = &tasks[current_task];
 
-    /* Reserve a slot first: a STARTING task is ignored by the scheduler
-     * until it is fully built. */
-    flags = irq_lock();
-    release_reaped_slots();
+    /* A STARTING task is ignored by the scheduler until it is fully
+     * built, so the slot is safe to fill with interrupts enabled. */
     parent_pid = parent->pid;
-    for (slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
-        if (tasks[slot].state == TASK_UNUSED) {
-            child = &tasks[slot];
-            break;
-        }
-    }
-    if (!child) {
-        irq_unlock(flags);
+    child = reserve_task_slot(parent);
+    if (!child)
         return -(int32_t)HAKU_EAGAIN;
-    }
-    memset(child, 0, sizeof(*child));
-    child->pid = slot + 1u;
-    child->parent_pid = parent_pid;
-    child->state = TASK_STARTING;
-    inherit_task_identity(child, parent);
-    irq_unlock(flags);
 
     /* The child gets its own address space that shares the parent's frames
      * copy-on-write: nothing is copied until either side writes. */
@@ -1371,6 +1666,137 @@ failed:
     return -(int32_t)HAKU_ENOMEM;
 }
 
+/* clone(2): the i386 form of thread creation. CLONE_VM shares the calling
+ * address space (so the child is a thread in effect), CLONE_FILES shares
+ * the descriptor row, and CLONE_THREAD puts the child in the caller's
+ * thread group so getpid() stays the same and the group id is the leader.
+ * Without CLONE_VM this is exactly fork. The SETTID/CLEARTID/SETTLS flags
+ * are honored; any other bit is -EINVAL. */
+int32_t scheduler_clone(regs_t *frame, uint32_t flags, uint32_t stack,
+                        uint32_t parent_tid, uint32_t child_tid,
+                        uint32_t tls) {
+    const uint32_t known = HAKU_CLONE_VM | HAKU_CLONE_FS | HAKU_CLONE_FILES |
+                           HAKU_CLONE_SIGHAND | HAKU_CLONE_SYSVSEM |
+                           HAKU_CLONE_THREAD | HAKU_CLONE_SETTLS |
+                           HAKU_CLONE_PARENT_SETTID |
+                           HAKU_CLONE_CHILD_SETTID |
+                           HAKU_CLONE_CHILD_CLEARTID | HAKU_SIGCHLD;
+    irqflags_t irq;
+    task_t *parent;
+    task_t *child;
+    task_t *owner;
+    uint32_t tid;
+    int share_vm, share_files;
+    int files_linked = 0;
+    int32_t error = -(int32_t)HAKU_ENOMEM;
+
+    if (!scheduler_started || !frame || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX || (frame->cs & 3u) != 3u)
+        return -(int32_t)HAKU_EINVAL;
+    if (flags & ~known) return -(int32_t)HAKU_EINVAL;
+    share_vm = (flags & HAKU_CLONE_VM) != 0u;
+    share_files = (flags & HAKU_CLONE_FILES) != 0u;
+    /* A shared handler table needs a shared address space, so Linux
+     * rejects CLONE_THREAD/CLONE_SIGHAND without CLONE_VM; CLONE_VFORK is
+     * vfork(2)'s job because it parks the parent. */
+    if (!share_vm && (flags & (HAKU_CLONE_THREAD | HAKU_CLONE_SIGHAND)))
+        return -(int32_t)HAKU_EINVAL;
+
+    parent = &tasks[current_task];
+    child = reserve_task_slot(parent);
+    if (!child) return -(int32_t)HAKU_EAGAIN;
+    tid = child->pid;
+
+    if (share_vm) {
+        /* Same page directory, same frames: the child only gets its own
+         * kernel stack, register frame and user stack. */
+        child->program = parent->program;
+        child->program.address_space.shared = 1;
+        child->space_owner = parent->space_owner ? parent->space_owner
+                                                 : parent->pid;
+        owner = task_by_pid(child->space_owner);
+        if (owner) owner->space_users++;
+        child->tgid = parent->tgid ? parent->tgid : parent->pid;
+        child->is_thread = (flags & HAKU_CLONE_THREAD) ? 1u : 0u;
+        child->fs_base = (flags & HAKU_CLONE_SETTLS) ? tls : parent->fs_base;
+    } else {
+        /* clone(SIGCHLD): a private address space sharing the parent's
+         * frames copy-on-write, exactly like fork. */
+        if (!paging_create_user_space(&child->program.address_space))
+            goto failed;
+        if (!paging_share_user_space(&parent->program.address_space,
+                                     &child->program.address_space))
+            goto failed;
+        child->program.entry = parent->program.entry;
+        child->program.user_stack = parent->program.user_stack;
+        child->heap_brk = parent->heap_brk;
+        child->heap_top = parent->heap_top;
+        child->mmap_region_count = parent->mmap_region_count;
+        memcpy(child->mmap_regions, parent->mmap_regions,
+               sizeof(child->mmap_regions));
+    }
+
+    if (!initialize_fork_stack(child, frame))
+        goto failed;
+    /* The child resumes at the caller's return address; a thread passes its
+     * own stack top, so it returns there instead of the creator's ESP. */
+    if (stack) child->frame->user_esp = stack;
+
+    if (share_files) {
+        if (vfs_share(parent->pid, tid) != 1)
+            goto failed;
+    } else if (vfs_inherit(parent->pid, tid) != 1) {
+        goto failed;
+    }
+    files_linked = 1;
+    child->signal_blocked = parent->signal_blocked;
+
+    /* CLONE_CHILD_SETTID writes the tid into the child's address space (the
+     * shared one for a thread), and CLONE_PARENT_SETTID into the caller's,
+     * before either task runs. */
+    if ((flags & HAKU_CLONE_CHILD_SETTID) && child_tid) {
+        if (!paging_copy_to_user_space(&child->program.address_space,
+                                       child_tid, &tid, sizeof(tid))) {
+            error = -(int32_t)HAKU_EFAULT;
+            goto failed;
+        }
+    }
+    if ((flags & HAKU_CLONE_CHILD_CLEARTID) && child_tid)
+        child->clear_child_tid = child_tid;
+    if ((flags & HAKU_CLONE_PARENT_SETTID) && parent_tid) {
+        if (!paging_copy_to_user_space(&parent->program.address_space,
+                                       parent_tid, &tid, sizeof(tid))) {
+            error = -(int32_t)HAKU_EFAULT;
+            goto failed;
+        }
+    }
+
+    irq = irq_lock();
+    child->state = TASK_RUNNABLE;
+    irq_unlock(irq);
+    klog_prefix();
+    klog_write(share_vm ? "sched: CLONE-OK parent=" : "sched: CLONE-FORK parent=");
+    klog_dec(parent->pid);
+    klog_write(" tid=");
+    klog_dec(tid);
+    klog_write(share_vm ? (share_files ? " vm+files\n" : " vm\n")
+                        : " private\n");
+    return (int32_t)tid;
+
+failed:
+    if (share_vm) {
+        owner = task_by_pid(child->space_owner);
+        if (owner && owner->space_users > 0u) owner->space_users--;
+        child->program.address_space.directory_phys = 0;
+    }
+    if (files_linked) vfs_close_all(tid);
+    release_task_resources(child);
+    irq = irq_lock();
+    memset(child, 0, sizeof(*child));
+    irq_unlock(irq);
+    return error;
+}
+
 /* vfork(2): the child runs in the parent's address space until it calls
  * execve or exits, and the parent is suspended until then (that is the
  * whole point: the child owns the parent's memory and stack). The child
@@ -1379,8 +1805,7 @@ failed:
 regs_t *scheduler_vfork(regs_t *frame) {
     irqflags_t flags;
     uint32_t parent_pid;
-    uint32_t slot;
-    task_t *child = 0;
+    task_t *child;
     task_t *parent;
     int next;
 
@@ -1392,34 +1817,28 @@ regs_t *scheduler_vfork(regs_t *frame) {
     }
     parent = &tasks[current_task];
 
-    flags = irq_lock();
-    release_reaped_slots();
     parent_pid = parent->pid;
-    for (slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
-        if (tasks[slot].state == TASK_UNUSED) {
-            child = &tasks[slot];
-            break;
-        }
-    }
+    child = reserve_task_slot(parent);
     if (!child) {
         frame->eax = 0u - HAKU_EAGAIN;
-        irq_unlock(flags);
         return frame;
     }
-    memset(child, 0, sizeof(*child));
-    child->pid = slot + 1u;
-    child->parent_pid = parent_pid;
-    child->state = TASK_STARTING;
+    flags = irq_lock();
     child->vfork_parent = parent_pid;
-    inherit_task_identity(child, parent);
     irq_unlock(flags);
 
     /* Borrow the parent's address space: same CR3, same frames, no copy.
      * Nothing may tear it down while the child runs (see
      * paging_destroy_user_space), and the parent cannot run until the
-     * child has finished with it. */
+     * child has finished with it. The parent's slot stays the space owner,
+     * so the child's exit drops its reference instead of freeing it. */
     child->program = parent->program;
     child->program.address_space.shared = 1;
+    child->space_owner = parent->space_owner ? parent->space_owner : parent_pid;
+    {
+        task_t *owner = task_by_pid(child->space_owner);
+        if (owner) owner->space_users++;
+    }
     if (!initialize_fork_stack(child, frame))
         goto failed;
     if (vfs_inherit(parent_pid, child->pid) != 1)
@@ -1459,6 +1878,10 @@ regs_t *scheduler_vfork(regs_t *frame) {
 failed:
     /* The parent never started the child, so it must not stay parked. The
      * borrowed space belongs to the parent and is not released here. */
+    if (child->space_owner) {
+        task_t *owner = task_by_pid(child->space_owner);
+        if (owner && owner->space_users > 0u) owner->space_users--;
+    }
     release_task_resources(child);
     flags = irq_lock();
     memset(child, 0, sizeof(*child));
@@ -1634,14 +2057,13 @@ regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
 /* ------------------------------------------------------------------ */
 
 /* A futex is a 32-bit word in user memory that a task can wait on.
- * Waiters are parked in the kernel and woken by FUTEX_WAKE. Haku has
- * one thread per process and no shared memory between processes, so the
- * number of distinct futexes in use at the same time is bounded by the
- * number of tasks: a small table of queues is enough and needs no
- * allocation.
+ * Waiters are parked in the kernel and woken by FUTEX_WAKE. The number of
+ * distinct futexes in use at the same time is bounded by the number of
+ * tasks: a small table of queues is enough and needs no allocation.
  *
- * A private futex (FUTEX_PRIVATE_FLAG) belongs to one process, so its
- * key carries the pid; a shared futex is keyed by its address alone. */
+ * A private futex (FUTEX_PRIVATE_FLAG) belongs to one address space, so
+ * its key carries the thread group id and one thread can wake another; a
+ * shared futex is keyed by its address alone. */
 #define FUTEX_MAX_QUEUES 8u
 
 typedef struct {
@@ -1721,7 +2143,9 @@ uint32_t scheduler_futex_wake(uint32_t address, uint32_t count,
                               uint32_t mask, uint32_t private_futex) {
     futex_queue_t *queue;
     uint32_t woken = 0;
-    uint32_t pid = scheduler_current_pid();
+    /* A private futex is private to the address space, so one thread can
+     * wake another: the key is the group id, not the thread id. */
+    uint32_t pid = scheduler_current_tgid();
 
     if (count == 0) return 0;
     queue = futex_find_queue(address, pid, private_futex);
@@ -1861,7 +2285,7 @@ int scheduler_grow_user_stack(uint32_t fault_addr) {
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX) return 0;
     if (fault_addr >= USER_STACK_TOP) return 0;
     if (fault_addr < USER_STACK_TOP - USER_STACK_GROWTH) return 0;
-    task = &tasks[current_task];
+    task = space_state(&tasks[current_task]);
     space = &task->program.address_space;
     if (!space->directory_phys) return 0;
     page = fault_addr & 0xFFFFF000u;
@@ -1877,7 +2301,7 @@ uint32_t scheduler_brk(uint32_t requested) {
 
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
         return 0u - HAKU_EINVAL;
-    task = &tasks[current_task];
+    task = space_state(&tasks[current_task]);
     space = &task->program.address_space;
     if (!space->directory_phys) return 0u - HAKU_EINVAL;
     if (task->heap_brk == 0) task->heap_brk = USER_HEAP_BASE;
@@ -1998,7 +2422,7 @@ uint32_t scheduler_mmap2(uint32_t address, uint32_t length, uint32_t prot,
         return 0u - HAKU_EINVAL;
     if (!(flags & HAKU_MAP_ANONYMOUS)) return 0u - HAKU_EINVAL;
 
-    task = &tasks[current_task];
+    task = space_state(&tasks[current_task]);
     space = &task->program.address_space;
     if (!space->directory_phys) return 0u - HAKU_EINVAL;
     if (length > USER_MMAP_LIMIT - USER_MMAP_BASE) return 0u - HAKU_ENOMEM;
@@ -2052,7 +2476,7 @@ uint32_t scheduler_mprotect(uint32_t address, uint32_t length, uint32_t prot) {
     if (length == 0 || address > 0xFFFFFFFFu - length) return 0u - HAKU_EINVAL;
     if (prot & ~(uint32_t)(HAKU_PROT_READ | HAKU_PROT_WRITE | HAKU_PROT_EXEC))
         return 0u - HAKU_EINVAL;
-    task = &tasks[current_task];
+    task = space_state(&tasks[current_task]);
     space = &task->program.address_space;
     if (!space->directory_phys) return 0u - HAKU_EINVAL;
 
@@ -2115,7 +2539,7 @@ uint32_t scheduler_mremap(uint32_t old_address, uint32_t old_length,
     if (old_address > 0xFFFFFFFFu - old_length) return 0u - HAKU_EINVAL;
     if (flags & ~(uint32_t)(HAKU_MREMAP_MAYMOVE | HAKU_MREMAP_FIXED))
         return 0u - HAKU_EINVAL;
-    task = &tasks[current_task];
+    task = space_state(&tasks[current_task]);
     space = &task->program.address_space;
     if (!space->directory_phys) return 0u - HAKU_EINVAL;
 
@@ -2230,7 +2654,7 @@ uint32_t scheduler_madvise(uint32_t address, uint32_t length, uint32_t advice) {
         return 0u - HAKU_EINVAL;
     if (length == 0 || address > 0xFFFFFFFFu - length) return 0u - HAKU_EINVAL;
     if (advice > HAKU_MADV_FREE) return 0u - HAKU_EINVAL;
-    task = &tasks[current_task];
+    task = space_state(&tasks[current_task]);
     space = &task->program.address_space;
     if (!space->directory_phys) return 0u - HAKU_EINVAL;
 
@@ -2314,7 +2738,7 @@ uint32_t scheduler_munmap(uint32_t address, uint32_t length) {
         return 0u - HAKU_EINVAL;
     if (length == 0 || address > 0xFFFFFFFFu - length)
         return 0u - HAKU_EINVAL;
-    task = &tasks[current_task];
+    task = space_state(&tasks[current_task]);
     space = &task->program.address_space;
     if (!space->directory_phys) return 0u - HAKU_EINVAL;
 

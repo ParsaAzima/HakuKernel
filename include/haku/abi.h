@@ -155,17 +155,24 @@
 #define HAKU_SYS_GETRANDOM 355u
 #define HAKU_SYS_RSEQ      386u
 
-/* Process-creation flags (Linux). Haku implements the fork-like case of
- * clone: a new process with its own copy of the address space and the
- * parent's descriptors. The sharing flags (CLONE_VM and friends) are
- * rejected with EINVAL. */
-#define HAKU_SIGCHLD       17u
-#define HAKU_CLONE_VM      0x100u
-#define HAKU_CLONE_FS      0x200u
-#define HAKU_CLONE_FILES   0x400u
-#define HAKU_CLONE_SIGHAND 0x800u
-#define HAKU_CLONE_VFORK   0x4000u
-#define HAKU_CLONE_THREAD  0x10000u
+/* Process-creation flags (Linux). clone(2) supports the fork-like case and
+ * the thread cases: CLONE_VM shares the address space, CLONE_FILES shares
+ * the descriptor row, CLONE_THREAD joins the caller's thread group, and the
+ * SETTID/CLEARTID/SETTLS flags are honored. CLONE_FS, CLONE_SIGHAND and
+ * CLONE_SYSVSEM are accepted as no-ops: Haku keeps one cwd per task, one
+ * signal table per process, and has no SysV semaphores. */
+#define HAKU_SIGCHLD             17u
+#define HAKU_CLONE_VM            0x100u
+#define HAKU_CLONE_FS            0x200u
+#define HAKU_CLONE_FILES         0x400u
+#define HAKU_CLONE_SIGHAND       0x800u
+#define HAKU_CLONE_VFORK         0x4000u
+#define HAKU_CLONE_THREAD        0x10000u
+#define HAKU_CLONE_SYSVSEM       0x40000u
+#define HAKU_CLONE_SETTLS        0x80000u
+#define HAKU_CLONE_PARENT_SETTID 0x100000u
+#define HAKU_CLONE_CHILD_CLEARTID 0x200000u
+#define HAKU_CLONE_CHILD_SETTID  0x1000000u
 /* wait4(2) options. WUNTRACED and WCONTINUED are accepted and ignored:
  * Haku has no job-control stop/continue states, but a shell that enables
  * job control passes WUNTRACED to every waitpid. */
@@ -293,9 +300,10 @@
 
 /* open(2)/openat(2) flags accepted by the current VFS implementation. The
  * remaining Linux flags are accepted where Haku can honour them: O_CLOEXEC
- * and O_NOCTTY have no effect (one thread per process, no controlling
- * terminal), O_DIRECTORY opens a directory for getdents64, and O_NONBLOCK
- * is remembered by fcntl but does not change console behaviour. */
+ * and O_NOCTTY have no effect (execve keeps descriptors and there is no
+ * controlling terminal), O_DIRECTORY opens a directory for getdents64, and
+ * O_NONBLOCK is remembered by fcntl but does not change console
+ * behaviour. */
 #define HAKU_O_RDONLY  0x0000u
 #define HAKU_O_WRONLY  0x0001u
 #define HAKU_O_RDWR    0x0002u

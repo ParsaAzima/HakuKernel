@@ -56,6 +56,23 @@ int32_t scheduler_spawn(loaded_elf_t *program);
  * parent's pages copy-on-write, and inherits its descriptors; the child
  * returns 0 from the call and the parent gets the new pid. */
 int32_t scheduler_fork(regs_t *frame);
+/* clone(2): CLONE_VM shares the caller's address space (a thread),
+ * CLONE_FILES shares the descriptor row and CLONE_THREAD joins the caller's
+ * thread group. Without CLONE_VM it behaves like fork. Returns the new tid
+ * or a negative -errno. */
+int32_t scheduler_clone(regs_t *frame, uint32_t flags, uint32_t stack,
+                        uint32_t parent_tid, uint32_t child_tid,
+                        uint32_t tls);
+/* exit_group(2): end every thread of the caller's group, then the caller.
+ * Returns the frame the scheduler resumes next. */
+regs_t *scheduler_exit_group(regs_t *frame);
+/* execve(2) from a thread ends the other threads first (Linux does the
+ * same); the caller keeps the address space so the image swap can free it. */
+void scheduler_exec_detach_threads(void);
+/* getpid(2) for a thread reports its group id. */
+uint32_t scheduler_current_tgid(void);
+/* set_tid_address(2): the word the kernel clears when this thread exits. */
+uint32_t scheduler_set_tid_address(uint32_t user_tidptr);
 /* vfork(2): the child borrows the parent's address space and the parent
  * is parked until the child execs or exits. Returns the frame to resume,
  * which is the child's when the call switched tasks. */
@@ -128,8 +145,8 @@ int32_t scheduler_set_comm(const char *name);
  * resumes the caller (which may be this task when nobody else is ready). */
 regs_t *scheduler_yield(regs_t *frame);
 /* Signals. kill(2) takes a pid, 0 for the caller, -1 for every other
- * process, or a negative process-group id. tkill/tgkill take thread ids,
- * and a thread id is a process id here. */
+ * process, or a negative process-group id. tkill/tgkill take thread ids;
+ * tgkill also checks that the thread belongs to the named group. */
 int32_t scheduler_kill_pid(uint32_t pid, uint32_t sig);
 int32_t scheduler_kill_all(uint32_t sig);
 /* Send a signal to every member of a process group (kill(-pgid, sig)).

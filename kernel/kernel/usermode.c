@@ -894,6 +894,9 @@ static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
         return copy_from_user_error((uint32_t)result);
     }
     kfree(arguments.strings);
+    /* Linux ends the other threads of the group when one execs; do it once
+     * the new image is ready so a lookup failure leaves the process alone. */
+    scheduler_exec_detach_threads();
     if (!scheduler_exec_current(&replacement, frame)) {
         paging_destroy_user_space(&replacement.address_space);
         return copy_from_user_error(HAKU_EIO);
@@ -1104,24 +1107,16 @@ static regs_t *sys_fork(regs_t *frame) {
     return frame;
 }
 
-/* clone(2): Haku implements the fork-like case only. The sharing flags
- * (CLONE_VM, CLONE_FILES, CLONE_THREAD, ...) need address-space sharing
- * and threads, which the kernel does not have yet. */
+/* clone(2): the i386 clone carries the flags in ebx, the new stack in ecx,
+ * the tid pointers in edx/esi and the TLS base in edi. Haku supports the
+ * fork-like case (no CLONE_VM) and thread creation; the scheduler validates
+ * the flag set. */
 static regs_t *sys_clone(regs_t *frame, uint32_t flags, uint32_t stack,
                          uint32_t parent_tid, uint32_t child_tid,
                          uint32_t tls) {
-    if (flags & (HAKU_CLONE_VM | HAKU_CLONE_FS | HAKU_CLONE_FILES |
-                 HAKU_CLONE_SIGHAND | HAKU_CLONE_VFORK | HAKU_CLONE_THREAD)) {
-        frame->eax = 0u - HAKU_EINVAL;
-        return frame;
-    }
-    if (stack || parent_tid || child_tid || tls) {
-        /* CLONE_SETTLS/CLONE_PARENT_SETTID/CLONE_CHILD_SETTID need
-         * thread-local storage and a second thread: not supported. */
-        frame->eax = 0u - HAKU_EINVAL;
-        return frame;
-    }
-    return sys_fork(frame);
+    frame->eax = (uint32_t)scheduler_clone(frame, flags, stack, parent_tid,
+                                           child_tid, tls);
+    return frame;
 }
 
 /* wait4(2): the Linux form of waitpid, with WNOHANG and a rusage block. */
@@ -1513,7 +1508,9 @@ static regs_t *sys_futex(regs_t *frame, uint32_t user_address, uint32_t op,
         frame->eax = copy_from_user_error(HAKU_EINVAL);
         return frame;
     }
-    current = scheduler_current_pid();
+    /* A private futex belongs to the address space, so the queue is keyed
+     * by the thread group: one thread can wake another's waiter. */
+    current = scheduler_current_tgid();
 
     if (command == HAKU_FUTEX_WAIT || command == HAKU_FUTEX_WAIT_BITSET) {
         uint32_t ticks = 0;
@@ -2427,21 +2424,17 @@ static uint32_t sys_llseek(uint32_t fd, uint32_t offset_high,
     return 0;
 }
 
-/* The kernel only stores the pointer so it can clear it when the thread
- * exits; Haku runs one thread per process and never clears it, so the
- * address is accepted as-is and the thread id is the pid. */
+/* set_tid_address(2): remember the word so exit can zero it and wake a
+ * joiner waiting there. Returns the caller's thread id. */
 static uint32_t sys_set_tid_address(uint32_t user_tidptr) {
-    (void)user_tidptr;
-    return scheduler_current_pid();
+    return scheduler_set_tid_address(user_tidptr);
 }
 
 regs_t *user_syscall(regs_t *r) {
     scheduler_note_syscall();
     switch (r->eax) {
     case HAKU_SYS_EXIT:
-    case HAKU_SYS_EXIT_GROUP:
-        /* Haku runs one thread per process, so ending the group and ending
-         * the calling thread are the same operation. */
+        /* exit(2) ends only the calling thread; its peers keep running. */
         cpu_cli();
         klog_prefix();
         klog_write("USER-EXIT-OK status=");
@@ -2450,6 +2443,16 @@ regs_t *user_syscall(regs_t *r) {
         klog_dec(scheduler_current_pid());
         klog_write("\n");
         return scheduler_exit_current(r);
+    case HAKU_SYS_EXIT_GROUP:
+        /* exit_group(2) ends every thread of the process. */
+        cpu_cli();
+        klog_prefix();
+        klog_write("USER-EXIT-OK status=");
+        klog_dec(r->ebx);
+        klog_write(" pid=");
+        klog_dec(scheduler_current_pid());
+        klog_write("\n");
+        return scheduler_exit_group(r);
     case HAKU_SYS_FORK:
         return sys_fork(r);
     case HAKU_SYS_VFORK:
@@ -2572,7 +2575,8 @@ regs_t *user_syscall(regs_t *r) {
         r->eax = sys_statx(r->ebx, r->ecx, r->edx, r->esi, r->edi);
         return r;
     case HAKU_SYS_GETPID:
-        r->eax = scheduler_current_pid();
+        /* A thread reports its process, not its own tid. */
+        r->eax = scheduler_current_tgid();
         return r;
     case HAKU_SYS_GETPPID:
         r->eax = scheduler_parent_pid();

@@ -325,7 +325,7 @@ static void test_filesystem_abi(void) {
                (int)sizeof(random_bytes), "getrandom");
     expect(sched_yield() == 0, "sched_yield");
     /* musl's startup registers the thread pointer's address with the kernel
-     * and expects the thread id back; Haku runs one thread per process. */
+     * and expects the thread id back. */
     expect(haku_syscall1(HAKU_SYS_SET_TID_ADDRESS, (int)&handler_runs) ==
                (int)getpid(),
            "set_tid_address returns the thread id");
@@ -798,6 +798,26 @@ static void test_auxiliary_vector(void) {
     }
 }
 
+/* Thread self-test: the body records its own ids and raises a flag the
+ * creator can see, which only works because the two share one address
+ * space. Returning 7 makes the exit status checkable through waitpid. */
+struct thread_boot {
+    volatile int *self;
+    volatile int *pid;
+    volatile int *ran;
+    volatile int *dupfd;
+};
+
+static int thread_body(void *argument) {
+    struct thread_boot *boot = (struct thread_boot *)argument;
+    *boot->self = gettid();
+    *boot->pid = getpid();
+    /* CLONE_FILES shares the descriptor row: the creator must see this. */
+    *boot->dupfd = dup(1);
+    *boot->ran = *boot->ran + 1;
+    return 7;
+}
+
 int main(void) {
     char buffer[64];
     char copy[32];
@@ -1008,7 +1028,7 @@ int main(void) {
     expect(handler_runs == 4 && handler_signal == SIGUSR2,
            "SA_RESTORER restorer returns");
 
-    /* The pid/tid forms. Haku has one thread per process. */
+    /* The pid/tid forms: kill names a process, tkill/tgkill a thread. */
     expect(kill(getpid(), 0) == 0, "kill sig 0 self");
     expect(kill(999, 0) == -1 && errno == ESRCH, "kill ESRCH");
     expect(tkill(getpid(), 0) == 0, "tkill sig 0 self");
@@ -1324,6 +1344,54 @@ int main(void) {
         }
     }
 
+    /* Threads: clone(CLONE_VM|CLONE_THREAD) runs a second task in the same
+     * address space, so a write in the thread is visible to the creator,
+     * getpid stays the same and gettid differs. */
+    {
+        static volatile int thread_ran;
+        static volatile int thread_self;
+        static volatile int thread_pid;
+        static volatile int thread_dupfd;
+        unsigned char *stack;
+        int tid = -1;
+        int status = 0;
+        int parent_pid = getpid();
+        struct thread_boot boot;
+
+        stack = (unsigned char *)mmap2(NULL, 0x4000u, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        expect(stack != MAP_FAILED, "mmap a thread stack");
+        if (stack != MAP_FAILED) {
+            boot.self = &thread_self;
+            boot.pid = &thread_pid;
+            boot.ran = &thread_ran;
+            boot.dupfd = &thread_dupfd;
+            thread_ran = 0;
+            thread_dupfd = -1;
+            tid = thread_create(thread_body, &boot, stack + 0x4000u);
+            expect(tid > 0, "thread_create");
+            if (tid > 0) {
+                expect(tid != parent_pid, "a thread has its own tid");
+                expect(waitpid(tid, &status, 0) == tid,
+                       "waitpid collects the thread");
+                expect(status == (7 << 8),
+                       "the thread reports its exit status");
+                expect(thread_ran == 1,
+                       "the thread's write is visible to the creator");
+                expect(thread_self == tid, "gettid in the thread");
+                expect(thread_pid == parent_pid,
+                       "getpid in the thread is the process id");
+                expect(gettid() == parent_pid,
+                       "the first thread's tid is the process id");
+                expect(thread_dupfd >= 0 &&
+                           fcntl(thread_dupfd, F_GETFD, 0) >= 0,
+                       "the thread's descriptor is visible to the creator");
+                if (thread_dupfd >= 0) close(thread_dupfd);
+            }
+            expect(munmap(stack, 0x4000u) == 0, "munmap the thread stack");
+        }
+    }
+
     test_filesystem_abi();
     test_concurrent_filesystem();
     test_syscall_errors();
@@ -1338,6 +1406,7 @@ int main(void) {
     printf("USER-SIGNAL-OK: kill tkill tgkill sigaction sigprocmask\n");
     printf("USER-MMAP-OK: mmap2 mprotect mremap madvise set_thread_area\n");
     printf("USER-FUTEX-OK: futex wait wake timeout\n");
+    printf("USER-THREAD-OK: clone shared space descriptors tid group\n");
     printf("USER-LIB-OK: syscalls strings memory file io errno (pid=%d)\n",
            getpid());
     return 0;
