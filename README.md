@@ -46,7 +46,8 @@ control and pipelines working.
   enforced by the loader on i386 without PAE.
 - **Processes** — 100 Hz preemptive scheduler, per-process address spaces and
   8 KiB kernel stacks, `spawn`/`fork`/`vfork`/`execve`/`wait4`, real process
-  groups and sessions, `kill(-pgid)`, foreground group on the console, signals.
+  groups and sessions, `kill(-pgid)`, foreground group on the console, signals,
+  and `clone`-created threads that share one address space and descriptor table.
 - **Syscalls** — the i386 numbers for a working file/process/memory/time/signal
   subset, validated user pointers, `-errno` results, and the 64-byte i386
   `struct stat` family that glibc and musl expect.
@@ -135,8 +136,9 @@ build.py             the whole build, test, and QEMU orchestration
 
 Haku does not claim POSIX compatibility. It implements a subset aimed at
 statically linked Linux binaries, on a single CPU, without demand paging,
-swap, or networking. The 32-bit image has no threads; the x86-64 port has
-`clone`/`futex` threads but no SMP, copy-on-write, or signal handlers. FAT12
+swap, or networking. The 32-bit image and the x86-64 port both have
+`clone`/`futex` threads, but neither has SMP, and the x86-64 port also lacks
+copy-on-write and signal handlers. FAT12
 has 8.3 names, no timestamps, and no
 permission bits. The x86-64 image is a bring-up milestone, not a usable
 system: its filesystem cache holds eight paths of at most 128 KiB each, its

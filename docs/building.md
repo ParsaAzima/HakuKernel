@@ -46,6 +46,8 @@ syscall handling, `spawn`/`waitpid` and exit-status reporting, page-protection
 faults (`USER-PROT-OK`), `execve` image replacement, process exit/reaping,
 copy-on-write `fork` and `vfork` (`USER-COW-OK`, `USER-VFORK-OK`,
 `VFORK-EXEC-RAN`), signal delivery and dispositions (`USER-SIGNAL-OK`),
+`clone`-created threads that share the address space and descriptors and
+report a distinct tid under the same pid (`USER-THREAD-OK`),
 the user C library (`USER-LIB-OK`), and timer IRQs
 through the serial log.
 

@@ -352,9 +352,7 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   then resumes with the child PID. The library's `vfork` keeps its return
   address in `edx` across the syscall because the child runs on the caller's
   stack. Covered by `USER-COW-OK`, `USER-VFORK-OK`, `VFORK-EXEC-RAN`, and a
-  `vfork` case in the C library self-test. `clone` still rejects the
-  thread-creating flags, stack pointers, and parent-tid arguments with
-  `EINVAL`.
+  `vfork` case in the C library self-test.
 - [x] Add signals: `kill`/`tkill`/`tgkill`, `rt_sigaction`,
   `rt_sigprocmask`, `rt_sigreturn`, pending-signal delivery, and default
   dispositions. Each task keeps a pending set, a blocked set, and one
@@ -401,8 +399,25 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   (`FUTEX_WAIT`/`FUTEX_WAKE` plus the `_PRIVATE` and `_BITSET` forms, with a
   relative timeout that reports `ETIMEDOUT`; waiters park on the scheduler's
   address queue instead of spinning, and the C library covers the value
-  check, the wake, and the timeout as `USER-FUTEX-OK`). Thread creation
-  itself stays out of scope: `clone` still rejects the thread flags.
+  check, the wake, and the timeout as `USER-FUTEX-OK`).
+- [x] Add threads: `clone(2)` accepts `CLONE_VM`, `CLONE_FILES`,
+  `CLONE_THREAD`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`
+  and `CLONE_CHILD_CLEARTID`, and treats `CLONE_FS`/`CLONE_SIGHAND`/
+  `CLONE_SYSVSEM` as no-ops. A task records its thread group, and one slot
+  owns the heap break and the mmap ledger; every other thread reaches it
+  through `space_state()`, so `brk`/`mmap`/`mprotect` in one thread are seen
+  by all. `exit` ends only the calling thread, while `exit_group`, a fatal
+  signal, and `execve` end its peers; a departing owner hands the group id
+  and the address space to a survivor. `getpid` reports the group id,
+  `gettid` the task id, a private futex is keyed by the group so one thread
+  can wake another, and `set_tid_address` records the word to clear. The C
+  library gains `gettid` and `thread_create` (an asm trampoline that returns
+  the tid to the creator and runs `fn(arg)` on the supplied stack in the
+  child); lib.elf checks a shared store, a `dup`ed descriptor, the
+  `gettid`/`getpid` pair and a `waitpid(tid)` status as `USER-THREAD-OK`.
+  Limitations: a thread costs a task slot (`SCHEDULER_MAX_PROCESSES` is 4),
+  signal dispositions are stored per task, and user TLS is one base per task
+  rather than a real per-thread block.
 - [x] Extend the filesystem ABI for libc and shell tooling: the `*at` family
   (`openat`, `unlinkat`, `renameat`, `mkdirat`, `faccessat`, and
   `fstatat` through the existing `fstatat64`/`statx`), `fchmod`/`fchown`

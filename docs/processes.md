@@ -26,10 +26,18 @@ moves the caller or one of its children into a live group, `setsid` makes the
 caller a leader of both, and `kill` with a negative pid signals a whole
 group. That is what lets `ash` run a foreground pipeline: it puts both
 children in a fresh group and hands that group to the terminal.
-`exit_group` ends the calling process like `exit`. `clone` is accepted only
-for the `SIGCHLD` form (`fork` with no sharing flags) and returns `EINVAL` for
-the thread-creating flags, stack pointer, or parent-tid arguments, so no
-half-supported threading model is exposed. A forked child gets a private copy
+`exit_group` ends the calling process like `exit`. `clone` accepts the
+thread-creating form: with `CLONE_VM` the child shares the caller's address
+space, `CLONE_FILES` shares the descriptor row, and `CLONE_THREAD` puts the
+child in the caller's thread group, so `getpid` stays the same while
+`gettid` differs. Without `CLONE_VM` it behaves exactly like `fork`. A
+thread costs a task slot, and the group's heap break and `mmap` ledger live
+in one owner slot that every thread reads (`space_state`), so `brk`,
+`mmap`, `mprotect`, and `munmap` in one thread are visible to the others.
+`exit` ends only the calling thread; `exit_group`, a fatal signal, and
+`execve` end the other threads, and when the owner leaves, the group id and
+the address space move to a surviving thread. A forked child gets a private
+copy
 of the address space (code, data, stacks, heap, and mappings), a copy of the
 caller's saved register frame with `eax` zeroed, and its own descriptor table;
 the parent sees the child PID. Pages are shared copy-on-write: each frame
@@ -98,6 +106,7 @@ resident/kernel/total byte counts, along with the pid, user/kernel timer
 ticks, syscall count, and voluntary/involuntary context switches.
 `resident_bytes` covers mapped user pages; `kernel_bytes` covers the user page
 tables, the page directory, and the 8 KiB kernel stack; `total_bytes` is their
-sum. A NULL or unmapped buffer returns `EFAULT`. Accounting is per process,
-not per thread (the kernel has no threads), there is no demand paging
+sum. A NULL or unmapped buffer returns `EFAULT`. Memory accounting is per
+address space (a thread reads the owner slot), while the timer and syscall
+counters are per task, there is no demand paging
 apart from the user stack, and ticks have 10 ms granularity.
