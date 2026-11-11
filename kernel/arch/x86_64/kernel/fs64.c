@@ -325,6 +325,23 @@ int fs64_lookup(const char *path) {
     return -1;
 }
 
+/* Drop a slot obtained from fs64_lookup(). A lookup does not count as a
+ * descriptor, so without this the slot stays pinned until it is evicted. */
+void fs64_release(int file) {
+    fs64_cache_t *slot;
+
+    if (file < 0 || (u32)file >= FS64_CACHE_MAX) return;
+    slot = &cache[file];
+    if (!slot->used) return;
+    (void)cache_flush(slot);
+    if (slot->refs > 0) {
+        slot->refs--;
+        if (slot->refs > 0) return;
+    }
+    (void)fat12_file_close(&slot->handle);
+    cache_clear(slot);
+}
+
 u64 fs64_size(int file) {
     if (file < 0 || (u32)file >= FS64_CACHE_MAX || !cache[file].used) return 0;
     return cache[file].size;

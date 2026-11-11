@@ -822,6 +822,58 @@ fork_done:
     cmp rax, -HAKU64_EINVAL
     jne fail
 
+    ; ---- fork + execve: run a program that lives on the disk ----------
+    ; USER.ELF is not linked into the kernel, so the only way this line can
+    ; print is if execve read it from the FAT12 volume, validated it and
+    ; replaced the child's address space with it.
+    mov r15d, 51
+    mov eax, HAKU64_SYS_FORK
+    syscall
+    test rax, rax
+    js fail
+    jz exec_child
+
+    mov r13, rax
+    mov r15d, 52
+    mov eax, HAKU64_SYS_WAIT4
+    mov rdi, r13
+    mov rsi, STATUS_BUF
+    xor edx, edx
+    syscall
+    cmp rax, r13
+    jne fail
+    mov r15d, 53
+    mov rbx, STATUS_BUF
+    mov rax, [rbx]
+    shr rax, 8
+    and eax, 0xFF
+    cmp eax, 42
+    jne fail
+    mov r15d, 54
+    mov eax, HAKU64_SYS_WRITE
+    mov edi, 1
+    lea rsi, [msg_exec]
+    mov edx, msg_exec_end - msg_exec
+    syscall
+    cmp rax, msg_exec_end - msg_exec
+    jne fail
+    jmp exec_done
+
+exec_child:
+    ; execve only returns when it failed; 99 is a status the parent rejects.
+    mov r15d, 55
+    mov eax, HAKU64_SYS_EXECVE
+    lea rdi, [path_user]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    mov eax, HAKU64_SYS_EXIT
+    mov edi, 99
+    syscall
+    jmp $
+
+exec_done:
+
     ; The INT 0x80 gate stays available; the error paths below use it so
     ; both entry points run in the same program.
     ; write() to a descriptor other than 1 or 2 is -EBADF.
@@ -956,6 +1008,10 @@ msg_dup:
     db 'HAKU64-DUP-OK', 13, 10
 msg_dup_end:
 
+msg_exec:
+    db 'HAKU64-EXEC-OK', 13, 10
+msg_exec_end:
+
 path_hello:
     db '/hello.txt', 0
 
@@ -976,6 +1032,9 @@ path_dotdot:
 
 path_dot:
     db '/./HELLO.TXT', 0
+
+path_user:
+    db '/USER.ELF', 0
 
 msg_abi:
     db 'HAKU64-ABI-OK'

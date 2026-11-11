@@ -555,6 +555,26 @@ regs64_t *sched64_fork(regs64_t *frame) {
     return frame;
 }
 
+/* execve's hand-off: the caller has just loaded a fresh image, so the old
+ * space is unreachable from ring 3 and is released here (aliased shared
+ * pages survive, exactly as they do at exit). The mapping table belongs to
+ * the old image and is cleared; the new image starts with an empty anonymous
+ * window. The caller is responsible for RIP/RSP and for switching CR3. */
+int task64_exec(int id, u64 space) {
+    if (!valid_id(id) || id == 0 || !space) return 0;
+    if (tasks[id].space && tasks[id].space != space) {
+        paging64_free_space_frames(tasks[id].space, exit_keep,
+                                   (void *)(u64)id);
+        paging64_destroy_space(tasks[id].space);
+    }
+    memset(&mappings[id], 0, sizeof(mappings[id]));
+    tasks[id].space = space;
+    tasks[id].mmap_next = K64_USER_MMAP_BASE;
+    tasks[id].fault_vector = 0;
+    tasks[id].fault_address = 0;
+    return 1;
+}
+
 /* Reap one child of `parent`. `pid` < 0 means any child, otherwise it must
  * match the child's pid. Returns the child's pid, -ECHILD when there is no
  * such child, or -EAGAIN when a matching child is still running. */

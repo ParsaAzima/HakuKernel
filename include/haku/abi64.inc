@@ -21,6 +21,7 @@
 %define HAKU64_SYS_NANOSLEEP     35
 %define HAKU64_SYS_GETPID        39
 %define HAKU64_SYS_FORK          57
+%define HAKU64_SYS_EXECVE        59
 %define HAKU64_SYS_EXIT          60
 %define HAKU64_SYS_WAIT4         61
 %define HAKU64_SYS_KILL          62
@@ -55,6 +56,7 @@
 
 ; Linux errno values the test program compares against.
 %define HAKU64_ENOENT 2
+%define HAKU64_ENOEXEC 8
 %define HAKU64_EBADF  9
 %define HAKU64_ENOMEM 12
 %define HAKU64_EFAULT 14

@@ -31,6 +31,9 @@
 
 #define SYS64_EPERM  1ull
 #define SYS64_ENOENT 2ull
+#define SYS64_EIO    5ull
+#define SYS64_E2BIG  7ull
+#define SYS64_ENOEXEC 8ull
 #define SYS64_EBADF  9ull
 #define SYS64_ECHILD 10ull
 #define SYS64_ENOMEM 12ull
@@ -470,6 +473,95 @@ static u64 sys64_dup2(u64 fd, u64 target) {
     return (u64)(s64)result;
 }
 
+/* execve(path, argv, envp): replace the caller's image with an ELF64 file
+ * from the FAT12 volume. The whole file is read into the heap (the page
+ * cache caps a file at 32 pages), elf64_load validates and maps it into a
+ * fresh address space, and task64_exec releases the old one. argv and envp
+ * are ignored: the new image starts with an empty stack and zeroed
+ * registers. Descriptors survive execve because there is no O_CLOEXEC. On
+ * failure nothing has changed and the caller continues normally. */
+static regs64_t *sys64_execve(regs64_t *frame) {
+    char name[K64_FS_PATH_MAX + 1];
+    loaded_elf64_t loaded;
+    u64 space = current_space();
+    u64 size;
+    u8 *buffer;
+    int id = sched64_current(), file;
+
+    for (u64 i = 0; i <= (u64)K64_FS_PATH_MAX; i++) {
+        if (!copy_from_user64(space, &name[i], frame->rdi + i, 1)) {
+            frame->rax = (u64)0 - SYS64_EFAULT;
+            return frame;
+        }
+        if (name[i] == '\0') break;
+        if (i == (u64)K64_FS_PATH_MAX) {
+            frame->rax = (u64)0 - SYS64_EINVAL;
+            return frame;
+        }
+    }
+
+    file = fs64_lookup(name);
+    if (file < 0) {
+        frame->rax = (u64)0 - SYS64_ENOENT;
+        return frame;
+    }
+    size = fs64_size(file);
+    if (size == 0 || size > (u64)0x20000) {
+        fs64_release(file);
+        frame->rax = (u64)0 - (size == 0 ? SYS64_ENOEXEC : SYS64_ENOMEM);
+        return frame;
+    }
+
+    buffer = (u8 *)kmalloc64(size);
+    if (!buffer) {
+        fs64_release(file);
+        frame->rax = (u64)0 - SYS64_ENOMEM;
+        return frame;
+    }
+    if (fs64_read(file, 0, buffer, size) != size) {
+        kfree64(buffer);
+        fs64_release(file);
+        frame->rax = (u64)0 - SYS64_EIO;
+        return frame;
+    }
+    fs64_release(file);
+
+    if (!elf64_load(buffer, size, &loaded)) {
+        kfree64(buffer);
+        frame->rax = (u64)0 - SYS64_ENOEXEC;
+        return frame;
+    }
+    kfree64(buffer);
+
+    if (!task64_exec(id, loaded.space)) {
+        elf64_unload(&loaded);
+        frame->rax = (u64)0 - SYS64_ENOMEM;
+        return frame;
+    }
+    paging64_switch_space(loaded.space);
+
+    /* Nothing of the old image may leak into the new one: clear the general
+     * registers and enter at the new entry with the new stack. */
+    frame->rax = 0;
+    frame->rbx = 0;
+    frame->rcx = 0;
+    frame->rdx = 0;
+    frame->rsi = 0;
+    frame->rdi = 0;
+    frame->rbp = 0;
+    frame->r8 = 0;
+    frame->r9 = 0;
+    frame->r10 = 0;
+    frame->r11 = 0;
+    frame->r12 = 0;
+    frame->r13 = 0;
+    frame->r14 = 0;
+    frame->r15 = 0;
+    frame->rip = loaded.entry;
+    frame->rsp = loaded.stack_top;
+    return frame;
+}
+
 /* lseek(fd, offset, whence). The offset is a signed byte count, so a
  * negative result is -EINVAL instead of a huge unsigned position. */
 static u64 sys64_lseek(u64 fd, u64 offset, u64 whence) {
@@ -684,6 +776,9 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     case K64_SYS_FORK:
         return sched64_fork(frame);
+
+    case K64_SYS_EXECVE:
+        return sys64_execve(frame);
 
     case K64_SYS_WAIT4:
         result = sys64_wait4(frame->rdi, frame->rsi, frame->rdx);

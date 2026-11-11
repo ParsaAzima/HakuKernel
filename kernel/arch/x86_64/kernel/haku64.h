@@ -135,6 +135,7 @@ typedef signed long long s64;
 #define K64_SYS_NANOSLEEP     35u
 #define K64_SYS_GETPID        39u
 #define K64_SYS_FORK          57u
+#define K64_SYS_EXECVE        59u
 #define K64_SYS_EXIT          60u
 #define K64_SYS_WAIT4         61u
 #define K64_SYS_KILL          62u
@@ -465,6 +466,7 @@ regs64_t *sched64_fork(regs64_t *frame);
 /* end the caller on a signal (no handlers exist, so this is exit-by-signal) */
 regs64_t *sched64_terminate(regs64_t *frame, u32 signal);
 /* reap a DONE child of `parent`; returns the child id or a negative errno */
+int task64_exec(int id, u64 space);
 int task64_reap(int parent, int pid, u64 *status);
 /* terminate a task as if by a signal; returns 0 or a negative errno */
 int task64_signal(int id, u32 signal);
@@ -479,6 +481,7 @@ int task64_parent(int id);
 #define K64_FS_CONSOLE  (-2)
 int fs64_init(void);
 int fs64_lookup(const char *path);
+void fs64_release(int file);
 int fs64_create_dir(const char *path);
 u64 fs64_size(int file);
 u64 fs64_pages(int file);

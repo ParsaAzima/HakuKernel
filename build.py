@@ -360,14 +360,16 @@ def build_shell_image(py, user_elf, busybox, command):
     return image
 
 
-def build_x64_fs(py, image):
-    """Seed the x86-64 data disk: two files the kernel reads at boot.
+def build_x64_fs(py, image, exec_elf):
+    """Seed the x86-64 data disk: three files the kernel reads at boot.
 
-    HELLO.TXT carries the 16-byte marker the ELF64 self-test prints, and
+    HELLO.TXT carries the 16-byte marker the ELF64 self-test prints,
     PATTERN.BIN is three pages so a file mapping and a multi-page read both
-    have data on every page. The pattern is the same (offset*37+11) & 0xFF
-    formula boot64.c uses to verify it. The image is rebuilt on every x64
-    run because the kernel also creates /TMP and writes NOTE.TXT into it.
+    have data on every page, and USER.ELF is the program the test execs from
+    the disk (the kernel image does not contain it, so running it proves the
+    exec path). The pattern is the same (offset*37+11) & 0xFF formula
+    boot64.c uses to verify it. The image is rebuilt on every x64 run because
+    the kernel also creates /TMP and writes NOTE.TXT into it.
     """
     hello = b"HAKU64-FILE-OK\r\n"
     pattern = bytes(((i * 37 + 11) & 0xFF) for i in range(3 * 4096))
@@ -379,7 +381,8 @@ def build_x64_fs(py, image):
         f.write(pattern)
 
     run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
-         f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}"])
+         f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
+         f"USER.ELF={exec_elf}"])
     log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes)")
 
 
@@ -408,6 +411,9 @@ def build_x64(nasm, py, memory_mb):
     isr_obj = os.path.join(BUILD, "isr64.obj")
     user_flat = os.path.join(BUILD, "ring3_elf64.bin")
     user_elf = os.path.join(BUILD, "ring3_elf64.elf")
+    exec_src = os.path.join(arch64, "user", "exec_elf64.asm")
+    exec_flat = os.path.join(BUILD, "exec_elf64.bin")
+    exec_elf = os.path.join(BUILD, "exec_elf64.elf")
     user_image_obj = os.path.join(BUILD, "user64_image.obj")
     kernel_pe = os.path.join(BUILD, "kernel64.pe")
     kernel_bin = os.path.join(BUILD, "kernel64.bin")
@@ -455,6 +461,14 @@ def build_x64(nasm, py, memory_mb):
     run([nasm, "-f", "win64", f"-DUSER64_IMAGE={embedded}",
          user_image_asm, "-o", user_image_obj])
 
+    # 2b. the program stored on the disk and run by execve(). Same layout,
+    #     same base: it never coexists with the image above because it runs
+    #     in a space of its own.
+    run([nasm, "-I" + os.path.join(ROOT, "include"), "-f", "bin",
+         exec_src, "-o", exec_flat])
+    run([py, os.path.join(ROOT, "tools", "mkelf64.py"),
+         exec_flat, exec_elf, f"--base={user_base:#x}"])
+
     run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:NATIVE",
                   "/ENTRY:entry64", "/BASE:0x10000", "/ALIGN:16", "/FIXED",
                   "/NODEFAULTLIB", "/OUT:" + kernel_pe,
@@ -484,7 +498,7 @@ def build_x64(nasm, py, memory_mb):
     # 4. a fresh FAT12 volume for the disk filesystem test. The kernel
     #    creates /TMP and writes NOTE.TXT during the run, so the seed files
     #    are rebuilt every time rather than reused.
-    build_x64_fs(py, fs_img)
+    build_x64_fs(py, fs_img, exec_elf)
 
     # 5. boot it. qemu-system-i386 refuses long mode without a 64-bit CPU
     #    model, so this mode uses the x86_64 binary. writethrough keeps the
@@ -514,7 +528,7 @@ def build_x64(nasm, py, memory_mb):
                 "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",
                 "HAKU64-RTC-OK", "HAKU64-SYSCALL64-OK", "HAKU64-FS-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
-                "HAKU64-DUP-OK", "HAKU64-SELFTEST-OK"]
+                "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():
