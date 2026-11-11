@@ -65,7 +65,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `wait4`, `kill`, `nanosleep`, `getpid`, `getppid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `execve`, `wait4`, `kill`, `nanosleep`, `getpid`, `getppid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
@@ -150,13 +150,13 @@ as a DPL-3 fallback, and the test program exercises both entry points.
 `sys64_dispatch` implements the x86-64 Linux convention — number in `RAX`,
 arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in `RAX` or a negative
 errno — with the Linux x86-64 numbers for `read`, `write`, `open`, `close`,
-`lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `wait4`, `kill`,
-`dup`, `dup2`, `nanosleep`, `getpid`, `getppid`, `clock_gettime` and
-`exit`/`exit_group`; an unimplemented number returns `-ENOSYS`. Every user
-pointer is resolved through the current space with `paging64_query_space`
-before it is dereferenced, and the copies move through the physmap: a ring-0
-page fault halts the kernel, so the CPU cannot be relied on to reject a bad
-address.
+`lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `execve`, `wait4`,
+`kill`, `dup`, `dup2`, `nanosleep`, `getpid`, `getppid`, `clock_gettime`
+and `exit`/`exit_group`; an unimplemented number returns `-ENOSYS`. Every
+user pointer is resolved through the current space with
+`paging64_query_space` before it is dereferenced, and the copies move through
+the physmap: a ring-0 page fault halts the kernel, so the CPU cannot be
+relied on to reject a bad address.
 
 `mmap` accepts anonymous ranges (`fd` must be `-1`) and file-backed ones.
 `MAP_FIXED` places a mapping at a page-aligned address inside the anonymous
@@ -192,9 +192,10 @@ symbolic links, at most 32 cached pages per file, and a writable
 relies on its descriptor staying open, because only descriptors pin a cache
 slot. `python build.py x64` builds `build/haku64_fs.img` with
 `tools/mkfat12.py --empty` on every run,
-seeds `HELLO.TXT` and `PATTERN.BIN`, attaches it to QEMU and checks the
-resulting image with `tools/lsfat12.py --check`, so a disk write is proven
-from the host's view of the volume and not only from the kernel's cache.
+seeds `HELLO.TXT`, `PATTERN.BIN` and `USER.ELF`, attaches it to QEMU and
+checks the resulting image with `tools/lsfat12.py --check`, so a disk write is
+proven from the host's view of the volume and not only from the kernel's
+cache.
 
 `fork` clones the address space page by page: `paging64_clone_space` walks
 the parent's user leaves, aliases the frames a mapping record marks shared,
@@ -217,6 +218,16 @@ handlers: `kill` and a ring-3 fault perform the default action, terminate,
 and `wait4` reports the signal number. `SIGCHLD` is not delivered, there are
 no signal masks, and a task cannot signal itself through `kill` — that path
 goes through `exit` so the dispatcher never resumes the frame.
+
+`execve` reads the whole file into a heap buffer (32 pages is the cache limit),
+runs `elf64_load`, and `task64_exec` releases the caller's old space — aliased
+shared frames survive, as they do at exit — clears the mapping table and
+resets the anonymous window before switching CR3. The caller is then resumed
+at the new entry with the new stack and zeroed registers. `argv`, `envp` and
+the auxiliary vector are ignored, so the new image starts with an empty
+argument area; descriptors survive because there is no `O_CLOEXEC`. A failed
+`execve` returns `-ENOENT`, `-ENOEXEC`, `-EIO` or `-ENOMEM` and leaves the
+caller running unchanged.
 
 `clock_gettime` reports `CLOCK_MONOTONIC` as time since boot and
 `CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the ticks
@@ -266,8 +277,14 @@ parent's word and the parent to see the child's store after `wait4`
 `dup` to prove both share an offset, `dup2`s the descriptor onto 9 and reads
 past a `close`, and writes `HAKU64-DUP-OK` through a `dup` of the console
 (`HAKU64-DUP-OK`); `nanosleep` must move `CLOCK_MONOTONIC` forward by at
-least the 10 ms requested, and a nanosecond field of 1e9 is `-EINVAL`.
-Finally it prints `HAKU64-ABI-OK`, stores a magic word in
+least the 10 ms requested, and a nanosecond field of 1e9 is `-EINVAL`. It then
+forks again and the child `execve`s `/USER.ELF`: the parent waits for status
+42, which is the exit code of `kernel/arch/x86_64/user/exec_elf64.asm`, and
+prints `HAKU64-EXEC-OK` only after seeing both the child's `HAKU64-EXEC-PROG`
+line and that status (`HAKU64-EXEC-OK`). `USER.ELF` is seeded on the FAT12
+volume by `build.py` and is not part of the kernel image, so the two markers
+prove the program came off the disk and that `execve` replaced the child's
+address space. Finally it prints `HAKU64-ABI-OK`, stores a magic word in
 its BSS page and exits with status 0; every failure exits with the number of
 the step that failed, which is what `HAKU64-ELF-RUN-FAIL: exit=` reports.
 `tools/mkelf64.py` wraps the flat binary in an

@@ -601,11 +601,11 @@ the port is complete.
   `O_APPEND`; dirty pages are written back on last close and on task exit,
   so the cache is write-back. Limits: 8.3 names, no `unlink`/`rename`/
   `getdents`, no symlinks, no write-through. `build.py x64` generates
-  `build/haku64_fs.img` with `tools/mkfat12.py --empty`, seeds `HELLO.TXT`
-  and `PATTERN.BIN`, attaches it to QEMU, and verifies the image with
-  `tools/lsfat12.py --check` after the run; the ring-3 test creates `/TMP`,
-  writes and re-reads `NOTE.TXT`, and the kernel re-reads the file after
-  close (`HAKU64-DISK-OK`).
+  `build/haku64_fs.img` with `tools/mkfat12.py --empty`, seeds `HELLO.TXT`,
+  `PATTERN.BIN` and `USER.ELF`, attaches it to QEMU, and verifies the image
+  with `tools/lsfat12.py --check` after the run; the ring-3 test creates
+  `/TMP`, writes and re-reads `NOTE.TXT`, and the kernel re-reads the file
+  after close (`HAKU64-DISK-OK`).
 - [x] `fork` and `wait4`: `paging64_clone_space` walks the parent's user
   pages and aliases the ranges a mapping record marks shared, copying
   everything else — there is no copy-on-write, so private pages are copied
@@ -628,6 +628,16 @@ the port is complete.
   `O_CLOEXEC`. `nanosleep` rounds up to whole ticks and waits with
   interrupts enabled, like `wait4`. The ring-3 test checks the shared
   offset, the redirection and a 10 ms sleep (`HAKU64-DUP-OK`).
+- [x] `execve` from the disk: the whole file is read into a heap buffer and
+  re-checked by `elf64_load`, `task64_exec` releases the caller's old space
+  (aliased shared pages survive), clears the mapping table and resets the
+  anonymous window before CR3 switches; the task is resumed at the new entry
+  with a zeroed register file. `argv`/`envp`/`auxv` are ignored, descriptors
+  survive (no `O_CLOEXEC`), and a failed call returns `-ENOENT`,
+  `-ENOEXEC`, `-EIO` or `-ENOMEM` with the caller untouched. `build.py`
+  seeds `USER.ELF` from `kernel/arch/x86_64/user/exec_elf64.asm`; the ring-3
+  test forks, execs it, requires the child's status 42 and prints
+  `HAKU64-EXEC-OK`.
 - [ ] Syscall table: port the i386 number table from `usermode.c` (97 cases)
   and the wider VFS/process surface onto the 64-bit ABI.
 - [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a

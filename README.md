@@ -61,10 +61,10 @@ control and pipelines working.
   frame allocator, heap, GDT/TSS with IST stacks, IDT/PIC, timer, RTC wall
   clock, round-robin scheduler, ring 3 with `SYSCALL`/`SYSRET` and the Linux
   syscall convention, NX enforcement, an ELF64 loader, a FAT12 disk with file
-  writes behind a page cache that file-backed `mmap` maps from, and
+  writes behind a page cache that file-backed `mmap` maps from,
   `fork`/`wait4` with default-action signals, `dup`/`dup2` over a shared file
-  description and `nanosleep`. No threads, copy-on-write, signal handlers, or
-  64-bit libc yet.
+  description, `nanosleep`, and `execve` of an ELF64 file from the disk. No
+  threads, copy-on-write, signal handlers, or 64-bit libc yet.
 
 ## Quick start
 
