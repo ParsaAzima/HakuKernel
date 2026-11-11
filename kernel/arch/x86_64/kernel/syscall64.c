@@ -473,20 +473,151 @@ static u64 sys64_dup2(u64 fd, u64 target) {
     return (u64)(s64)result;
 }
 
+/* execve's argv/envp arrive as a user array of user string pointers. Both are
+ * copied into kernel buffers before the address space is replaced; the caps
+ * keep the copy off the kernel stack's deep end and are reported as E2BIG. */
+#define SYS64_EXEC_VEC_MAX   8u
+#define SYS64_EXEC_ARG_MAX   128u
+#define SYS64_EXEC_BYTES_MAX 768u
+#define SYS64_EXEC_WORDS_MAX 64u
+
+#define SYS64_AT_NULL   0ull
+#define SYS64_AT_PAGESZ 6ull
+#define SYS64_AT_ENTRY  9ull
+
+typedef struct {
+    u32 count;
+    u32 length;
+    u32 offsets[SYS64_EXEC_VEC_MAX];
+    u32 lengths[SYS64_EXEC_VEC_MAX];   /* including the terminator */
+    char strings[SYS64_EXEC_BYTES_MAX];
+} exec_vector64_t;
+
+/* Copy one NUL-terminated string out of user memory in page-sized chunks.
+ * Returns the length including the terminator when it fit in `max` bytes, 0
+ * when it did not, and -1 when the pointer is unreadable. One page-table
+ * walk per page, not one per byte. */
+static int copy_user_string64(u64 space, u64 address, char *dst, u32 max) {
+    u32 done = 0;
+
+    while (done < max) {
+        u64 page = K64_PAGE_SIZE - ((address + done) & (K64_PAGE_SIZE - 1));
+        u32 chunk = max - done;
+
+        if (page < chunk) chunk = (u32)page;
+        if (!copy_from_user64(space, dst + done, address + done, chunk))
+            return -1;
+        for (u32 i = 0; i < chunk; i++)
+            if (dst[done + i] == '\0') return (int)(done + i + 1);
+        done += chunk;
+    }
+    return 0;
+}
+
+/* Capture one vector. `user_vector` 0 is an empty vector, and a missing
+ * terminating NULL past the maximum is E2BIG, not a silent truncation. */
+static int capture_vector64(u64 space, u64 user_vector,
+                            exec_vector64_t *out) {
+    out->count = 0;
+    out->length = 0;
+    if (!user_vector) return 0;
+
+    for (u32 i = 0; i < SYS64_EXEC_VEC_MAX; i++) {
+        u64 entry;
+        u32 room;
+        int length;
+        if (!copy_from_user64(space, &entry, user_vector + i * 8ull, 8))
+            return SYS64_EFAULT;
+        if (entry == 0) return 0;
+        if (out->length >= SYS64_EXEC_BYTES_MAX) return SYS64_E2BIG;
+
+        room = SYS64_EXEC_BYTES_MAX - out->length;
+        if (room > SYS64_EXEC_ARG_MAX) room = SYS64_EXEC_ARG_MAX;
+        length = copy_user_string64(space, entry,
+                                    &out->strings[out->length], room);
+        if (length < 0) return SYS64_EFAULT;
+        if (length == 0) return SYS64_E2BIG;
+
+        out->offsets[i] = out->length;
+        out->lengths[i] = (u32)length;
+        out->length += (u32)length;
+        out->count++;
+    }
+    return SYS64_E2BIG;
+}
+
+/* Copy one captured vector onto the new stack, growing downwards. The
+ * strings keep their byte order and only the word block below is aligned. */
+static int place_vector64(u64 space, u64 bottom, const exec_vector64_t *v,
+                          u64 *sp, u64 *addresses) {
+    for (u32 i = 0; i < v->count; i++) {
+        u64 length = v->lengths[i];
+
+        if (*sp < bottom + length) return SYS64_E2BIG;
+        *sp -= length;
+        if (!copy_to_user64(space, *sp, &v->strings[v->offsets[i]], length))
+            return SYS64_EIO;
+        addresses[i] = *sp;
+    }
+    return 0;
+}
+
+/* Lay out argc/argv/NULL/envp/NULL and a small auxiliary vector on the stack
+ * elf64_load allocated. AT_PAGESZ and AT_ENTRY are what a static startup stub
+ * asks for; there is no AT_PHDR because the loader does not expose it yet. */
+static int build_exec_stack64(loaded_elf64_t *loaded,
+                              const exec_vector64_t *argv,
+                              const exec_vector64_t *envp) {
+    u64 argv_addresses[SYS64_EXEC_VEC_MAX];
+    u64 envp_addresses[SYS64_EXEC_VEC_MAX];
+    u64 words[SYS64_EXEC_WORDS_MAX];
+    u64 count = 0, size, sp = loaded->stack_top;
+    int error;
+
+    error = place_vector64(loaded->space, loaded->stack_bottom, argv, &sp,
+                           argv_addresses);
+    if (error) return error;
+    error = place_vector64(loaded->space, loaded->stack_bottom, envp, &sp,
+                           envp_addresses);
+    if (error) return error;
+
+    words[count++] = argv->count;
+    for (u32 i = 0; i < argv->count; i++) words[count++] = argv_addresses[i];
+    words[count++] = 0;
+    for (u32 i = 0; i < envp->count; i++) words[count++] = envp_addresses[i];
+    words[count++] = 0;
+    words[count++] = SYS64_AT_PAGESZ;
+    words[count++] = K64_PAGE_SIZE;
+    words[count++] = SYS64_AT_ENTRY;
+    words[count++] = loaded->entry;
+    words[count++] = SYS64_AT_NULL;
+    words[count++] = 0;
+
+    size = count * 8ull;
+    if (sp < loaded->stack_bottom + size) return SYS64_E2BIG;
+    sp = (sp - size) & ~15ull;
+    if (sp < loaded->stack_bottom) return SYS64_E2BIG;
+    if (!copy_to_user64(loaded->space, sp, words, size)) return SYS64_EIO;
+    loaded->stack_top = sp;
+    return 0;
+}
+
 /* execve(path, argv, envp): replace the caller's image with an ELF64 file
- * from the FAT12 volume. The whole file is read into the heap (the page
- * cache caps a file at 32 pages), elf64_load validates and maps it into a
- * fresh address space, and task64_exec releases the old one. argv and envp
- * are ignored: the new image starts with an empty stack and zeroed
- * registers. Descriptors survive execve because there is no O_CLOEXEC. On
+ * from the FAT12 volume. argv/envp strings are copied into kernel buffers
+ * first, because the old address space is gone once the new one is current;
+ * then the whole file is read into the heap (the page cache caps a file at
+ * 32 pages), elf64_load validates and maps it, its stack gets argc/argv/
+ * envp and a three-entry auxiliary vector, and task64_exec releases the old
+ * space. Descriptors survive execve because there is no O_CLOEXEC. On
  * failure nothing has changed and the caller continues normally. */
 static regs64_t *sys64_execve(regs64_t *frame) {
     char name[K64_FS_PATH_MAX + 1];
+    exec_vector64_t argv, envp;
     loaded_elf64_t loaded;
     u64 space = current_space();
     u64 size;
     u8 *buffer;
-    int id = sched64_current(), file;
+    int error, id = sched64_current(), file;
 
     for (u64 i = 0; i <= (u64)K64_FS_PATH_MAX; i++) {
         if (!copy_from_user64(space, &name[i], frame->rdi + i, 1)) {
@@ -498,6 +629,13 @@ static regs64_t *sys64_execve(regs64_t *frame) {
             frame->rax = (u64)0 - SYS64_EINVAL;
             return frame;
         }
+    }
+
+    error = capture_vector64(space, frame->rsi, &argv);
+    if (error == 0) error = capture_vector64(space, frame->rdx, &envp);
+    if (error) {
+        frame->rax = (u64)0 - (u64)error;
+        return frame;
     }
 
     file = fs64_lookup(name);
@@ -532,6 +670,13 @@ static regs64_t *sys64_execve(regs64_t *frame) {
         return frame;
     }
     kfree64(buffer);
+
+    error = build_exec_stack64(&loaded, &argv, &envp);
+    if (error) {
+        elf64_unload(&loaded);
+        frame->rax = (u64)0 - (u64)error;
+        return frame;
+    }
 
     if (!task64_exec(id, loaded.space)) {
         elf64_unload(&loaded);

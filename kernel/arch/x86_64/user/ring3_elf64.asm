@@ -13,8 +13,8 @@
 ; zero-filled BSS page and exits with status 0; the kernel reads both back,
 ; which proves the image ran in ring 3 instead of merely being mapped. A
 ; failure exits with the number of the step that failed (the early ABI tests
-; leave 1, the disk, fork, dup and sleep steps use 20-50), which the kernel
-; prints as HAKU64-ELF-RUN-FAIL: exit=N.
+; leave 1, the disk, fork, dup, sleep and exec steps use 20-56), which the
+; kernel prints as HAKU64-ELF-RUN-FAIL: exit=N.
 ;
 ; The code is position independent (RIP-relative operands only), so the flat
 ; binary does not need a linker to resolve USER64_BASE: mkelf64.py chooses the
@@ -41,6 +41,8 @@ default rel
 %define STATUS_BUF (USER64_BSS + 0x300)
 %define NOTE_BUF   (USER64_BSS + 0x400)
 %define REREAD_BUF (USER64_BSS + 0x500)
+%define EXEC_ARGV  (USER64_BSS + 0x600)
+%define EXEC_ENVP  (USER64_BSS + 0x680)
 
 _start:
     mov r15d, 1                     ; step number reported by fail (see top)
@@ -860,13 +862,40 @@ fork_done:
     jmp exec_done
 
 exec_child:
-    ; execve only returns when it failed; 99 is a status the parent rejects.
+    ; A failed execve must leave the image running: /NOPE does not exist, so
+    ; this returns -ENOENT and the child keeps executing these instructions.
     mov r15d, 55
     mov eax, HAKU64_SYS_EXECVE
-    lea rdi, [path_user]
+    lea rdi, [path_missing]
     xor esi, esi
     xor edx, edx
     syscall
+    cmp rax, -HAKU64_ENOENT
+    jne exec_bad
+
+    ; Now the real thing: argv = {"/USER.ELF", "alpha", "beta", NULL} and
+    ; envp = {"A=1", NULL}. The stack the child gets built by execve is what
+    ; USER.ELF reads, so status 42 proves argc/argv/envp landed correctly.
+    mov rbx, EXEC_ARGV
+    lea rax, [path_user]
+    mov [rbx], rax
+    lea rax, [exec_arg1]
+    mov [rbx + 8], rax
+    lea rax, [exec_arg2]
+    mov [rbx + 16], rax
+    mov qword [rbx + 24], 0
+    mov rdx, EXEC_ENVP
+    lea rax, [exec_env1]
+    mov [rdx], rax
+    mov qword [rdx + 8], 0
+
+    mov r15d, 56
+    mov rsi, rbx
+    mov eax, HAKU64_SYS_EXECVE
+    lea rdi, [path_user]
+    syscall
+exec_bad:
+    ; execve only returns when it failed; 99 is a status the parent rejects.
     mov eax, HAKU64_SYS_EXIT
     mov edi, 99
     syscall
@@ -1035,6 +1064,15 @@ path_dot:
 
 path_user:
     db '/USER.ELF', 0
+
+exec_arg1:
+    db 'alpha', 0
+
+exec_arg2:
+    db 'beta', 0
+
+exec_env1:
+    db 'A=1', 0
 
 msg_abi:
     db 'HAKU64-ABI-OK'
