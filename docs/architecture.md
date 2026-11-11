@@ -64,8 +64,9 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
+| threads | `clone(CLONE_VM)` shares one space and, with `CLONE_FILES`, one descriptor table; a futex hands the flag over | `HAKU64-THREAD-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `execve`, `wait4`, `kill`, `nanosleep`, `getpid`, `getppid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `clone`, `execve`, `wait4`, `kill`, `futex`, `nanosleep`, `getpid`, `getppid`, `gettid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
@@ -150,9 +151,10 @@ as a DPL-3 fallback, and the test program exercises both entry points.
 `sys64_dispatch` implements the x86-64 Linux convention — number in `RAX`,
 arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in `RAX` or a negative
 errno — with the Linux x86-64 numbers for `read`, `write`, `open`, `close`,
-`lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `execve`, `wait4`,
-`kill`, `dup`, `dup2`, `nanosleep`, `getpid`, `getppid`, `clock_gettime`
-and `exit`/`exit_group`; an unimplemented number returns `-ENOSYS`. Every
+`lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `clone`, `execve`,
+`wait4`, `kill`, `futex`, `dup`, `dup2`, `nanosleep`, `getpid`, `getppid`,
+`gettid`, `clock_gettime` and `exit`/`exit_group`; an unimplemented number
+returns `-ENOSYS`. Every
 user pointer is resolved through the current space with
 `paging64_query_space` before it is dereferenced, and the copies move through
 the physmap: a ring-0 page fault halts the kernel, so the CPU cannot be
@@ -232,7 +234,49 @@ out in page-sized chunks (one page-table walk per page) into an 8-entry,
 resumed at the new entry with that stack and zeroed registers. Descriptors
 survive execve because there is no `O_CLOEXEC`. A failed call returns
 `-ENOENT`, `-ENOEXEC`, `-EIO`, `-E2BIG`, `-EFAULT` or `-ENOMEM` and leaves the
-caller running unchanged.
+caller running unchanged. A task whose space is shared with another thread
+cannot exec at all: `task64_exec` refuses, because there is no way to stop the
+other threads, and the call reports `-EINVAL`.
+
+Threads are tasks that share one address space. `task64.c` gives each slot a
+`space_owner`, so exactly one slot owns the PML4, the mapping records and the
+anonymous bump pointer while `space_refs[owner]` counts the live users. A
+thread's `sched64_space` is the owner's, `mmap` reserves from the owner's bump
+pointer (so two threads never get the same range), and `munmap` edits the
+owner's records. The space is released once, when the last user is reaped; if
+the owner dies while a thread still runs, the records and the bump pointer
+move to that thread so a later `munmap` or the final exit still sees them.
+
+`clone` requires `CLONE_VM` and a 16-byte aligned child stack inside the user
+half; without `CLONE_VM` it falls back to `sched64_fork`, so a caller that
+asks for a process still gets one. `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`,
+`CLONE_THREAD`, `CLONE_SYSVSEM` and `CLONE_PARENT_SETTID` are accepted and
+everything else — TLS, child-tid stores, `CLONE_CLEARTID` — is `-EINVAL`
+rather than ignored, so a caller never believes it got a feature the kernel
+does not implement. The child resumes right after the `SYSCALL` with `RAX=0`
+and the requested stack, keeps the creator as its parent (so `wait4(tid)`
+reaps it), and with `CLONE_THREAD` keeps the creator's `tgid`: `getpid`
+returns the thread group's id while `gettid` returns the task's own, and
+`getppid` answers with the group leader's parent. `CLONE_FILES` makes the
+descriptor table shared: `fs64.c` marks one slot as the table's owner with a
+user count, every descriptor call resolves through it, and only the last user
+closes the descriptions. Without `CLONE_FILES` the child gets a private copy
+of the table, with the same descriptions and therefore the same offsets.
+
+`futex` implements `FUTEX_WAIT` and `FUTEX_WAKE`, with `FUTEX_PRIVATE_FLAG`
+accepted because there is one address space per check, and the op is the low
+seven bits. `WAIT` reads the word through the page-table validator and
+compares it with the expected value: a mismatch is `-EAGAIN`, not a sleep
+that misses the wake. A match moves the task to `K64_TASK_WAIT` with its
+syscall frame saved and `RAX=0`, so a wake resumes it as if the call had
+returned; the round-robin scan skips `WAIT`. `WAKE` makes at most `count`
+waiters on the same address runnable again and answers how many it woke. There
+is no timeout and no priority inheritance, and a wait that leaves nothing
+runnable prints `HAKU64-TASK-HALT: every task is blocked on a futex` and halts
+instead of spinning. Two thread limitations are deliberate: `exit` and
+`exit_group` end only the calling task (there is no group exit that stops the
+other threads), and `kill` addresses one task id, so a signal aimed at a
+process id reaches the thread in that slot rather than the whole group.
 
 `clock_gettime` reports `CLOCK_MONOTONIC` as time since boot and
 `CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the ticks
@@ -260,8 +304,9 @@ then allocates a four-page stack ending one page below the top of PML4 slot
 1; the gap between the stack and the image is unmapped, so a runaway stack
 faults instead of overwriting code. Images must load above
 `0x0000008000010000`, which keeps the first 64 KiB of the slot unmapped.
-There is no `AT_PHDR` or auxiliary vector yet because nothing walks it; the
-loader records the page-aligned start of the first writable segment so the
+There is no `AT_PHDR` because nothing walks it — only the `execve` hand-off
+builds an auxiliary vector, with `AT_PAGESZ`, `AT_ENTRY` and `AT_NULL` — and
+the loader records the page-aligned start of the first writable segment so the
 self-test can read it back.
 
 The test executable is `kernel/arch/x86_64/user/ring3_elf64.asm`: a flat
@@ -293,7 +338,14 @@ status 42 and then prints `HAKU64-EXEC-OK`. `USER.ELF` is seeded on the FAT12
 volume by `build.py` and is not part of the kernel image, so the three markers
 prove the program came off the disk, that `execve` replaced the child's
 address space, and that the argument vector landed where a startup stub reads
-it. Finally it prints `HAKU64-ABI-OK`, stores a magic word in
+it. It next maps a two-page thread stack, `clone`s a thread with
+`CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD`, sleeps in
+`futex(FUTEX_WAIT)` on a word in the shared BSS, and requires the thread to
+have bumped that word with `lock inc`, stored its `gettid` and `getpid`
+(equal to the parent's), and `dup2`d the console onto 9 in the shared
+descriptor table — the parent proves the last one by writing through 9 and
+printing `HAKU64-THREAD-OK` — before `wait4(tid)` reaps it with status 7.
+Finally it prints `HAKU64-ABI-OK`, stores a magic word in
 its BSS page and exits with status 0; every failure exits with the number of
 the step that failed, which is what `HAKU64-ELF-RUN-FAIL: exit=` reports.
 `tools/mkelf64.py` wraps the flat binary in an

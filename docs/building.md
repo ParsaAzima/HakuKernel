@@ -62,9 +62,13 @@ matrix, including `mmap`/`munmap`), `HAKU64-DISK-OK` (the program created
 after `close`), `HAKU64-FORK-OK` (a forked child and its parent observed the
 same `MAP_SHARED` page), `HAKU64-DUP-OK` (a duplicated descriptor shared
 one file offset, `dup2` redirected it, and `nanosleep` advanced the monotonic
-clock) and `HAKU64-EXEC-OK` (a child `execve`d `USER.ELF` off the volume with
+clock), `HAKU64-EXEC-OK` (a child `execve`d `USER.ELF` off the volume with
 two arguments and one environment variable, the program checked the stack
-image and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS`, and it exited 42).
+image and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS`, and it exited 42) and
+`HAKU64-THREAD-OK` (a `clone`d thread shared the address space and the
+descriptor table, bumped a shared word, woke the parent through a futex, and
+the parent's write through the thread's `dup2` target printed the marker
+before `wait4` reaped the thread with status 7).
 After QEMU exits, `tools/lsfat12.py --check` verifies the volume the guest
 just wrote. The 32-bit `haku.img` stays the default image.
 

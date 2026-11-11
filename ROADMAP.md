@@ -643,6 +643,32 @@ the port is complete.
   failed exec to return `-ENOENT` and then forks, execs it with two arguments
   and one variable, requires the child's status 42 and prints
   `HAKU64-EXEC-OK` after `HAKU64-EXEC-ARGS`.
+- [x] Threads: `clone` with `CLONE_VM`, `CLONE_FILES`, `CLONE_SIGHAND`,
+  `CLONE_THREAD`, `CLONE_SYSVSEM` and `CLONE_PARENT_SETTID`, plus `gettid`
+  and `futex`. `task64.c` records one `space_owner` per slot, so a thread
+  group has exactly one PML4, one mapping table and one anonymous bump
+  pointer; `space_refs` counts the users, the last one to be reaped frees the
+  frames and tables, and if the owner dies first the records move to a
+  surviving thread. The child runs at the parent's `RIP` with `RAX=0` on the
+  requested 16-byte-aligned stack, keeps the creator as its parent so
+  `wait4(tid)` reaps it, and `CLONE_THREAD` keeps the creator's `tgid` while
+  `gettid` differs; a call without `CLONE_VM` falls back to `fork`, and
+  unsupported flags (TLS, child-tid stores, `CLONE_CLEARTID`) are `-EINVAL`.
+  `CLONE_FILES` shares the descriptor table through an owner plus user count
+  in `fs64.c`, so one thread's `dup2` is visible to the others and only the
+  last user closes the descriptions. `futex` has `WAIT`/`WAKE` only, no
+  timeout: `WAIT` compares the word (mismatch is `-EAGAIN`), parks the task in
+  the new `K64_TASK_WAIT` state with `RAX=0` and its syscall frame saved, and
+  `WAKE` makes up to N waiters on that address runnable; a wait that leaves
+  nothing runnable halts with `HAKU64-TASK-HALT` instead of spinning. `execve`
+  from a shared space is `-EINVAL`. The ring-3 test maps a two-page thread
+  stack, clones a thread, sleeps on a futex and requires the thread's locked
+  increment, its `gettid`/`getpid`, and a `dup2` onto 9 that the parent then
+  writes through (`HAKU64-THREAD-OK`), before reaping the thread with status
+  7. `tools/mkelf64.py` gained `--data-offset` because the test program grew
+  past one code page. Limits: `exit`/`exit_group` end only the calling task
+  (no group exit), `kill` addresses one task id rather than a whole group, and
+  `futex` supports `WAIT`/`WAKE` only, with no timeout.
 - [ ] Syscall table: port the i386 number table from `usermode.c` (97 cases)
   and the wider VFS/process surface onto the 64-bit ABI.
 - [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a

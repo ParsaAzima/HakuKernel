@@ -63,9 +63,10 @@ control and pipelines working.
   syscall convention, NX enforcement, an ELF64 loader, a FAT12 disk with file
   writes behind a page cache that file-backed `mmap` maps from,
   `fork`/`wait4` with default-action signals, `dup`/`dup2` over a shared file
-  description, `nanosleep`, and `execve` of an ELF64 file from the disk with
-  `argc`/`argv`/`envp` on the new stack. No threads, copy-on-write, signal
-  handlers, or 64-bit libc yet.
+  description, `nanosleep`, `execve` of an ELF64 file from the disk with
+  `argc`/`argv`/`envp` on the new stack, and threads: `clone` with
+  `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`, `gettid`, and `futex` wait/wake.
+  No copy-on-write, signal handlers, or 64-bit libc yet.
 
 ## Quick start
 
@@ -128,8 +129,10 @@ build.py             the whole build, test, and QEMU orchestration
 ## Limitations
 
 Haku does not claim POSIX compatibility. It implements a subset aimed at
-statically linked Linux binaries, on a single CPU, without threads, demand
-paging, swap, or networking. FAT12 has 8.3 names, no timestamps, and no
+statically linked Linux binaries, on a single CPU, without demand paging,
+swap, or networking. The 32-bit image has no threads; the x86-64 port has
+`clone`/`futex` threads but no SMP, copy-on-write, or signal handlers. FAT12
+has 8.3 names, no timestamps, and no
 permission bits. The x86-64 image is a bring-up milestone, not a usable
 system: its filesystem cache holds eight paths of at most 128 KiB each, its
 `fork` copies pages instead of sharing them copy-on-write, and its signals
