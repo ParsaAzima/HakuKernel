@@ -65,6 +65,13 @@ typedef struct {
 
 static vfs_fd_t descriptors[VFS_MAX_PROCESSES][VFS_FD_LIMIT];
 static vfs_ofd_t ofd_table[VFS_MAX_PROCESSES * VFS_FD_LIMIT];
+/* CLONE_FILES: a thread shares its creator's descriptor row. row_of maps a
+ * pid to the row it uses (VFS_ROW_OWN means "its own", pid - 1) and
+ * row_users counts the pids pointing at that row, so the row is torn down
+ * by the last user. A fork child gets its own row through vfs_inherit. */
+#define VFS_ROW_OWN 0xFFFFFFFFu
+static uint32_t row_of[VFS_MAX_PROCESSES];
+static uint32_t row_users[VFS_MAX_PROCESSES];
 static const vfs_fs_ops_t *fs_table[VFS_MAX_FS];
 static uint32_t fs_count;
 /* Mount table. One backend is mounted at "" (the root); the others are
@@ -199,6 +206,18 @@ static int pid_valid(uint32_t pid) {
     return pid > 0 && pid <= VFS_MAX_PROCESSES;
 }
 
+/* The descriptor row a pid uses, and that row's table. */
+static uint32_t fd_row(uint32_t pid) {
+    uint32_t row;
+    if (!pid_valid(pid)) return 0;
+    row = row_of[pid - 1u];
+    return row == VFS_ROW_OWN ? pid - 1u : row;
+}
+
+static vfs_fd_t *fd_table(uint32_t pid) {
+    return descriptors[fd_row(pid)];
+}
+
 static int name_equal(const char *a, const char *b) {
     size_t i = 0;
     for (;;) {
@@ -219,8 +238,8 @@ static int ofd_alloc(void) {
  * empty or out of range. 0-2 are the standard descriptors (console). */
 static vfs_ofd_t *fd_ofd(uint32_t pid, uint32_t fd) {
     if (!pid_valid(pid) || fd >= VFS_FD_LIMIT) return 0;
-    if (!descriptors[pid - 1u][fd].used) return 0;
-    return &ofd_table[descriptors[pid - 1u][fd].ofd];
+    if (!fd_table(pid)[fd].used) return 0;
+    return &ofd_table[fd_table(pid)[fd].ofd];
 }
 
 /* Drop one descriptor's reference: the backend close runs (IRQ-safely) and
@@ -476,6 +495,10 @@ void vfs_init(void) {
     memset(ofd_table, 0, sizeof(ofd_table));
     memset(pipes, 0, sizeof(pipes));
     memset(mounts, 0, sizeof(mounts));
+    for (uint32_t i = 0; i < VFS_MAX_PROCESSES; i++) {
+        row_of[i] = VFS_ROW_OWN;
+        row_users[i] = 1;
+    }
     mount_count = 0;
     fs_count = 0;
     stdio_device = 0;
@@ -494,8 +517,8 @@ static int stdio_bind(uint32_t pid, uint32_t fd, uint32_t accmode) {
     vfs_ofd_t *ofd = ofd_create(VFS_OFD_DEVICE, accmode);
     if (!ofd) return 0;
     ofd->device = stdio_device;
-    descriptors[pid - 1u][fd].ofd = ofd_slot(ofd);
-    descriptors[pid - 1u][fd].used = 1;
+    fd_table(pid)[fd].ofd = ofd_slot(ofd);
+    fd_table(pid)[fd].used = 1;
     return 1;
 }
 
@@ -503,12 +526,12 @@ int vfs_open_stdio(uint32_t pid) {
     int result = 1;
     if (!pid_valid(pid) || !stdio_device) return 0;
     mutex_lock(&vfs_lock);
-    if (!descriptors[pid - 1u][0].used && !stdio_bind(pid, 0, VFS_O_RDONLY))
+    if (!fd_table(pid)[0].used && !stdio_bind(pid, 0, VFS_O_RDONLY))
         result = 0;
-    if (result && !descriptors[pid - 1u][1].used &&
+    if (result && !fd_table(pid)[1].used &&
         !stdio_bind(pid, 1, VFS_O_WRONLY))
         result = 0;
-    if (result && !descriptors[pid - 1u][2].used &&
+    if (result && !fd_table(pid)[2].used &&
         !stdio_bind(pid, 2, VFS_O_WRONLY))
         result = 0;
     mutex_unlock(&vfs_lock);
@@ -521,20 +544,23 @@ int32_t vfs_inherit(uint32_t parent_pid, uint32_t child_pid) {
     if (parent_pid == child_pid) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
     /* A reused pid must start clean; releasing stale descriptors is a
-     * no-op when the slot was already released on its previous exit. */
+     * no-op when the slot was already released on its previous exit. The
+     * child gets a row of its own even when the parent shares one. */
+    row_of[child_pid - 1u] = VFS_ROW_OWN;
+    row_users[child_pid - 1u] = 1;
     for (uint32_t fd = 0; fd < VFS_FD_LIMIT; fd++) {
-        vfs_fd_t *slot = &descriptors[child_pid - 1u][fd];
+        vfs_fd_t *slot = &fd_table(child_pid)[fd];
         if (slot->used) {
             slot->used = 0;
             ofd_release(&ofd_table[slot->ofd]);
         }
     }
     for (uint32_t fd = 0; fd < VFS_FD_LIMIT; fd++) {
-        vfs_fd_t *parent = &descriptors[parent_pid - 1u][fd];
+        vfs_fd_t *parent = &fd_table(parent_pid)[fd];
         if (!parent->used) continue;
         ofd_table[parent->ofd].refs++;
-        descriptors[child_pid - 1u][fd] = *parent;
-        descriptors[child_pid - 1u][fd].used = 1;
+        fd_table(child_pid)[fd] = *parent;
+        fd_table(child_pid)[fd].used = 1;
     }
     mutex_unlock(&vfs_lock);
     return 1;
@@ -545,7 +571,7 @@ uint32_t vfs_open_count(uint32_t pid) {
     if (!pid_valid(pid)) return 0;
     mutex_lock(&vfs_lock);
     for (uint32_t fd = 0; fd < VFS_FD_LIMIT; fd++)
-        if (descriptors[pid - 1u][fd].used) count++;
+        if (fd_table(pid)[fd].used) count++;
     mutex_unlock(&vfs_lock);
     return count;
 }
@@ -591,7 +617,7 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
         return -VFS_EROFS;
     }
     for (fd = VFS_FIRST_FILE_FD; fd < VFS_FD_LIMIT; fd++)
-        if (!descriptors[pid - 1u][fd].used) break;
+        if (!fd_table(pid)[fd].used) break;
     if (fd == VFS_FD_LIMIT) {
         mutex_unlock(&vfs_lock);
         return -VFS_EMFILE;
@@ -616,7 +642,7 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
     ofd->backend = handle;
     ofd->refs = 1;
     ofd->used = 1;
-    slot = &descriptors[pid - 1u][fd];
+    slot = &fd_table(pid)[fd];
     slot->ofd = (uint32_t)ofd_index;
     slot->used = 1;
     mutex_unlock(&vfs_lock);
@@ -629,7 +655,7 @@ int32_t vfs_close(uint32_t pid, uint32_t fd) {
     int32_t closed;
     if (!pid_valid(pid) || fd >= VFS_FD_LIMIT) return -VFS_EBADF;
     mutex_lock(&vfs_lock);
-    slot = &descriptors[pid - 1u][fd];
+    slot = &fd_table(pid)[fd];
     if (!slot->used) {
         mutex_unlock(&vfs_lock);
         return -VFS_EBADF;
@@ -653,14 +679,14 @@ int32_t vfs_dup(uint32_t pid, uint32_t fd) {
         return -VFS_EBADF;
     }
     for (newfd = 0; newfd < VFS_FD_LIMIT; newfd++)
-        if (!descriptors[pid - 1u][newfd].used) break;
+        if (!fd_table(pid)[newfd].used) break;
     if (newfd == VFS_FD_LIMIT) {
         mutex_unlock(&vfs_lock);
         return -VFS_EMFILE;
     }
     ofd->refs++;
-    descriptors[pid - 1u][newfd].ofd = descriptors[pid - 1u][fd].ofd;
-    descriptors[pid - 1u][newfd].used = 1;
+    fd_table(pid)[newfd].ofd = fd_table(pid)[fd].ofd;
+    fd_table(pid)[newfd].used = 1;
     mutex_unlock(&vfs_lock);
     return (int32_t)newfd;
 }
@@ -671,7 +697,7 @@ int32_t vfs_dup2(uint32_t pid, uint32_t oldfd, uint32_t newfd) {
     if (!pid_valid(pid) || oldfd >= VFS_FD_LIMIT || newfd >= VFS_FD_LIMIT)
         return -VFS_EBADF;
     mutex_lock(&vfs_lock);
-    if (!descriptors[pid - 1u][oldfd].used) {
+    if (!fd_table(pid)[oldfd].used) {
         mutex_unlock(&vfs_lock);
         return -VFS_EBADF;
     }
@@ -683,13 +709,13 @@ int32_t vfs_dup2(uint32_t pid, uint32_t oldfd, uint32_t newfd) {
     if (ofd) {
         /* Target was open: POSIX closes it first and does not report a
          * failure here, so the dup2 outcome is unaffected by the close. */
-        vfs_ofd_t *victim = &ofd_table[descriptors[pid - 1u][newfd].ofd];
-        descriptors[pid - 1u][newfd].used = 0;
+        vfs_ofd_t *victim = &ofd_table[fd_table(pid)[newfd].ofd];
+        fd_table(pid)[newfd].used = 0;
         ofd_release(victim);
     }
-    ofd_table[descriptors[pid - 1u][oldfd].ofd].refs++;
-    slot = &descriptors[pid - 1u][newfd];
-    slot->ofd = descriptors[pid - 1u][oldfd].ofd;
+    ofd_table[fd_table(pid)[oldfd].ofd].refs++;
+    slot = &fd_table(pid)[newfd];
+    slot->ofd = fd_table(pid)[oldfd].ofd;
     slot->used = 1;
     mutex_unlock(&vfs_lock);
     return (int32_t)newfd;
@@ -1022,15 +1048,65 @@ int32_t vfs_readlink(uint32_t pid, const char *path, char *buffer,
 }
 
 void vfs_close_all(uint32_t pid) {
+    uint32_t row;
+
     if (!pid_valid(pid)) return;
+    /* A task that shares its row with a thread group detaches instead of
+     * closing: the descriptors stay open for the other users and the last
+     * one to go performs the real close. The pid always returns to its own
+     * row (descriptors[pid-1]), which is empty because only this pid can
+     * own it. */
+    mutex_lock(&vfs_lock);
+    row = fd_row(pid);
+    if (row_users[row] > 1u) {
+        row_users[row]--;
+        row_of[pid - 1u] = VFS_ROW_OWN;
+        row_users[pid - 1u] = 1;
+        mutex_unlock(&vfs_lock);
+        memset(descriptors[pid - 1u], 0, sizeof(descriptors[pid - 1u]));
+        return;
+    }
+    mutex_unlock(&vfs_lock);
     for (uint32_t fd = 0; fd < VFS_FD_LIMIT; fd++) {
-        vfs_fd_t *slot = &descriptors[pid - 1u][fd];
+        vfs_fd_t *slot = &descriptors[row][fd];
         if (!slot->used) continue;
         slot->used = 0;
         mutex_lock(&vfs_lock);
         ofd_release(&ofd_table[slot->ofd]);
         mutex_unlock(&vfs_lock);
     }
+    mutex_lock(&vfs_lock);
+    row_of[pid - 1u] = VFS_ROW_OWN;
+    row_users[row] = 1;
+    if (row != pid - 1u) {
+        row_users[pid - 1u] = 1;
+        mutex_unlock(&vfs_lock);
+        memset(descriptors[pid - 1u], 0, sizeof(descriptors[pid - 1u]));
+        return;
+    }
+    mutex_unlock(&vfs_lock);
+}
+
+/* clone(CLONE_FILES): the child uses the parent's descriptor row from the
+ * start, so an open/close/dup in either task is visible to the other. */
+int32_t vfs_share(uint32_t parent_pid, uint32_t child_pid) {
+    uint32_t row;
+
+    if (!pid_valid(parent_pid) || !pid_valid(child_pid))
+        return -VFS_EINVAL;
+    if (parent_pid == child_pid) return -VFS_EINVAL;
+    mutex_lock(&vfs_lock);
+    row = fd_row(parent_pid);
+    if (row_users[row] == 0u) row_users[row] = 1;
+    row_users[row]++;
+    row_of[child_pid - 1u] = row;
+    /* The child's home row is now free, but whichever row it lands in must
+     * count this task; a row still shared by a previous group keeps its
+     * own count. */
+    if (row != child_pid - 1u && row_users[child_pid - 1u] == 0u)
+        row_users[child_pid - 1u] = 1;
+    mutex_unlock(&vfs_lock);
+    return 1;
 }
 
 int32_t vfs_opendir(uint32_t pid, const char *path) {
@@ -1054,7 +1130,7 @@ int32_t vfs_opendir(uint32_t pid, const char *path) {
         return -VFS_EIO;
     }
     for (fd = VFS_FIRST_FILE_FD; fd < VFS_FD_LIMIT; fd++)
-        if (!descriptors[pid - 1u][fd].used) break;
+        if (!fd_table(pid)[fd].used) break;
     if (fd == VFS_FD_LIMIT) {
         mutex_unlock(&vfs_lock);
         return -VFS_EMFILE;
@@ -1086,7 +1162,7 @@ int32_t vfs_opendir(uint32_t pid, const char *path) {
     }
     ofd->refs = 1;
     ofd->used = 1;
-    slot = &descriptors[pid - 1u][fd];
+    slot = &fd_table(pid)[fd];
     slot->ofd = (uint32_t)ofd_index;
     slot->used = 1;
     mutex_unlock(&vfs_lock);
@@ -1166,13 +1242,13 @@ int32_t vfs_pipe(uint32_t pid, uint32_t *fds) {
     if (!pid_valid(pid) || !fds) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
     for (read_fd = 0; read_fd < VFS_FD_LIMIT; read_fd++)
-        if (!descriptors[pid - 1u][read_fd].used) break;
+        if (!fd_table(pid)[read_fd].used) break;
     if (read_fd == VFS_FD_LIMIT) {
         mutex_unlock(&vfs_lock);
         return -VFS_EMFILE;
     }
     for (write_fd = read_fd + 1u; write_fd < VFS_FD_LIMIT; write_fd++)
-        if (!descriptors[pid - 1u][write_fd].used) break;
+        if (!fd_table(pid)[write_fd].used) break;
     if (write_fd == VFS_FD_LIMIT) {
         mutex_unlock(&vfs_lock);
         return -VFS_EMFILE;
@@ -1217,10 +1293,10 @@ int32_t vfs_pipe(uint32_t pid, uint32_t *fds) {
     ofd_table[writer_ofd].accmode = VFS_O_WRONLY;
     ofd_table[writer_ofd].refs = 1;
     ofd_table[writer_ofd].used = 1;
-    descriptors[pid - 1u][read_fd].ofd = (uint32_t)reader_ofd;
-    descriptors[pid - 1u][read_fd].used = 1;
-    descriptors[pid - 1u][write_fd].ofd = (uint32_t)writer_ofd;
-    descriptors[pid - 1u][write_fd].used = 1;
+    fd_table(pid)[read_fd].ofd = (uint32_t)reader_ofd;
+    fd_table(pid)[read_fd].used = 1;
+    fd_table(pid)[write_fd].ofd = (uint32_t)writer_ofd;
+    fd_table(pid)[write_fd].used = 1;
     mutex_unlock(&vfs_lock);
     fds[0] = read_fd;
     fds[1] = write_fd;
@@ -1239,14 +1315,14 @@ int32_t vfs_dup_min(uint32_t pid, uint32_t fd, uint32_t minfd) {
         return -VFS_EBADF;
     }
     for (newfd = minfd; newfd < VFS_FD_LIMIT; newfd++)
-        if (!descriptors[pid - 1u][newfd].used) break;
+        if (!fd_table(pid)[newfd].used) break;
     if (newfd == VFS_FD_LIMIT) {
         mutex_unlock(&vfs_lock);
         return -VFS_EMFILE;
     }
     ofd->refs++;
-    descriptors[pid - 1u][newfd].ofd = descriptors[pid - 1u][fd].ofd;
-    descriptors[pid - 1u][newfd].used = 1;
+    fd_table(pid)[newfd].ofd = fd_table(pid)[fd].ofd;
+    fd_table(pid)[newfd].used = 1;
     mutex_unlock(&vfs_lock);
     return (int32_t)newfd;
 }

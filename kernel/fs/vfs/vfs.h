@@ -212,6 +212,11 @@ int vfs_open_stdio(uint32_t pid);
  * file descriptions (each copy bumps the reference count). Called on
  * spawn before the child runs. Returns 1 or a negative -VFS_E* errno. */
 int32_t vfs_inherit(uint32_t parent_pid, uint32_t child_pid);
+/* clone(CLONE_FILES): point the child at the parent's descriptor row so
+ * open/close/dup in either task is visible to both. The row is reference
+ * counted and vfs_close_all only detaches while another user remains.
+ * Returns 1 or a negative -VFS_E* errno. */
+int32_t vfs_share(uint32_t parent_pid, uint32_t child_pid);
 /* Number of descriptors currently open for a process (0..VFS_FD_LIMIT). */
 uint32_t vfs_open_count(uint32_t pid);
 /* Follow symbolic links in the last component across mounts, writing the
