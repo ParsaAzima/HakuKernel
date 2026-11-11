@@ -58,8 +58,10 @@ program ran in ring 3, stored its BSS word and exited with status 0),
 `HAKU64-ABI-OK` (the six-argument `INT 0x80` ABI passed its success and error
 matrix, including `mmap`/`munmap`), `HAKU64-DISK-OK` (the program created
 `/TMP`, wrote `NOTE.TXT` there and the kernel read it back from the volume
-after `close`) and `HAKU64-FORK-OK` (a forked child and its parent observed
-the same `MAP_SHARED` page). After QEMU exits, `tools/lsfat12.py --check`
+after `close`), `HAKU64-FORK-OK` (a forked child and its parent observed the
+same `MAP_SHARED` page) and `HAKU64-DUP-OK` (a duplicated descriptor shared
+one file offset, `dup2` redirected it, and `nanosleep` advanced the monotonic
+clock). After QEMU exits, `tools/lsfat12.py --check`
 verifies the volume the guest just wrote. The 32-bit `haku.img` stays the
 default image.
 

@@ -62,8 +62,9 @@ control and pipelines working.
   clock, round-robin scheduler, ring 3 with `SYSCALL`/`SYSRET` and the Linux
   syscall convention, NX enforcement, an ELF64 loader, a FAT12 disk with file
   writes behind a page cache that file-backed `mmap` maps from, and
-  `fork`/`wait4` with default-action signals. No threads, copy-on-write,
-  signal handlers, or 64-bit libc yet.
+  `fork`/`wait4` with default-action signals, `dup`/`dup2` over a shared file
+  description and `nanosleep`. No threads, copy-on-write, signal handlers, or
+  64-bit libc yet.
 
 ## Quick start
 

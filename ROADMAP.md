@@ -619,6 +619,15 @@ the port is complete.
   delivered and there are no handlers or masks. The ring-3 test forks,
   observes one `MAP_SHARED` page from both processes and prints
   `HAKU64-FORK-OK`.
+- [x] Descriptor duplication and sleep: descriptors index a 64-entry
+  description table holding the cache slot, access mode and offset, so
+  `dup`, `dup2` and `fork` share one file offset (a `dup2` onto 1 redirects
+  stdout onto a file, and `dup` of the console still writes to COM1). `dup`
+  answers 3 and up because 0..2 are the console; closing a console
+  descriptor that was never duplicated is a no-op; there is no `dup3` or
+  `O_CLOEXEC`. `nanosleep` rounds up to whole ticks and waits with
+  interrupts enabled, like `wait4`. The ring-3 test checks the shared
+  offset, the redirection and a 10 ms sleep (`HAKU64-DUP-OK`).
 - [ ] Syscall table: port the i386 number table from `usermode.c` (97 cases)
   and the wider VFS/process surface onto the 64-bit ABI.
 - [x] ELF64 loader: static `ET_EXEC` images validated, mapped into a

@@ -65,7 +65,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `wait4`, `kill`, `getpid`, `getppid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `wait4`, `kill`, `nanosleep`, `getpid`, `getppid`, `clock_gettime`, `exit` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
@@ -151,8 +151,8 @@ as a DPL-3 fallback, and the test program exercises both entry points.
 arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in `RAX` or a negative
 errno — with the Linux x86-64 numbers for `read`, `write`, `open`, `close`,
 `lseek`, `writev`, `mmap`, `munmap`, `mkdir`, `fork`, `wait4`, `kill`,
-`getpid`, `getppid`, `clock_gettime` and `exit`/`exit_group`; an
-unimplemented number returns `-ENOSYS`. Every user
+`dup`, `dup2`, `nanosleep`, `getpid`, `getppid`, `clock_gettime` and
+`exit`/`exit_group`; an unimplemented number returns `-ENOSYS`. Every user
 pointer is resolved through the current space with `paging64_query_space`
 before it is dereferenced, and the copies move through the physmap: a ring-0
 page fault halts the kernel, so the CPU cannot be relied on to reject a bad
@@ -201,22 +201,32 @@ the parent's user leaves, aliases the frames a mapping record marks shared,
 and copies everything else into fresh frames. There is no copy-on-write yet,
 so a private page costs its copy at fork time. The child gets a copy of the
 parent's syscall frame on its own 16 KiB kernel stack with `RAX=0`, a copy of
-the descriptor table (cache slots and positions are shared) and the mapping
-table, with shared ranges marked borrow-only. `wait4` blocks until a child is
-`DONE`, writes `(status & 0xFF) << 8` or the terminating signal, and reaps
-it; a task's space, frames and kernel stack are released only at that point,
-which is also what lets the boot test inspect a task after it stopped.
-Signals have no handlers: `kill` and a ring-3 fault perform the default
-action, terminate, and `wait4` reports the signal number. `SIGCHLD` is not
-delivered, there are no signal masks, and a task cannot signal itself
-through `kill` — that path goes through `exit` so the dispatcher never
-resumes the frame.
+the descriptor table and the mapping table, with shared ranges marked
+borrow-only. A descriptor is only an index into a 64-entry description table
+holding the cache slot, the access mode and the file offset, so `fork` and
+`dup` leave both processes pointing at one description: they share the offset
+and, through the cache, the bytes. `dup2` moves a description onto a chosen
+descriptor — including 0..2, which is how stdout is redirected onto a file —
+and `dup` always answers 3 or above because 0..2 are the console. Closing a
+console descriptor that was never duplicated is a no-op; there is no
+`O_CLOEXEC` and no `dup3`. `wait4` blocks until a child is `DONE`, writes
+`(status & 0xFF) << 8` or the terminating signal, and reaps it; a task's
+space, frames and kernel stack are released only at that point, which is also
+what lets the boot test inspect a task after it stopped. Signals have no
+handlers: `kill` and a ring-3 fault perform the default action, terminate,
+and `wait4` reports the signal number. `SIGCHLD` is not delivered, there are
+no signal masks, and a task cannot signal itself through `kill` — that path
+goes through `exit` so the dispatcher never resumes the frame.
 
 `clock_gettime` reports `CLOCK_MONOTONIC` as time since boot and
 `CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the ticks
 elapsed since that sample; when the RTC cannot be read it falls back to
-monotonic time. The full i386 number table stays with the later userland
-stage.
+monotonic time. `nanosleep` rounds the request up to whole timer ticks and
+then waits with interrupts enabled, the same way `wait4` does, so other
+READY tasks run during the sleep; there is no sleep queue, the waiter stays
+the current task and is simply resumed, and `remaining` is never written
+because nothing interrupts the sleep. The full i386 number table stays with
+the later userland stage.
 
 The 64-bit path now has an ELF64 loader and a FAT12 data disk, but no
 64-bit libc and no bootable root filesystem image; `haku.img` remains the
@@ -252,7 +262,12 @@ range, creates `/TMP`, writes `/TMP/NOTE.TXT`, reads it back before and after
 `close` (`HAKU64-DISK-OK`), resolves `/TMP/../HELLO.TXT` and `/./HELLO.TXT`,
 then maps a shared anonymous page, forks, and requires the child to see the
 parent's word and the parent to see the child's store after `wait4`
-(`HAKU64-FORK-OK`). Finally it prints `HAKU64-ABI-OK`, stores a magic word in
+(`HAKU64-FORK-OK`). It then reads `/HELLO.TXT` through one descriptor and its
+`dup` to prove both share an offset, `dup2`s the descriptor onto 9 and reads
+past a `close`, and writes `HAKU64-DUP-OK` through a `dup` of the console
+(`HAKU64-DUP-OK`); `nanosleep` must move `CLOCK_MONOTONIC` forward by at
+least the 10 ms requested, and a nanosecond field of 1e9 is `-EINVAL`.
+Finally it prints `HAKU64-ABI-OK`, stores a magic word in
 its BSS page and exits with status 0; every failure exits with the number of
 the step that failed, which is what `HAKU64-ELF-RUN-FAIL: exit=` reports.
 `tools/mkelf64.py` wraps the flat binary in an
