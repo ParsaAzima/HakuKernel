@@ -16,6 +16,8 @@ Pipeline:
     kernel/**/*.c --cl--> kernel objects
     + arch/x86/kernel/{entry,isr}.asm --nasm--> entry objects
     kernel objects + entry objects --link--> kernel.pe --pe2bin--> kernel.bin
+    kernel/module/{demo,lib}/*.c + *.asm --cl/nasm--> module objects
+        --mkhakumod (ELF32 or COFF link)--> MODULE/HELLO/ROMFS.HKM
     arch/x86/boot/stage1.asm --nasm--> stage1.bin (512 B)
     arch/x86/boot/stage2.asm --nasm (kernel entry + size from PE)--> stage2.bin
     stage1 + stage2 + kernel.bin --mkimg--> haku.img (boot floppy)
@@ -713,6 +715,14 @@ def main():
     # link line, so keep them out of this glob.
     c_files = [p for p in c_files
                if os.path.join("arch", "x86_64") + os.sep not in p]
+    # kernel/module/lib is libhakumod, the runtime a *module* links against,
+    # and kernel/module/demo holds the example modules themselves. Both are
+    # compiled per module further down, never into the kernel image.
+    module_lib_dir = os.path.join(kernel_dir, "module", "lib")
+    module_demo_dir = os.path.join(kernel_dir, "module", "demo")
+    c_files = [p for p in c_files
+               if not p.startswith(module_lib_dir + os.sep)
+               and not p.startswith(module_demo_dir + os.sep)]
     if not c_files:
         sys.exit("no kernel/**/*.c files found")
     entry_asm = os.path.join(arch_dir, "kernel", "entry.asm")
@@ -791,28 +801,48 @@ def main():
     run([nasm, "-I" + nasm_include, "-f", "bin", vfork_asm, "-o", vfork_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", fault_asm, "-o", fault_elf])
 
-    # Modules are assembled as relocatable ELF32 objects and packed into the
-    # kernel's .hkm container on the host. The kernel therefore never learns
-    # to parse ELF; it only applies the packed relocations. The demo proves
-    # the loader, hello is a char device, and romfs is a filesystem — both
-    # capabilities are registered from module code and detached on unload.
+    # Modules are packed into the kernel's .hkm container on the host, so
+    # the kernel never learns an object format. hello and romfs are C,
+    # linked by the packer with libhakumod, the freestanding runtime a
+    # module links against; haku_demo stays a NASM ELF32 object and keeps
+    # that host path alive. /Gy gives every function its own COMDAT so the
+    # packer can drop library helpers a module never calls.
+    module_pack_script = os.path.join(ROOT, "tools", "mkhakumod.py")
+    module_c_flags = (["/nologo", "/c", "/GS-", "/Zl", "/Os", "/Gy", "/W3"]
+                      + no_sse + ["/I" + include_dir])
+    lib_object = os.path.join(BUILD, "modlib_module_lib.obj")
+    run(cc + module_c_flags +
+        ["/Fo" + lib_object, os.path.join(module_lib_dir, "module_lib.c")])
+    runtime_object = os.path.join(BUILD, "modlib_runtime.obj")
+    run([nasm, "-f", "win32", os.path.join(module_lib_dir, "runtime.asm"),
+         "-o", runtime_object])
+    module_runtime = [lib_object, runtime_object]
+    log("libhakumod built (module_lib.obj + runtime.obj)")
+
     module_specs = [
         ("haku_demo.asm", "MODULE.HKM", "HAKU-DEMO"),
-        ("hello.asm", "HELLO.HKM", "HAKU-HELLO"),
-        ("romfs.asm", "ROMFS.HKM", "HAKU-ROMFS"),
+        ("hello.c", "HELLO.HKM", "HAKU-HELLO"),
+        ("romfs.c", "ROMFS.HKM", "HAKU-ROMFS"),
     ]
-    module_pack_script = os.path.join(ROOT, "tools", "mkhakumod.py")
     module_sources = []
     module_archives = []
     for source_name, image_name, module_name in module_specs:
         module_source = os.path.join(kernel_dir, "module", "demo",
                                      source_name)
-        module_object = os.path.join(BUILD,
-                                     os.path.splitext(source_name)[0] + ".o")
+        stem = os.path.splitext(source_name)[0]
+        objects = []
+        if source_name.endswith(".c"):
+            module_object = os.path.join(BUILD, "mod_" + stem + ".obj")
+            run(cc + module_c_flags + ["/Fo" + module_object, module_source])
+            objects.append(module_object)
+            objects += module_runtime
+        else:
+            module_object = os.path.join(BUILD, stem + ".o")
+            run([nasm, "-f", "elf32", module_source, "-o", module_object])
+            objects.append(module_object)
         module_image = os.path.join(BUILD, image_name)
-        run([nasm, "-f", "elf32", module_source, "-o", module_object])
-        run([py, module_pack_script, module_object, module_image,
-             "--name", module_name])
+        run([py, module_pack_script] + objects +
+            [module_image, "--name", module_name])
         module_sources.append(module_source)
         module_archives.append(f"{image_name}={module_image}")
 
@@ -1118,6 +1148,7 @@ def main():
             "MODULE-UNLOAD-OK name=HAKU-DEMO",
             "USER-MODDEV-OK",  # a module registered /dev/hello and it read back
             "HELLO-MODULE-OK",
+            "HELLO-LIB-OK",    # the C module's runtime helpers computed correctly
             "USER-ROMFS-OK",   # a module mounted a read-only filesystem at /rom
             "ROMFS-MODULE-OK",
             "USER-EXIT-OK status=0 pid=1",

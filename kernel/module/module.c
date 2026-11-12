@@ -17,11 +17,20 @@
 #include "haku_module.h"
 #include "devfs.h"
 #include "haku/abi.h"
+#include "haku/module.h"
 #include "heap.h"
 #include "klog.h"
 #include "pit.h"
 #include "sync.h"
 #include "vfs.h"
+
+/* A C module builds its filesystem table in its own image, so the public
+ * header mirrors vfs_fs_ops_t. A size mismatch means the two disagree about
+ * the table and the kernel would call through the wrong slot; fail here
+ * instead of at runtime. The headless C-filesystem test covers the field
+ * order. */
+typedef char module_fs_ops_mirror_size[
+    (sizeof(haku_module_fs_ops_t) == sizeof(vfs_fs_ops_t)) ? 1 : -1];
 
 /* Module lifecycle. A slot is only reusable once it is FREE; LOADING and
  * UNLOADING make a second init_module/delete_module for the same name fail
