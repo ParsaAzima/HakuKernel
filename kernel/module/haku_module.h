@@ -35,6 +35,37 @@
  * privileges. The loader validates the container so a truncated or corrupt
  * file cannot make it read out of bounds, but it cannot sandbox a module
  * that was written maliciously. Only a privileged caller should load one.
+ *
+ * Kernel exports a module may link against (all use the cdecl convention and
+ * return 0 on success, a negative -errno otherwise):
+ *
+ *   void haku_module_log(const char *text);
+ *   void haku_module_log_dec(uint32_t value);
+ *   void haku_module_log_hex(uint32_t value);
+ *   uint32_t haku_module_ticks(void);
+ *   void *haku_module_alloc(uint32_t size);
+ *   void haku_module_free(void *pointer);
+ *
+ * Capability registration is only valid while the module's init hook runs.
+ * The kernel binds what it registers to the module slot and detaches it
+ * before the image is freed:
+ *
+ *   int haku_module_register_device(const char *name,
+ *                                   int32_t (*read)(void *, uint32_t,
+ *                                                   uint32_t *),
+ *                                   int32_t (*write)(const void *, uint32_t,
+ *                                                    uint32_t *));
+ *   int haku_module_register_fs(const void *vfs_fs_ops);
+ *   int haku_module_mount(const char *prefix, const char *name,
+ *                         uint32_t flags);
+ *   void haku_module_fill_stat(void *vfs_stat, uint32_t mode,
+ *                              uint32_t size, uint32_t ino);
+ *   void haku_module_fill_dirent(void *vfs_dirent, uint32_t ino,
+ *                                uint32_t type, const char *name);
+ *
+ * A module may register one device and one readonly-or-readwrite
+ * filesystem, and mount that filesystem once at a non-root prefix. The exit
+ * hook runs after the kernel detaches them and cannot register new ones.
  */
 #ifndef HAKU_MODULE_H
 #define HAKU_MODULE_H
@@ -46,7 +77,13 @@
 
 #define HAKU_MODULE_HEADER_SIZE 72u
 #define HAKU_MODULE_IMAGE_OFFSET 72u
+/* Module name field in the header. */
 #define HAKU_MODULE_NAME_MAX 24u
+/* Longest imported symbol name. This is separate from the module name limit
+ * because kernel exports such as `haku_module_register_device` are longer
+ * than a module name; the string table itself is bounded by
+ * HAKU_MODULE_MAX_STRINGS. */
+#define HAKU_MODULE_SYMBOL_MAX 48u
 #define HAKU_MODULE_MAX_IMAGE 65536u
 #define HAKU_MODULE_MAX_BSS 65536u
 #define HAKU_MODULE_MAX_RELOCS 256u

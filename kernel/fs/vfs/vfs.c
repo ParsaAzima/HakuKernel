@@ -5,7 +5,7 @@
 
 #define VFS_MAX_PROCESSES SCHEDULER_MAX_PROCESSES
 #define VFS_FIRST_FILE_FD 3u
-#define VFS_MAX_FS 4u
+#define VFS_MAX_FS 8u
 #define VFS_MAX_PIPES 4u
 #define VFS_PIPE_CAPACITY 512u
 #define VFS_SUPPORTED_FLAGS \
@@ -304,7 +304,11 @@ static vfs_mount_t *mount_resolve(const char *path, const char **relative) {
     vfs_mount_t *best = 0;
     int best_length = -1;
     for (uint32_t i = 0; i < mount_count; i++) {
-        int length = mount_match(&mounts[i], path);
+        int length;
+        /* An unmounted slot keeps its prefix (so indices stay stable) but
+         * owns nothing; skipping it here is what detaches the backend. */
+        if (!mounts[i].ops) continue;
+        length = mount_match(&mounts[i], path);
         if (length > best_length) {
             best = &mounts[i];
             best_length = length;
@@ -466,11 +470,21 @@ int32_t vfs_mount(const char *prefix, const char *name, uint32_t flags) {
         return mounted;
     }
     if (!mount) {
-        if (mount_count >= VFS_MAX_MOUNTS) {
-            mutex_unlock(&vfs_lock);
-            return -VFS_EBUSY;
+        /* A slot freed by vfs_unmount is reused rather than appended, so an
+         * index already recorded in an open description never shifts. */
+        for (uint32_t i = 0; i < mount_count; i++) {
+            if (!mounts[i].ops) {
+                mount = &mounts[i];
+                break;
+            }
         }
-        mount = &mounts[mount_count++];
+        if (!mount) {
+            if (mount_count >= VFS_MAX_MOUNTS) {
+                mutex_unlock(&vfs_lock);
+                return -VFS_EBUSY;
+            }
+            mount = &mounts[mount_count++];
+        }
         memset(mount, 0, sizeof(*mount));
         {
             uint32_t length = (uint32_t)strlen(prefix);
@@ -486,8 +500,73 @@ int32_t vfs_mount(const char *prefix, const char *name, uint32_t flags) {
 int vfs_mounted(const char *prefix) {
     if (!prefix) return 0;
     for (uint32_t i = 0; i < mount_count; i++)
-        if (name_equal(mounts[i].prefix, prefix)) return 1;
+        if (mounts[i].ops && name_equal(mounts[i].prefix, prefix)) return 1;
     return 0;
+}
+
+int32_t vfs_unregister_fs(const vfs_fs_ops_t *ops) {
+    uint32_t index = VFS_MAX_FS;
+    uint32_t i;
+    if (!ops) return -VFS_EINVAL;
+    mutex_lock(&vfs_lock);
+    for (i = 0; i < fs_count; i++) {
+        if (fs_table[i] == ops) {
+            index = i;
+            break;
+        }
+    }
+    if (index == VFS_MAX_FS) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_ENOENT;
+    }
+    /* A mounted backend is still being called through this table; the
+     * module has to unmount first so no live path can reach freed code. */
+    for (i = 0; i < mount_count; i++) {
+        if (mounts[i].ops == ops) {
+            mutex_unlock(&vfs_lock);
+            return -VFS_EBUSY;
+        }
+    }
+    for (i = index; i + 1u < fs_count; i++) fs_table[i] = fs_table[i + 1u];
+    fs_table[--fs_count] = 0;
+    mutex_unlock(&vfs_lock);
+    return 1;
+}
+
+int32_t vfs_unmount(const char *prefix) {
+    vfs_mount_t *mount = 0;
+    uint32_t index;
+    uint32_t i;
+    if (!prefix_valid(prefix)) return -VFS_EINVAL;
+    /* The root is the boot namespace; replacing it is allowed, detaching it
+     * is not. */
+    if (prefix[0] == 0) return -VFS_EINVAL;
+    mutex_lock(&vfs_lock);
+    for (i = 0; i < mount_count; i++) {
+        if (mounts[i].ops && name_equal(mounts[i].prefix, prefix)) {
+            mount = &mounts[i];
+            index = i;
+            break;
+        }
+    }
+    if (!mount) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_ENOENT;
+    }
+    /* An open file description carries the mount index and the backend
+     * handle, so detaching now would leave it pointing at freed module
+     * code. Refuse until the last descriptor through this mount closes. */
+    for (i = 0; i < VFS_MAX_PROCESSES * VFS_FD_LIMIT; i++) {
+        if (ofd_table[i].used && ofd_table[i].mount_index == index) {
+            mutex_unlock(&vfs_lock);
+            return -VFS_EBUSY;
+        }
+    }
+    mount->ops = 0;
+    mount->flags = 0;
+    mount->prefix[0] = 0;
+    mutex_unlock(&vfs_lock);
+    return 1;
 }
 
 void vfs_init(void) {

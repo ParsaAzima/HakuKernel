@@ -23,6 +23,7 @@ VERSION = 1
 HEADER_SIZE = 72
 IMAGE_OFFSET = 72
 NAME_MAX = 24
+SYMBOL_MAX = 48
 MAX_IMAGE = 64 * 1024
 MAX_BSS = 64 * 1024
 MAX_RELOCS = 256
@@ -216,6 +217,8 @@ def main(argv):
     def string_offset(text):
         if text in string_names:
             return string_names[text]
+        if len(text) > SYMBOL_MAX:
+            fail(f"import name {text!r} exceeds {SYMBOL_MAX} bytes")
         offset = len(strings)
         strings.extend(text.encode("ascii", errors="replace") + b"\0")
         if len(strings) > MAX_STRINGS:

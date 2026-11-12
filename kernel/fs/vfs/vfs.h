@@ -191,6 +191,11 @@ typedef struct {
  * -VFS_EROFS. An existing mount keeps serving if the new mount fails. */
 #define VFS_MOUNT_RDONLY 0x1u
 int vfs_register_fs(const vfs_fs_ops_t *ops);
+/* Remove a backend that no mount references any more. Returns 1, or a
+ * negative -VFS_E* errno (-ENOENT when it is not registered, -EBUSY while a
+ * mount still points at it). A loadable module unregisters through this
+ * before its image is freed, so a stale vfs_fs_ops_t never stays reachable. */
+int32_t vfs_unregister_fs(const vfs_fs_ops_t *ops);
 int32_t vfs_mount_root(const char *name);
 int32_t vfs_mount_root_flags(const char *name, uint32_t flags);
 /* Mount a registered backend at a canonical directory prefix ("" for the
@@ -198,6 +203,11 @@ int32_t vfs_mount_root_flags(const char *name, uint32_t flags);
  * below the prefix is resolved by that backend; a name that crosses mounts
  * fails with EXDEV and the mount point itself cannot be removed. */
 int32_t vfs_mount(const char *prefix, const char *name, uint32_t flags);
+/* Detach the backend at the prefix. Refused with -EBUSY while a descriptor
+ * opened through that mount is still live, and the root mount is never
+ * removable. The slot is reused by the next mount, so mount indices stay
+ * stable for open descriptions. Returns 1 or a negative -VFS_E* errno. */
+int32_t vfs_unmount(const char *prefix);
 /* 1 when a backend is mounted at the prefix. */
 int vfs_mounted(const char *prefix);
 /* Install a character device (the console) for the standard descriptors. */

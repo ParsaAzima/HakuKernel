@@ -791,16 +791,30 @@ def main():
     run([nasm, "-I" + nasm_include, "-f", "bin", vfork_asm, "-o", vfork_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", fault_asm, "-o", fault_elf])
 
-    # The demo module is assembled as a relocatable ELF32 object and packed
-    # into the kernel's .hkm container on the host. The kernel therefore
-    # never learns to parse ELF; it only applies the packed relocations.
-    module_asm = os.path.join(kernel_dir, "module", "demo", "haku_demo.asm")
-    module_obj = os.path.join(BUILD, "haku_demo.o")
-    module_hkm = os.path.join(BUILD, "MODULE.HKM")
+    # Modules are assembled as relocatable ELF32 objects and packed into the
+    # kernel's .hkm container on the host. The kernel therefore never learns
+    # to parse ELF; it only applies the packed relocations. The demo proves
+    # the loader, hello is a char device, and romfs is a filesystem — both
+    # capabilities are registered from module code and detached on unload.
+    module_specs = [
+        ("haku_demo.asm", "MODULE.HKM", "HAKU-DEMO"),
+        ("hello.asm", "HELLO.HKM", "HAKU-HELLO"),
+        ("romfs.asm", "ROMFS.HKM", "HAKU-ROMFS"),
+    ]
     module_pack_script = os.path.join(ROOT, "tools", "mkhakumod.py")
-    run([nasm, "-f", "elf32", module_asm, "-o", module_obj])
-    run([py, module_pack_script, module_obj, module_hkm,
-         "--name", "HAKU-DEMO"])
+    module_sources = []
+    module_archives = []
+    for source_name, image_name, module_name in module_specs:
+        module_source = os.path.join(kernel_dir, "module", "demo",
+                                     source_name)
+        module_object = os.path.join(BUILD,
+                                     os.path.splitext(source_name)[0] + ".o")
+        module_image = os.path.join(BUILD, image_name)
+        run([nasm, "-f", "elf32", module_source, "-o", module_object])
+        run([py, module_pack_script, module_object, module_image,
+             "--name", module_name])
+        module_sources.append(module_source)
+        module_archives.append(f"{image_name}={module_image}")
 
     # The user C library is linked into a fixed-base PE image, then repacked
     # as ELF32 so the existing loader can map RX/R/RW sections.
@@ -837,7 +851,7 @@ def main():
          f"init={init_override or user_elf}", f"HAKU.ELF={user_elf}",
          f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
          f"VFORK.ELF={vfork_elf}", f"FAULT.ELF={fault_elf}",
-         f"LIB.ELF={libtest_elf}", f"MODULE.HKM={module_hkm}",
+         f"LIB.ELF={libtest_elf}", *module_archives,
          "--dir=dev", "--dir=proc", "--dir=disk"])
 
     if mode in ("headless", "probe") or fresh or \
@@ -849,7 +863,7 @@ def main():
              f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
              f"FAULT.ELF={fault_elf}", f"LIB.ELF={libtest_elf}",
              f"VFORK.ELF={vfork_elf}", f"INITRD={initramfs_image}",
-             f"MODULE.HKM={module_hkm}"])
+             *module_archives])
         log(f"FAT12 program disk ready "
             f"({os.path.getsize(filesystem_image)} bytes)")
     else:
@@ -861,7 +875,8 @@ def main():
                            os.path.getmtime(child_asm),
                            os.path.getmtime(vfork_asm),
                            os.path.getmtime(fault_asm),
-                           os.path.getmtime(module_asm),
+                           max(os.path.getmtime(source)
+                               for source in module_sources),
                            os.path.getmtime(user_test_source),
                            max(os.path.getmtime(source)
                                for source in user_lib_sources))
@@ -1101,6 +1116,10 @@ def main():
             "HAKU-MODULE-EXIT", # delete_module called the module's exit hook
             "MODULE-LOAD-OK name=HAKU-DEMO",
             "MODULE-UNLOAD-OK name=HAKU-DEMO",
+            "USER-MODDEV-OK",  # a module registered /dev/hello and it read back
+            "HELLO-MODULE-OK",
+            "USER-ROMFS-OK",   # a module mounted a read-only filesystem at /rom
+            "ROMFS-MODULE-OK",
             "USER-EXIT-OK status=0 pid=1",
             "SCHED-REAP-OK",
             "FS-ERRORS-OK",  # missing/invalid/exists/badfd map to distinct errno

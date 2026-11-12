@@ -791,6 +791,129 @@ static void test_haku_module(void) {
     printf("USER-MODULE-OK: init_module delete_module ring0 demo\n");
 }
 
+/* Load a packed module from the boot namespace. The kernel copies the image,
+ * so the user buffer is released as soon as init_module returns. */
+static int load_module_image(const char *path) {
+    haku_stat64_t status;
+    unsigned char *image;
+    unsigned int size;
+    int total = 0;
+    int fd;
+
+    if (stat(path, &status) != 0 || status.st_size <= 0) return -1;
+    size = (unsigned int)status.st_size;
+    image = (unsigned char *)malloc(size);
+    if (!image) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        free(image);
+        return -1;
+    }
+    while (total < (int)size) {
+        int got = read(fd, image + total, size - (unsigned int)total);
+        if (got <= 0) break;
+        total += got;
+    }
+    close(fd);
+    if (total != (int)size) {
+        free(image);
+        return -1;
+    }
+    total = haku_syscall3(HAKU_SYS_INIT_MODULE, (int)image, total, 0);
+    free(image);
+    return total;
+}
+
+/* A character device is a capability a module can own: hello.asm registers
+ * /dev/hello, the kernel counts descriptors opened through it, and unload is
+ * refused until the last one closes. */
+static void test_haku_device_module(void) {
+    char buffer[64];
+    haku_stat64_t status;
+    int fd;
+    int length;
+
+    expect(stat("/dev/hello", &status) != 0, "/dev/hello starts absent");
+    expect(load_module_image("/HELLO.HKM") == 0,
+           "init_module registers /dev/hello");
+    fd = open("/dev/hello", O_RDONLY);
+    expect(fd >= 0, "open the module device");
+    if (fd >= 0) {
+        length = read(fd, buffer, sizeof(buffer));
+        expect(length == 25 &&
+                   strncmp(buffer, "hello from a haku module\n", 25) == 0,
+               "read returns the module's greeting");
+        expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-HELLO", 0) ==
+                   -EBUSY,
+               "delete_module refuses while the device is open");
+        close(fd);
+    }
+    expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-HELLO", 0) == 0,
+           "delete_module removes the device once closed");
+    expect_errno(open("/dev/hello", O_RDONLY), ENOENT,
+                 "the device name is gone after unload");
+    expect(load_module_image("/HELLO.HKM") == 0,
+           "the device slot is reusable after unload");
+    expect(stat("/dev/hello", &status) == 0, "/dev/hello is registered again");
+    expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-HELLO", 0) == 0,
+           "the reloaded device unloads too");
+    printf("USER-MODDEV-OK: module char device registered and removed\n");
+}
+
+/* A filesystem is the other capability: romfs.asm registers a read-only
+ * backend, mounts it at /rom and serves two files. Open descriptors pin the
+ * mount, so delete_module fails until the last one closes. */
+static void test_haku_romfs_module(void) {
+    char buffer[128];
+    haku_stat64_t status;
+    struct dirent *entry;
+    DIR *dir;
+    int fd;
+    int length;
+    int found_readme = 0;
+    int found_version = 0;
+
+    expect(stat("/rom", &status) != 0, "/rom starts unmounted");
+    expect(load_module_image("/ROMFS.HKM") == 0,
+           "init_module registers and mounts romfs");
+    expect(stat("/rom", &status) == 0 && S_ISDIR(status.st_mode),
+           "/rom is a directory");
+    expect(stat("/rom/README", &status) == 0 && S_ISREG(status.st_mode) &&
+               status.st_size > 0,
+           "/rom/README is a regular file");
+    fd = open("/rom/README", O_RDONLY);
+    expect(fd >= 0, "open a file from the module filesystem");
+    if (fd >= 0) {
+        length = read(fd, buffer, sizeof(buffer) - 1);
+        if (length > 0) buffer[length] = 0;
+        expect(length > 0 && strncmp(buffer, "Haku romfs:", 11) == 0,
+               "read returns the module's file contents");
+        expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-ROMFS", 0) ==
+                   -EBUSY,
+               "delete_module refuses while /rom is open");
+        close(fd);
+    }
+    dir = opendir("/rom");
+    if (dir) {
+        while ((entry = readdir(dir)) != 0) {
+            if (strcmp(entry->d_name, "README") == 0) found_readme = 1;
+            if (strcmp(entry->d_name, "VERSION") == 0) found_version = 1;
+        }
+        closedir(dir);
+    }
+    expect(found_readme == 1 && found_version == 1,
+           "readdir lists the module filesystem");
+    expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-ROMFS", 0) == 0,
+           "delete_module unmounts romfs");
+    expect_errno(open("/rom/README", O_RDONLY), ENOENT, "/rom is gone");
+    expect(load_module_image("/ROMFS.HKM") == 0,
+           "the mount and filesystem slots are reusable after unload");
+    expect(stat("/rom/VERSION", &status) == 0, "/rom is mounted again");
+    expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-ROMFS", 0) == 0,
+           "the reloaded filesystem unloads too");
+    printf("USER-ROMFS-OK: module filesystem mounted, read and unmounted\n");
+}
+
 /* The kernel builds the Linux initial stack: argc, argv[], NULL, envp[],
  * NULL, then the auxiliary vector. A libc reads AT_PAGESZ and AT_RANDOM
  * from it before main runs, so the shape has to be right even though this
@@ -1458,6 +1581,8 @@ int main(void) {
     test_syscall_errors();
     test_initramfs_root();
     test_haku_module();
+    test_haku_device_module();
+    test_haku_romfs_module();
 
     if (failures) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);
