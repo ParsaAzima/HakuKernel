@@ -63,6 +63,17 @@ compatibility is not a short-term goal.
   (`SMP-LOCK-OK counter=100000 expected=100000`); and a private GDT/TSS plus
   the shared IDT on each AP (`SMP-AP-GDT-OK`, `HAKU64-SMP-AP-GDT-OK`). The APs
   park with interrupts off; the bootstrap processor still runs every task.
+- [x] Loadable ring-0 modules (`haku module`): `tools/mkhakumod.py` packs a
+  NASM ELF32 object into a flat `.hkm` container (image, BSS, entry/exit
+  offsets, `R_386_32`/`R_386_PC32` relocations, import names), and
+  `init_module`/`delete_module` (Linux i386 128/129) validate, relocate and
+  run it against a six-entry kernel export table. A four-slot table with
+  `LOADING`/`LIVE`/`UNLOADING` states refuses duplicate and overlapping
+  calls. The headless run loads, double-loads, and unloads
+  `MODULE.HKM` (`USER-MODULE-OK`, `MODULE-LOAD-OK name=HAKU-DEMO`,
+  `MODULE-UNLOAD-OK name=HAKU-DEMO`, `HAKU-MODULE-OK`, `HAKU-MODULE-EXIT`).
+  Modules are trusted ring-0 code and the x86-64 kernel does not load them
+  yet.
 - [x] A statically linked musl binary booted as `/init` in Linux CI
   (`musl_probe`, `MUSL-PROBE-OK`): Linux-shaped initial stack and auxiliary
   vector, Linux-shaped `set_thread_area`, and the `_llseek`/`readv`/`writev`/

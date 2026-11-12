@@ -55,6 +55,11 @@ control and pipelines working.
 - **Syscalls** — the i386 numbers for a working file/process/memory/time/signal
   subset, validated user pointers, `-errno` results, and the 64-byte i386
   `struct stat` family that glibc and musl expect.
+- **Modules** — `haku module`: a packed `.hkm` container (built on the host by
+  `tools/mkhakumod.py` from a NASM ELF32 object) loaded with `init_module`,
+  relocated against a six-entry kernel export table, and unloaded with
+  `delete_module`. Modules are trusted ring-0 code; the 32-bit kernel loads
+  them today.
 - **Storage** — ATA PIO on both legacy channels with reset/retry recovery, a
   writable FAT12 driver, a VFS with per-process descriptors, `ramfs` root,
   `initramfs` (cpio newc), `/dev`, and a generated `/proc`.

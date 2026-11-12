@@ -71,6 +71,9 @@ Haku/
                         panic.c/.h: fatal handler + halted state message
                         crash.c/.h: register/MMU/stack crash reports
                         heap.c/.h: kernel kmalloc/kfree allocator
+    module/             haku_module.h: .hkm container layout, limits, loader API
+                        module.c: validation, relocation, export table, slots
+                        demo/haku_demo.asm: ring-0 demo module (MODULE.HKM)
   user/
     lib/              errno.c, fsabi.c, memory.c, mman.c, signal.c, stdio.c,
                       string.c, unistd.c, crt0.asm, syscall.asm: user C library
@@ -87,6 +90,7 @@ Haku/
   tools/pe2elf.py      fixed-base PE32 to ELF32 (RX/R/RW) for user C
   tools/mkelf64.py     flat x86-64 binary → static ELF64 (RX code + RW BSS) for
                       the 64-bit loader test
+  tools/mkhakumod.py   NASM ELF32 relocatable object → packed .hkm module
   .github/workflows/  ci.yml: hosted headless build/test + artifacts
                       release.yml: tag-driven bootable image release
   build.py             the whole build: cl/link/nasm/qemu orchestration

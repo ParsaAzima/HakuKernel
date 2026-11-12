@@ -51,7 +51,11 @@ copy-on-write `fork` and `vfork` (`USER-COW-OK`, `USER-VFORK-OK`,
 `VFORK-EXEC-RAN`), signal delivery and dispositions (`USER-SIGNAL-OK`),
 `clone`-created threads that share the address space and descriptors and
 report a distinct tid under the same pid (`USER-THREAD-OK`),
-the user C library (`USER-LIB-OK`), and timer IRQs
+the user C library (`USER-LIB-OK`), a packed ring-0 module that is loaded,
+refused twice under the same name, and unloaded again
+(`USER-MODULE-OK`, `MODULE-LOAD-OK name=HAKU-DEMO`,
+`MODULE-UNLOAD-OK name=HAKU-DEMO`, and the module's own
+`HAKU-MODULE-OK`/`HAKU-MODULE-EXIT` lines), and timer IRQs
 through the serial log.
 
 Both QEMU runs ask for two CPUs (`-smp 2`). The kernel parses the ACPI MADT,
@@ -120,8 +124,13 @@ existing image is reused untouched, so files created in a previous QEMU
 session survive the next build. It is (re)created from `kernel/arch/x86/user/user.asm`,
 `kernel/arch/x86/user/exec_target.asm`, `kernel/arch/x86/user/child.asm`,
 `kernel/arch/x86/user/vfork_target.asm`, the
-user library in `user/lib/`, and `user/tests/libtest.c` only when missing or
-with `--fresh`. If any test-program source is newer than a reused image,
+user library in `user/lib/`, `user/tests/libtest.c`, and the packed module
+`build/MODULE.HKM` only when missing or
+with `--fresh`. `MODULE.HKM` is assembled from
+`kernel/module/demo/haku_demo.asm` as an ELF32 object and packed by
+`tools/mkhakumod.py`; the same file goes into the initramfs and the FAT12
+seed disk, so the ring-3 test can read it by name either way. If any
+test-program or module source is newer than a reused image,
 the build warns that its test ELFs on disk may be stale. `headless` always
 starts from a fresh image (its fault-injection tests mutate the disk) and,
 after the serial-log check passes, re-verifies the post-run image on the

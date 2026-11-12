@@ -116,6 +116,34 @@ relocations, shared libraries, and images larger than the loader's limits
 (1280 KiB for a program read by the boot and exec paths, 384 KiB for the
 initramfs archive) are not supported.
 
+## Haku module loading
+
+`tools/mkhakumod.py` is the only code that understands ELF for modules. It
+accepts the subset a NASM `-f elf32` object uses (no `RELA`, no `COMMON`, no
+absolute symbols), rejects an object that does not define `haku_module_init`,
+extracts the addend from each relocated word and writes zero there, and emits
+the `.hkm` container described in `kernel/module/haku_module.h`. The demo
+source is `kernel/module/demo/haku_demo.asm`; `build.py` assembles it, packs it
+as `build/MODULE.HKM`, and installs that file in both the initramfs and the
+FAT12 seed disk, so a user program can read it and call `init_module`.
+
+The loader does no symbol table lookup at run time. The host has already
+reduced `haku_module_init`/`haku_module_exit` to offsets inside the image and
+turned every undefined symbol into an offset into the import-string table, so
+loading is: range-check the header, allocate `image + bss` from the heap, copy,
+then walk at most 256 relocation records. Each import name is matched with a
+fixed-length comparison against the six-entry export table — a deliberate
+linear scan over a tiny constant table, not a general hash lookup.
+
+Slot states make concurrent calls safe without holding a lock across a hook.
+`module_load` reserves the slot (copying the name and the function pointers
+while `LOADING`), releases the lock, and only then calls `init`, so a module
+that logs, allocates, or takes a while does not stall `delete_module` on
+another task, which in turn sees `-EBUSY` if it asks for that same name. Error
+mapping: bad container or relocation `-EINVAL`, unknown import `-ENOENT`,
+duplicate name `-EEXIST`, full table `-ENOSPC`, heap exhaustion `-ENOMEM`,
+overlapping load/unload `-EBUSY`.
+
 ## Why `link.exe` + `tools/pe2bin.py`?
 
 MS `link.exe` cannot emit flat binaries and raw COFF objects carry

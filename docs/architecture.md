@@ -520,6 +520,48 @@ What is *not* shared yet: the scheduler's current-task pointer, run-state
 bitmap and tick counters are still one set of globals, the timer still runs on
 the BSP, and nothing dispatches a task to an AP. Those are stage D.
 
+### Haku modules
+
+A Haku module is loadable ring-0 code in a flat, self-describing container, not
+an ELF object. The kernel has no ELF writer and does not learn one: the host
+tool `tools/mkhakumod.py` parses the ELF32 relocatable object NASM produces,
+lays the allocatable sections out back to back, records the BSS size and the
+entry/exit offsets, and reduces the `R_386_32`/`R_386_PC32` relocations to
+records the loader can apply. The `.hkm` layout (a 72-byte header followed by
+the image, the relocation records and a string table) is documented in
+`kernel/module/haku_module.h`; the kernel never reads an ELF header.
+
+Two relocation types exist. `R_386_32` computes `S + A` and `R_386_PC32`
+computes `S + A - P`, where `P` is the runtime address of the relocated word.
+The symbol is either an offset into the string table — resolved against the
+kernel's export table — or `HAKU_MODULE_SYM_BASE` (`0xFFFFFFFE`), which means
+"S is the module load base" and carries the section-relative target in the
+addend. A module links only against `haku_module_log`, `haku_module_log_dec`,
+`haku_module_log_hex`, `haku_module_ticks`, `haku_module_alloc`, and
+`haku_module_free`; the lookup is a linear scan over six entries, so loading is
+`O(relocations × exports)` with both bounded by constants.
+
+The loader (`kernel/module/module.c`) validates every field against the file
+size and the fixed limits (64 KiB image, 64 KiB BSS, 256 relocations, 4 KiB of
+import names), allocates and zeroes `image + bss`, copies the image, applies
+the relocations, and only then publishes the name. A four-slot table tracks
+each module as `FREE`, `LOADING`, `LIVE`, or `UNLOADING`, and the transitions
+run under `spin_lock_irqsave`, so a second load or unload of the same name
+reports `-EBUSY` instead of racing the hooks. `init_module` runs the module's
+`int haku_module_init(void)` after the slot is reserved and drops the module if
+it returns non-zero; `delete_module` calls the optional
+`void haku_module_exit(void)` and frees the image. Markers:
+`MODULE-LOAD-OK name=HAKU-DEMO` and `MODULE-UNLOAD-OK name=HAKU-DEMO`, with the
+demo module printing `HAKU-MODULE-OK`/`HAKU-MODULE-EXIT` from its own relocated
+code.
+
+Modules are trusted kernel code. The validation is a container check: it stops
+a truncated or corrupt file from making the loader read out of bounds, but it
+cannot sandbox code written maliciously, because the module runs in ring 0 with
+the kernel's privileges. Images are allocated from the writable kernel heap, so
+only the 32-bit kernel loads modules today; the x86-64 kernel would need
+executable heap mappings first.
+
 ### Physical frame allocator
 
 `kernel/arch/x86/mm/frame.c` now builds its usable-frame bitmap from the 64-bit base and
