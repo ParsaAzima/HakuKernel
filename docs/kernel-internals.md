@@ -122,27 +122,45 @@ initramfs archive) are not supported.
 accepts the subset a NASM `-f elf32` object uses (no `RELA`, no `COMMON`, no
 absolute symbols), rejects an object that does not define `haku_module_init`,
 extracts the addend from each relocated word and writes zero there, and emits
-the `.hkm` container described in `kernel/module/haku_module.h`. The demo
-source is `kernel/module/demo/haku_demo.asm`; `build.py` assembles it, packs it
-as `build/MODULE.HKM`, and installs that file in both the initramfs and the
-FAT12 seed disk, so a user program can read it and call `init_module`.
+the `.hkm` container described in `kernel/module/haku_module.h`. `build.py`
+assembles three modules, packs `build/MODULE.HKM`, `build/HELLO.HKM`, and
+`build/ROMFS.HKM`, and installs them in both the initramfs and the FAT12 seed
+disk, so a user program can read them and call `init_module`. `haku_demo.asm`
+proves relocation and logging, `hello.asm` registers a character device, and
+`romfs.asm` registers and mounts a read-only filesystem.
 
 The loader does no symbol table lookup at run time. The host has already
 reduced `haku_module_init`/`haku_module_exit` to offsets inside the image and
 turned every undefined symbol into an offset into the import-string table, so
 loading is: range-check the header, allocate `image + bss` from the heap, copy,
-then walk at most 256 relocation records. Each import name is matched with a
-fixed-length comparison against the six-entry export table — a deliberate
-linear scan over a tiny constant table, not a general hash lookup.
+then walk at most 256 relocation records. Each import name is matched against
+the eleven-entry export table with an exact, 48-byte-bounded comparison — a
+deliberate linear scan over a tiny constant table, not a general hash lookup.
 
 Slot states make concurrent calls safe without holding a lock across a hook.
 `module_load` reserves the slot (copying the name and the function pointers
-while `LOADING`), releases the lock, and only then calls `init`, so a module
-that logs, allocates, or takes a while does not stall `delete_module` on
-another task, which in turn sees `-EBUSY` if it asks for that same name. Error
-mapping: bad container or relocation `-EINVAL`, unknown import `-ENOENT`,
-duplicate name `-EEXIST`, full table `-ENOSPC`, heap exhaustion `-ENOMEM`,
-overlapping load/unload `-EBUSY`.
+while `LOADING`), releases the lock, claims the single `module_api_owner` token,
+and only then calls `init`, so a module that logs, allocates, or takes a while
+does not stall `delete_module` on another task, which in turn sees `-EBUSY` if
+it asks for that same name. The token is what makes the capability calls safe:
+`haku_module_register_device`, `haku_module_register_fs`, and
+`haku_module_mount` bind the resource to the slot that is currently running its
+init hook, and report `-EPERM` from anywhere else — including the exit hook.
+
+Teardown is detached-before-free. `delete_module` marks the slot `UNLOADING`,
+unmounts the module's prefix (`-EBUSY` while any open description points at
+that mount), unregisters the filesystem (`-EBUSY` while a mount still uses the
+table), and removes the device (`-EBUSY` while a descriptor is open). Only when
+all three succeed does it run `haku_module_exit`, free the image, and clear the
+slot; a failure restores `LIVE` and returns the error. A failed init gets the
+same teardown, and if a concurrent open pins the new resource the module stays
+loaded and the load reports `-EBUSY` instead of freeing live code. Mount slots
+and devfs slots are reused after unload, so an existing open description's
+mount index never shifts.
+
+Error mapping: bad container or relocation `-EINVAL`, unknown import
+`-ENOENT`, duplicate name `-EEXIST`, full table `-ENOSPC`, heap exhaustion
+`-ENOMEM`, overlapping load/unload or a capability still in use `-EBUSY`.
 
 ## Why `link.exe` + `tools/pe2bin.py`?
 

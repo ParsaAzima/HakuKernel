@@ -337,15 +337,19 @@ Loadable modules use the Linux i386 numbers `init_module` (128) and
 in [architecture](architecture.md#haku-modules), not an ELF object.
 `init_module(image, len, params)` copies at most 73 800 bytes of the caller's
 image into the kernel heap, validates and relocates it, runs its
-`haku_module_init`, and keeps it if that returns zero. `params` has no
+`haku_module_init`, and keeps it if that returns zero (a negative return is
+propagated; any other non-zero return becomes `-EINVAL`). `params` has no
 meaning and is accepted only when it is NULL or a readable pointer; the call
 reports `-E2BIG` for an oversized buffer and `-EINVAL` for a bad container.
 `delete_module(name, flags)` requires `flags == 0`, copies at most 24
-characters of the name page by page, runs `haku_module_exit` when the module
-has one, and reports `-ENOENT` for a name that is not loaded. The calls are
-not restricted by uid — Haku has a single privileged user — but module code
-runs in ring 0, so only a loader that already trusts the image should call
-`init_module`.
+characters of the name page by page, and reports `-ENOENT` for a name that is
+not loaded. A module that registered a device or a filesystem is detached
+first: the call reports `-EBUSY` while a descriptor opened through that device
+or mount is still live, and leaves the module loaded and usable. When the
+teardown succeeds it runs `haku_module_exit` (which can no longer register
+anything) and frees the image. The calls are not restricted by uid — Haku has a
+single privileged user — but module code runs in ring 0, so only a loader that
+already trusts the image should call `init_module`.
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
@@ -412,13 +416,16 @@ userland; conformance is not a goal. What exists, by area:
   `chmod`/`chown`/`fchmod`/`fchown` (accepted,
   nothing to change).
 - **Time:** `gettimeofday`, `nanosleep`.
-- **Modules:** `init_module` (packed `.hkm` image, params ignored),
-  `delete_module` (runs the exit hook and frees the image).
+- **Modules:** `init_module` (packed `.hkm` image, params ignored; the module
+  may register a device and mount a filesystem while its init hook runs),
+  `delete_module` (detaches those resources first, reports `-EBUSY` while a
+  descriptor still uses them, then runs the exit hook and frees the image).
 - **Haku-specific:** `spawn`, `getusage`, `futex`.
 
 Deliberately absent: job-control stop/continue states (the group and session
 calls are real, but stop signals still end a process), hard links, file-backed
-mappings, `socket`, `mount` (the boot namespace is fixed at boot), networking,
+mappings, `socket`, a user-facing `mount` (users cannot reparent the boot
+namespace; loadable modules mount their own prefix during init), networking,
 and loadable modules on the x86-64 kernel (its heap pages are not executable).
 `clone`-created threads are present: a thread shares the caller's address
 space, descriptors and signal dispositions, reports the process id from

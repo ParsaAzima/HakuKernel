@@ -71,9 +71,13 @@ Haku/
                         panic.c/.h: fatal handler + halted state message
                         crash.c/.h: register/MMU/stack crash reports
                         heap.c/.h: kernel kmalloc/kfree allocator
-    module/             haku_module.h: .hkm container layout, limits, loader API
-                        module.c: validation, relocation, export table, slots
+    module/             haku_module.h: .hkm container layout, limits, loader API,
+                                        kernel exports a module may import
+                        module.c: validation, relocation, export table, slots,
+                                  capability ownership and teardown
                         demo/haku_demo.asm: ring-0 demo module (MODULE.HKM)
+                        demo/hello.asm: /dev/hello character device (HELLO.HKM)
+                        demo/romfs.asm: read-only /rom filesystem (ROMFS.HKM)
   user/
     lib/              errno.c, fsabi.c, memory.c, mman.c, signal.c, stdio.c,
                       string.c, unistd.c, crt0.asm, syscall.asm: user C library

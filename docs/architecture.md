@@ -536,10 +536,17 @@ computes `S + A - P`, where `P` is the runtime address of the relocated word.
 The symbol is either an offset into the string table — resolved against the
 kernel's export table — or `HAKU_MODULE_SYM_BASE` (`0xFFFFFFFE`), which means
 "S is the module load base" and carries the section-relative target in the
-addend. A module links only against `haku_module_log`, `haku_module_log_dec`,
-`haku_module_log_hex`, `haku_module_ticks`, `haku_module_alloc`, and
-`haku_module_free`; the lookup is a linear scan over six entries, so loading is
-`O(relocations × exports)` with both bounded by constants.
+addend. A module links only against the kernel's export table; the lookup is a
+linear scan over eleven entries, so loading is `O(relocations × exports)` with
+both bounded by constants. The exports are six utilities (`haku_module_log`,
+`haku_module_log_dec`, `haku_module_log_hex`, `haku_module_ticks`,
+`haku_module_alloc`, `haku_module_free`), three capability calls
+(`haku_module_register_device`, `haku_module_register_fs`,
+`haku_module_mount`), and two struct fillers (`haku_module_fill_stat`,
+`haku_module_fill_dirent`) that keep the kernel's `vfs_stat_t` and
+`vfs_dirent_t` layouts out of assembly. Imported names have their own
+48-byte bound (`HAKU_MODULE_SYMBOL_MAX`), because an export such as
+`haku_module_register_device` is longer than a 24-byte module name.
 
 The loader (`kernel/module/module.c`) validates every field against the file
 size and the fixed limits (64 KiB image, 64 KiB BSS, 256 relocations, 4 KiB of
@@ -548,12 +555,62 @@ the relocations, and only then publishes the name. A four-slot table tracks
 each module as `FREE`, `LOADING`, `LIVE`, or `UNLOADING`, and the transitions
 run under `spin_lock_irqsave`, so a second load or unload of the same name
 reports `-EBUSY` instead of racing the hooks. `init_module` runs the module's
-`int haku_module_init(void)` after the slot is reserved and drops the module if
-it returns non-zero; `delete_module` calls the optional
-`void haku_module_exit(void)` and frees the image. Markers:
-`MODULE-LOAD-OK name=HAKU-DEMO` and `MODULE-UNLOAD-OK name=HAKU-DEMO`, with the
-demo module printing `HAKU-MODULE-OK`/`HAKU-MODULE-EXIT` from its own relocated
-code.
+`int haku_module_init(void)` after the slot is reserved, propagates a negative
+return from the hook, and otherwise maps a non-zero return to `-EINVAL`.
+
+#### Capabilities owned by a module
+
+A module is more than code: it can expose kernel functionality. There are two
+capability kinds, and the module slot owns them:
+
+- a character device, registered in devfs and reached as `/dev/<name>`;
+- a filesystem backend (`vfs_fs_ops_t`), mounted once at a non-root prefix.
+
+Registration is only valid while that slot's init hook is running. The loader
+sets a single `module_api_owner` token around the hook, so the three
+registration calls answer `-EPERM` from any other context — including the
+module's own exit hook, which runs with no token. Each slot may own at most one
+device and one filesystem, and may mount that filesystem once. The root prefix
+is refused: a module adds a namespace instead of replacing the boot one.
+
+Unloading is ordered so freed module code is never reachable. `delete_module`
+first detaches the mount, then unregisters the filesystem, then removes the
+device. Each step checks its own liveness:
+
+- `vfs_unmount` refuses the root, reports `-ENOENT` when no backend is mounted
+  at the prefix, and reports `-EBUSY` while any open file description carries
+  that mount's index. The slot keeps its index but is skipped by path
+  resolution and reused by the next `vfs_mount`, so descriptors that were
+  already open never observe a shifted index.
+- `vfs_unregister_fs` reports `-EBUSY` while a mount still points at the
+  `vfs_fs_ops_t` and only then compacts the backend table (`VFS_MAX_FS` is 8,
+  up from 4, so a module filesystem fits).
+- `devfs_unregister_device` reports `-EBUSY` while a descriptor is open on the
+  device. The devfs table has six built-in slots plus four module slots, and
+  each slot carries an `opens` refcount; a module name is copied into kernel
+  storage because the module image is freed at unload.
+
+If any of those checks fails, `delete_module` restores `MODULE_LIVE` and
+returns the error, leaving the module fully usable; closing the last descriptor
+makes the next unload succeed. A failing init hook gets the same teardown, and
+if a concurrent open pins the fresh resource the module stays `LIVE` and
+`init_module` reports `-EBUSY` rather than freeing an image that is still in
+use.
+
+`build.py` packs three modules and installs them in both the initramfs and the
+FAT12 seed disk:
+
+- `MODULE.HKM` from `haku_demo.asm` proves relocation and logging
+  (`HAKU-MODULE-OK`/`HAKU-MODULE-EXIT`);
+- `HELLO.HKM` from `hello.asm` registers `/dev/hello`, a read-only character
+  device that returns `hello from a haku module\n` (`HELLO-MODULE-OK`);
+- `ROMFS.HKM` from `romfs.asm` registers a read-only filesystem and mounts it at
+  `/rom` with `README` and `VERSION` (`ROMFS-MODULE-OK`).
+
+The user-library test drives each one: it opens the device and the files,
+checks that `delete_module` reports `-EBUSY` while a descriptor is open, closes
+it, unloads, and reloads to prove the slots are reusable
+(`USER-MODDEV-OK`, `USER-ROMFS-OK`).
 
 Modules are trusted kernel code. The validation is a container check: it stops
 a truncated or corrupt file from making the loader read out of bounds, but it

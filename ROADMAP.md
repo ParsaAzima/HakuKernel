@@ -67,10 +67,18 @@ compatibility is not a short-term goal.
   NASM ELF32 object into a flat `.hkm` container (image, BSS, entry/exit
   offsets, `R_386_32`/`R_386_PC32` relocations, import names), and
   `init_module`/`delete_module` (Linux i386 128/129) validate, relocate and
-  run it against a six-entry kernel export table. A four-slot table with
+  run it against an eleven-entry kernel export table. A four-slot table with
   `LOADING`/`LIVE`/`UNLOADING` states refuses duplicate and overlapping
-  calls. The headless run loads, double-loads, and unloads
-  `MODULE.HKM` (`USER-MODULE-OK`, `MODULE-LOAD-OK name=HAKU-DEMO`,
+  calls. A module can own real kernel capabilities: `haku_module_register_device`
+  adds a `/dev` entry with an open refcount, and
+  `haku_module_register_fs` + `haku_module_mount` register and mount a
+  filesystem at a non-root prefix. Registration is bound to the slot whose init
+  hook is running; unload detaches the mount, filesystem, and device first and
+  reports `-EBUSY` while a descriptor still uses them, so freed module code is
+  never reachable. `HELLO.HKM` (`/dev/hello`) and `ROMFS.HKM` (`/rom`) exercise
+  both paths in the headless run (`USER-MODDEV-OK`, `HELLO-MODULE-OK`,
+  `USER-ROMFS-OK`, `ROMFS-MODULE-OK`) alongside the original `MODULE.HKM`
+  (`USER-MODULE-OK`, `MODULE-LOAD-OK name=HAKU-DEMO`,
   `MODULE-UNLOAD-OK name=HAKU-DEMO`, `HAKU-MODULE-OK`, `HAKU-MODULE-EXIT`).
   Modules are trusted ring-0 code and the x86-64 kernel does not load them
   yet.

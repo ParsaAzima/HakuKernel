@@ -49,7 +49,12 @@ instead of calling the backend, including writes through a descriptor that
 was opened before the remount. A mount point cannot be unlinked, renamed, or
 removed (`EBUSY`), a `rename` that would cross two mounts reports `EXDEV`, and
 a mount point directory must exist in the parent filesystem so it shows up in
-a listing. Disk I/O is serialized
+a listing. The mount table is also mutable at run time from kernel code:
+`vfs_unmount` detaches a non-root prefix (refusing while any open descriptor
+still points at that mount) and frees its slot for reuse, and
+`vfs_unregister_fs` compacts the backend table once no mount refers to a
+vector. That is what lets a loadable module add a filesystem and disappear
+cleanly. Disk I/O is serialized
 against the preemptive scheduler; file contents and directory/FAT metadata
 are written through to the ATA disk. The current VFS supports up to five
 simultaneously open regular files per process (descriptors 3-7; `0`/`1`/`2`
@@ -129,10 +134,13 @@ archive still boots the old way with FAT12 as the root.
   so nothing survives a reboot — which is exactly what an initramfs needs.
   Unlinking a file that is still open keeps the data alive until the last
   descriptor closes, the same promise FAT12 makes.
-- **`devfs`** (`kernel/fs/devfs`) is a fixed table of `/dev/null`, `/dev/zero`,
-  `/dev/urandom`, `/dev/random`, `/dev/console`, and `/dev/tty`. These are
-  ordinary descriptors on the normal read/write path; `seek` reports `ESPIPE`
-  and the entries cannot be unlinked or renamed.
+- **`devfs`** (`kernel/fs/devfs`) has six built-in entries — `/dev/null`,
+  `/dev/zero`, `/dev/urandom`, `/dev/random`, `/dev/console`, and `/dev/tty` —
+  plus four slots a loadable module can fill with `devfs_register_device`. Each
+  slot counts the descriptors open on it, so a module cannot be unloaded while
+  someone still holds its device. These are ordinary descriptors on the normal
+  read/write path; `seek` reports `ESPIPE` and the entries cannot be unlinked
+  or renamed.
 - **`procfs`** (`kernel/fs/procfs`) generates `/proc/version`, `/proc/uptime`,
   and `/proc/meminfo` when the file is opened, so a `cat` sees current values.
   It is read-only: writes report `EACCES`, and the entries cannot be removed.
