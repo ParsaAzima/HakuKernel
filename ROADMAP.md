@@ -15,7 +15,8 @@ compatibility is not a short-term goal.
   memory-map-sized supervisor direct map, and separate user address spaces.
 - [x] Size the frame pool and direct map from the detected RAM instead of a
   fixed 128 MiB (`paging_init` reads the highest usable E820 address and
-  maps that much up to the 1020 MiB the 32-bit address space can reach;
+  maps that much up to the 1000 MiB the 32-bit address space can reach once
+  the local-APIC page and ACPI window are reserved;
   bitmaps, direct-map tables, and frame reference counters are sized at boot,
   `MEM-OK` reports the result, and `/proc/meminfo` describes physical memory
   rather than the kernel heap).
@@ -54,6 +55,14 @@ compatibility is not a short-term goal.
   filesystem, with `/init` running as PID 1 (`INITRAMFS-UNPACK-OK`,
   `INIT-READ-OK name=init`); media without an archive still boots FAT12 as
   the root.
+- [x] SMP bring-up stages A to C: ACPI MADT discovery, a shared xAPIC driver,
+  and real-mode trampolines that bring the application processors online on
+  the 32-bit (`SMP-OK cpus=2`, `SMP-AP-OK cpu=1`) and x86-64
+  (`HAKU64-SMP-OK: cpus=2`, `HAKU64-SMP-AP-OK cpu=1`) kernels; atomic
+  `xchg` spinlocks whose cross-CPU counter check passes
+  (`SMP-LOCK-OK counter=100000 expected=100000`); and a private GDT/TSS plus
+  the shared IDT on each AP (`SMP-AP-GDT-OK`, `HAKU64-SMP-AP-GDT-OK`). The APs
+  park with interrupts off; the bootstrap processor still runs every task.
 - [x] A statically linked musl binary booted as `/init` in Linux CI
   (`musl_probe`, `MUSL-PROBE-OK`): Linux-shaped initial stack and auxiliary
   vector, Linux-shaped `set_thread_area`, and the `_llseek`/`readv`/`writev`/
@@ -247,6 +256,39 @@ address-space or descriptor sharing.
   attributes timer ticks by CPL and counts syscalls plus voluntary and
   involuntary switches; `getusage` (0x1001) returns a 64-byte snapshot;
   `USER-USAGE-OK` covers growth, release, tick, syscall, and peak deltas).
+
+**SMP (staged).** Stage A brought the 32-bit kernel's application processors
+online, stage B did the same for x86-64, and stage C gave them state they can
+touch together; all three are described in
+[architecture](docs/architecture.md#smp-acpi-the-local-apic-and-application-processors).
+The APs park and the bootstrap processor schedules. The remaining work is what
+makes a second scheduling CPU safe:
+
+- [ ] Per-CPU state: a per-CPU block (current task, idle context, tick
+  counters, run-state bitmap, kernel stack) reached through a fixed register
+  or `GS` base, replacing the scheduler's single set of globals.
+- [x] Atomic kernel locks: `spin_lock`/`spin_lock_irqsave` acquire with a
+  `LOCK`-implicit `xchg` and release with a plain store, and the APs prove it
+  by incrementing a non-atomic counter under the lock
+  (`SMP-LOCK-OK counter=100000 expected=100000`). `irq_lock` keeps its
+  interrupt-mask semantics, which is still what serialises a task against the
+  timer on one CPU.
+- [x] Per-CPU GDT/TSS: each AP gets a private descriptor table with the same
+  flat segments and its own TSS, so a ring-3 entry on that CPU uses its own
+  `RSP0`/`esp0` and IST stacks; the shared IDT is loaded on the AP too
+  (`SMP-AP-GDT-OK`, `HAKU64-SMP-AP-GDT-OK`). The 32-bit tables are static, the
+  x86-64 tables come from the frame allocator on the BSP because it is not yet
+  cross-CPU safe.
+- [ ] Per-CPU timer: program the AP's local-APIC timer (or hand the PIT to
+  one CPU and use the LAPIC timer on the others) and drive the scheduler from
+  whichever CPU takes the tick.
+- [ ] Wake the APs into the scheduler, add task affinity/load balancing, and
+  assert real concurrency with a marker that proves two tasks ran on two
+  different CPUs (for example, a shared counter advanced by two tasks pinned
+  to different CPUs).
+- [ ] Make the frame allocator, heap and VFS safe to call from an AP; they
+  are still called from the BSP only, which is why the AP's descriptor table
+  is prepared on the BSP.
 
 **Acceptance criteria:** A process blocked on I/O does not prevent other
 processes from making progress; allocator stress tests complete without frame
@@ -755,7 +797,8 @@ set; the 32-bit image keeps working from the same tree.
 
 These features require separate milestones and design decisions:
 
-- SMP and architectures other than x86 (x86-64 itself is Milestone 8).
+- Architectures other than x86; SMP beyond the staged bring-up tracked in
+  Milestone 4.
 - Networking, TCP/IP, USB, audio, and a complete graphical interface.
 - Full POSIX and glibc compatibility, a dynamic linker, and shared
   libraries; the userland target is a statically linked musl userland

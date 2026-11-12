@@ -38,6 +38,20 @@ told apart from a `ud2` that the compiler emitted for an unreachable path.
 - `spin_lock_irqsave`/`spin_unlock_irqrestore` — a spinlock whose holder also
   disables interrupts, making it non-preemptible and safe from IRQ context.
 
+Acquisition is atomic across CPUs: the spinlocks exchange with `xchg` (a
+locked bus operation) and release with a plain store, so an application
+processor entering the critical section at the same instant as the bootstrap
+processor cannot both succeed. Interrupts are still what serialises a task
+against its own timer preemption on one CPU, so the interrupt-save variant
+keeps `cli`.
+
+The state *inside* the critical sections is still per-machine, not per-CPU:
+the scheduler keeps one current task, one run-state bitmap and one tick
+counter, and only the bootstrap processor takes timer interrupts. Running
+tasks on a second CPU needs per-CPU blocks and a per-CPU timer; that is the
+remaining SMP work in the
+[roadmap](../ROADMAP.md#4-concurrency-and-memory-management).
+
 The locking rules per subsystem:
 
 - **Scheduler**: every task-array mutation runs with interrupts disabled (in an

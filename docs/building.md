@@ -26,7 +26,7 @@ python build.py shell           :: boot a busybox ash shell (interactive)
 python build.py shell --check   :: scripted shell run, assert its markers
 python build.py x64             :: build haku64.img (64-bit kernel) and boot it
 python build.py probe --init=X  :: boot an external ELF as /init, check markers
-python build.py --memory=1024   :: guest RAM in MiB (default 512, kernel cap 1020)
+python build.py --memory=1024   :: guest RAM in MiB (default 512, 32-bit map cap 1000)
 python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
@@ -34,7 +34,10 @@ The kernel does not assume a memory size: it reads the E820 map, sizes the
 supervisor direct map and the frame pool from it, and reports both in the
 boot log (`MEM-OK: usable=…kB free=…kB direct-map=…MB`). `--memory=` only
 changes how much RAM QEMU gives the guest; the kernel uses whatever it finds,
-up to the 1020 MiB the 32-bit address space can map without PAE.
+up to the 1000 MiB the 32-bit address space can map without PAE. The last
+usable page-directory entries belong to the local APIC (`0xFEE00000`) and the
+ACPI scratch window, so the 32-bit direct map stops there. The x86-64 build
+maps RAM with 2 MiB pages and has no such ceiling.
 
 `python build.py headless` verifies ATA detection on both legacy channels
 (`ATA-SCAN-OK devices=2`), the software-reset recovery path
@@ -50,6 +53,19 @@ copy-on-write `fork` and `vfork` (`USER-COW-OK`, `USER-VFORK-OK`,
 report a distinct tid under the same pid (`USER-THREAD-OK`),
 the user C library (`USER-LIB-OK`), and timer IRQs
 through the serial log.
+
+Both QEMU runs ask for two CPUs (`-smp 2`). The kernel parses the ACPI MADT,
+enables its local APIC and starts the second processor through a real-mode
+trampoline; the AP comes online, loads a private GDT/TSS and the shared IDT,
+parks on a private stack with interrupts off, and the bootstrap processor
+keeps the timer and the scheduler. The headless check asserts
+`SMP-OK cpus=2` and `SMP-AP-OK cpu=1` (32-bit) or `HAKU64-SMP-OK: cpus=2` and
+`HAKU64-SMP-AP-OK cpu=1` (x86-64), so a machine that silently stayed
+uniprocessor fails the run. It also runs a cross-CPU lock test — each CPU
+increments a plain counter under the spinlock — and asserts
+`SMP-LOCK-OK counter=100000 expected=100000` plus `SMP-AP-GDT-OK` (the
+`HAKU64-` prefixed markers on x86-64), which catches a non-atomic lock or a TSS
+that still belongs to the bootstrap processor.
 
 `python build.py x64` builds and boots `haku64.img` separately and asserts
 its own marker set. That run starts a fresh FAT12 data disk

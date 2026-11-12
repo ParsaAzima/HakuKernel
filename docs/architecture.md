@@ -28,7 +28,7 @@ Memory map:
 | `0x1000–0x4000` | x86-64 boot: PML4, PDPT and PD (1 GiB identity map, 2 MiB pages) |
 | `0x400000–0x500000` | direct-map page tables (one per 4 MiB of mapped RAM) |
 | `0xC0000000–0xC0400000` | supervisor framebuffer window (one page-directory entry) |
-| `0xC0400000–0xFFFFFFFF` | supervisor direct map of physical `0–1020 MiB`, sized from E820 at boot |
+| `0xC0400000–0xFFFFFFFF` | supervisor direct map of physical `0–1000 MiB`, sized from E820 at boot (the last two PDEs are the local-APIC page and the ACPI window) |
 | `0x100000–0x400000` | kernel heap (kmalloc/kfree, 16 B aligned) |
 | `0x90000` | bootstrap kernel stack top (grows down) |
 | low E820 frames (often 4–8 MiB) | per-process 8 KiB kernel stacks, accessed through the direct map |
@@ -72,10 +72,10 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
 
 The physmap is why the 64-bit build has no equivalent of the 32-bit
-1020 MiB ceiling: one page directory covers a GiB with 2 MiB pages, so
+1000 MiB ceiling: one page directory covers a GiB with 2 MiB pages, so
 mapping 5 GiB costs five directories and no page tables. A 4 GiB guest
 reports `physmap=5120MiB` and a 5120 MiB frame limit; the 32-bit image on
-the same machine stops at 1020 MiB.
+the same machine stops at 1000 MiB.
 
 Interrupts follow the 32-bit model with 64-bit frames: `isr64.asm` has one
 stub per vector, pushes a zero in the error-code slot for the vectors the CPU
@@ -418,6 +418,100 @@ triple-faulting. The syscall gate at vector 128 is DPL 3; all other gates
 remain ring-0-only. All are interrupt gates, so handlers run with IF clear.
 The boot proves the exception path with an `INT3` self-test.
 
+### SMP: ACPI, the local APIC and application processors
+
+SMP bring-up is staged, and stages A through C are implemented: both kernels
+discover the machine's processors, enable the local APIC, start every
+application processor, give it its own descriptor table, TSS and the shared
+IDT, and park it. Stages A and B are the bring-up itself; stage C is the
+shared state a second CPU needs — atomic spinlocks and per-CPU descriptor
+tables. Scheduling on the APs is still stage D, so all tasks run on the
+bootstrap processor (BSP) and the APs sit in a `cli`/`hlt` loop on a private
+stack.
+
+Three pieces are shared by both builds:
+
+- `kernel/drivers/acpi.c` finds the RSDP (extended BIOS data area, then the
+  `0xE0000–0xFFFFF` firmware window), follows the RSDT or XSDT, and parses the
+  MADT's local-APIC (type 0), x2APIC (type 9) and MMIO-override (type 5)
+  entries. AML and the ACPI interpreter are not implemented, and neither is
+  anything else the kernel does not need at boot. All walks are bounded by the
+  tables' own lengths and small hard caps.
+- `kernel/drivers/apic.c` drives the xAPIC register page: it enables the unit
+  through `SVR`, sets `TPR` to zero, masks every LVT input except LINT0, and
+  sends INIT/SIPI IPIs. LINT0 is programmed for ExtINT, which is what keeps
+  the 8259 PIC usable after the APIC is enabled — with the unit on, the PIC's
+  output reaches the CPU through LINT0, and leaving that input masked would
+  silently lose every hardware interrupt.
+- A per-architecture hook maps ACPI tables and the APIC page, because each
+  build reaches physical memory differently.
+
+The 32-bit build (`kernel/arch/x86/kernel/smp.c`) copies
+`ap_trampoline.asm` to physical `0x8000` (dead stage-2 space, inside the
+identity map and the vector the SIPI names), passes the kernel page directory,
+a direct-mapped stack, the CPU index and the C entry point in a four-word
+parameter block at `0x8F00`, then performs INIT-SIPI-SIPI. The trampoline
+takes the AP from real mode to protected mode, loads CR3, enables paging and
+calls `smp_ap_entry`. The local APIC is identity mapped at `0xFEE00000`
+(page-directory entry 1019) and that entry is copied into every process
+directory, so an interrupt or IPI never depends on which CR3 is loaded.
+ACPI tables are read through a two-page scratch window at `0xFF000000`.
+
+The x86-64 build (`kernel/arch/x86_64/kernel/smp64.c`) uses
+`ap_trampoline64.asm`, which walks an AP through protected mode with PAE,
+sets `EFER.LME|NXE`, enables paging and far-jumps into a 64-bit code segment.
+It reuses the BSP's PML4, so no page tables are built on the AP. The APIC page
+lives in its own uncached PML4 slot (`K64_LAPIC_VIRT`, PCD+PWT) and is copied
+into every per-process PML4; ACPI tables are read through a separate window in
+slot 384. The two windows are why the 64-bit identity-mapped probe used by the
+exception self-test lives in slot 416.
+
+`python build.py headless` and `python build.py x64` both boot with `-smp 2`
+and assert `SMP-OK cpus=2`/`SMP-AP-OK cpu=1` and
+`HAKU64-SMP-OK: cpus=2`/`HAKU64-SMP-AP-OK cpu=1` respectively.
+
+#### Stage C: state a second CPU can share
+
+Three things had to change before an AP could do anything beyond parking.
+
+- **Atomic spinlocks.** `spin_lock` and `spin_lock_irqsave` now acquire with
+  `xchg`, which is implicitly locked with a memory operand, so two CPUs
+  entering together cannot both see a free lock. `spin_unlock` is a plain
+  store: x86 does not move earlier stores past a later one, so the critical
+  section is visible before the lock is released. The poll before each retry
+  is an ordinary volatile read plus a `pause` hint; a stale value costs a
+  spin, never the lock. The x86-64 build uses the same exchange through
+  `cpu_atomic_exchange64`, which also backs its disk mutex. `cli` is still
+  what protects the interrupt-save variant, but it is no longer what makes
+  the acquisition atomic — on one CPU that was enough, on two it was not.
+- **Per-CPU GDT/TSS.** A TSS is a single object, so each CPU needs its own, and
+  the 32-bit build cannot put one behind the same table without a private
+  copy. `gdt_init_ap(cpu, stack_top)` fills, loads and `LTR`s a private table
+  with flat ring-0/ring-3 descriptors and the same selector values, then
+  `tss.rsp0` (`esp0` on 32-bit) points at that CPU's kernel stack. Both
+  tables describe identical segments, so the cached CS/SS stay valid and
+  `gdt_load` does not reload them. The x86-64 build allocates the table, TSS
+  and two IST stacks with the frame allocator *on the BSP* — the allocator is
+  not yet cross-CPU safe — and the AP only executes `LGDT`/`LTR`, reached
+  through the shared physmap.
+- **AP IDT.** An AP starts with `IDTR` zero, so its first exception would be a
+  triple fault. Both builds load the shared table on the AP right after the
+  new descriptor table.
+
+The headless runs then prove both halves. Each CPU increments a plain
+(non-atomic) counter 50 000 times under the spinlock, so the expected total is
+`50000 * cpu_count`; a missing lock loses updates and the sum comes out short.
+The reported TSS stack is checked against the frame the BSP allocated for that
+CPU. Markers: `SMP-LOCK-OK counter=100000 expected=100000` and
+`SMP-AP-GDT-OK cpu=1 esp0=…` on 32-bit; `HAKU64-SMP-LOCK-OK` and
+`HAKU64-SMP-AP-GDT-OK … rsp0=…` on x86-64. The AP sets `online` before its
+loop, so the BSP runs its share while the AP is still working and the two
+loops overlap.
+
+What is *not* shared yet: the scheduler's current-task pointer, run-state
+bitmap and tick counters are still one set of globals, the timer still runs on
+the BSP, and nothing dispatches a task to an AP. Those are stage D.
+
 ### Physical frame allocator
 
 `kernel/arch/x86/mm/frame.c` now builds its usable-frame bitmap from the 64-bit base and
@@ -429,10 +523,11 @@ direct-map tables, the ISA hole, and the 1–4 MiB heap. The pool is sized from
 the memory map instead of a fixed limit: `paging_init` reads the highest
 usable E820 address, rounds it up to a 4 MiB boundary, and maps exactly that
 much, so a 512 MiB guest gets a 512 MiB pool and a 2 GiB guest gets the
-1020 MiB the 32-bit address space can address. `frame_usable_count()` reports
+1000 MiB the 32-bit address space can address once the local-APIC page and
+the ACPI scratch window are reserved. `frame_usable_count()` reports
 the E820-usable pages inside that window, and every tracked frame is
 allocatable: a permanent supervisor direct map at `0xC0400000` addresses
-physical `0–1020 MiB`, and its PDEs are copied into each user page directory.
+physical `0–1000 MiB`, and its PDEs are copied into each user page directory.
 The bitmaps, the direct-map page tables, and the per-frame reference counters
 are all sized at boot (heap allocations and low RAM), so the kernel image does
 not carry a worst-case array. The self-test chain-allocates past the old

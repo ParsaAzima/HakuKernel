@@ -48,6 +48,10 @@ control and pipelines working.
   8 KiB kernel stacks, `spawn`/`fork`/`vfork`/`execve`/`wait4`, real process
   groups and sessions, `kill(-pgid)`, foreground group on the console, signals,
   and `clone`-created threads that share one address space and descriptor table.
+- **SMP bring-up** — ACPI MADT discovery, a local-APIC driver and INIT-SIPI
+  trampolines that bring the application processors online on both kernels,
+  with atomic spinlocks and a private GDT/TSS per processor; the APs park with
+  interrupts off and the bootstrap CPU keeps scheduling.
 - **Syscalls** — the i386 numbers for a working file/process/memory/time/signal
   subset, validated user pointers, `-errno` results, and the 64-byte i386
   `struct stat` family that glibc and musl expect.
@@ -137,7 +141,10 @@ build.py             the whole build, test, and QEMU orchestration
 Haku does not claim POSIX compatibility. It implements a subset aimed at
 statically linked Linux binaries, on a single CPU, without demand paging,
 swap, or networking. The 32-bit image and the x86-64 port both have
-`clone`/`futex` threads, but neither has SMP, and the x86-64 port also lacks
+`clone`/`futex` threads and bring the application processors online with their
+own TSS and the shared IDT, but the application processors are parked: every
+task still runs on the bootstrap processor. Kernel spinlocks are atomic across
+CPUs, but the scheduler state is not per-CPU yet. The x86-64 port also lacks
 copy-on-write and signal handlers. FAT12
 has 8.3 names, no timestamps, and no
 permission bits. The x86-64 image is a bring-up milestone, not a usable

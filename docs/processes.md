@@ -59,6 +59,15 @@ kernel stack are reclaimed after execution has moved to another stack. When
 no user process is runnable, the scheduler runs a dedicated kernel idle
 context.
 
+Scheduling is single-CPU. Both builds bring the application processors online,
+give each one a private descriptor table and TSS plus the shared IDT, and park
+them (see [SMP](architecture.md#smp-acpi-the-local-apic-and-application-processors)).
+Only the bootstrap processor takes timer interrupts and selects the next task,
+so the scheduler, wait queues and run-state bitmap still need no per-CPU
+replication. Letting an AP schedule requires per-CPU current-task state and a
+per-CPU timer; that is the next SMP stage in the
+[roadmap](../ROADMAP.md#4-concurrency-and-memory-management).
+
 `kernel/arch/x86/kernel/gdt.c` installs flat ring-0/ring-3 code and data descriptors plus a
 32-bit TSS. `kernel/arch/x86/mm/paging.c` gives each process supervisor-only kernel
 identity and direct-map entries and maps its user program and two-page user
