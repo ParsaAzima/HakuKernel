@@ -674,18 +674,23 @@ the port is complete.
   `/TMP`, writes and re-reads `NOTE.TXT`, and the kernel re-reads the file
   after close (`HAKU64-DISK-OK`).
 - [x] `fork` and `wait4`: `paging64_clone_space` walks the parent's user
-  pages and aliases the ranges a mapping record marks shared, copying
-  everything else — there is no copy-on-write, so private pages are copied
-  up front. The child gets its own 16 KiB kernel stack, a copy of the
-  parent's syscall frame with `RAX=0`, and a copy of the descriptor and
-  mapping tables. `wait4` blocks until a child is `DONE`, reports
-  `(status & 0xFF) << 8` or the terminating signal, and reaps it, which is
-  the only place a task's space, frames and stack are released. Signals are
-  terminate-only (`SIGINT`, `SIGKILL`, `SIGTERM`, `SIGSEGV`): `kill` and a
-  ring-3 fault end the task and `wait4` reports the number; `SIGCHLD` is not
-  delivered and there are no handlers or masks. The ring-3 test forks,
-  observes one `MAP_SHARED` page from both processes and prints
-  `HAKU64-FORK-OK`.
+  pages and aliases the ranges a mapping record marks shared; every private
+  page is mapped read-only in both spaces with a `PAGE_COW` software bit and
+  a per-frame reference count, and `paging64_break_cow` gives the first
+  writer a private copy (a page whose count has dropped to one just takes
+  the write permission back). Kernel copies through the direct map break the
+  sharing first, and `mprotect` keeps the logical writability in
+  `PAGE_COW_RW` so a read-only COW page still faults as a protection error.
+  The child gets its own 16 KiB kernel stack, a copy of the parent's syscall
+  frame with `RAX=0`, and a copy of the descriptor and mapping tables.
+  `wait4` blocks until a child is `DONE`, reports `(status & 0xFF) << 8` or
+  the terminating signal, and reaps it, which is the only place a task's
+  space, frames and stack are released. Signals are terminate-only
+  (`SIGINT`, `SIGKILL`, `SIGTERM`, `SIGSEGV`): `kill` and a ring-3 fault end
+  the task and `wait4` reports the number; `SIGCHLD` is not delivered and
+  there are no handlers or masks. The ring-3 test forks, observes one
+  `MAP_SHARED` page from both processes (`HAKU64-FORK-OK`), then proves a
+  private page is copied only on write (`HAKU64-COW-OK`).
 - [x] Descriptor duplication and sleep: descriptors index a 64-entry
   description table holding the cache slot, access mode and offset, so
   `dup`, `dup2`, `dup3` and `fork` share one file offset (a `dup2` onto 1

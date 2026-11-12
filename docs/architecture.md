@@ -191,8 +191,8 @@ descriptor position as the `getdents64` cursor.
 window and refuses an occupied range instead of replacing it; without it the
 per-task bump region from `K64_USER_MMAP_BASE` supplies the address.
 `MAP_SHARED` on a file maps the file's own frames, so a store through the
-mapping is visible to `read`; `MAP_PRIVATE` copies the pages at map time,
-because copy-on-write is not implemented. Mapping past the end of a file
+mapping is visible to `read`; `MAP_PRIVATE` copies the pages at map time, so
+a later file update does not change the mapping. Mapping past the end of a file
 is `-EINVAL` rather than the `SIGBUS` a Linux process would take, and a
 page-aligned `offset` selects where in the file the mapping starts. A
 writable shared file mapping needs a descriptor opened for writing and is
@@ -226,10 +226,18 @@ proven from the host's view of the volume and not only from the kernel's
 cache.
 
 `fork` clones the address space page by page: `paging64_clone_space` walks
-the parent's user leaves, aliases the frames a mapping record marks shared,
-and copies everything else into fresh frames. There is no copy-on-write yet,
-so a private page costs its copy at fork time. The child gets a copy of the
-parent's syscall frame on its own 16 KiB kernel stack with `RAX=0`, a copy of
+the parent's user leaves and aliases the frames a mapping record marks shared.
+Every private page becomes a read-only copy-on-write mapping in both spaces:
+the leaf carries `PAGE_COW` (bit 9) and, when the mapping was writable,
+`PAGE_COW_RW` (bit 10), and a per-frame reference count records how many
+spaces map it. The first write in either space takes a private copy (or, when
+the count has already dropped to one, simply restores the write bit); the
+kernel's direct-map copy path breaks the sharing before it writes, and
+`mprotect` keeps a COW page write-protected while remembering the logical
+permission. Reference counts live one byte per frame in 4 KiB chunks claimed
+from the frame allocator on first use, so a machine that never forks pays only
+the 32 KiB chunk-pointer array. The child gets a copy of
+the parent's syscall frame on its own 16 KiB kernel stack with `RAX=0`, a copy of
 the descriptor table and the mapping table, with shared ranges marked
 borrow-only. A descriptor is only an index into a 64-entry description table
 holding the cache slot, the access mode and the file offset, so `fork` and

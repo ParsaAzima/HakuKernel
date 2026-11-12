@@ -78,7 +78,8 @@ static executable mapped into a fresh address space), `HAKU64-ELF-RUN-OK`
 matrix, including `mmap`/`munmap`), `HAKU64-DISK-OK` (the program created
 `/TMP`, wrote `NOTE.TXT` there and the kernel read it back from the volume
 after `close`), `HAKU64-FORK-OK` (a forked child and its parent observed the
-same `MAP_SHARED` page), `HAKU64-DUP-OK` (a duplicated descriptor shared
+same `MAP_SHARED` page), `HAKU64-COW-OK` (a private page forked read-only and
+each writer got its own copy), `HAKU64-DUP-OK` (a duplicated descriptor shared
 one file offset, `dup2` redirected it, and `nanosleep` advanced the monotonic
 clock), `HAKU64-EXEC-OK` (a child `execve`d `USER.ELF` off the volume with
 two arguments and one environment variable, the program checked the stack

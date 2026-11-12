@@ -67,7 +67,8 @@ control and pipelines working.
   clock, round-robin scheduler, ring 3 with `SYSCALL`/`SYSRET` and the Linux
   syscall convention, NX enforcement, an ELF64 loader, a FAT12 disk with file
   writes behind a page cache that file-backed `mmap` maps from,
-  `fork`/`wait4` with default-action signals, `dup`/`dup2` over a shared file
+  `fork`/`wait4` with copy-on-write pages and default-action signals,
+  `dup`/`dup2` over a shared file
   description, `nanosleep`, `execve` of an ELF64 file from the disk with
   `argc`/`argv`/`envp` on the new stack, threads: `clone` with
   `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`, `gettid`, and `futex` wait/wake,
@@ -76,7 +77,7 @@ control and pipelines working.
   `pread`/`pwrite`, `mprotect`/`brk`/`madvise`, `poll`/`select`, `fcntl`/
   `ioctl`/`dup3`, `uname`/`times`/`getrusage`/`getrlimit` and the identity,
   `prctl` and `getrandom` calls.
-  No copy-on-write, signal handlers, pipes, or 64-bit libc yet.
+  No signal handlers, pipes, or 64-bit libc yet.
 
 ## Quick start
 
@@ -145,12 +146,11 @@ swap, or networking. The 32-bit image and the x86-64 port both have
 own TSS and the shared IDT, but the application processors are parked: every
 task still runs on the bootstrap processor. Kernel spinlocks are atomic across
 CPUs, but the scheduler state is not per-CPU yet. The x86-64 port also lacks
-copy-on-write and signal handlers. FAT12
+signal handlers. FAT12
 has 8.3 names, no timestamps, and no
 permission bits. The x86-64 image is a bring-up milestone, not a usable
-system: its filesystem cache holds eight paths of at most 128 KiB each, its
-`fork` copies pages instead of sharing them copy-on-write, and its signals
-only terminate. Everything beyond the implemented subset returns `ENOSYS`
+system: its filesystem cache holds eight paths of at most 128 KiB each, and
+its signals only terminate. Everything beyond the implemented subset returns `ENOSYS`
 rather than pretending to work.
 
 ## Policies
