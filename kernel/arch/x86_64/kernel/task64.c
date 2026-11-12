@@ -580,14 +580,16 @@ void task64_map_drop(int id, u64 base, u64 length) {
 }
 
 /* ------------------------------------------------------------ fork / exit
- * A forked child gets its own address space: paging64_clone_space copies
+ * A forked child gets its own address space: paging64_clone_space shares
  * every page except the ones a mapping record marks shared, which are the
- * same frames in both spaces. That is the whole of the fork model here:
- * there is no copy-on-write, so a private page costs its copy up front.
+ * same frames writable in both spaces. A private page is mapped read-only
+ * and copy-on-write in both, so the copy is paid for by whichever side
+ * writes first and a process that never writes costs nothing.
  *
- * A child costs a 16 KiB kernel stack and a copied frame. The frame is the
- * parent's syscall frame with RAX set to zero, so the child resumes exactly
- * where the parent returned from fork() but with the child's return value.
+ * A child costs a 16 KiB kernel stack and a copied register frame. The
+ * frame is the parent's syscall frame with RAX set to zero, so the child
+ * resumes exactly where the parent returned from fork() but with the
+ * child's return value.
  *
  * Nothing is released at exit: a DONE task keeps its space, frames and
  * stack until someone reaps it, which is what lets wait4() read the status

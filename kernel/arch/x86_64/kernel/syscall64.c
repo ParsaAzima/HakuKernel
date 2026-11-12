@@ -68,7 +68,9 @@ static u64 current_space(void) {
 }
 
 /* Resolve one user address in `space`. Returns 0 unless the page is
- * mapped, belongs to the user half and (when asked) is writable. */
+ * mapped, belongs to the user half and (when asked) is writable. A write to
+ * a copy-on-write page breaks the sharing first, so the physical address
+ * that comes back is the private copy. */
 static int user_page64(u64 space, u64 address, u64 *phys, int need_write) {
     u64 page;
     int writable, user;
@@ -77,7 +79,12 @@ static int user_page64(u64 space, u64 address, u64 *phys, int need_write) {
     if (!paging64_query_space(space, address, &page, &writable, &user))
         return 0;
     if (!user) return 0;
-    if (need_write && !writable) return 0;
+    if (need_write) {
+        if (!paging64_write_prepare(space, address)) return 0;
+        if (!paging64_query_space(space, address, &page, &writable, &user))
+            return 0;
+        if (!user || !writable) return 0;
+    }
     *phys = page;
     return 1;
 }
@@ -1002,7 +1009,7 @@ fail:
 
         if (!paging64_query_space(space, virt, 0, 0, 0)) continue;
         phys = paging64_unmap_space(space, virt);
-        if (phys && task64_map_owned(id, virt)) frame64_free(phys);
+        if (phys && task64_map_owned(id, virt)) frame64_user_release(phys);
     }
     task64_map_drop(id, base, pages * K64_PAGE_SIZE);
     return (u64)0 - SYS64_ENOMEM;
@@ -1028,7 +1035,7 @@ static u64 sys64_munmap(u64 address, u64 length) {
         u64 virt = address + i * K64_PAGE_SIZE;
         u64 phys = paging64_unmap_space(space, virt);
 
-        if (phys && task64_map_owned(id, virt)) frame64_free(phys);
+        if (phys && task64_map_owned(id, virt)) frame64_user_release(phys);
     }
     task64_map_drop(id, address, pages * K64_PAGE_SIZE);
     return 0;
@@ -1927,7 +1934,7 @@ static u64 sys64_brk(u64 value) {
             if (paging64_query_space(space, undo, 0, 0, 0)) {
                 u64 phys = paging64_unmap_space(space, undo);
 
-                if (phys) frame64_free(phys);
+                if (phys) frame64_user_release(phys);
             }
         return task64_get_brk(id);
     }
@@ -1939,7 +1946,7 @@ static u64 sys64_brk(u64 value) {
         for (u64 virt = from; virt < to; virt += K64_PAGE_SIZE) {
             u64 phys = paging64_unmap_space(space, virt);
 
-            if (phys) frame64_free(phys);
+            if (phys) frame64_user_release(phys);
         }
         task64_set_brk(id, value);
     }

@@ -25,6 +25,37 @@ static u32 *usable_bitmap;
 static u64 frame_count;
 static u64 frame_hint;
 
+/* Copy-on-write reference counts: one byte per frame, allocated in 4 KiB
+ * chunks as sharing appears. A chunk covers 4096 frames (16 MiB of RAM), so
+ * a machine that never forks pays only the chunk-pointer array: 32 KiB on a
+ * 64 GiB limit. A frame that is never shared has no count (zero) and its
+ * owner frees it directly, which is what keeps the common path unchanged. */
+#define REF_CHUNK_FRAMES 4096ull
+static u8 **ref_chunks;
+static u64 ref_chunk_count;
+
+/* Count slot for one frame, allocating its chunk when `create` is set. The
+ * chunk frame itself is never counted: the allocator does not touch this
+ * table, so there is no recursion. */
+static u8 *ref_entry(u64 frame, int create) {
+    u64 index = frame / REF_CHUNK_FRAMES;
+    u8 *chunk;
+
+    if (index >= ref_chunk_count) return 0;
+    chunk = ref_chunks[index];
+    if (!chunk) {
+        u64 phys;
+
+        if (!create) return 0;
+        phys = frame64_alloc();
+        if (!phys) return 0;
+        chunk = (u8 *)phys_to_virt64(phys);
+        memset(chunk, 0, K64_PAGE_SIZE);
+        ref_chunks[index] = chunk;
+    }
+    return chunk + (frame % REF_CHUNK_FRAMES);
+}
+
 static int bit_test(const u32 *bitmap, u64 frame) {
     return (bitmap[frame >> 5] >> (frame & 31u)) & 1u;
 }
@@ -103,6 +134,14 @@ int frame64_init(u64 phys_limit) {
     /* Firmware, the boot stages, the kernel image, the boot window and the
      * heap: nothing below K64_RESERVED_END may be handed out. */
     mark_reserved(0, K64_RESERVED_END);
+
+    /* One count byte per tracked frame, reached through a table of chunk
+     * pointers. The pointers are allocated now; the chunks themselves wait
+     * for the first fork. */
+    ref_chunk_count = (frame_count + REF_CHUNK_FRAMES - 1) / REF_CHUNK_FRAMES;
+    ref_chunks = (u8 **)bootmem64_alloc(ref_chunk_count * sizeof(u8 *), 8);
+    if (!ref_chunks) return 0;
+    memset(ref_chunks, 0, ref_chunk_count * sizeof(u8 *));
     return 1;
 }
 
@@ -134,6 +173,55 @@ void frame64_free(u64 phys) {
     if (!bit_test(usable_bitmap, frame) || !bit_test(used_bitmap, frame)) return;
     bit_clear(used_bitmap, frame);
     if (frame < frame_hint) frame_hint = frame;
+}
+
+/* fork maps a private frame in one more space. The first share records the
+ * owner too, so the count goes straight to two; later forks add one each.
+ * A frame that is already counted keeps its owner's claim. */
+void frame64_ref_share(u64 phys) {
+    u64 frame;
+    u8 *entry;
+
+    if ((phys & (K64_PAGE_SIZE - 1ull)) != 0) return;
+    frame = phys >> 12;
+    if (frame >= frame_count) return;
+    entry = ref_entry(frame, 1);
+    if (!entry) return;
+    if (*entry == 0)
+        *entry = 2;
+    else if (*entry != 0xFFu)
+        (*entry)++;
+}
+
+/* One space stopped mapping a frame. A counted frame drops by one and is
+ * freed with its last reference; an uncounted frame was never shared, so
+ * this space was its only owner and the free is immediate. */
+void frame64_user_release(u64 phys) {
+    u64 frame;
+    u8 *entry;
+
+    if ((phys & (K64_PAGE_SIZE - 1ull)) != 0) return;
+    frame = phys >> 12;
+    if (frame >= frame_count) return;
+    entry = ref_entry(frame, 0);
+    if (!entry || *entry == 0) {
+        frame64_free(phys);
+        return;
+    }
+    (*entry)--;
+    if (*entry == 0) frame64_free(phys);
+}
+
+/* Current share count of a frame, for the boot self-test. */
+u32 frame64_ref_count(u64 phys) {
+    u64 frame;
+    u8 *entry;
+
+    if ((phys & (K64_PAGE_SIZE - 1ull)) != 0) return 0;
+    frame = phys >> 12;
+    if (frame >= frame_count) return 0;
+    entry = ref_entry(frame, 0);
+    return entry ? *entry : 0;
 }
 
 u64 frame64_free_count(void) {

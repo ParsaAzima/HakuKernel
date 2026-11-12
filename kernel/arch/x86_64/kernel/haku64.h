@@ -505,12 +505,18 @@ u64 paging64_unmap_space(u64 space, u64 virt);
 /* Change writable/executable of one mapped user page (mprotect). */
 int paging64_protect_space(u64 space, u64 virt, int writable, int executable);
 void paging64_destroy_space(u64 space);
-/* fork support: clone every user page (shared ranges are aliased, the rest
- * copied) and free a space's frames, keeping the ones `keep` claims. */
+/* fork support: share every user page copy-on-write (shared ranges are
+ * aliased) and free a space's frames, keeping the ones `keep` claims. */
 u64 paging64_clone_space(u64 parent,
                          int (*shared)(u64 virt, void *ctx), void *ctx);
 void paging64_free_space_frames(u64 space,
                                 int (*keep)(u64 virt, void *ctx), void *ctx);
+/* Give the faulting space its own copy of a shared page. Returns 1 when it
+ * broke the sharing, 0 when the page is absent, not COW or out of memory. */
+int paging64_break_cow(u64 space, u64 virt);
+/* Make one page ready for a kernel direct-map write, breaking COW first.
+ * Returns 1 when the page is writable afterwards. */
+int paging64_write_prepare(u64 space, u64 virt);
 void paging64_switch_space(u64 space);
 
 /* ------------------------------------------------------------- ELF64 loader
@@ -576,6 +582,11 @@ extern const u8 user64_image_end[];
 int frame64_init(u64 phys_limit);
 u64 frame64_alloc(void);
 void frame64_free(u64 phys);
+/* fork copies-on-write: a shared frame is counted, and the last owner
+ * frees it. An uncounted frame is released by its only owner at once. */
+void frame64_ref_share(u64 phys);
+void frame64_user_release(u64 phys);
+u32 frame64_ref_count(u64 phys);
 u64 frame64_free_count(void);
 u64 frame64_usable_count(void);
 u64 frame64_limit(void);

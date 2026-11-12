@@ -33,6 +33,12 @@
 #define PAGE_PWT      0x008ull   /* write-through (MMIO) */
 #define PAGE_PCD      0x010ull   /* cache disable (MMIO) */
 #define PAGE_LARGE    0x080ull   /* PS: 2 MiB page in a page directory */
+/* Bits 9 and 10 are ignored by the walker, so they carry the fork state:
+ * PAGE_COW marks a frame two spaces share, and PAGE_COW_RW remembers that
+ * the mapping is logically writable, so the break can restore the write bit
+ * (mprotect may have made it read-only in the meantime). */
+#define PAGE_COW      0x200ull
+#define PAGE_COW_RW   0x400ull
 #define PAGE_NX       K64_PAGE_NX
 
 #define PML4_INDEX(v) (((v) >> 39) & 0x1FFull)
@@ -215,10 +221,9 @@ u64 paging64_create_space(void) {
  * as needed. Only the user half is accepted: letting a caller put a leaf in
  * slot 0 or in the physmap slot would mean editing a table the kernel
  * shares with every other space. */
-int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user,
-                       int executable) {
+static u64 *space_leaf_create(u64 space, u64 virt) {
     u64 *pml4, *pdpt, *pd, *pt;
-    u64 entry_flags = PAGE_PRESENT | PAGE_WRITABLE | (user ? PAGE_USER : 0);
+    u64 entry_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 
     if (!space || !user_address(virt)) return 0;
     pml4 = (u64 *)phys_to_virt64(space);
@@ -244,11 +249,18 @@ int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user,
         pd[PD_INDEX(virt)] = table_phys(pt) | entry_flags;
     }
     pt = (u64 *)phys_to_virt64(pd[PD_INDEX(virt)] & K64_PHYS_MASK);
+    return &pt[PT_INDEX(virt)];
+}
 
-    pt[PT_INDEX(virt)] = (phys & K64_PAGE_MASK) | PAGE_PRESENT |
-                         (writable ? PAGE_WRITABLE : 0) |
-                         (user ? PAGE_USER : 0) |
-                         (executable ? 0 : PAGE_NX);
+int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user,
+                       int executable) {
+    u64 *entry = space_leaf_create(space, virt);
+
+    if (!entry) return 0;
+    *entry = (phys & K64_PAGE_MASK) | PAGE_PRESENT |
+             (writable ? PAGE_WRITABLE : 0) |
+             (user ? PAGE_USER : 0) |
+             (executable ? 0 : PAGE_NX);
     /* Harmless for a non-current space: the TLB only has entries for the
      * current CR3, and a CR3 write flushes the rest. */
     invlpg64(virt);
@@ -316,10 +328,17 @@ int paging64_protect_space(u64 space, u64 virt, int writable, int executable) {
     entry = space_leaf(space, virt);
     if (!entry || !(*entry & PAGE_PRESENT)) return 0;
     if (!(*entry & PAGE_USER)) return 0;
-    if (writable)
-        *entry |= PAGE_WRITABLE;
-    else
-        *entry &= ~PAGE_WRITABLE;
+    if (writable) {
+        /* A copy-on-write page stays write-protected while it is shared;
+         * the logical permission is recorded so the next write can break
+         * the sharing instead of faulting forever. */
+        if (*entry & PAGE_COW)
+            *entry |= PAGE_COW_RW;
+        else
+            *entry |= PAGE_WRITABLE;
+    } else {
+        *entry &= ~(PAGE_WRITABLE | PAGE_COW_RW);
+    }
     if (executable)
         *entry &= ~PAGE_NX;
     else
@@ -407,35 +426,45 @@ static int walk_user_pages(u64 space,
 }
 
 typedef struct {
+    u64 parent;
     u64 child;
     int (*shared)(u64 virt, void *ctx);
     void *ctx;
 } clone_state_t;
 
+/* A page a mapping record marks shared is the same memory in both spaces:
+ * alias the frame and leave ownership with whoever allocated it. Every
+ * private page is shared instead of copied: both spaces map the frame
+ * read-only with PAGE_COW set, the count goes to two (or one more), and the
+ * first write on either side copies it in paging64_break_cow(). */
 static int clone_visit(u64 virt, u64 phys, u64 flags, void *opaque) {
     clone_state_t *st = (clone_state_t *)opaque;
     int writable = (flags & PAGE_WRITABLE) != 0;
     int executable = (flags & PAGE_NX) == 0;
-    u64 frame;
-    u8 *dst;
+    u64 pte;
+    u64 *parent_entry, *child_entry;
 
-    /* A shared range is the same memory in both spaces: alias the frame and
-     * leave ownership with whoever allocated it. */
     if (st->shared && st->shared(virt, st->ctx))
         return paging64_map_space(st->child, virt, phys, writable, 1,
                                   executable);
 
-    /* Everything else is a private copy. There is no copy-on-write: fork
-     * pays for the copy up front, so the child can never see a later parent
-     * store. */
-    frame = frame64_alloc();
-    if (!frame) return 0;
-    dst = (u8 *)phys_to_virt64(frame);
-    memcpy(dst, (const u8 *)phys_to_virt64(phys), K64_PAGE_SIZE);
-    if (!paging64_map_space(st->child, virt, frame, writable, 1, executable)) {
-        frame64_free(frame);
-        return 0;
-    }
+    parent_entry = space_leaf(st->parent, virt);
+    if (!parent_entry) return 0;
+    child_entry = space_leaf_create(st->child, virt);
+    if (!child_entry) return 0;
+
+    /* A page that was already shared keeps its own COW state; a fresh
+     * private page becomes writable-in-principle only if it was writable
+     * here. The parent's write permission is dropped in both cases. */
+    pte = PAGE_PRESENT | PAGE_USER | PAGE_COW |
+          ((flags & (PAGE_WRITABLE | PAGE_COW_RW)) ? PAGE_COW_RW : 0) |
+          (executable ? 0 : PAGE_NX);
+    pte |= phys & K64_PHYS_MASK;
+
+    frame64_ref_share(phys);
+    *parent_entry = pte;
+    *child_entry = pte;
+    invlpg64(virt);
     return 1;
 }
 
@@ -449,13 +478,15 @@ static int free_visit(u64 virt, u64 phys, u64 flags, void *opaque) {
 
     (void)flags;
     if (st->keep && st->keep(virt, st->ctx)) return 1;
-    frame64_free(phys);
+    frame64_user_release(phys);
     return 1;
 }
 
-/* A new space with a copy of every present user page. Pages `shared` reports
- * true are aliased, the rest are copied into fresh frames. On failure the
- * half-built space is torn down and 0 is returned. */
+/* A new space that shares every present user page with `parent`. Pages
+ * `shared` reports true are aliased read-only or writable as they were;
+ * every private page is mapped read-only with PAGE_COW, and the first write
+ * in either space gets a private copy. On failure the half-built space is
+ * torn down (dropping the temporary extra reference) and 0 is returned. */
 u64 paging64_clone_space(u64 parent,
                          int (*shared)(u64 virt, void *ctx), void *ctx) {
     clone_state_t state;
@@ -466,6 +497,7 @@ u64 paging64_clone_space(u64 parent,
     child = paging64_create_space();
     if (!child) return 0;
 
+    state.parent = parent;
     state.child = child;
     state.shared = shared;
     state.ctx = ctx;
@@ -477,6 +509,63 @@ u64 paging64_clone_space(u64 parent,
         return 0;
     }
     return child;
+}
+
+/* Turn a write fault on a shared page into a private copy. The caller has
+ * already seen P=1 and W/R=1, so this only has to replace the frame; the
+ * faulting instruction is then re-executed. Returns 1 when the page was a
+ * writable copy-on-write page and now belongs to `space` alone. */
+int paging64_break_cow(u64 space, u64 virt) {
+    u64 *entry;
+    u64 pte, frame, copy;
+    u8 *dst;
+
+    if (!space || !user_address(virt)) return 0;
+    entry = space_leaf(space, virt);
+    if (!entry) return 0;
+    pte = *entry;
+    if ((pte & (PAGE_PRESENT | PAGE_COW)) != (PAGE_PRESENT | PAGE_COW))
+        return 0;
+    /* A COW page whose mapping was made read-only (mprotect) must fault as
+     * a protection error, not silently become writable. */
+    if (!(pte & PAGE_COW_RW)) return 0;
+    frame = pte & K64_PHYS_MASK;
+
+    /* The last space mapping the frame does not need a copy: taking the
+     * write permission back is the whole point of breaking the sharing. */
+    if (frame64_ref_count(frame) <= 1) {
+        *entry = (pte & ~(PAGE_COW | PAGE_COW_RW)) | PAGE_WRITABLE;
+        invlpg64(virt);
+        return 1;
+    }
+
+    copy = frame64_alloc();
+    if (!copy) return 0;
+    dst = (u8 *)phys_to_virt64(copy);
+    memcpy(dst, (const u8 *)phys_to_virt64(frame), K64_PAGE_SIZE);
+    /* Install the private copy before dropping the old reference; the old
+     * frame stays mapped and alive until the new leaf is in place. */
+    *entry = (copy & K64_PHYS_MASK) |
+             (pte & ~(PAGE_COW | PAGE_COW_RW)) | PAGE_WRITABLE;
+    invlpg64(virt);
+    frame64_user_release(frame);
+    return 1;
+}
+
+/* Make `virt` writable by the kernel's direct-map copy path: break the
+ * sharing when the leaf is copy-on-write, and otherwise report whether the
+ * mapping already allows writes. */
+int paging64_write_prepare(u64 space, u64 virt) {
+    u64 *entry;
+
+    if (!space || !user_address(virt)) return 0;
+    entry = space_leaf(space, virt);
+    if (!entry || !(*entry & PAGE_PRESENT)) return 0;
+    if (*entry & PAGE_COW) {
+        if (!(*entry & PAGE_COW_RW)) return 0;
+        return paging64_break_cow(space, virt);
+    }
+    return (*entry & PAGE_WRITABLE) != 0;
 }
 
 /* Release every user frame in `space` that `keep` does not claim. A task

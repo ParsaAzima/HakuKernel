@@ -688,6 +688,95 @@ child_proc:
 
 fork_done:
 
+    ; ---- fork: a private page is shared copy-on-write -----------------
+    ; The parent stores a word and forks. The child must see the original
+    ; and may overwrite it without the parent seeing the store: that is
+    ; only true if fork shares the frame read-only and each writer copies
+    ; it. Reaping the child returns the count to one, so the parent's own
+    ; store can simply drop the write protection.
+    mov r15d, 60
+    mov eax, HAKU64_SYS_MMAP
+    xor edi, edi
+    mov esi, 0x1000
+    mov edx, HAKU64_PROT_READ | HAKU64_PROT_WRITE
+    mov r10d, HAKU64_MAP_PRIVATE | HAKU64_MAP_ANONYMOUS
+    mov r8, -1
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle fail
+    mov r12, rax
+    mov rax, 0x1111222233334444
+    mov [r12], rax
+
+    mov r15d, 61
+    mov eax, HAKU64_SYS_FORK
+    syscall
+    test rax, rax
+    js fail
+    jz cow_child
+
+    mov r13, rax
+    mov r15d, 62
+    mov eax, HAKU64_SYS_WAIT4
+    mov rdi, r13
+    mov rsi, STATUS_BUF
+    xor edx, edx
+    syscall
+    cmp rax, r13
+    jne fail
+    mov rdx, STATUS_BUF
+    mov rax, [rdx]
+    shr rax, 8
+    and eax, 0xFF
+    cmp eax, 9
+    jne fail
+
+    ; The child wrote its own copy, so the parent's word is untouched.
+    mov r15d, 63
+    mov rax, 0x1111222233334444
+    cmp [r12], rax
+    jne fail
+
+    ; And a parent store now gets the page back, writable.
+    mov rax, 0x5555666677778888
+    mov [r12], rax
+    cmp [r12], rax
+    jne fail
+
+    mov r15d, 64
+    mov eax, HAKU64_SYS_MUNMAP
+    mov rdi, r12
+    mov esi, 0x1000
+    syscall
+    test rax, rax
+    jne fail
+
+    mov r15d, 65
+    mov eax, HAKU64_SYS_WRITE
+    mov edi, 1
+    lea rsi, [msg_cow]
+    mov edx, msg_cow_end - msg_cow
+    syscall
+    cmp rax, msg_cow_end - msg_cow
+    jne fail
+    jmp cow_done
+
+cow_child:
+    mov rax, 0x1111222233334444
+    cmp [r12], rax
+    jne fail
+    mov rax, 0xAAAABBBBCCCCDDDD
+    mov [r12], rax
+    cmp [r12], rax
+    jne fail
+    mov eax, HAKU64_SYS_EXIT
+    mov edi, 9
+    syscall
+    jmp $
+
+cow_done:
+
     ; ---- dup: two descriptors, one description ------------------------
     ; HELLO.TXT starts with "HAKU64-FILE-OK\r\n". Read 4 bytes, dup the
     ; descriptor, then read the next 4 through the duplicate: they are
@@ -1708,6 +1797,10 @@ msg_disk_end:
 msg_fork:
     db 'HAKU64-FORK-OK', 13, 10
 msg_fork_end:
+
+msg_cow:
+    db 'HAKU64-COW-OK', 13, 10
+msg_cow_end:
 
 msg_dup:
     db 'HAKU64-DUP-OK', 13, 10

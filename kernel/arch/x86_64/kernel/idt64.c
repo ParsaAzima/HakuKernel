@@ -209,6 +209,12 @@ static regs64_t *handle_exception(regs64_t *r) {
             return r;
         }
         if ((r->cs & 3u) == 3u) {
+            /* A write to a copy-on-write page is not a fault: the writer
+             * gets a private copy and re-executes the instruction (P=1,
+             * W/R=1). Any other #PF still ends the task. */
+            if ((r->error & 3u) == 3u &&
+                paging64_break_cow(read_cr3_64() & K64_PAGE_MASK, cr2))
+                return r;
             /* There is no signal model yet, so a user fault terminates the
              * task instead of halting the machine. That is what makes an
              * NX violation or a wild stack access testable. */

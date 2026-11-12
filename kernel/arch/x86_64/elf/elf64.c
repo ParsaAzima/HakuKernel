@@ -229,12 +229,12 @@ void elf64_unload(loaded_elf64_t *loaded) {
     for (u64 page = loaded->image_low; page < loaded->image_high;
          page += K64_PAGE_SIZE) {
         u64 phys = paging64_translate_space(loaded->space, page);
-        if (phys) frame64_free(phys & K64_PAGE_MASK);
+        if (phys) frame64_user_release(phys & K64_PAGE_MASK);
     }
     for (u64 page = loaded->stack_bottom; page < loaded->stack_top;
          page += K64_PAGE_SIZE) {
         u64 phys = paging64_translate_space(loaded->space, page);
-        if (phys) frame64_free(phys & K64_PAGE_MASK);
+        if (phys) frame64_user_release(phys & K64_PAGE_MASK);
     }
     paging64_destroy_space(loaded->space);
     memset(loaded, 0, sizeof(*loaded));
