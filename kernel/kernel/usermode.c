@@ -11,6 +11,7 @@
 #include "sync.h"
 #include "terminal.h"
 #include "fat12.h"
+#include "haku_module.h"
 #include "heap.h"
 #include "vfs.h"
 
@@ -2430,6 +2431,71 @@ static uint32_t sys_set_tid_address(uint32_t user_tidptr) {
     return scheduler_set_tid_address(user_tidptr);
 }
 
+/* Copy at most HAKU_MODULE_NAME_MAX characters of a user module name. The
+ * copy is page-chunked, so a name that ends exactly at a page boundary does
+ * not need the next page to be mapped; each chunk is range-checked once and
+ * copied in one block. Returns 1 when the name is NUL-terminated, otherwise
+ * a negative -errno. */
+static int copy_user_module_name(uint32_t user_name,
+                                 char out[HAKU_MODULE_NAME_MAX + 1]) {
+    uint32_t copied = 0;
+
+    while (copied <= HAKU_MODULE_NAME_MAX) {
+        uint32_t page_left;
+        uint32_t want;
+        uint32_t i;
+        if (user_name > 0xFFFFFFFFu - copied)
+            return -(int32_t)HAKU_EFAULT;
+        page_left = 4096u - ((user_name + copied) & 0xFFFu);
+        want = HAKU_MODULE_NAME_MAX + 1u - copied;
+        if (want > page_left) want = page_left;
+        if (!copy_from_user(out + copied, user_name + copied, want))
+            return -(int32_t)HAKU_EFAULT;
+        for (i = 0; i < want; i++) {
+            if (!out[copied + i]) return 1;
+        }
+        copied += want;
+    }
+    return -(int32_t)HAKU_ENAMETOOLONG;
+}
+
+/* init_module(128): copy a .hkm file into the kernel heap and load it. The
+ * params argument has no meaning for Haku modules; a non-NULL pointer is
+ * still checked so a bad argument is reported the way Linux reports it. */
+static uint32_t sys_init_module(uint32_t user_image, uint32_t length,
+                                uint32_t user_params) {
+    uint8_t *file;
+    int32_t result;
+
+    if (!user_image || length < HAKU_MODULE_HEADER_SIZE)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (length > HAKU_MODULE_MAX_FILE)
+        return copy_from_user_error(HAKU_E2BIG);
+    if (user_params && !paging_user_range_valid(user_params, 1, 0))
+        return copy_from_user_error(HAKU_EFAULT);
+    file = (uint8_t *)kmalloc(length);
+    if (!file) return copy_from_user_error(HAKU_ENOMEM);
+    if (!copy_from_user(file, user_image, length)) {
+        kfree(file);
+        return copy_from_user_error(HAKU_EFAULT);
+    }
+    result = module_load(file, length);
+    kfree(file);
+    return result == 0 ? 0u : (uint32_t)result;
+}
+
+/* delete_module(129): run the module's exit hook and free its image. */
+static uint32_t sys_delete_module(uint32_t user_name, uint32_t flags) {
+    char name[HAKU_MODULE_NAME_MAX + 1];
+    int32_t copied;
+
+    if (flags != 0u) return copy_from_user_error(HAKU_EINVAL);
+    if (!user_name) return copy_from_user_error(HAKU_EFAULT);
+    copied = copy_user_module_name(user_name, name);
+    if (copied != 1) return (uint32_t)copied;
+    return (uint32_t)module_unload(name);
+}
+
 regs_t *user_syscall(regs_t *r) {
     scheduler_note_syscall();
     switch (r->eax) {
@@ -2746,6 +2812,12 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_PERSONALITY:
         r->eax = sys_personality(r->ebx);
+        return r;
+    case HAKU_SYS_INIT_MODULE:
+        r->eax = sys_init_module(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_DELETE_MODULE:
+        r->eax = sys_delete_module(r->ebx, r->ecx);
         return r;
     default:
         r->eax = copy_from_user_error(HAKU_ENOSYS);

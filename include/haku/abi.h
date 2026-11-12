@@ -85,6 +85,14 @@
 #define HAKU_SYS_RT_SIGPROCMASK 175u
 #define HAKU_SYS_TKILL   238u
 #define HAKU_SYS_TGKILL  270u
+/* Loadable modules: Linux i386 numbers for init_module(void *image,
+ * unsigned long len, const char *params) and delete_module(const char *name,
+ * unsigned int flags). Haku modules are packed by tools/mkhakumod.py rather
+ * than being ELF, but the calls keep the Linux shape so a module loader in a
+ * user program does not need a private ABI. Params are accepted and ignored;
+ * only a trusted caller should use these, because module code runs in ring 0. */
+#define HAKU_SYS_INIT_MODULE   128u
+#define HAKU_SYS_DELETE_MODULE 129u
 
 /* i386 Linux syscall numbers reserved for the upcoming milestones: they
  * are listed so the ABI stays a single, Linux-shaped table, but the kernel

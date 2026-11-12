@@ -730,6 +730,67 @@ static void test_initramfs_root(void) {
            "procfs, /disk mount\n");
 }
 
+/* Haku modules: /MODULE.HKM is the packed demo the host build produced. The
+ * test loads it (the module's ring-0 init runs and logs its marker), loads
+ * the same name again (the table must refuse it), then unloads it and proves
+ * the name is gone. A truncated container is rejected before any code runs. */
+static void test_haku_module(void) {
+    haku_stat64_t status;
+    unsigned char *image;
+    unsigned int size;
+    int total = 0;
+    int fd;
+
+    if (stat("/MODULE.HKM", &status) != 0) {
+        expect(0, "stat the packed module");
+        return;
+    }
+    expect(status.st_size > 0 && status.st_size <= 65536,
+           "the module image has a sane size");
+    size = (unsigned int)status.st_size;
+    image = (unsigned char *)malloc(size);
+    if (!image) {
+        expect(0, "allocate the module buffer");
+        return;
+    }
+
+    fd = open("/MODULE.HKM", O_RDONLY);
+    expect(fd >= 0, "open the packed module");
+    if (fd >= 0) {
+        while (total < (int)size) {
+            int got = read(fd, image + total, size - (unsigned int)total);
+            if (got <= 0) break;
+            total += got;
+        }
+        close(fd);
+    }
+    expect(total == (int)size, "read the whole module file");
+
+    if (total == (int)size) {
+        expect(haku_syscall3(HAKU_SYS_INIT_MODULE, (int)image, total, 0) == 0,
+               "init_module loads the demo module");
+        expect(haku_syscall3(HAKU_SYS_INIT_MODULE, (int)image, total, 0) ==
+                   -EEXIST,
+               "init_module refuses a duplicate name");
+        expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-DEMO", 0) == 0,
+               "delete_module unloads the demo module");
+        expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-DEMO", 0) ==
+                   -ENOENT,
+               "a second delete_module reports ENOENT");
+        expect(haku_syscall2(HAKU_SYS_DELETE_MODULE, (int)"HAKU-DEMO", 1) ==
+                   -EINVAL,
+               "delete_module rejects flags");
+        expect(haku_syscall3(HAKU_SYS_INIT_MODULE, (int)image, 16, 0) ==
+                   -EINVAL,
+               "init_module rejects a truncated image");
+        expect(haku_syscall3(HAKU_SYS_INIT_MODULE, 0, total, 0) == -EINVAL,
+               "init_module rejects a NULL image");
+    }
+
+    free(image);
+    printf("USER-MODULE-OK: init_module delete_module ring0 demo\n");
+}
+
 /* The kernel builds the Linux initial stack: argc, argv[], NULL, envp[],
  * NULL, then the auxiliary vector. A libc reads AT_PAGESZ and AT_RANDOM
  * from it before main runs, so the shape has to be right even though this
@@ -1396,6 +1457,7 @@ int main(void) {
     test_concurrent_filesystem();
     test_syscall_errors();
     test_initramfs_root();
+    test_haku_module();
 
     if (failures) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);

@@ -742,6 +742,7 @@ def main():
         os.path.join(kernel_dir, "fs", "procfs"),
         os.path.join(kernel_dir, "fs", "initramfs"),
         os.path.join(kernel_dir, "kernel"),
+        os.path.join(kernel_dir, "module"),
     ]
     fat12_script = os.path.join(ROOT, "tools", "mkfat12.py")
     cpio_script = os.path.join(ROOT, "tools", "mkcpio.py")
@@ -790,6 +791,17 @@ def main():
     run([nasm, "-I" + nasm_include, "-f", "bin", vfork_asm, "-o", vfork_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", fault_asm, "-o", fault_elf])
 
+    # The demo module is assembled as a relocatable ELF32 object and packed
+    # into the kernel's .hkm container on the host. The kernel therefore
+    # never learns to parse ELF; it only applies the packed relocations.
+    module_asm = os.path.join(kernel_dir, "module", "demo", "haku_demo.asm")
+    module_obj = os.path.join(BUILD, "haku_demo.o")
+    module_hkm = os.path.join(BUILD, "MODULE.HKM")
+    module_pack_script = os.path.join(ROOT, "tools", "mkhakumod.py")
+    run([nasm, "-f", "elf32", module_asm, "-o", module_obj])
+    run([py, module_pack_script, module_obj, module_hkm,
+         "--name", "HAKU-DEMO"])
+
     # The user C library is linked into a fixed-base PE image, then repacked
     # as ELF32 so the existing loader can map RX/R/RW sections.
     user_objects = []
@@ -825,8 +837,8 @@ def main():
          f"init={init_override or user_elf}", f"HAKU.ELF={user_elf}",
          f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
          f"VFORK.ELF={vfork_elf}", f"FAULT.ELF={fault_elf}",
-         f"LIB.ELF={libtest_elf}", "--dir=dev", "--dir=proc",
-         "--dir=disk"])
+         f"LIB.ELF={libtest_elf}", f"MODULE.HKM={module_hkm}",
+         "--dir=dev", "--dir=proc", "--dir=disk"])
 
     if mode in ("headless", "probe") or fresh or \
             not os.path.isfile(filesystem_image):
@@ -836,7 +848,8 @@ def main():
         run([py, fat12_script, user_elf, filesystem_image,
              f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
              f"FAULT.ELF={fault_elf}", f"LIB.ELF={libtest_elf}",
-             f"VFORK.ELF={vfork_elf}", f"INITRD={initramfs_image}"])
+             f"VFORK.ELF={vfork_elf}", f"INITRD={initramfs_image}",
+             f"MODULE.HKM={module_hkm}"])
         log(f"FAT12 program disk ready "
             f"({os.path.getsize(filesystem_image)} bytes)")
     else:
@@ -848,6 +861,7 @@ def main():
                            os.path.getmtime(child_asm),
                            os.path.getmtime(vfork_asm),
                            os.path.getmtime(fault_asm),
+                           os.path.getmtime(module_asm),
                            os.path.getmtime(user_test_source),
                            max(os.path.getmtime(source)
                                for source in user_lib_sources))
@@ -1082,6 +1096,11 @@ def main():
             "USER-INITRAMFS-OK", # ramfs root, long names, symlinks, devfs, procfs
             "SCHED-CONCURRENT-OK", # two tasks doing disk I/O at once
             "USER-LIB-OK",   # C library syscalls/strings/malloc/file I/O
+            "USER-MODULE-OK", # init_module/delete_module loaded the demo module
+            "HAKU-MODULE-OK", # the module's relocated ring-0 init really ran
+            "HAKU-MODULE-EXIT", # delete_module called the module's exit hook
+            "MODULE-LOAD-OK name=HAKU-DEMO",
+            "MODULE-UNLOAD-OK name=HAKU-DEMO",
             "USER-EXIT-OK status=0 pid=1",
             "SCHED-REAP-OK",
             "FS-ERRORS-OK",  # missing/invalid/exists/badfd map to distinct errno
