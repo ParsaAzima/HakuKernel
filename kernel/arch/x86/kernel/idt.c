@@ -152,9 +152,15 @@ regs_t *isr_handler(regs_t *r) {
         panic_exception("page fault in kernel mode", r);
     }
     if (r->int_no == 255) {
-        klog_prefix();
-        klog_write("EXC-FF-UNEXPECTED: halting\n");
-        panic("unexpected interrupt vector 255");
+        /* The shared catch-all stub pushes 255 for every vector from 48
+         * up, so this is also where a spurious local-APIC interrupt lands.
+         * A spurious vector needs no EOI and is safe to ignore; anything
+         * else on an unmapped gate is reported at debug level rather than
+         * halting the machine. */
+        if (klog_begin(KLOG_DEBUG)) {
+            klog_write("APIC-DEFAULT: interrupt on unmapped vector (ignored)\n");
+        }
+        return r;
     }
     const char *name = r->int_no < 32 ? exc_names[r->int_no] : "???";
     klog_prefix();

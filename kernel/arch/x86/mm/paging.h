@@ -68,18 +68,35 @@
  *
  * The map is sized at boot from the E820 map instead of a fixed 128 MiB, so
  * the kernel uses the memory the machine actually has. Its size is bounded
- * by the 1 GiB kernel half of the 32-bit address space: the window ends at
- * 0xFFFFFFFF, which leaves 1020 MiB for physical memory once the 4 MiB
- * framebuffer window is subtracted. A machine with more RAM than that keeps
- * the extra memory out of the frame pool rather than aliasing it.
+ * by the 1 GiB kernel half of the 32-bit address space. The last usable
+ * page-directory entries are reserved: entry 1019 maps the local APIC at
+ * its architectural 0xFEE00000 address, and entry 1023 is the scratch
+ * window used to read ACPI tables before the APIC exists. That leaves
+ * 1000 MiB for physical memory once the 4 MiB framebuffer window is
+ * subtracted. A machine with more RAM than that keeps the extra memory out
+ * of the frame pool rather than aliasing it.
  *
  * The page tables live in low RAM at physical 0x400000 (DIRECT_TABLE_PHYS in
  * paging.c), not in .bss: 255 tables would add 1 MiB to the kernel image,
  * which must stay below the 0x80000 boot stack. */
 #define PAGING_DIRECT_MAP_BASE  0xC0400000u
-#define PAGING_DIRECT_MAP_MAX_MB 1020u
+#define PAGING_DIRECT_MAP_MAX_MB 1000u
 #define PAGING_DIRECT_MAP_MAX_BYTES (PAGING_DIRECT_MAP_MAX_MB * 1024u * 1024u)
 #define PAGING_PHYS_LIMIT_MAX    PAGING_DIRECT_MAP_MAX_BYTES
+
+/* The local APIC's MMIO page. It is identity mapped in the kernel's page
+ * directory (entry 1019) and that PDE is copied into every user directory,
+ * so a syscall or an AP can reach the unit without switching CR3. PCD+PWT
+ * keep the page uncached, which is what the architectural MMIO region
+ * requires. */
+#define PAGING_LAPIC_PHYS   0xFEE00000u
+#define PAGING_LAPIC_INDEX  (PAGING_LAPIC_PHYS >> 22)
+
+/* Scratch window for ACPI tables: two pages mapped on demand, used only
+ * during SMP bring-up and never copied into a user directory. */
+#define PAGING_TEMP_WINDOW  0xFF000000u
+#define PAGING_TEMP_PAGES   2u
+
 /* Physical memory the allocator tracks and the direct map covers, detected
  * from E820 by paging_init and rounded up to a 4 MiB page-table boundary. */
 uint32_t paging_phys_limit(void);
@@ -134,6 +151,13 @@ uint32_t paging_map_framebuffer(uint32_t physical_base, uint32_t length);
 void paging_activate_user_space(const address_space_t *space);
 void paging_activate_kernel_space(void);
 void paging_destroy_user_space(address_space_t *space);
+/* Map up to two consecutive physical pages into PAGING_TEMP_WINDOW and
+ * return the window base. Used to read ACPI tables that live above the
+ * direct map. The mapping is replaced by the next call. */
+void *paging_temp_map(uint32_t phys, uint32_t pages);
+/* Identity map the local APIC page with its uncached attributes. Returns 0
+ * when no frame was available for the page table. */
+int paging_map_lapic(void);
 /* Share every user page of one address space with another (fork). Both
  * spaces map the same frames; writable pages are write-protected and
  * marked PAGE_COW in both, so the first write in either space copies the

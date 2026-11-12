@@ -17,6 +17,7 @@
 #include "pic.h"
 #include "pit.h"
 #include "gdt.h"
+#include "smp.h"
 #include "terminal.h"
 #include "usermode.h"
 
@@ -98,6 +99,14 @@ void kernel_main(void) {
         klog_write("MB\n");
     }
 
+    /* The APIC page sits above the direct map, so it gets a page-table entry
+     * of its own. Mapping it here (before the first user space exists) is
+     * what lets paging_create_user_space copy the entry into every process,
+     * and it keeps the 8259 usable once apic_init switches LINT0 to ExtINT. */
+    if (!paging_map_lapic()) {
+        panic("APIC-FAIL: no frame for the local APIC page");
+    }
+
     /* Framebuffer console: the bootloader discovered a linear framebuffer
      * with the VBE BIOS calls; map it and draw the console there. Without
      * one the VGA text buffer stays in use. */
@@ -141,6 +150,10 @@ void kernel_main(void) {
     klog_log(KLOG_INFO, "PIC-OK: 8259 remapped to 0x20/0x28\n");
     pit_init(100);
     klog_log(KLOG_INFO, "PIT-OK: 100Hz timer on IRQ0\n");
+
+    /* ACPI + local APIC + application processors. Runs with interrupts off:
+     * the APs are parked and the BSP keeps its 8259 timer. */
+    smp_init();
 
     pic_clear_mask(0);
     cpu_sti();

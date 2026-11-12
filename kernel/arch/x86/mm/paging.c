@@ -19,9 +19,9 @@
 #define TAB1 ((uint32_t *)PAGING_TABLE1_PHYS)
 
 /* Storage for the direct-map page tables, carved out of the identity-mapped
- * 4-5 MiB window instead of .bss: a 1020 MiB map needs 255 tables (1 MiB),
- * which would push the kernel image past the 0x80000 boot stack. The region
- * is reserved in the frame allocator by reserve_kernel_regions(). */
+ * 4-5 MiB window instead of .bss: a 1000 MiB map needs 250 tables (1000
+ * KiB), which would push the kernel image past the 0x80000 boot stack. The
+ * region is reserved in the frame allocator by reserve_kernel_regions(). */
 #define DIRECT_TABLE_PHYS 0x00400000u
 #define DIRECT_TABLE_BYTES 0x00100000u
 
@@ -220,6 +220,73 @@ void paging_invlpg(uint32_t virtual_addr) {
     }
 }
 
+/* Scratch window for ACPI tables, mapped two pages at a time. The page
+ * table and the current physical base are remembered so a scan that reads
+ * several fields from the same page does not rewrite the PTE for each read. */
+static uint32_t *temp_table;
+static uint32_t temp_first_phys;
+static int temp_valid;
+
+void *paging_temp_map(uint32_t phys, uint32_t pages) {
+    uint32_t base = phys & 0xFFFFF000u;
+    uint32_t count = pages;
+    uint32_t i;
+
+    if (count == 0) count = 1;
+    if (count > PAGING_TEMP_PAGES) count = PAGING_TEMP_PAGES;
+
+    if (!temp_table) {
+        uint32_t table_phys = alloc_page_table();
+        if (!table_phys) return 0;
+        temp_table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+        DIR[PAGING_TEMP_WINDOW >> 22] = table_phys | PAGE_PRESENT | PAGE_RW;
+    }
+    if (temp_valid && temp_first_phys == base)
+        return (void *)PAGING_TEMP_WINDOW;
+
+    for (i = 0; i < count; i++) {
+        uint32_t page_phys = base + i * 0x1000u;
+        if (page_phys < base) break;   /* wrap at 4 GiB: nothing to map */
+        temp_table[i] = page_phys | PAGE_PRESENT | PAGE_RW;
+        paging_invlpg(PAGING_TEMP_WINDOW + i * 0x1000u);
+    }
+    /* A previous call may have mapped a second page; leaving the PTE behind
+     * would alias a physical page the caller is not inspecting. */
+    for (; i < PAGING_TEMP_PAGES; i++) {
+        if (temp_table[i] & PAGE_PRESENT) {
+            temp_table[i] = 0;
+            paging_invlpg(PAGING_TEMP_WINDOW + i * 0x1000u);
+        }
+    }
+    temp_first_phys = base;
+    temp_valid = 1;
+    return (void *)PAGING_TEMP_WINDOW;
+}
+
+/* The APIC page needs a page table of its own because entry 1019 is outside
+ * the direct-map range. Idempotent, so both the early boot call and the APIC
+ * driver can ask for it. */
+int paging_map_lapic(void) {
+    uint32_t table_phys;
+    uint32_t *table;
+
+    if (DIR[PAGING_LAPIC_INDEX] & PAGE_PRESENT) return 1;
+    table_phys = alloc_page_table();
+    if (!table_phys) return 0;
+    table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+    table[(PAGING_LAPIC_PHYS >> 12) & 0x3FFu] =
+        PAGING_LAPIC_PHYS | PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT;
+    DIR[PAGING_LAPIC_INDEX] = table_phys | PAGE_PRESENT | PAGE_RW;
+    paging_invlpg(PAGING_LAPIC_PHYS);
+    return 1;
+}
+
+/* ACPI tables can sit above the direct map (reclaimable regions are not
+ * part of usable RAM), so the shared parser borrows the scratch window. */
+void *acpi_arch_map_table(uint32_t phys) {
+    return paging_temp_map(phys, PAGING_TEMP_PAGES);
+}
+
 int paging_create_user_space(address_space_t *space) {
     uint32_t *directory;
     uint32_t directory_phys;
@@ -238,6 +305,10 @@ int paging_create_user_space(address_space_t *space) {
         directory[index] = DIR[index];
     }
     directory[PAGING_FB_WINDOW >> 22] = DIR[PAGING_FB_WINDOW >> 22];
+    /* Keep the local APIC reachable under every CR3: an interrupt handler
+     * that acknowledges through the unit must not fault because a user
+     * space is active. Missing when SMP never came up, which is harmless. */
+    directory[PAGING_LAPIC_INDEX] = DIR[PAGING_LAPIC_INDEX];
     space->directory_phys = directory_phys;
     space->mapped_pages = 0;
     space->page_tables = 0;

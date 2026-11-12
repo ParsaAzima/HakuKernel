@@ -706,6 +706,7 @@ def main():
         sys.exit("no kernel/**/*.c files found")
     entry_asm = os.path.join(arch_dir, "kernel", "entry.asm")
     isr_asm = os.path.join(arch_dir, "kernel", "isr.asm")
+    ap_trampoline_asm = os.path.join(arch_dir, "kernel", "ap_trampoline.asm")
     user_asm = os.path.join(arch_dir, "user", "user.asm")
     exec_target_asm = os.path.join(arch_dir, "user", "exec_target.asm")
     child_asm = os.path.join(arch_dir, "user", "child.asm")
@@ -735,6 +736,7 @@ def main():
     cpio_script = os.path.join(ROOT, "tools", "mkcpio.py")
     entry_obj = os.path.join(BUILD, "entry.obj")
     isr_obj = os.path.join(BUILD, "isr.obj")
+    ap_trampoline_obj = os.path.join(BUILD, "ap_trampoline.obj")
     user_elf = os.path.join(BUILD, "user.elf")
     exec_target_elf = os.path.join(BUILD, "exec_target.elf")
     child_elf = os.path.join(BUILD, "child.elf")
@@ -856,7 +858,9 @@ def main():
     # 3. asm stubs -> COFF (entry linked FIRST so the image starts there)
     run([nasm, "-I" + nasm_include, "-f", "win32", entry_asm, "-o", entry_obj])
     run([nasm, "-I" + nasm_include, "-f", "win32", isr_asm, "-o", isr_obj])
-    log("entry.obj + isr.obj built")
+    run([nasm, "-I" + nasm_include, "-f", "win32", ap_trampoline_asm,
+         "-o", ap_trampoline_obj])
+    log("entry.obj + isr.obj + ap_trampoline.obj built")
 
     # 4. link a fixed-base PE (/ENTRY:entry — link prepends _ for x86;
     #    /ALIGN:16 packs sections; /FIXED drops .reloc — we always load
@@ -864,7 +868,7 @@ def main():
     run(linker + ["/NOLOGO", "/SUBSYSTEM:NATIVE", "/ENTRY:entry",
          "/BASE:0x10000", "/ALIGN:16", "/FIXED", "/NODEFAULTLIB",
          "/MAP:" + os.path.join(BUILD, "kernel.map"),
-         "/OUT:" + kernel_pe, entry_obj, isr_obj] + c_objs)
+         "/OUT:" + kernel_pe, entry_obj, isr_obj, ap_trampoline_obj] + c_objs)
     log("kernel.pe linked")
 
     # 4. PE -> flat binary, learn the entry address
@@ -896,6 +900,7 @@ def main():
         f.truncate(1474560)
 
     disk = [qemu, "-m", str(memory_mb),
+            "-smp", "2",
             "-drive", f"file={img},format=raw,if=floppy,index=0",
             "-drive", f"file={filesystem_image},format=raw,if=ide,index=0,media=disk",
             "-drive", f"file={spare_image},format=raw,if=ide,index=2,media=disk",
@@ -1011,6 +1016,8 @@ def main():
             "E820-OK",       # stage2 INT 15h map handoff verified
             "FRAME-OK",      # frame_alloc/free self-test passed
             "MEM-OK",        # direct map and frame pool sized from E820
+            "SMP-OK cpus=2",  # ACPI MADT found both CPUs
+            "SMP-AP-OK cpu=1",# the AP ran the trampoline and parked on its stack
             "GDT-OK",        # kernel/user selectors and ring-0 TSS stack loaded
             "ELF-REJECT-OK", # malformed images and W+X segments were rejected
             "ELF-LOAD-OK",   # valid ELF32 PT_LOAD segments loaded to fresh CR3
