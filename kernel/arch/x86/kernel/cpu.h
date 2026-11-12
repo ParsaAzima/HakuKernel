@@ -23,6 +23,13 @@ void cpu_irq_restore(uint32_t flags);
 /* ~1us delay via the POST-card port, like Linux io_delay(). */
 void io_wait(void);
 
+/* Atomic primitives used by the spinlocks. xchg with a memory operand is
+ * implicitly locked, so the exchange is one indivisible bus operation even
+ * when two CPUs run it at once. */
+uint32_t cpu_atomic_exchange(volatile uint32_t *address, uint32_t value);
+/* Spin-wait hint: tells the CPU this is a tight poll loop. */
+void cpu_pause(void);
+
 /* Minimal libc substitutes (defined in cpu.c, resolved inside our link). */
 void *memset(void *dst, int c, size_t n);
 void *memcpy(void *dst, const void *src, size_t n);

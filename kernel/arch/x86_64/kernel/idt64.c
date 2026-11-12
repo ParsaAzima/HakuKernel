@@ -124,6 +124,12 @@ void idt64_init(void) {
     isr64_load_idt((u64)&idtr);
 }
 
+/* APs start with IDTR = 0; load the shared table so an exception there is
+ * reported instead of triple-faulting. */
+void idt64_load_ap(void) {
+    isr64_load_idt((u64)&idtr);
+}
+
 u32 exc64_count(u32 vector) {
     return vector < 32 ? exc_counts[vector] : 0;
 }

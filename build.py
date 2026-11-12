@@ -535,6 +535,8 @@ def build_x64(nasm, py, memory_mb):
                 "HAKU64-FRAME-OK", "HAKU64-HEAP-OK", "HAKU64-GDT-OK",
                 "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
                 "HAKU64-SMP-OK: cpus=2", "HAKU64-SMP-AP-OK cpu=1",
+                "HAKU64-SMP-LOCK-OK",
+                "HAKU64-SMP-AP-GDT-OK",
                 "HAKU64-VM-OK", "HAKU64-PROC-OK", "HAKU64-USER-OK",
                 "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
                 "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",
@@ -1026,6 +1028,8 @@ def main():
             "MEM-OK",        # direct map and frame pool sized from E820
             "SMP-OK cpus=2",  # ACPI MADT found both CPUs
             "SMP-AP-OK cpu=1",# the AP ran the trampoline and parked on its stack
+            "SMP-LOCK-OK",    # both CPUs incremented one lock-protected counter
+            "SMP-AP-GDT-OK",  # the AP loaded its own GDT/TSS and the shared IDT
             "GDT-OK",        # kernel/user selectors and ring-0 TSS stack loaded
             "ELF-REJECT-OK", # malformed images and W+X segments were rejected
             "ELF-LOAD-OK",   # valid ELF32 PT_LOAD segments loaded to fresh CR3

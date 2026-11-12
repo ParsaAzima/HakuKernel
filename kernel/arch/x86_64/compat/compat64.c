@@ -2,9 +2,9 @@
  * into the x86-64 kernel unchanged.
  *
  * Only the seams live here: port I/O, the tiny logging surface those files
- * use, and a single-CPU spin mutex. The filesystem and disk logic itself is
- * the same source the 32-bit image boots and tests, which is why the 64-bit
- * port gets path walking and writes without a second implementation.
+ * use, and a spin mutex. The filesystem and disk logic itself is the same
+ * source the 32-bit image boots and tests, which is why the 64-bit port gets
+ * path walking and writes without a second implementation.
  */
 #include "cpu.h"
 #include "klog.h"
@@ -70,8 +70,9 @@ void klog_log(klog_level_t level, const char *message) {
 
 void mutex_lock(mutex_t *mutex) {
     if (!mutex) return;
-    while (mutex->locked) cpu_pause64();
-    mutex->locked = 1;
+    while (cpu_atomic_exchange64(&mutex->locked, 1u)) {
+        while (mutex->locked) cpu_pause64();
+    }
 }
 
 void mutex_unlock(mutex_t *mutex) {

@@ -12,44 +12,31 @@ void spin_init(spinlock_t *lock) {
     lock->locked = 0;
 }
 
-/* Test-and-set under a brief interrupt mask so the acquisition is atomic
- * with respect to the timer. After that the critical section runs with
- * interrupts enabled: if the holder is preempted, the timer will schedule
- * it again while this task busy-waits. Callers must have interrupts
- * enabled (boot and the quiescent idle self-test are single-threaded). */
+/* Test-and-set with an atomic exchange. The exchange is one locked bus
+ * operation, so two CPUs entering together cannot both see a free lock. The
+ * polling load is a plain volatile read: it only decides when to retry, and
+ * the retry re-exchanges, so a stale value costs a spin, never the lock.
+ * Interrupts stay enabled for the critical section; if the holder is
+ * preempted, the timer will schedule it again while this task busy-waits. */
 void spin_lock(spinlock_t *lock) {
-    for (;;) {
-        irqflags_t flags = irq_lock();
-        if (!lock->locked) {
-            lock->locked = 1;
-            irq_unlock(flags);
-            return;
-        }
-        irq_unlock(flags);
-        while (lock->locked) {
-            /*
-             * The condition is volatile, so each iteration re-reads the
-             * word. Yielding to the timer here is what lets the holder
-             * make progress; a dedicated wait queue is a later milestone.
-             */
-        }
+    while (cpu_atomic_exchange(&lock->locked, 1u)) {
+        while (lock->locked) cpu_pause();
     }
 }
 
+/* A plain store is the release: x86 does not reorder earlier stores past a
+ * later one, so the critical section is visible before the lock is. */
 void spin_unlock(spinlock_t *lock) {
-    irqflags_t flags = irq_lock();
     lock->locked = 0;
-    irq_unlock(flags);
 }
 
 /* All holders keep interrupts disabled, so no other task can be stopped
- * while holding one of these locks; the busy-wait only runs if the same
- * context re-acquires the lock, which the rules forbid. */
+ * while holding one of these locks; the busy-wait only runs if another CPU
+ * holds the lock or the same context re-acquires it, and the latter is
+ * forbidden by the locking rules. */
 irqflags_t spin_lock_irqsave(spinlock_t *lock) {
     irqflags_t flags = irq_lock();
-    while (lock->locked) {
-    }
-    lock->locked = 1;
+    while (cpu_atomic_exchange(&lock->locked, 1u)) cpu_pause();
     return flags;
 }
 

@@ -40,15 +40,30 @@ static gdt_entry_t gdt[7];
 static gdtr_t gdtr;
 static tss_t tss;
 
+/* One private table and TSS per application processor: a TSS is a single
+ * object, and every CPU needs its own so a ring-3 entry uses that CPU's
+ * RSP0 and IST stacks. Index 0 is unused (the BSP keeps the table above),
+ * and the selector values are the same because the indices match. */
+#define GDT_AP_MAX 8u
+static gdt_entry_t ap_gdt[GDT_AP_MAX][7];
+static gdtr_t ap_gdtr[GDT_AP_MAX];
+static tss_t ap_tss[GDT_AP_MAX];
+static volatile uint32_t ap_gdt_ready[GDT_AP_MAX];
+
+static void gdt_entry_set(gdt_entry_t *table, uint32_t index, uint32_t base,
+                          uint32_t limit, uint8_t access, uint8_t flags) {
+    table[index].base_low = (uint16_t)(base & 0xFFFFu);
+    table[index].base_mid = (uint8_t)((base >> 16) & 0xFFu);
+    table[index].base_high = (uint8_t)((base >> 24) & 0xFFu);
+    table[index].limit_low = (uint16_t)(limit & 0xFFFFu);
+    table[index].granularity = (uint8_t)(((limit >> 16) & 0x0Fu) |
+                                        (flags & 0xF0u));
+    table[index].access = access;
+}
+
 static void gdt_set(uint32_t index, uint32_t base, uint32_t limit,
                     uint8_t access, uint8_t flags) {
-    gdt[index].base_low = (uint16_t)(base & 0xFFFFu);
-    gdt[index].base_mid = (uint8_t)((base >> 16) & 0xFFu);
-    gdt[index].base_high = (uint8_t)((base >> 24) & 0xFFu);
-    gdt[index].limit_low = (uint16_t)(limit & 0xFFFFu);
-    gdt[index].granularity = (uint8_t)(((limit >> 16) & 0x0Fu) |
-                                        (flags & 0xF0u));
-    gdt[index].access = access;
+    gdt_entry_set(gdt, index, base, limit, access, flags);
 }
 
 int gdt_init(void) {
@@ -80,6 +95,47 @@ int gdt_init(void) {
 
 void gdt_set_kernel_stack(uint32_t stack_top) {
     tss.esp0 = stack_top;
+}
+
+/* Per-AP GDT/TSS. The AP runs this on its own stack with the trampoline's
+ * temporary table still loaded; both tables describe the same flat segments,
+ * so replacing the table does not invalidate CS and SS (gdt_load does not
+ * reload them). The new TSS is loaded with LTR so the CPU has an RSP0 for a
+ * ring-3 entry. */
+int gdt_init_ap(uint32_t cpu, uint32_t kernel_stack_top) {
+    gdt_entry_t *table;
+    tss_t *ap;
+    gdtr_t *descriptor;
+
+    if (cpu == 0 || cpu >= GDT_AP_MAX) return 0;
+    table = ap_gdt[cpu];
+    ap = &ap_tss[cpu];
+    descriptor = &ap_gdtr[cpu];
+
+    memset(table, 0, sizeof(ap_gdt[cpu]));
+    memset(ap, 0, sizeof(*ap));
+    gdt_entry_set(table, 1, 0, 0xFFFFFu, 0x9Au, 0xCFu);
+    gdt_entry_set(table, 2, 0, 0xFFFFFu, 0x92u, 0xCFu);
+    gdt_entry_set(table, 3, 0, 0xFFFFFu, 0xFAu, 0xCFu);
+    gdt_entry_set(table, 4, 0, 0xFFFFFu, 0xF2u, 0xCFu);
+    gdt_entry_set(table, 6, 0, 0xFFFFFu, 0xF2u, 0xCFu);
+
+    ap->ss0 = KERNEL_DS;
+    ap->esp0 = kernel_stack_top;
+    ap->iomap_base = sizeof(*ap);
+    gdt_entry_set(table, 5, (uint32_t)ap, sizeof(*ap) - 1u, 0x89u, 0x00u);
+
+    descriptor->limit = (uint16_t)(sizeof(ap_gdt[cpu]) - 1u);
+    descriptor->base = (uint32_t)table;
+    gdt_load((uint32_t)descriptor);
+    tss_load(TSS_SELECTOR);
+    ap_gdt_ready[cpu] = 1;
+    return 1;
+}
+
+uint32_t gdt_ap_tss_esp0(uint32_t cpu) {
+    if (cpu >= GDT_AP_MAX || !ap_gdt_ready[cpu]) return 0;
+    return ap_tss[cpu].esp0;
 }
 
 /* Move the user FS segment to a new base (the thread pointer). The

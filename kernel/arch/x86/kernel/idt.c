@@ -88,6 +88,10 @@ void idt_init(void) {
     idt_load((uint32_t)&idtr);
 }
 
+void idt_load_ap(void) {
+    idt_load((uint32_t)&idtr);
+}
+
 void irq_install(uint8_t irq, irq_fn_t fn) {
     if (irq < 16) irq_handlers[irq] = fn;
 }

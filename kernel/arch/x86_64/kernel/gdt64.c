@@ -111,3 +111,82 @@ void gdt64_set_rsp0(u64 top) {
 u64 gdt64_rsp0(void) {
     return tss.rsp0;
 }
+
+/* ------------------------------------------------- per-AP descriptor tables
+ * A TSS is a single object, so every CPU needs its own. The table, the TSS
+ * and the two IST stacks come from the frame allocator and are reached
+ * through the physmap, which every address space shares. Preparation runs on
+ * the bootstrap processor (the allocator is not cross-CPU safe yet);
+ * loading runs on the AP itself. */
+typedef struct {
+    u64 *table;
+    tss64_t *tss;
+    u64 rsp0;
+    u64 ist1_top;
+    u64 ist2_top;
+    u32 ready;
+} ap_gdt64_t;
+
+static ap_gdt64_t ap_tables[K64_SMP_MAX_CPUS];
+static table_desc64_t ap_gdtr[K64_SMP_MAX_CPUS];
+
+/* Fill a private table and TSS for `cpu`. Returns 0 when a frame is missing
+ * or the index is the bootstrap processor's. */
+int gdt64_prepare_ap(u32 cpu, u64 rsp0_top) {
+    u64 table_phys, ist1_phys, ist2_phys;
+    u64 *table;
+    tss64_t *ap_tss;
+
+    if (cpu == 0 || cpu >= K64_SMP_MAX_CPUS) return 0;
+    if (ap_tables[cpu].ready) return 1;
+
+    table_phys = frame64_alloc();
+    ist1_phys = frame64_alloc();
+    ist2_phys = frame64_alloc();
+    if (!table_phys || !ist1_phys || !ist2_phys) {
+        if (table_phys) frame64_free(table_phys);
+        if (ist1_phys) frame64_free(ist1_phys);
+        if (ist2_phys) frame64_free(ist2_phys);
+        return 0;
+    }
+
+    table = (u64 *)phys_to_virt64(table_phys);
+    memset(table, 0, K64_PAGE_SIZE);
+    set_code(&table[1], 0);        /* K64_KERNEL_CS */
+    set_data(&table[2], 0);        /* K64_KERNEL_DS */
+    set_data(&table[3], 3);        /* K64_USER_DS   */
+    set_code(&table[4], 3);        /* K64_USER_CS   */
+
+    /* The TSS shares the page with the 64-byte table. */
+    ap_tss = (tss64_t *)(table + GDT_ENTRIES);
+    memset(ap_tss, 0, sizeof(*ap_tss));
+    ap_tss->rsp0 = rsp0_top;
+    ap_tss->ist[0] = (u64)phys_to_virt64(ist1_phys) + K64_PAGE_SIZE;
+    ap_tss->ist[1] = (u64)phys_to_virt64(ist2_phys) + K64_PAGE_SIZE;
+    ap_tss->iomap_base = (u16)sizeof(*ap_tss);
+    set_tss(&table[5], (u64)ap_tss, (u32)sizeof(*ap_tss) - 1u);
+
+    ap_gdtr[cpu].limit = (u16)(GDT_ENTRIES * sizeof(u64) - 1u);
+    ap_gdtr[cpu].base = (u64)table;
+
+    ap_tables[cpu].table = table;
+    ap_tables[cpu].tss = ap_tss;
+    ap_tables[cpu].rsp0 = rsp0_top;
+    ap_tables[cpu].ist1_top = ap_tss->ist[0];
+    ap_tables[cpu].ist2_top = ap_tss->ist[1];
+    ap_tables[cpu].ready = 1;
+    return 1;
+}
+
+/* LGDT + LTR on the calling AP. */
+int gdt64_load_ap(u32 cpu) {
+    if (cpu >= K64_SMP_MAX_CPUS || !ap_tables[cpu].ready) return 0;
+    gdt64_load((u64)&ap_gdtr[cpu]);
+    tss64_load((u16)K64_TSS_SEL);
+    return 1;
+}
+
+u64 gdt64_ap_rsp0(u32 cpu) {
+    if (cpu >= K64_SMP_MAX_CPUS || !ap_tables[cpu].ready) return 0;
+    return ap_tables[cpu].tss->rsp0;
+}

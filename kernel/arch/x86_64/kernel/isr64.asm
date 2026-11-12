@@ -28,6 +28,7 @@ global tss64_load
 global sti64
 global cli64
 global apic_msr_enable64
+global cpu_atomic_exchange64
 global read_cr2_64
 global read_cr3_64
 global write_cr3_64
@@ -363,6 +364,14 @@ apic_msr_enable64:
     rdmsr
     or eax, 800h
     wrmsr
+    ret
+
+; u32 cpu_atomic_exchange64(volatile u32 *address, u32 value)
+; RCX holds the address and EDX the new word. xchg with a memory operand is
+; implicitly locked; returns the old word in EAX.
+cpu_atomic_exchange64:
+    mov eax, edx
+    lock xchg [rcx], eax
     ret
 
 ; u64 read_cr2_64(void)

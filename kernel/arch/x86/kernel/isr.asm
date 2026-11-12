@@ -31,6 +31,22 @@ _cpu_cli:
     cli
     ret
 
+; uint32_t cpu_atomic_exchange(volatile uint32_t *address, uint32_t value)
+; xchg with a memory operand is implicitly locked, so two CPUs running this
+; at once still see one indivisible exchange. Returns the old word in EAX.
+global _cpu_atomic_exchange
+_cpu_atomic_exchange:
+    mov ecx, [esp+4]
+    mov eax, [esp+8]
+    xchg [ecx], eax
+    ret
+
+; void cpu_pause(void) — spin-wait hint, no architectural side effect.
+global _cpu_pause
+_cpu_pause:
+    pause
+    ret
+
 ; The first privilege transition also needs a safe ring-0 stack.
 global _gdt_load, _tss_load, _scheduler_enter_frame
 _gdt_load:                       ; void gdt_load(uint32_t gdtr_addr)

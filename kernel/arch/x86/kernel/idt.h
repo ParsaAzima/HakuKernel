@@ -45,6 +45,9 @@ typedef struct {
 
 void idt_init(void);
 void idt_set_gate(uint8_t n, uint32_t handler, uint16_t sel, uint8_t flags);
+/* Load the shared IDT on an application processor, which starts with no
+ * IDTR and would triple-fault on its first exception. */
+void idt_load_ap(void);
 
 /* C dispatchers called from isr.asm. */
 regs_t *isr_handler(regs_t *r);

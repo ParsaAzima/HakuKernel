@@ -589,6 +589,11 @@ u64 heap64_free_bytes(void);
 
 /* gdt64.c: GDT, TSS and the IST stacks */
 void gdt64_init(void);
+/* Per-AP descriptor table and TSS. Prepare on the bootstrap processor,
+ * load on the AP. rsp0_top is what a ring-3 entry on that CPU would use. */
+int gdt64_prepare_ap(u32 cpu, u64 rsp0_top);
+int gdt64_load_ap(u32 cpu);
+u64 gdt64_ap_rsp0(u32 cpu);
 u64 gdt64_tss_base(void);
 u64 gdt64_ist_top(u32 index);
 void gdt64_set_rsp0(u64 top);
@@ -755,6 +760,8 @@ u64 sys64_count(void);
 
 /* idt64.c: gate table plus the C exception/IRQ dispatcher */
 void idt64_init(void);
+/* Load the shared IDT on an application processor. */
+void idt64_load_ap(void);
 regs64_t *isr64_dispatch(regs64_t *r);
 u32 exc64_count(u32 vector);
 u64 exc64_last_cr2(void);
@@ -786,5 +793,7 @@ u32 smp64_cpu_count(void);
 void smp64_ap_entry(u64 cpu);
 /* From isr64.asm: set APICBASE.EN in IA32_APIC_BASE. */
 void apic_msr_enable64(void);
+/* From isr64.asm: atomic exchange, returns the previous word. */
+u32 cpu_atomic_exchange64(volatile u32 *address, u32 value);
 
 #endif

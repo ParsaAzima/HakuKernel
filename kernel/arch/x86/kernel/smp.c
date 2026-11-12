@@ -18,8 +18,11 @@
 #include "apic.h"
 #include "cpu.h"
 #include "frame.h"
+#include "gdt.h"
+#include "idt.h"
 #include "klog.h"
 #include "paging.h"
+#include "sync.h"
 
 #define SMP_TRAMPOLINE_BASE 0x8000u
 #define SMP_TRAMPOLINE_VECTOR (SMP_TRAMPOLINE_BASE >> 12)
@@ -30,15 +33,28 @@
 #define SMP_STACK_PAGES 1u
 #define SMP_START_ATTEMPTS 3u
 #define SMP_ONLINE_SPINS 200000u
+/* Increments each CPU contributes to the cross-CPU lock test. Large enough
+ * that a SIPI's startup latency overlaps the BSP's share, small enough to
+ * stay well under a second even under TCG. */
+#define SMP_LOCK_ITERATIONS 50000u
 
 typedef struct {
     uint32_t apic_id;
     uint32_t stack_phys;
-    volatile uint32_t online;
+    uint32_t stack_top;
+    volatile uint32_t online;   /* AP reached the C entry point */
+    volatile uint32_t done;     /* AP finished its share of the lock test */
+    volatile uint32_t gdt_ok;   /* AP loaded its private GDT/TSS and IDT */
 } smp_cpu_t;
 
 static smp_cpu_t cpus[SMP_MAX_CPUS];
 static uint32_t cpu_count;
+
+/* Shared by every CPU during bring-up. The counter is incremented with a
+ * plain load/add/store on purpose: without a working atomic lock, two CPUs
+ * running this at once lose updates and the total comes out short. */
+static spinlock_t lock_test = SPINLOCK_INIT;
+static volatile uint32_t lock_counter;
 
 /* Provided by ap_trampoline.asm. The blob is copied, not executed in place,
  * so its link address only has to be readable. */
@@ -52,7 +68,29 @@ extern void smp_memory_barrier(void);
  * installed. Everything beyond this point must stay per-CPU: the BSP owns
  * the scheduler until the next stage. */
 void smp_ap_entry(uint32_t cpu) {
-    if (cpu < SMP_MAX_CPUS) cpus[cpu].online = 1;
+    uint32_t i;
+
+    if (cpu < SMP_MAX_CPUS) {
+        /* Give this CPU its own descriptor table, TSS and the shared IDT
+         * before running any work: from here an exception on the AP is
+         * reportable instead of a triple fault. */
+        if (gdt_init_ap(cpu, cpus[cpu].stack_top)) {
+            idt_load_ap();
+            cpus[cpu].gdt_ok = 1;
+        }
+        /* Announce arrival before the loop so the BSP can move on and start
+         * its own share; that overlap is what makes the lock test
+         * meaningful. */
+        cpus[cpu].online = 1;
+    }
+
+    for (i = 0; i < SMP_LOCK_ITERATIONS; i++) {
+        spin_lock(&lock_test);
+        lock_counter++;
+        spin_unlock(&lock_test);
+    }
+
+    if (cpu < SMP_MAX_CPUS) cpus[cpu].done = 1;
 
     /* The AP has no work and must not touch shared scheduler state yet. */
     for (;;) {
@@ -73,6 +111,7 @@ static int start_ap(uint32_t index, uint32_t apic_id) {
     if (!cpus[index].stack_phys) return 0;
     stack_top = (uint32_t)PHYS_TO_VIRT(cpus[index].stack_phys) +
                 SMP_STACK_PAGES * FRAME_SIZE;
+    cpus[index].stack_top = stack_top;
 
     memcpy((void *)SMP_TRAMPOLINE_BASE, (void *)ap_trampoline_start,
            blob_size);
@@ -103,9 +142,13 @@ int smp_init(void) {
     const acpi_info_t *info;
     uint32_t bsp_id;
     uint32_t i;
+    uint32_t spin;
+    uint32_t expected;
 
     memset(cpus, 0, sizeof(cpus));
     cpu_count = 0;
+    lock_counter = 0;
+    lock_test.locked = 0;
 
     if (!acpi_init() || !acpi_info()->have_madt) {
         klog_log(KLOG_WARN, "SMP-SKIP: no ACPI MADT, staying uniprocessor\n");
@@ -151,6 +194,48 @@ int smp_init(void) {
     klog_write(" madt=cpus/");
     klog_dec(info->cpu_count);
     klog_write(" parked=1\n");
+
+    /* The BSP takes the same share as each AP. The APs are already running
+     * theirs, so the two loops overlap and the lock has to be atomic across
+     * CPUs, not just across an interrupt. */
+    for (i = 0; i < SMP_LOCK_ITERATIONS; i++) {
+        spin_lock(&lock_test);
+        lock_counter++;
+        spin_unlock(&lock_test);
+    }
+    for (i = 1; i < cpu_count; i++) {
+        for (spin = 0; spin < SMP_ONLINE_SPINS; spin++) {
+            if (cpus[i].done) break;
+            apic_delay(10);
+        }
+    }
+
+    /* Each AP rebuilt its descriptor table: prove the TSS it loaded carries
+     * that CPU's stack, which is what a ring-3 entry would use. */
+    for (i = 1; i < cpu_count; i++) {
+        klog_prefix();
+        if (cpus[i].gdt_ok && gdt_ap_tss_esp0(i) == cpus[i].stack_top) {
+            klog_write("SMP-AP-GDT-OK cpu=");
+        } else {
+            klog_write("SMP-AP-GDT-FAIL cpu=");
+        }
+        klog_dec(i);
+        klog_write(" esp0=");
+        klog_hex(gdt_ap_tss_esp0(i));
+        klog_write("\n");
+    }
+
+    expected = SMP_LOCK_ITERATIONS * cpu_count;
+    klog_prefix();
+    if (lock_counter == expected) {
+        klog_write("SMP-LOCK-OK counter=");
+    } else {
+        klog_write("SMP-LOCK-FAIL counter=");
+    }
+    klog_dec(lock_counter);
+    klog_write(" expected=");
+    klog_dec(expected);
+    klog_write("\n");
     return (int)cpu_count;
 }
 

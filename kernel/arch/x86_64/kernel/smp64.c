@@ -15,6 +15,7 @@
 #include "acpi.h"
 #include "apic.h"
 #include "haku64.h"
+#include "sync.h"
 
 #define SMP64_TRAMPOLINE_BASE 0x8000ull
 #define SMP64_TRAMPOLINE_VECTOR 0x08u
@@ -24,15 +25,24 @@
 
 #define SMP64_START_ATTEMPTS 3u
 #define SMP64_ONLINE_SPINS 200000u
+/* Increments each CPU contributes to the cross-CPU lock test; see the 32-bit
+ * smp.c for why the counter update itself is deliberately not atomic. */
+#define SMP64_LOCK_ITERATIONS 50000u
 
 typedef struct {
     u32 apic_id;
     u64 stack_phys;
+    u64 stack_top;
     volatile u32 online;
+    volatile u32 done;
+    volatile u32 gdt_ok;
 } smp64_cpu_t;
 
 static smp64_cpu_t cpus[K64_SMP_MAX_CPUS];
 static u32 cpu_count;
+
+static mutex_t lock_test = MUTEX_INIT;
+static volatile u32 lock_counter;
 
 /* From ap_trampoline64.asm. The blob is copied, not executed in place. */
 extern void ap_trampoline64_start(void);
@@ -42,7 +52,25 @@ extern void smp_memory_barrier64(void);
 /* Running on the AP's private stack with the trampoline's bootstrap GDT.
  * Nothing here may touch shared scheduler state; the BSP owns it. */
 void smp64_ap_entry(u64 cpu) {
-    if (cpu < (u64)K64_SMP_MAX_CPUS) cpus[cpu].online = 1;
+    u32 i;
+
+    if (cpu < (u64)K64_SMP_MAX_CPUS) {
+        /* Switch from the trampoline's bootstrap table to this CPU's own
+         * GDT/TSS and the shared IDT before doing anything else. */
+        if (gdt64_load_ap((u32)cpu)) {
+            idt64_load_ap();
+            cpus[cpu].gdt_ok = 1;
+        }
+        cpus[cpu].online = 1;
+    }
+
+    for (i = 0; i < SMP64_LOCK_ITERATIONS; i++) {
+        mutex_lock(&lock_test);
+        lock_counter++;
+        mutex_unlock(&lock_test);
+    }
+
+    if (cpu < (u64)K64_SMP_MAX_CPUS) cpus[cpu].done = 1;
 
     for (;;) {
         cli64();
@@ -61,6 +89,14 @@ static int start_ap(u32 index, u32 apic_id) {
     if (!stack_phys) return 0;
     cpus[index].stack_phys = stack_phys;
     stack_top = (u64)phys_to_virt64(stack_phys) + K64_PAGE_SIZE;
+    cpus[index].stack_top = stack_top;
+    /* Build the descriptor table here, while only the BSP uses the frame
+     * allocator; the AP only loads it. */
+    if (!gdt64_prepare_ap(index, stack_top)) {
+        frame64_free(stack_phys);
+        cpus[index].stack_phys = 0;
+        return 0;
+    }
 
     memcpy((void *)SMP64_TRAMPOLINE_BASE, (void *)ap_trampoline64_start,
            blob_size);
@@ -91,9 +127,13 @@ int smp64_init(void) {
     const acpi_info_t *info;
     u32 bsp_id;
     u32 i;
+    u32 spin;
+    u32 expected;
 
     memset(cpus, 0, sizeof(cpus));
     cpu_count = 0;
+    lock_counter = 0;
+    lock_test.locked = 0;
 
     if (!acpi_init() || !acpi_info()->have_madt) {
         k64_puts("HAKU64-SMP-SKIP: no ACPI MADT\r\n");
@@ -135,6 +175,46 @@ int smp64_init(void) {
     k64_puts(" madt=");
     k64_dec(info->cpu_count);
     k64_puts(" parked=1\r\n");
+
+    /* The BSP takes the same share as each AP while the APs run theirs, so
+     * the counter update has to be protected by a lock that is atomic across
+     * CPUs, not by a local interrupt mask. */
+    for (i = 0; i < SMP64_LOCK_ITERATIONS; i++) {
+        mutex_lock(&lock_test);
+        lock_counter++;
+        mutex_unlock(&lock_test);
+    }
+    for (i = 1; i < cpu_count; i++) {
+        for (spin = 0; spin < SMP64_ONLINE_SPINS; spin++) {
+            if (cpus[i].done) break;
+            apic_delay(10);
+        }
+    }
+
+    /* Each AP switched to its own GDT/TSS: prove the TSS carries that CPU's
+     * stack, which is what a ring-3 entry would use. */
+    for (i = 1; i < cpu_count; i++) {
+        if (cpus[i].gdt_ok && gdt64_ap_rsp0(i) == cpus[i].stack_top) {
+            k64_puts("HAKU64-SMP-AP-GDT-OK cpu=");
+        } else {
+            k64_puts("HAKU64-SMP-AP-GDT-FAIL cpu=");
+        }
+        k64_dec(i);
+        k64_puts(" rsp0=");
+        k64_hex(gdt64_ap_rsp0(i));
+        k64_puts("\r\n");
+    }
+
+    expected = SMP64_LOCK_ITERATIONS * cpu_count;
+    if (lock_counter == expected) {
+        k64_puts("HAKU64-SMP-LOCK-OK counter=");
+    } else {
+        k64_puts("HAKU64-SMP-LOCK-FAIL counter=");
+    }
+    k64_dec(lock_counter);
+    k64_puts(" expected=");
+    k64_dec(expected);
+    k64_puts("\r\n");
     return (int)cpu_count;
 }
 
