@@ -56,13 +56,16 @@ control and pipelines working.
   subset, validated user pointers, `-errno` results, and the 64-byte i386
   `struct stat` family that glibc and musl expect.
 - **Modules** — `haku module`: a packed `.hkm` container (built on the host by
-  `tools/mkhakumod.py` from a NASM ELF32 object) loaded with `init_module`,
-  relocated against an eleven-entry kernel export table, and unloaded with
-  `delete_module`. A module can register a `/dev` character device or a
-  filesystem backend and mount it at its own prefix; the kernel ties both to
-  the module slot, refuses the unload while a descriptor is open (`-EBUSY`),
-  and detaches everything before the image is freed. Modules are trusted
-  ring-0 code; the 32-bit kernel loads them today.
+  `tools/mkhakumod.py` from NASM ELF32 or COFF/i386 objects) loaded with
+  `init_module`, relocated against an eleven-entry kernel export table, and
+  unloaded with `delete_module`. A module can register a `/dev` character
+  device or a filesystem backend and mount it at its own prefix; the kernel
+  ties both to the module slot, refuses the unload while a descriptor is open
+  (`-EBUSY`), and detaches everything before the image is freed. C modules are
+  first-class: `include/haku/module.h` declares the services and `libhakumod`
+  supplies the string and 64-bit helpers the compiler calls, with the packer
+  dropping whatever a module does not reach. Modules are trusted ring-0 code;
+  the 32-bit kernel loads them today.
 - **Storage** — ATA PIO on both legacy channels with reset/retry recovery, a
   writable FAT12 driver, a VFS with per-process descriptors, `ramfs` root,
   `initramfs` (cpio newc), `/dev`, and a generated `/proc`.

@@ -55,10 +55,12 @@ the user C library (`USER-LIB-OK`), a packed ring-0 module that is loaded,
 refused twice under the same name, and unloaded again
 (`USER-MODULE-OK`, `MODULE-LOAD-OK name=HAKU-DEMO`,
 `MODULE-UNLOAD-OK name=HAKU-DEMO`, and the module's own
-`HAKU-MODULE-OK`/`HAKU-MODULE-EXIT` lines), a module-owned character device
-(`USER-MODDEV-OK`, `HELLO-MODULE-OK`, including a `delete_module` that reports
-`-EBUSY` while the device is open), a module-mounted read-only filesystem
-(`USER-ROMFS-OK`, `ROMFS-MODULE-OK`), and timer IRQs through the serial log.
+`HAKU-MODULE-OK`/`HAKU-MODULE-EXIT` lines), a C module that links
+`libhakumod`, registers a character device and checks the runtime it linked
+(`HELLO-LIB-OK`, `USER-MODDEV-OK`, `HELLO-MODULE-OK`, including a
+`delete_module` that reports `-EBUSY` while the device is open), a C module
+that registers and mounts a read-only filesystem (`USER-ROMFS-OK`,
+`ROMFS-MODULE-OK`), and timer IRQs through the serial log.
 
 Both QEMU runs ask for two CPUs (`-smp 2`). The kernel parses the ACPI MADT,
 enables its local APIC and starts the second processor through a real-mode
@@ -128,10 +130,12 @@ session survive the next build. It is (re)created from `kernel/arch/x86/user/use
 `kernel/arch/x86/user/vfork_target.asm`, the
 user library in `user/lib/`, `user/tests/libtest.c`, and the packed modules
 `build/MODULE.HKM`, `build/HELLO.HKM`, and `build/ROMFS.HKM` only when missing
-or with `--fresh`. Each module is assembled from its source under
-`kernel/module/demo/` as an ELF32 object and packed by `tools/mkhakumod.py`;
-the same files go into the initramfs and the FAT12 seed disk, so the ring-3
-test can read them by name either way. If any
+or with `--fresh`. The demo module is assembled from `haku_demo.asm` as an
+ELF32 object; `hello.c` and `romfs.c` are compiled with the kernel's switches
+plus `/Gy` and linked with `libhakumod` (`build/modlib_module_lib.obj` and
+`build/modlib_runtime.obj`) by `tools/mkhakumod.py`, which is also a small
+COFF linker. The same files go into the initramfs and the FAT12 seed disk, so
+the ring-3 test can read them by name either way. If any
 test-program or module source is newer than a reused image,
 the build warns that its test ELFs on disk may be stale. `headless` always
 starts from a fresh image (its fault-injection tests mutate the disk) and,

@@ -118,16 +118,33 @@ initramfs archive) are not supported.
 
 ## Haku module loading
 
-`tools/mkhakumod.py` is the only code that understands ELF for modules. It
-accepts the subset a NASM `-f elf32` object uses (no `RELA`, no `COMMON`, no
-absolute symbols), rejects an object that does not define `haku_module_init`,
-extracts the addend from each relocated word and writes zero there, and emits
-the `.hkm` container described in `kernel/module/haku_module.h`. `build.py`
-assembles three modules, packs `build/MODULE.HKM`, `build/HELLO.HKM`, and
-`build/ROMFS.HKM`, and installs them in both the initramfs and the FAT12 seed
-disk, so a user program can read them and call `init_module`. `haku_demo.asm`
-proves relocation and logging, `hello.asm` registers a character device, and
-`romfs.asm` registers and mounts a read-only filesystem.
+`tools/mkhakumod.py` is the only code that understands object files for
+modules. It accepts the subset a NASM `-f elf32` object uses (no `RELA`, no
+`COMMON`, no absolute symbols) and the COFF/i386 objects `cl.exe` or `clang-cl`
+emit, rejects a module that does not define `haku_module_init`, extracts the
+addend from each relocated word and writes zero there, and emits the `.hkm`
+container described in `kernel/module/haku_module.h`.
+
+With COFF input the tool is a small static linker, because a C module is
+several objects (`hello.c` plus `libhakumod`). It resolves defined symbols to
+section offsets, turns undefined ones into kernel imports (one leading C
+decoration underscore is removed), folds duplicate `COMDAT SELECT_ANY`
+definitions — the same function emitted inline in two objects — and rejects any
+other duplicate definition. The sections are then laid out only if the entry or
+exit hook reaches them, walking the relocation graph, so an unused library
+routine costs nothing. Two COFF relocation types are understood:
+`IMAGE_REL_I386_DIR32` as `R_386_32`, and `IMAGE_REL_I386_REL32` as
+`R_386_PC32` with its addend reduced by four, because the COFF field is
+relative to the end of the four-byte word while ELF is relative to its start.
+Sections with `LNK_INFO`, `LNK_REMOVE`, or `MEM_DISCARDABLE` are dropped, and
+uninitialized sections with no raw data become BSS.
+
+`build.py` builds three modules, packs `build/MODULE.HKM`, `build/HELLO.HKM`,
+and `build/ROMFS.HKM`, and installs them in both the initramfs and the FAT12
+seed disk, so a user program can read them and call `init_module`.
+`haku_demo.asm` keeps the NASM/ELF32 path alive and proves relocation and
+logging, `hello.c` registers a character device and checks the C runtime it
+linked, and `romfs.c` registers and mounts a read-only filesystem.
 
 The loader does no symbol table lookup at run time. The host has already
 reduced `haku_module_init`/`haku_module_exit` to offsets inside the image and
@@ -157,6 +174,17 @@ same teardown, and if a concurrent open pins the new resource the module stays
 loaded and the load reports `-EBUSY` instead of freeing live code. Mount slots
 and devfs slots are reused after unload, so an existing open description's
 mount index never shifts.
+
+A C module is compiled with the kernel's switches plus `/Gy`, then packed with
+`libhakumod` (`kernel/module/lib/module_lib.c` and `runtime.asm`): the string
+routines and 64-bit multiply/divide helpers in C, the stack probes and 64-bit
+shift helpers in assembly, since their calling convention lives in registers C
+cannot name. Nothing is linked eagerly, so the reachability pass decides the
+final image. Module code runs in ring 0 on the calling task's 8 KiB kernel
+stack and must not use floating point — the kernel neither saves x87/SSE state
+across a task switch nor sets `CR4.OSFXSR` — so frames stay small and vector
+instructions stay out. `module.c` also checks at build time that the public
+`haku_module_fs_ops_t` and the kernel's `vfs_fs_ops_t` have the same size.
 
 Error mapping: bad container or relocation `-EINVAL`, unknown import
 `-ENOENT`, duplicate name `-EEXIST`, full table `-ENOSPC`, heap exhaustion

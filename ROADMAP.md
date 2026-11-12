@@ -63,25 +63,33 @@ compatibility is not a short-term goal.
   (`SMP-LOCK-OK counter=100000 expected=100000`); and a private GDT/TSS plus
   the shared IDT on each AP (`SMP-AP-GDT-OK`, `HAKU64-SMP-AP-GDT-OK`). The APs
   park with interrupts off; the bootstrap processor still runs every task.
-- [x] Loadable ring-0 modules (`haku module`): `tools/mkhakumod.py` packs a
-  NASM ELF32 object into a flat `.hkm` container (image, BSS, entry/exit
+- [x] Loadable ring-0 modules (`haku module`): `tools/mkhakumod.py` packs
+  relocatable objects into a flat `.hkm` container (image, BSS, entry/exit
   offsets, `R_386_32`/`R_386_PC32` relocations, import names), and
   `init_module`/`delete_module` (Linux i386 128/129) validate, relocate and
-  run it against an eleven-entry kernel export table. A four-slot table with
-  `LOADING`/`LIVE`/`UNLOADING` states refuses duplicate and overlapping
-  calls. A module can own real kernel capabilities: `haku_module_register_device`
-  adds a `/dev` entry with an open refcount, and
+  run it against an eleven-entry kernel export table. The host tool accepts a
+  NASM ELF32 object unchanged and links COFF/i386 objects (MSVC or clang-cl),
+  folding COMDAT duplicates, resolving internal symbols and dropping the
+  sections the entry point cannot reach. Modules are written in C against
+  `include/haku/module.h` and link `libhakumod`
+  (`kernel/module/lib/module_lib.c` + `runtime.asm`), which supplies the
+  string routines, the 64-bit multiply/divide/shift helpers and the stack
+  probes the compiler expects, so a module needs no libc. A four-slot table
+  with `LOADING`/`LIVE`/`UNLOADING` states refuses duplicate and overlapping
+  calls. A module can own real kernel capabilities:
+  `haku_module_register_device` adds a `/dev` entry with an open refcount, and
   `haku_module_register_fs` + `haku_module_mount` register and mount a
   filesystem at a non-root prefix. Registration is bound to the slot whose init
   hook is running; unload detaches the mount, filesystem, and device first and
   reports `-EBUSY` while a descriptor still uses them, so freed module code is
-  never reachable. `HELLO.HKM` (`/dev/hello`) and `ROMFS.HKM` (`/rom`) exercise
-  both paths in the headless run (`USER-MODDEV-OK`, `HELLO-MODULE-OK`,
-  `USER-ROMFS-OK`, `ROMFS-MODULE-OK`) alongside the original `MODULE.HKM`
-  (`USER-MODULE-OK`, `MODULE-LOAD-OK name=HAKU-DEMO`,
-  `MODULE-UNLOAD-OK name=HAKU-DEMO`, `HAKU-MODULE-OK`, `HAKU-MODULE-EXIT`).
-  Modules are trusted ring-0 code and the x86-64 kernel does not load them
-  yet.
+  never reachable. `HELLO.HKM` (`hello.c`, `/dev/hello`) and `ROMFS.HKM`
+  (`romfs.c`, `/rom`) are C modules and exercise both paths in the headless run
+  (`USER-MODDEV-OK`, `HELLO-MODULE-OK`, `USER-ROMFS-OK`, `ROMFS-MODULE-OK`),
+  with `hello.c` also checking the linked runtime (`HELLO-LIB-OK`) alongside the
+  original NASM `MODULE.HKM` (`USER-MODULE-OK`,
+  `MODULE-LOAD-OK name=HAKU-DEMO`, `MODULE-UNLOAD-OK name=HAKU-DEMO`,
+  `HAKU-MODULE-OK`, `HAKU-MODULE-EXIT`). Modules are trusted ring-0 code and the
+  x86-64 kernel does not load them yet.
 - [x] A statically linked musl binary booted as `/init` in Linux CI
   (`musl_probe`, `MUSL-PROBE-OK`): Linux-shaped initial stack and auxiliary
   vector, Linux-shaped `set_thread_area`, and the `_llseek`/`readv`/`writev`/

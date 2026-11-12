@@ -523,13 +523,24 @@ the BSP, and nothing dispatches a task to an AP. Those are stage D.
 ### Haku modules
 
 A Haku module is loadable ring-0 code in a flat, self-describing container, not
-an ELF object. The kernel has no ELF writer and does not learn one: the host
-tool `tools/mkhakumod.py` parses the ELF32 relocatable object NASM produces,
-lays the allocatable sections out back to back, records the BSS size and the
-entry/exit offsets, and reduces the `R_386_32`/`R_386_PC32` relocations to
-records the loader can apply. The `.hkm` layout (a 72-byte header followed by
-the image, the relocation records and a string table) is documented in
-`kernel/module/haku_module.h`; the kernel never reads an ELF header.
+an ELF or COFF object. The kernel has no object-file writer and does not learn
+one: the host tool `tools/mkhakumod.py` reads the relocatable objects a
+compiler emits, lays the allocatable sections out back to back, records the BSS
+size and the entry/exit offsets, and reduces the relocations to records the
+loader can apply. The `.hkm` layout (a 72-byte header followed by the image,
+the relocation records and a string table) is documented in
+`kernel/module/haku_module.h`; the kernel never reads an object header.
+
+The host tool accepts two object formats. A NASM `-f elf32` object is packed on
+its own and keeps the ELF addend convention. A COFF/i386 object (`cl.exe`, or
+`clang-cl` with `--target=i686-pc-windows-msvc`) may be given together with
+others, and the tool links them: `IMAGE_REL_I386_DIR32`/`REL32` become
+`R_386_32`/`R_386_PC32`, a symbol defined in the image resolves to its section
+offset, an undefined one becomes a kernel import with one C decoration
+underscore removed, two `COMDAT SELECT_ANY` definitions fold into the first, and
+sections the entry and exit hooks cannot reach are dropped. The reachability
+pass is what keeps a C module small: it links one library object and ships only
+the helpers it actually calls.
 
 Two relocation types exist. `R_386_32` computes `S + A` and `R_386_PC32`
 computes `S + A - P`, where `P` is the runtime address of the relocated word.
@@ -544,7 +555,7 @@ both bounded by constants. The exports are six utilities (`haku_module_log`,
 (`haku_module_register_device`, `haku_module_register_fs`,
 `haku_module_mount`), and two struct fillers (`haku_module_fill_stat`,
 `haku_module_fill_dirent`) that keep the kernel's `vfs_stat_t` and
-`vfs_dirent_t` layouts out of assembly. Imported names have their own
+`vfs_dirent_t` layouts out of module code. Imported names have their own
 48-byte bound (`HAKU_MODULE_SYMBOL_MAX`), because an export such as
 `haku_module_register_device` is longer than a 24-byte module name.
 
@@ -558,13 +569,66 @@ reports `-EBUSY` instead of racing the hooks. `init_module` runs the module's
 `int haku_module_init(void)` after the slot is reserved, propagates a negative
 return from the hook, and otherwise maps a non-zero return to `-EINVAL`.
 
+#### Writing a module in C
+
+`include/haku/module.h` is the whole public interface. It declares the eleven
+services above, the typed device callbacks, and `haku_module_fs_ops_t`, which
+mirrors `vfs_fs_ops_t` field for field; `module.c` refuses to build if the two
+structures ever differ in size, and the headless C-filesystem test exercises
+their field order. A module defines
+
+```c
+int haku_module_init(void);   /* required; 0 accepts the load */
+void haku_module_exit(void);  /* optional; teardown after detach */
+```
+
+and nothing else is special: the packer finds the entry and exit by name.
+
+A C module links `libhakumod`, which is `kernel/module/lib/module_lib.c` plus
+`kernel/module/lib/runtime.asm`. The C half supplies `memset`, `memcpy`,
+`memmove`, `strlen`, `strcmp` and the compiler's 64-bit helpers (`__allmul`,
+`__aulldiv`, `__aullrem`, `__alldiv`, `__allrem`); the assembly half supplies
+the `__chkstk`/`___chkstk_ms` stack probes and the `__allshl`/`__aullshr`/
+`__allshr` shift helpers, whose calling convention (count in `cl`, value in
+`edx:eax`) C cannot express. The 64-bit helpers are spelled `_allmul` and so
+on in C on purpose: the compiler's own reference to a helper is undecorated,
+so a C definition of `__allmul` would produce `___allmul` and never resolve.
+None of the library is linked eagerly — the packer's reachability pass drops
+every section the module does not call.
+
+There is no libc and no floating point. The kernel does not save x87 or SSE
+state across a task switch and never sets `CR4.OSFXSR`, so a module must not
+touch either; the build passes `/arch:IA32` (or `-mno-sse -mno-sse2 -mno-mmx`)
+to keep the compiler from doing it silently. Module code runs in ring 0 on the
+calling task's kernel stack, which is two 4 KiB pages, so frames stay small and
+a module never blocks, sleeps, or spins waiting for another task. A module that
+needs a large buffer takes it from `haku_module_alloc`, not from the stack.
+
+`build.py` compiles the modules with
+
+```
+cl /nologo /c /GS- /Zl /Os /Gy /W3 /arch:IA32 /Iinclude
+```
+
+and packs each one with the runtime objects:
+
+```
+python tools/mkhakumod.py build/mod_hello.obj build/modlib_module_lib.obj \
+       build/modlib_runtime.obj build/HELLO.HKM --name HAKU-HELLO
+```
+
+`/Gy` (one COMDAT per function) is required for the dead-code pass to be
+useful; `/GS-` removes the security cookie, which would need a CRT; `/Zl`
+keeps the default library out.
+
 #### Capabilities owned by a module
 
 A module is more than code: it can expose kernel functionality. There are two
 capability kinds, and the module slot owns them:
 
 - a character device, registered in devfs and reached as `/dev/<name>`;
-- a filesystem backend (`vfs_fs_ops_t`), mounted once at a non-root prefix.
+- a filesystem backend (`vfs_fs_ops_t`, which `haku_module_fs_ops_t` mirrors
+  in the public header), mounted once at a non-root prefix.
 
 Registration is only valid while that slot's init hook is running. The loader
 sets a single `module_api_owner` token around the hook, so the three
@@ -600,12 +664,18 @@ use.
 `build.py` packs three modules and installs them in both the initramfs and the
 FAT12 seed disk:
 
-- `MODULE.HKM` from `haku_demo.asm` proves relocation and logging
+- `MODULE.HKM` from the NASM object `haku_demo.asm` keeps the ELF32 host path
+  alive and proves relocation and logging
   (`HAKU-MODULE-OK`/`HAKU-MODULE-EXIT`);
-- `HELLO.HKM` from `hello.asm` registers `/dev/hello`, a read-only character
-  device that returns `hello from a haku module\n` (`HELLO-MODULE-OK`);
-- `ROMFS.HKM` from `romfs.asm` registers a read-only filesystem and mounts it at
-  `/rom` with `README` and `VERSION` (`ROMFS-MODULE-OK`).
+- `HELLO.HKM` from `hello.c` is a C device module: it registers `/dev/hello`, a
+  read-only character device that returns `hello from a haku module\n`
+  (`HELLO-MODULE-OK`), and before that it checks the runtime it is linked with
+  — the string routines and the 64-bit multiply, divide and remainder helpers,
+  against volatile operands the optimizer cannot fold — so a broken helper
+  fails the load instead of corrupting a read later (`HELLO-LIB-OK`);
+- `ROMFS.HKM` from `romfs.c` is a C filesystem backend that registers a
+  read-only filesystem and mounts it at `/rom` with `README` and `VERSION`
+  (`ROMFS-MODULE-OK`).
 
 The user-library test drives each one: it opens the device and the files,
 checks that `delete_module` reports `-EBUSY` while a descriptor is open, closes

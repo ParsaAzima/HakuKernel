@@ -75,9 +75,11 @@ Haku/
                                         kernel exports a module may import
                         module.c: validation, relocation, export table, slots,
                                   capability ownership and teardown
+                        lib/module_lib.c: libhakumod's string and 64-bit helpers
+                        lib/runtime.asm: stack probes + 64-bit shift helpers
                         demo/haku_demo.asm: ring-0 demo module (MODULE.HKM)
-                        demo/hello.asm: /dev/hello character device (HELLO.HKM)
-                        demo/romfs.asm: read-only /rom filesystem (ROMFS.HKM)
+                        demo/hello.c: C /dev/hello character device (HELLO.HKM)
+                        demo/romfs.c: C read-only /rom filesystem (ROMFS.HKM)
   user/
     lib/              errno.c, fsabi.c, memory.c, mman.c, signal.c, stdio.c,
                       string.c, unistd.c, crt0.asm, syscall.asm: user C library
@@ -86,7 +88,10 @@ Haku/
   include/haku/         abi.h + abi.inc + abi64.inc: shared user/kernel ABI constants
                         types/errno/string/stdlib/unistd/fcntl/stat/stdio/
                         signal/mman/dirent/poll/termios/resource.h: user
-                        library headers, plus haku.h
+                        library headers
+                        module.h: the C interface a kernel module is written
+                        against (services, device callbacks, fs ops table)
+                        plus haku.h
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks
   tools/mkfat12.py     FAT12 image builder for the user ELF
@@ -94,7 +99,9 @@ Haku/
   tools/pe2elf.py      fixed-base PE32 to ELF32 (RX/R/RW) for user C
   tools/mkelf64.py     flat x86-64 binary → static ELF64 (RX code + RW BSS) for
                       the 64-bit loader test
-  tools/mkhakumod.py   NASM ELF32 relocatable object → packed .hkm module
+  tools/mkhakumod.py   relocatable objects (NASM ELF32 or COFF/i386) → packed
+                       .hkm module; links C objects, folds COMDAT, drops
+                       unreachable sections
   .github/workflows/  ci.yml: hosted headless build/test + artifacts
                       release.yml: tag-driven bootable image release
   build.py             the whole build: cl/link/nasm/qemu orchestration
