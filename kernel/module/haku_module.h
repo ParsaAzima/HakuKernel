@@ -1,11 +1,13 @@
 /* Haku modules: loadable ring-0 code in a flat, self-describing container.
  *
- * A module is not an ELF object. The kernel has no ELF writer and does not
- * need to learn one: `tools/mkhakumod.py` parses the NASM ELF32 relocatable
- * object on the host and packs the allocatable sections, the BSS size, the
- * entry/exit offsets, and the handful of relocations into the `.hkm` layout
- * below. The loader then only has to copy the image, resolve a few named
- * imports against the export table, and apply R_386_32 / R_386_PC32.
+ * A module is not an ELF or COFF object. The kernel has no object-file writer
+ * and does not need to learn one: `tools/mkhakumod.py` reads the relocatable
+ * objects on the host — a single NASM ELF32 object, or the COFF/i386 objects a
+ * C compiler emits, which it links — and packs the allocatable sections, the
+ * BSS size, the entry/exit offsets, and the handful of relocations into the
+ * `.hkm` layout below. The loader then only has to copy the image, resolve a
+ * few named imports against the export table, and apply R_386_32 /
+ * R_386_PC32.
  *
  * Layout (all integers little-endian, the header is 72 bytes):
  *
