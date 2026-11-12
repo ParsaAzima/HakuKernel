@@ -86,6 +86,24 @@ typedef signed long long s64;
 #define K64_HEAP_SIZE        0x00800000ull
 #define K64_RESERVED_END     (K64_HEAP_START + K64_HEAP_SIZE)
 
+/* ------------------------------------------------------------ device windows
+ * Two kernel virtual windows outside the physmap, each with its own PML4
+ * slot so a 4 KiB mapping never touches the 2 MiB pages the physmap uses:
+ *
+ *   K64_LAPIC_VIRT (slot 448)  the local APIC MMIO page, uncached. The
+ *                             mapping is copied into every per-process PML4,
+ *                             because an interrupt handler or an IPI send
+ *                             must reach the unit whatever CR3 is loaded.
+ *   K64_ACPI_WINDOW (slot 384) two pages used to read ACPI tables at boot.
+ *                             Never copied into a user space.
+ *
+ * Both sit in the upper canonical half, next to the physmap (slot 256). */
+#define K64_LAPIC_PHYS   0xFEE00000ull
+#define K64_LAPIC_VIRT   0xFFFFE00000000000ull
+#define K64_LAPIC_SLOT   448u
+#define K64_ACPI_WINDOW  0xFFFFC00000000000ull
+#define K64_ACPI_WINDOW_PAGES 2u
+
 /* E820 handover from stage2 (24-byte entries, count at 0x6FFC). */
 #define K64_E820_COUNT (*(volatile u32 *)0x6FFC)
 #define K64_E820_MAP   0x7000ull
@@ -462,6 +480,12 @@ int paging64_unmap_page(u64 virt);
 u64 paging64_translate(u64 virt);
 u64 paging64_phys_map_bytes(void);
 void *phys_to_virt64(u64 phys);
+/* Map an MMIO page into the kernel half with PCD+PWT (uncached). Used for
+ * the local APIC page; the caller supplies a window outside the physmap. */
+int paging64_map_device_page(u64 virt, u64 phys);
+/* Idempotently map K64_LAPIC_VIRT -> K64_LAPIC_PHYS. Returns 0 when no
+ * boot memory was left for the intermediate tables. */
+int paging64_map_lapic(void);
 
 /* Per-process address spaces. A space is the physical address of a PML4
  * that shares the kernel's identity map and physmap and owns PML4 slot 1.
@@ -750,5 +774,17 @@ void timer64_init(u32 hz);
 void timer64_tick(void);
 u64 timer64_ticks(void);
 u32 timer64_hz(void);
+
+/* smp64.c: ACPI + local APIC discovery and AP bring-up. Stage B keeps the
+ * bootstrap processor as the only scheduling CPU; the APs come online and
+ * park with interrupts off. Returns the online CPU count (1 when the
+ * machine stayed uniprocessor). */
+#define K64_SMP_MAX_CPUS 8u
+int smp64_init(void);
+u32 smp64_cpu_count(void);
+/* Entry point the long-mode trampoline calls on the AP. */
+void smp64_ap_entry(u64 cpu);
+/* From isr64.asm: set APICBASE.EN in IA32_APIC_BASE. */
+void apic_msr_enable64(void);
 
 #endif

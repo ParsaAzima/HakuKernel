@@ -402,6 +402,7 @@ def build_x64(nasm, py, memory_mb):
     arch64 = os.path.join(ROOT, "kernel", "arch", "x86_64")
     entry_asm = os.path.join(arch64, "boot", "entry64.asm")
     isr_asm = os.path.join(arch64, "kernel", "isr64.asm")
+    ap_trampoline64_asm = os.path.join(arch64, "kernel", "ap_trampoline64.asm")
     user_src = os.path.join(arch64, "user", "ring3_elf64.asm")
     user_image_asm = os.path.join(arch64, "user", "user64_image.asm")
     stage1_asm = os.path.join(arch32, "boot", "stage1.asm")
@@ -409,6 +410,7 @@ def build_x64(nasm, py, memory_mb):
 
     entry_obj = os.path.join(BUILD, "entry64.obj")
     isr_obj = os.path.join(BUILD, "isr64.obj")
+    ap_trampoline64_obj = os.path.join(BUILD, "ap_trampoline64.obj")
     user_flat = os.path.join(BUILD, "ring3_elf64.bin")
     user_elf = os.path.join(BUILD, "ring3_elf64.elf")
     exec_src = os.path.join(arch64, "user", "exec_elf64.asm")
@@ -435,11 +437,14 @@ def build_x64(nasm, py, memory_mb):
     sources = sorted(glob.glob(os.path.join(arch64, "**", "*.c"),
                                recursive=True))
     sources += [os.path.join(ROOT, "kernel", "drivers", "ata.c"),
+                os.path.join(ROOT, "kernel", "drivers", "acpi.c"),
+                os.path.join(ROOT, "kernel", "drivers", "apic.c"),
                 os.path.join(ROOT, "kernel", "fs", "fat12", "fat12.c")]
     if not sources:
         sys.exit("no kernel/arch/x86_64/**/*.c files found")
     run([nasm, "-f", "win64", entry_asm, "-o", entry_obj])
     run([nasm, "-f", "win64", isr_asm, "-o", isr_obj])
+    run([nasm, "-f", "win64", ap_trampoline64_asm, "-o", ap_trampoline64_obj])
     objects = []
     for src in sources:
         obj = os.path.join(BUILD, "x64_" +
@@ -476,7 +481,8 @@ def build_x64(nasm, py, memory_mb):
     run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:NATIVE",
                   "/ENTRY:entry64", "/BASE:0x10000", "/ALIGN:16", "/FIXED",
                   "/NODEFAULTLIB", "/OUT:" + kernel_pe,
-                  entry_obj, isr_obj, user_image_obj] + objects)
+                  entry_obj, isr_obj, ap_trampoline64_obj,
+                  user_image_obj] + objects)
     pe = subprocess.run([py, os.path.join(ROOT, "tools", "pe2bin.py"),
                          kernel_pe, kernel_bin],
                         capture_output=True, text=True)
@@ -512,6 +518,7 @@ def build_x64(nasm, py, memory_mb):
     if os.path.exists(serial):
         os.remove(serial)
     proc = subprocess.Popen([qemu, "-m", str(memory_mb), "-cpu", "qemu64",
+                             "-smp", "2",
                              "-drive", f"file={img},format=raw,if=floppy,index=0",
                              "-drive", f"file={fs_img},format=raw,if=ide,"
                                        "index=0,media=disk,cache=writethrough",
@@ -527,6 +534,7 @@ def build_x64(nasm, py, memory_mb):
     required = ["HAKU64-BOOT-OK", "HAKU64-E820-OK", "HAKU64-PAGING-OK",
                 "HAKU64-FRAME-OK", "HAKU64-HEAP-OK", "HAKU64-GDT-OK",
                 "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
+                "HAKU64-SMP-OK: cpus=2", "HAKU64-SMP-AP-OK cpu=1",
                 "HAKU64-VM-OK", "HAKU64-PROC-OK", "HAKU64-USER-OK",
                 "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
                 "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",

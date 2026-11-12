@@ -19,17 +19,19 @@
  *
  * Per-process spaces (paging64_create_space and friends) are built later,
  * after the frame allocator exists, so they take their tables from
- * frame64_alloc and reach them through the physmap. A space copies the two
- * kernel PML4 entries — the identity map and the physmap — and owns slot 1
- * (K64_USER_BASE) alone. That split is what makes the kernel stack,
- * heap and page tables usable under every CR3 without ever putting a user
- * mapping in the kernel's own slot.
+ * frame64_alloc and reach them through the physmap. A space copies the three
+ * kernel PML4 entries — the identity map, the physmap and the local-APIC
+ * window — and owns slot 1 (K64_USER_BASE) alone. That split is what makes
+ * the kernel stack, heap and page tables usable under every CR3 without ever
+ * putting a user mapping in the kernel's own slot.
  */
 #include "haku64.h"
 
 #define PAGE_PRESENT  0x001ull
 #define PAGE_WRITABLE 0x002ull
 #define PAGE_USER     0x004ull
+#define PAGE_PWT      0x008ull   /* write-through (MMIO) */
+#define PAGE_PCD      0x010ull   /* cache disable (MMIO) */
 #define PAGE_LARGE    0x080ull   /* PS: 2 MiB page in a page directory */
 #define PAGE_NX       K64_PAGE_NX
 
@@ -148,6 +150,23 @@ u64 paging64_phys_map_bytes(void) {
     return phys_map_bytes;
 }
 
+/* MMIO mappings live outside the physmap so they cannot collide with a 2 MiB
+ * physmap page. PCD+PWT mark the page uncached; the architecture requires
+ * that for the local APIC window. */
+int paging64_map_device_page(u64 virt, u64 phys) {
+    u64 *entry = page_table_for(virt, 1);
+    if (!entry) return 0;
+    *entry = (phys & K64_PAGE_MASK) | PAGE_PRESENT | PAGE_WRITABLE |
+             PAGE_PCD | PAGE_PWT;
+    invlpg64(virt);
+    return 1;
+}
+
+int paging64_map_lapic(void) {
+    if (paging64_translate(K64_LAPIC_VIRT) != 0) return 1;
+    return paging64_map_device_page(K64_LAPIC_VIRT, K64_LAPIC_PHYS);
+}
+
 /* ------------------------------------------------------------ address spaces */
 
 /* One zeroed table from the frame allocator, reached through the physmap.
@@ -185,6 +204,10 @@ u64 paging64_create_space(void) {
     boot = (u64 *)PML4_PHYS;
     root[0] = boot[0];                         /* identity map, slot 0 */
     root[PML4_INDEX(K64_PHYS_MAP_BASE)] = boot[PML4_INDEX(K64_PHYS_MAP_BASE)];
+    /* The local APIC is reachable from a user space too: an interrupt that
+     * arrives while a process runs acknowledges through the unit, and the
+     * IPI path must work without switching CR3 first. */
+    root[K64_LAPIC_SLOT] = boot[K64_LAPIC_SLOT];
     return space;
 }
 

@@ -27,6 +27,7 @@ global gdt64_load
 global tss64_load
 global sti64
 global cli64
+global apic_msr_enable64
 global read_cr2_64
 global read_cr3_64
 global write_cr3_64
@@ -352,6 +353,16 @@ sti64:
 
 cli64:
     cli
+    ret
+
+; void apic_msr_enable64(void)
+; IA32_APIC_BASE (MSR 0x1B), bit 11 is the global enable. The base stays at
+; the reset default 0xFEE00000; only the enable bit is touched.
+apic_msr_enable64:
+    mov ecx, 01Bh
+    rdmsr
+    or eax, 800h
+    wrmsr
     ret
 
 ; u64 read_cr2_64(void)

@@ -223,9 +223,11 @@ static int test_idt_table(void) {
     return 1;
 }
 
-/* An address in PML4 slot 384: canonical (bits 63..48 sign-extend bit 47)
- * and, unlike the physmap's slot 256, never populated. */
-#define K64_UNMAPPED_PROBE 0xFFFFC00000000000ull
+/* An address in PML4 slot 416: canonical (bits 63..48 sign-extend bit 47)
+ * and never populated. The neighbouring slots are taken — 256 is the
+ * physmap, 384 the ACPI window and 448 the local-APIC window — so the probe
+ * must stay clear of those three. */
+#define K64_UNMAPPED_PROBE 0xFFFFD00000000000ull
 
 static int test_exceptions(void) {
     /* INT3 is a trap, not a fault: the handler reports it and returns, and
@@ -804,6 +806,11 @@ void kernel64_main(void) {
     k64_puts(" hz=");
     k64_dec(timer64_hz());
     k64_puts("\r\n");
+
+    /* ACPI, the local APIC and the application processors. Interrupts are
+     * still off here: the APs come online parked and the bootstrap
+     * processor keeps the 8259 timer it just programmed. */
+    smp64_init();
     sti64();
 
     if (!test_exceptions()) k64_fail("exception dispatch self-test");
