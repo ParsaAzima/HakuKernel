@@ -544,9 +544,14 @@ int paging64_break_cow(u64 space, u64 virt) {
     dst = (u8 *)phys_to_virt64(copy);
     memcpy(dst, (const u8 *)phys_to_virt64(frame), K64_PAGE_SIZE);
     /* Install the private copy before dropping the old reference; the old
-     * frame stays mapped and alive until the new leaf is in place. */
+     * frame stays mapped and alive until the new leaf is in place. The old
+     * physical address has to be cleared out of the reused bits first:
+     * OR-ing the copy into a leaf that still names the old frame produces a
+     * third, unrelated address, and the process then reads some other
+     * frame's contents. */
     *entry = (copy & K64_PHYS_MASK) |
-             (pte & ~(PAGE_COW | PAGE_COW_RW)) | PAGE_WRITABLE;
+             (pte & ~(K64_PHYS_MASK | PAGE_COW | PAGE_COW_RW)) |
+             PAGE_WRITABLE;
     invlpg64(virt);
     frame64_user_release(frame);
     return 1;
