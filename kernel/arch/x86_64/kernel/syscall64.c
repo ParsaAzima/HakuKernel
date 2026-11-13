@@ -1639,7 +1639,10 @@ static u64 sys64_uname(u64 buf) {
     memcpy(out[0], "Haku", 5);
     memcpy(out[1], "haku64", 7);
     memcpy(out[2], "1.0", 4);
-    memcpy(out[3], "x86_64", 7);
+    memcpy(out[3], "Haku 1.0", 9);
+    /* machine, not version: an uname(1) that prints `machine` has to see the
+     * architecture the program was built for. */
+    memcpy(out[4], "x86_64", 7);
     if (!copy_to_user64(current_space(), buf, out, sizeof(out)))
         return (u64)0 - SYS64_EFAULT;
     return 0;

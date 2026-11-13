@@ -721,7 +721,10 @@ regs64_t *sched64_fork(regs64_t *frame) {
 
     tasks[child].id = (u32)child;
     tasks[child].parent = parent;
-    tasks[child].tgid = tasks[parent].tgid;
+    /* A forked child leads its own thread group, so getpid() has to report
+     * the child and not the parent it was copied from. Only clone() with
+     * CLONE_THREAD shares a group id. */
+    tasks[child].tgid = (u32)child;
     tasks[child].space = space;
     tasks[child].stack_base = (u64)stack;
     tasks[child].stack_top = top;
