@@ -120,31 +120,41 @@ initramfs archive) are not supported.
 
 `tools/mkhakumod.py` is the only code that understands object files for
 modules. It accepts the subset a NASM `-f elf32` object uses (no `RELA`, no
-`COMMON`, no absolute symbols) and the COFF/i386 objects `cl.exe` or `clang-cl`
-emit, rejects a module that does not define `haku_module_init`, extracts the
-addend from each relocated word and writes zero there, and emits the `.hkm`
-container described in `kernel/module/haku_module.h`.
+`COMMON`, no absolute symbols) and the COFF objects `cl.exe` or `clang-cl`
+emit for i386 or amd64, rejects a module that does not define
+`haku_module_init`, extracts the addend from each relocated word and writes
+zero there, and emits the `.hkm` container described in
+`kernel/module/haku_module.h`. One input object set must be a single
+architecture; the header version records it (1 = i386, 2 = x86-64), and a
+loader refuses the other version before touching the image.
 
 With COFF input the tool is a small static linker, because a C module is
 several objects (`hello.c` plus `libhakumod`). It resolves defined symbols to
 section offsets, turns undefined ones into kernel imports (one leading C
-decoration underscore is removed), folds duplicate `COMDAT SELECT_ANY`
-definitions — the same function emitted inline in two objects — and rejects any
-other duplicate definition. The sections are then laid out only if the entry or
-exit hook reaches them, walking the relocation graph, so an unused library
-routine costs nothing. Two COFF relocation types are understood:
-`IMAGE_REL_I386_DIR32` as `R_386_32`, and `IMAGE_REL_I386_REL32` as
+decoration underscore is removed on i386 only), folds duplicate
+`COMDAT SELECT_ANY` definitions — the same function emitted inline in two
+objects — and rejects any other duplicate definition. The sections are then
+laid out only if the entry or exit hook reaches them, walking the relocation
+graph, so an unused library routine costs nothing. On i386,
+`IMAGE_REL_I386_DIR32` becomes `R_386_32` and `IMAGE_REL_I386_REL32` becomes
 `R_386_PC32` with its addend reduced by four, because the COFF field is
 relative to the end of the four-byte word while ELF is relative to its start.
-Sections with `LNK_INFO`, `LNK_REMOVE`, or `MEM_DISCARDABLE` are dropped, and
-uninitialized sections with no raw data become BSS.
+On amd64 the accepted forms are `ADDR64`/`DIR64` (absolute, `R_64_ABS`),
+`ADDR32` (absolute) and `REL32` (`R_64_PC32`, also biased by four),
+`.pdata`/`.xdata` are dropped because the kernel does no SEH unwinding, and no
+underscore is stripped. Sections with `LNK_INFO`, `LNK_REMOVE`, or
+`MEM_DISCARDABLE` are dropped, and uninitialized sections with no raw data
+become BSS.
 
-`build.py` builds three modules, packs `build/MODULE.HKM`, `build/HELLO.HKM`,
-and `build/ROMFS.HKM`, and installs them in both the initramfs and the FAT12
-seed disk, so a user program can read them and call `init_module`.
-`haku_demo.asm` keeps the NASM/ELF32 path alive and proves relocation and
-logging, `hello.c` registers a character device and checks the C runtime it
-linked, and `romfs.c` registers and mounts a read-only filesystem.
+`build.py` builds three modules for the 32-bit image, packs
+`build/MODULE.HKM`, `build/HELLO.HKM`, and `build/ROMFS.HKM`, and installs
+them in both the initramfs and the FAT12 seed disk, so a user program can read
+them and call `init_module`. `haku_demo.asm` keeps the NASM/ELF32 path alive
+and proves relocation and logging, `hello.c` registers a character device and
+checks the C runtime it linked, and `romfs.c` registers and mounts a read-only
+filesystem. The x64 build packs one module, `build/X64MOD.HKM` from
+`x64demo.c`, and seeds it on `build/haku64_fs.img`; the boot self-test reads it
+back from the FAT12 volume, so the disk path is part of the check.
 
 The loader does no symbol table lookup at run time. The host has already
 reduced `haku_module_init`/`haku_module_exit` to offsets inside the image and
@@ -153,6 +163,18 @@ loading is: range-check the header, allocate `image + bss` from the heap, copy,
 then walk at most 256 relocation records. Each import name is matched against
 the eleven-entry export table with an exact, 48-byte-bounded comparison — a
 deliberate linear scan over a tiny constant table, not a general hash lookup.
+
+`kernel/arch/x86_64/kernel/module64.c` is the same algorithm on the 64-bit
+side: it accepts version 2 only, applies `R_64_ABS`/`R_64_PC32`, and stores the
+low 32 bits of every computed address because the image, the kernel text and
+the exports all live below 4 GiB (an amd64 pointer is packed with a zero upper
+half). Its export table has the same eleven names so `include/haku/module.h`
+and `libhakumod` are shared; the six utilities work, while the capability
+calls and the two struct fillers answer `-ENOSYS` until a 64-bit VFS and devfs
+exist. User space reaches both loaders through `init_module` (175) and
+`delete_module` (176); `syscall64.c` bounds the image length by the container's
+worst case, copies it page by page, and copies the name into a 25-byte stack
+buffer.
 
 Slot states make concurrent calls safe without holding a lock across a hook.
 `module_load` reserves the slot (copying the name and the function pointers
@@ -179,12 +201,17 @@ A C module is compiled with the kernel's switches plus `/Gy`, then packed with
 `libhakumod` (`kernel/module/lib/module_lib.c` and `runtime.asm`): the string
 routines and 64-bit multiply/divide helpers in C, the stack probes and 64-bit
 shift helpers in assembly, since their calling convention lives in registers C
-cannot name. Nothing is linked eagerly, so the reachability pass decides the
-final image. Module code runs in ring 0 on the calling task's 8 KiB kernel
-stack and must not use floating point — the kernel neither saves x87/SSE state
-across a task switch nor sets `CR4.OSFXSR` — so frames stay small and vector
-instructions stay out. `module.c` also checks at build time that the public
-`haku_module_fs_ops_t` and the kernel's `vfs_fs_ops_t` have the same size.
+cannot name. The x86-64 build uses the same C file plus `runtime64.asm`, which
+supplies `__chkstk`/`___chkstk_ms` (MSVC x64 passes the frame size in RAX).
+Nothing is linked eagerly, so the reachability pass decides the final image.
+Module code runs in ring 0 on the calling task's kernel stack — 8 KiB on i386,
+16 KiB on x86-64 — so frames stay small. A 32-bit module must not use
+floating point or SSE: the kernel neither saves x87/SSE state across a task
+switch nor sets `CR4.OSFXSR`. On x86-64 SSE2 is part of the ABI and the
+scheduler `FXSAVE`s each task, so compiler-emitted SSE2 is safe, but there is
+still no math library. `module.c` also checks at build time that the public
+`haku_module_fs_ops_t` and the kernel's `vfs_fs_ops_t` have the same size; that
+assert is part of the 32-bit build only, since the 64-bit kernel has no VFS.
 
 Error mapping: bad container or relocation `-EINVAL`, unknown import
 `-ENOENT`, duplicate name `-EEXIST`, full table `-ENOSPC`, heap exhaustion

@@ -20,7 +20,8 @@ Haku/
       user/             user.asm, child.asm, fault.asm, exec_target.asm,
                         vfork_target.asm: ELF32 test programs (syscall,
                         spawn/waitpid, protection faults, execve/vfork)
-    arch/x86_64/
+    arch/x86_64/          primary target (build.py default); arch/x86 is
+                          built with --arch=i386
       boot/             entry64.asm: PAE + EFER.LME + PML4/PDPT/PD, far jump
                         into a 64-bit code segment, then call into C
       kernel/           boot64.c: bring-up sequence (E820 → physmap → frames
@@ -37,7 +38,12 @@ Haku/
                         timer64.c: 100 Hz PIT tick counter;
                         task64.c: tasks, per-task kernel stacks, round-robin
                         preemptive scheduler and the frame-pointer switch;
-                        syscall64.c: DPL-3 INT 0x80 gate (write/exit)
+                        syscall64.c: SYSCALL/SYSRET plus the DPL-3 INT 0x80
+                        fallback and the ported call table;
+                        fs64.c: FAT12 page cache in front of the ATA disk;
+                        rtc64.c: CMOS wall clock;
+                        smp64.c: ACPI MADT, local APIC and AP bring-up;
+                        module64.c: .hkm version 2 loader, exports and slots
       elf/              elf64.c: validated static ELF64 PT_LOAD loader that
                         maps segments into a per-process space
       user/             ring3_elf64.asm: ELF64 test program (write, BSS store,
@@ -71,15 +77,18 @@ Haku/
                         panic.c/.h: fatal handler + halted state message
                         crash.c/.h: register/MMU/stack crash reports
                         heap.c/.h: kernel kmalloc/kfree allocator
-    module/             haku_module.h: .hkm container layout, limits, loader API,
-                                        kernel exports a module may import
-                        module.c: validation, relocation, export table, slots,
-                                  capability ownership and teardown
+    module/             haku_module.h: .hkm container layout (version 1 = i386,
+                                        2 = x86-64), limits, loader API and
+                                        the kernel exports a module may import
+                        module.c: 32-bit validation, relocation, export table,
+                                  slots, capability ownership and teardown
                         lib/module_lib.c: libhakumod's string and 64-bit helpers
-                        lib/runtime.asm: stack probes + 64-bit shift helpers
+                        lib/runtime.asm: i386 stack probes + shift helpers
+                        lib/runtime64.asm: x64 __chkstk stack probes
                         demo/haku_demo.asm: ring-0 demo module (MODULE.HKM)
                         demo/hello.c: C /dev/hello character device (HELLO.HKM)
                         demo/romfs.c: C read-only /rom filesystem (ROMFS.HKM)
+                        demo/x64demo.c: x86-64 demo module (X64MOD.HKM)
   user/
     lib/              errno.c, fsabi.c, memory.c, mman.c, signal.c, stdio.c,
                       string.c, unistd.c, crt0.asm, syscall.asm: user C library
@@ -90,7 +99,9 @@ Haku/
                         signal/mman/dirent/poll/termios/resource.h: user
                         library headers
                         module.h: the C interface a kernel module is written
-                        against (services, device callbacks, fs ops table)
+                        against (services, device callbacks, fs ops table) on
+                        both architectures; capability calls answer -ENOSYS
+                        on x86-64 until a 64-bit VFS exists
                         plus haku.h
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks
@@ -99,14 +110,16 @@ Haku/
   tools/pe2elf.py      fixed-base PE32 to ELF32 (RX/R/RW) for user C
   tools/mkelf64.py     flat x86-64 binary → static ELF64 (RX code + RW BSS) for
                       the 64-bit loader test
-  tools/mkhakumod.py   relocatable objects (NASM ELF32 or COFF/i386) → packed
-                       .hkm module; links C objects, folds COMDAT, drops
+  tools/mkhakumod.py   relocatable objects (NASM ELF32 or COFF i386/amd64) →
+                       packed .hkm module; links C objects, folds COMDAT, drops
                        unreachable sections
-  .github/workflows/  ci.yml: hosted headless build/test + artifacts
+  .github/workflows/  ci.yml: hosted x86-64 + i386 headless build/test, artifacts
                       release.yml: tag-driven bootable image release
   build.py             the whole build: cl/link/nasm/qemu orchestration
-  build/               generated files (stage*.bin, *.obj/pe, haku.img, ...)
-  haku.img             bootable floppy image
+  build/               generated files (stage*.bin, *.obj/pe, haku64.img, ...)
+  haku64.img           primary bootable floppy image (x86-64)
+  haku.img             bootable floppy image (i386, --arch=i386)
+  build/haku64_fs.img  1.44 MB FAT12 ATA disk for the x64 kernel
   build/haku_fs.img    1.44 MB FAT12 ATA disk image with HAKU/NEXT/LIB ELFs
                       and the INITRD initramfs archive
   build/ata_spare.img  1.44 MB blank ATA disk on the secondary channel (scan test)

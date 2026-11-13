@@ -5,6 +5,12 @@
 The i386-compatible syscall ABI, memory-management calls, the implemented
 POSIX surface, and the self-test markers that cover them.
 
+The x86-64 kernel serves the ported subset under the x86-64 Linux numbers with
+`rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` arguments and `rax` for the number and the
+result, entered by `SYSCALL` with an `INT 0x80` fallback. This page documents
+the 32-bit table in full because it is the complete one; the 64-bit image still
+lacks pipes, a VFS and signal handlers.
+
 ## Syscall ABI
 
 The syscall ABI follows
@@ -351,6 +357,13 @@ anything) and frees the image. The calls are not restricted by uid — Haku has 
 single privileged user — but module code runs in ring 0, so only a loader that
 already trusts the image should call `init_module`.
 
+The x86-64 kernel serves the same two operations under the x86-64 Linux
+numbers, `init_module` (175) and `delete_module` (176). The container must be
+version 2; the length bound and page-wise copies are the same, and the loader
+relocates the 64-bit forms. A 64-bit module can log, read ticks and use the
+kernel heap, but its capability calls answer `-ENOSYS` until there is a 64-bit
+VFS, so `delete_module` has nothing to detach.
+
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
 rejects unmapped/kernel pointers, wraparound, invalid descriptors and
@@ -426,7 +439,8 @@ Deliberately absent: job-control stop/continue states (the group and session
 calls are real, but stop signals still end a process), hard links, file-backed
 mappings, `socket`, a user-facing `mount` (users cannot reparent the boot
 namespace; loadable modules mount their own prefix during init), networking,
-and loadable modules on the x86-64 kernel (its heap pages are not executable).
+pipes on x86-64, a 64-bit VFS/devfs, and the capability half of the x64 module
+API (registration answers `-ENOSYS`).
 `clone`-created threads are present: a thread shares the caller's address
 space, descriptors and signal dispositions, reports the process id from
 `getpid` and its own id from `gettid`, and the thread form is exercised as

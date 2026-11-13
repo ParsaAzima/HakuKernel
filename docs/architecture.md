@@ -2,7 +2,7 @@
 
 [Back to documentation index](README.md)
 
-Boot chain, memory map, the long-mode work in progress, the IDT, and the
+Boot chain, memory map, the x86-64 port, the IDT, and the
 physical frame allocator.
 
 ## How it works
@@ -38,14 +38,16 @@ Memory map:
 | `0xBFFFE000–0xC0000000` | user stack (two pages initially, grows downward on fault up to 1 MiB) |
 | `0xB8000` | VGA text buffer |
 
-### x86-64: boot path, memory and interrupts (work in progress)
+### x86-64: boot path, memory and interrupts (primary)
 
-`python build.py x64` produces `haku64.img` from the same stage1/stage2
-floppy, with a 64-bit kernel entry instead of the 32-bit one. Stage 2 still
-leaves the CPU in 32-bit protected mode; `kernel/arch/x86_64/boot/entry64.asm`
-takes over from there, enables PAE and `EFER.LME`, installs a PML4/PDPT/PD
-identity map of the first 1 GiB with 2 MiB pages, and far-jumps to a 64-bit
-code segment.
+x86-64 is the primary architecture: `python build.py`, `run` and `headless`
+produce and boot `haku64.img` from the same stage1/stage2 floppy, with a
+64-bit kernel entry. The original 32-bit image is still built with
+`--arch=i386`, and it remains the one that carries busybox, the user C library
+and the probes. Stage 2 leaves the CPU in 32-bit protected mode;
+`kernel/arch/x86_64/boot/entry64.asm` takes over from there, enables PAE and
+`EFER.LME`, installs a PML4/PDPT/PD identity map of the first 1 GiB with 2 MiB
+pages, and far-jumps to a 64-bit code segment.
 
 From `kernel64_main` the 64-bit kernel brings up, in order:
 
@@ -69,6 +71,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, process, time, limits, `poll`/`select` (pipes are still missing) | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
+| modules | `X64MOD.HKM` is read from the disk, relocated and run; duplicate, truncated and bad-magic images refused | `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
 
 The physmap is why the 64-bit build has no equivalent of the 32-bit
@@ -218,9 +221,11 @@ are explicit: only 8.3 names, no `unlink`, `rename` or `getdents`, no
 symbolic links, at most 32 cached pages per file, and a writable
 `MAP_SHARED` mapping requires a writable descriptor. A shared mapping also
 relies on its descriptor staying open, because only descriptors pin a cache
-slot. `python build.py x64` builds `build/haku64_fs.img` with
+slot. `python build.py headless` builds
+`build/haku64_fs.img` with
 `tools/mkfat12.py --empty` on every run,
-seeds `HELLO.TXT`, `PATTERN.BIN` and `USER.ELF`, attaches it to QEMU and
+seeds `HELLO.TXT`, `PATTERN.BIN`, `USER.ELF` and `X64MOD.HKM`, attaches it to
+QEMU and
 checks the resulting image with `tools/lsfat12.py --check`, so a disk write is
 proven from the host's view of the volume and not only from the kernel's
 cache.
@@ -327,11 +332,13 @@ ready returns 0 rather than blocking. Pipes, symlinks and real signal
 handlers are still missing; the syscall port that is there covers what the
 tests and a static libc probe need.
 
-The 64-bit path now has an ELF64 loader and a FAT12 data disk, but no
-64-bit libc and no bootable root filesystem image; `haku.img` remains the
-default image and [the roadmap](../ROADMAP.md) (Milestone 8) lists the
-remaining stages. The 64-bit sources are excluded from the 32-bit link line,
-so both targets build from one tree.
+The 64-bit path now has an ELF64 loader, a FAT12 data disk, the syscall table
+and a module loader, but no 64-bit libc, no VFS/devfs and no bootable root
+filesystem image. The boot self-test still runs from the kernel rather than a
+64-bit `/init`, so `haku64.img` is the primary image while the full shell and
+userland remain on the 32-bit side. [The roadmap](../ROADMAP.md) (Milestone 8)
+lists the remaining stages. The 64-bit sources are excluded from the 32-bit
+link line, so both targets build from one tree.
 
 `kernel/arch/x86_64/elf/elf64.c` follows the 32-bit loader's rules — validate
 the whole image before mapping, accept only static `ET_EXEC`, require
@@ -474,8 +481,8 @@ into every per-process PML4; ACPI tables are read through a separate window in
 slot 384. The two windows are why the 64-bit identity-mapped probe used by the
 exception self-test lives in slot 416.
 
-`python build.py headless` and `python build.py x64` both boot with `-smp 2`
-and assert `SMP-OK cpus=2`/`SMP-AP-OK cpu=1` and
+`python build.py headless --arch=i386` and `python build.py headless` both boot
+with `-smp 2` and assert `SMP-OK cpus=2`/`SMP-AP-OK cpu=1` and
 `HAKU64-SMP-OK: cpus=2`/`HAKU64-SMP-AP-OK cpu=1` respectively.
 
 #### Stage C: state a second CPU can share
@@ -529,27 +536,36 @@ compiler emits, lays the allocatable sections out back to back, records the BSS
 size and the entry/exit offsets, and reduces the relocations to records the
 loader can apply. The `.hkm` layout (a 72-byte header followed by the image,
 the relocation records and a string table) is documented in
-`kernel/module/haku_module.h`; the kernel never reads an object header.
+`kernel/module/haku_module.h`; the kernel never reads an object header. The
+header's version field names the architecture — 1 is i386, 2 is x86-64 — so an
+image packed for one kernel is refused by the other instead of being relocated
+with the wrong arithmetic.
 
-The host tool accepts two object formats. A NASM `-f elf32` object is packed on
-its own and keeps the ELF addend convention. A COFF/i386 object (`cl.exe`, or
-`clang-cl` with `--target=i686-pc-windows-msvc`) may be given together with
-others, and the tool links them: `IMAGE_REL_I386_DIR32`/`REL32` become
-`R_386_32`/`R_386_PC32`, a symbol defined in the image resolves to its section
-offset, an undefined one becomes a kernel import with one C decoration
-underscore removed, two `COMDAT SELECT_ANY` definitions fold into the first, and
-sections the entry and exit hooks cannot reach are dropped. The reachability
-pass is what keeps a C module small: it links one library object and ships only
-the helpers it actually calls.
+The host tool accepts two object formats and two architectures. A NASM
+`-f elf32` object is packed on its own and keeps the ELF addend convention. A
+COFF object may be given together with others, and the tool links them:
+`IMAGE_REL_I386_DIR32`/`REL32` (or the amd64 `ADDR64`, `ADDR32`, `REL32` and
+`DIR64`) become container relocations, a symbol defined in the image resolves
+to its section offset, an undefined one becomes a kernel import with one C
+decoration underscore removed on i386, two `COMDAT SELECT_ANY` definitions fold
+into the first, and sections the entry and exit hooks cannot reach are dropped.
+For amd64 the tool also drops `.pdata`/`.xdata` (the kernel does no SEH
+unwinding). The reachability pass is what keeps a C module small: it links one
+library object and ships only the helpers it actually calls.
 
-Two relocation types exist. `R_386_32` computes `S + A` and `R_386_PC32`
-computes `S + A - P`, where `P` is the runtime address of the relocated word.
-The symbol is either an offset into the string table — resolved against the
-kernel's export table — or `HAKU_MODULE_SYM_BASE` (`0xFFFFFFFE`), which means
-"S is the module load base" and carries the section-relative target in the
-addend. A module links only against the kernel's export table; the lookup is a
-linear scan over eleven entries, so loading is `O(relocations × exports)` with
-both bounded by constants. The exports are six utilities (`haku_module_log`,
+Four relocation types exist, each storing one 32-bit word. On i386, `R_386_32`
+computes `S + A` and `R_386_PC32` computes `S + A - P`; on x86-64, `R_64_ABS`
+and `R_64_PC32` do the same arithmetic on 64-bit addresses and store the low
+half. The latter is safe because every address the kernel can hand a module —
+the image from the heap, the kernel text and the exports — is below 4 GiB, and
+an amd64 pointer is packed as its low half with a zero upper half. `P` is the
+runtime address of the relocated word. The symbol is either an offset into the
+string table — resolved against the kernel's export table — or
+`HAKU_MODULE_SYM_BASE` (`0xFFFFFFFE`), which means "S is the module load base"
+and carries the section-relative target in the addend. A module links only
+against the kernel's export table; the lookup is a linear scan over eleven
+entries, so loading is `O(relocations × exports)` with both bounded by
+constants. The exports are six utilities (`haku_module_log`,
 `haku_module_log_dec`, `haku_module_log_hex`, `haku_module_ticks`,
 `haku_module_alloc`, `haku_module_free`), three capability calls
 (`haku_module_register_device`, `haku_module_register_fs`,
@@ -568,6 +584,17 @@ run under `spin_lock_irqsave`, so a second load or unload of the same name
 reports `-EBUSY` instead of racing the hooks. `init_module` runs the module's
 `int haku_module_init(void)` after the slot is reserved, propagates a negative
 return from the hook, and otherwise maps a non-zero return to `-EINVAL`.
+
+The x86-64 loader (`kernel/arch/x86_64/kernel/module64.c`) applies the same
+container rules with the version 2 check and the two 64-bit relocation forms.
+It exports the same eleven symbols so one library serves both kernels, but
+only the six utilities do work: logging, ticks and the heap exist on the 64-bit
+side, while the three capability calls and the two struct fillers answer
+`-ENOSYS` because there is no 64-bit VFS or devfs to own the result. A 64-bit
+module can therefore compute and report; publishing a device or a filesystem
+waits for the 64-bit VFS. The lifecycle is the same four-slot table, with the
+transitions under an atomic lock, and `init_module`/`delete_module` copy the
+user buffer page by page through `copy_from_user64` before the loader sees it.
 
 #### Writing a module in C
 
@@ -596,25 +623,39 @@ so a C definition of `__allmul` would produce `___allmul` and never resolve.
 None of the library is linked eagerly — the packer's reachability pass drops
 every section the module does not call.
 
-There is no libc and no floating point. The kernel does not save x87 or SSE
-state across a task switch and never sets `CR4.OSFXSR`, so a module must not
-touch either; the build passes `/arch:IA32` (or `-mno-sse -mno-sse2 -mno-mmx`)
-to keep the compiler from doing it silently. Module code runs in ring 0 on the
-calling task's kernel stack, which is two 4 KiB pages, so frames stay small and
-a module never blocks, sleeps, or spins waiting for another task. A module that
-needs a large buffer takes it from `haku_module_alloc`, not from the stack.
+There is no libc and no floating-point library. On i386 the kernel does not
+save x87 or SSE state across a task switch and never sets `CR4.OSFXSR`, so a
+32-bit module must not touch either; the build passes `/arch:IA32` (or
+`-mno-sse -mno-sse2 -mno-mmx`) to keep the compiler from doing it silently. On
+x86-64, SSE2 is part of the ABI, so `sched64_init` enables the FPU and every
+switch `FXSAVE`s/`FXRSTOR`s the task; compiler-emitted SSE2 is therefore safe,
+but a module still has no math library and must not assume x87. Module code
+runs in ring 0 on the calling task's kernel stack, which is two 4 KiB pages on
+i386 and 16 KiB on x86-64, so frames stay small and a module never blocks,
+sleeps, or spins waiting for another task. A module that needs a large buffer
+takes it from `haku_module_alloc`, not from the stack.
 
-`build.py` compiles the modules with
+`build.py` compiles the 32-bit modules with
 
 ```
 cl /nologo /c /GS- /Zl /Os /Gy /W3 /arch:IA32 /Iinclude
 ```
 
-and packs each one with the runtime objects:
+and the x86-64 demo with the x64 compiler and its own runtime:
+
+```
+cl /nologo /c /GS- /Zl /Os /Gy /W3 /Iinclude /Ikernel\module \
+   /Ikernel\arch\x86_64\compat
+nasm -f win64 kernel\module\lib\runtime64.asm -o build\x64_modruntime.obj
+```
+
+Each one is packed with the library objects:
 
 ```
 python tools/mkhakumod.py build/mod_hello.obj build/modlib_module_lib.obj \
        build/modlib_runtime.obj build/HELLO.HKM --name HAKU-HELLO
+python tools/mkhakumod.py build/x64_demo.obj build/x64_modlib.obj \
+       build/x64_modruntime.obj build/X64MOD.HKM --name HAKU-X64
 ```
 
 `/Gy` (one COMDAT per function) is required for the dead-code pass to be
@@ -624,7 +665,10 @@ keeps the default library out.
 #### Capabilities owned by a module
 
 A module is more than code: it can expose kernel functionality. There are two
-capability kinds, and the module slot owns them:
+capability kinds, and the module slot owns them. This layer belongs to the
+32-bit kernel; the x86-64 build exports the same calls so one header serves
+both, but answers `-ENOSYS` because it has no VFS or devfs yet. The two kinds
+are:
 
 - a character device, registered in devfs and reached as `/dev/<name>`;
 - a filesystem backend (`vfs_fs_ops_t`, which `haku_module_fs_ops_t` mirrors
@@ -661,8 +705,8 @@ if a concurrent open pins the fresh resource the module stays `LIVE` and
 `init_module` reports `-EBUSY` rather than freeing an image that is still in
 use.
 
-`build.py` packs three modules and installs them in both the initramfs and the
-FAT12 seed disk:
+`build.py` packs three modules for the 32-bit image and installs them in both
+the initramfs and the FAT12 seed disk:
 
 - `MODULE.HKM` from the NASM object `haku_demo.asm` keeps the ELF32 host path
   alive and proves relocation and logging
@@ -677,17 +721,29 @@ FAT12 seed disk:
   read-only filesystem and mounts it at `/rom` with `README` and `VERSION`
   (`ROMFS-MODULE-OK`).
 
-The user-library test drives each one: it opens the device and the files,
-checks that `delete_module` reports `-EBUSY` while a descriptor is open, closes
-it, unloads, and reloads to prove the slots are reusable
+The x86-64 build packs a fourth, `X64MOD.HKM` from `x64demo.c`. It is seeded on
+the x64 data disk rather than installed in an image, so the boot test exercises
+the whole on-disk path: read the file, validate the version 2 container,
+relocate `R_64_ABS`/`R_64_PC32` (including a pointer table that becomes
+`DIR64` relocations), resolve imports, run the init hook, then unload and free
+the image. Its checks cover the library's strings, a heap round trip, the tick
+counter and a pointer table (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`,
+`HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`); a duplicate load, a
+truncated file and a corrupted magic must all be refused before
+`HAKU64-MODULE-REJECT-OK` is printed.
+
+The user-library test drives each of the three: it opens the device and the
+files, checks that `delete_module` reports `-EBUSY` while a descriptor is open,
+closes it, unloads, and reloads to prove the slots are reusable
 (`USER-MODDEV-OK`, `USER-ROMFS-OK`).
 
 Modules are trusted kernel code. The validation is a container check: it stops
 a truncated or corrupt file from making the loader read out of bounds, but it
 cannot sandbox code written maliciously, because the module runs in ring 0 with
-the kernel's privileges. Images are allocated from the writable kernel heap, so
-only the 32-bit kernel loads modules today; the x86-64 kernel would need
-executable heap mappings first.
+the kernel's privileges. Both kernels allocate images from a heap that is
+already executable — the 64-bit heap lives in the boot identity map and the
+32-bit heap in its direct map — so executability is not what gates the feature;
+the remaining gap is the 64-bit VFS/devfs that capability registration needs.
 
 ### Physical frame allocator
 

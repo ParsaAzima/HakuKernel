@@ -9,26 +9,31 @@ manual test runs.
 
 | Tool | Version here | Notes |
 |---|---|---|
-| Visual Studio 2022 | 17.x, **Desktop development with C++** | we use the x86 `cl.exe` directly — no project/solution needed |
+| Visual Studio 2022 | 17.x, **Desktop development with C++** | we call the x86 and x64 `cl.exe`/`link.exe` directly — no project/solution needed |
 | NASM | 3.02 | `winget install -e --id NASM.NASM` |
-| QEMU | 11.x | `C:\Program Files\qemu\qemu-system-i386.exe` |
+| QEMU | 11.x | both `qemu-system-i386.exe` and `qemu-system-x86_64.exe` |
 | Python 3 | 3.14 | drives the whole build (`build.py` + helpers) |
 
 ## Build & run
 
 ```cmd
 cd D:\Source\Haku
-python build.py                 :: build haku.img only (data image preserved)
-python build.py run             :: build + boot in a QEMU window
-python build.py run --fresh     :: recreate the FAT12 data image, then boot
-python build.py headless        :: fresh data image + boot headless, verify
-python build.py shell           :: boot a busybox ash shell (interactive)
+python build.py                 :: build haku64.img only (x86-64)
+python build.py run             :: build + boot haku64.img in a QEMU window
+python build.py headless        :: build + boot headless, verify markers
+python build.py x64             :: alias for the headless x86-64 check
+python build.py headless --arch=i386    :: 32-bit headless run
+python build.py run --arch=i386 --fresh :: 32-bit window, fresh data image
+python build.py shell           :: 32-bit busybox ash shell (interactive)
 python build.py shell --check   :: scripted shell run, assert its markers
-python build.py x64             :: build haku64.img (64-bit kernel) and boot it
-python build.py probe --init=X  :: boot an external ELF as /init, check markers
+python build.py probe --init=X  :: boot an external ELF32 as /init (32-bit)
 python build.py --memory=1024   :: guest RAM in MiB (default 512, 32-bit map cap 1000)
 python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
+
+x86-64 is the primary target. `shell` and `probe` force the 32-bit image
+because the 64-bit side has no libc, VFS, shell or user C library yet; passing
+`--arch=x64` with either is an error rather than a silent switch.
 
 The kernel does not assume a memory size: it reads the E820 map, sizes the
 supervisor direct map and the frame pool from it, and reports both in the
@@ -39,7 +44,8 @@ usable page-directory entries belong to the local APIC (`0xFEE00000`) and the
 ACPI scratch window, so the 32-bit direct map stops there. The x86-64 build
 maps RAM with 2 MiB pages and has no such ceiling.
 
-`python build.py headless` verifies ATA detection on both legacy channels
+`python build.py headless --arch=i386` verifies ATA detection on both legacy
+channels
 (`ATA-SCAN-OK devices=2`), the software-reset recovery path
 (`ATA-RECOVERY-OK`), cross-channel sector reads (`ATA-MULTI-OK`),
 FAT12 mounting and
@@ -75,35 +81,41 @@ increments a plain counter under the spinlock — and asserts
 `HAKU64-` prefixed markers on x86-64), which catches a non-atomic lock or a TSS
 that still belongs to the bootstrap processor.
 
-`python build.py x64` builds and boots `haku64.img` separately and asserts
-its own marker set. That run starts a fresh FAT12 data disk
-(`build/haku64_fs.img`) seeded with `HELLO.TXT`, `PATTERN.BIN` and the
-`USER.ELF` program the test execs, ends with `HAKU64-ELF-REJECT-OK` (six
-malformed ELF64 images refused with a reason), `HAKU64-ELF-OK` (the embedded
-static executable mapped into a fresh address space), `HAKU64-ELF-RUN-OK`
-(the program ran in ring 3, stored its BSS word and exited with status 0),
-`HAKU64-ABI-OK` (the six-argument `INT 0x80` ABI passed its success and error
-matrix, including `mmap`/`munmap`), `HAKU64-DISK-OK` (the program created
-`/TMP`, wrote `NOTE.TXT` there and the kernel read it back from the volume
-after `close`), `HAKU64-FORK-OK` (a forked child and its parent observed the
-same `MAP_SHARED` page), `HAKU64-COW-OK` (a private page forked read-only and
-each writer got its own copy), `HAKU64-DUP-OK` (a duplicated descriptor shared
-one file offset, `dup2` redirected it, and `nanosleep` advanced the monotonic
-clock), `HAKU64-EXEC-OK` (a child `execve`d `USER.ELF` off the volume with
-two arguments and one environment variable, the program checked the stack
-image and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS`, and it exited 42) and
+`python build.py headless` builds and boots `haku64.img`, the default run. That
+run starts a fresh FAT12 data disk (`build/haku64_fs.img`) seeded with
+`HELLO.TXT`, `PATTERN.BIN`, the `USER.ELF` program the test execs, and
+`X64MOD.HKM`, the packed x86-64 module. It ends with
+`HAKU64-ELF-REJECT-OK` (six malformed ELF64 images refused with a reason),
+`HAKU64-ELF-OK` (the embedded static executable mapped into a fresh address
+space), `HAKU64-ELF-RUN-OK` (the program ran in ring 3, stored its BSS word
+and exited with status 0), `HAKU64-ABI-OK` (the six-argument `INT 0x80` ABI
+passed its success and error matrix, including `mmap`/`munmap`),
+`HAKU64-DISK-OK` (the program created `/TMP`, wrote `NOTE.TXT` there and the
+kernel read it back from the volume after `close`), `HAKU64-FORK-OK` (a forked
+child and its parent observed the same `MAP_SHARED` page), `HAKU64-COW-OK` (a
+private page forked read-only and each writer got its own copy),
+`HAKU64-DUP-OK` (a duplicated descriptor shared one file offset, `dup2`
+redirected it, and `nanosleep` advanced the monotonic clock),
+`HAKU64-EXEC-OK` (a child `execve`d `USER.ELF` off the volume with two
+arguments and one environment variable, the program checked the stack image
+and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS`, and it exited 42),
 `HAKU64-THREAD-OK` (a `clone`d thread shared the address space and the
 descriptor table, bumped a shared word, woke the parent through a futex, and
 the parent's write through the thread's `dup2` target printed the marker
 before `wait4` reaped the thread with status 7), and `HAKU64-PORT-OK` (the
-ported table: `stat`/`fstat`/`statx`, `chdir`/`getcwd` with a relative
-open, `openat`/`mkdirat`, `getdents64` on an empty and a seeded directory,
-`ftruncate`/`truncate`/`renameat`/`unlinkat`, `uname`/`times`/
-`getrlimit`/`clock_getres`, `prctl` names, two different `getrandom`
-words, `brk`+`mprotect`, `poll`/`select`, `sched_yield` and `dup3`/
-`fcntl`).
+ported table: `stat`/`fstat`/`statx`, `chdir`/`getcwd` with a relative open,
+`openat`/`mkdirat`, `getdents64` on an empty and a seeded directory,
+`ftruncate`/`truncate`/`renameat`/`unlinkat`, `uname`/`times`/`getrlimit`/
+`clock_getres`, `prctl` names, two different `getrandom` words,
+`brk`+`mprotect`, `poll`/`select`, `sched_yield` and `dup3`/`fcntl`). It also
+loads `X64MOD.HKM` from the FAT12 volume: the module logs, reads ticks, uses
+the heap and exits (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`,
+`HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`), while a duplicate load, a
+truncated file and a bad magic must be refused before
+`HAKU64-MODULE-REJECT-OK`.
 After QEMU exits, `tools/lsfat12.py --check` verifies the volume the guest
-just wrote. The 32-bit `haku.img` stays the default image.
+just wrote. The 32-bit `haku.img` is still built with `--arch=i386`, and it
+remains the only image with the user land, shell and capability modules.
 
 `python build.py shell` boots something else entirely: a real static
 `busybox` (musl, i386) as PID 1, so the guest comes up in `ash` instead of
@@ -142,6 +154,11 @@ starts from a fresh image (its fault-injection tests mutate the disk) and,
 after the serial-log check passes, re-verifies the post-run image on the
 host side.
 
+`build/haku64_fs.img` is the x86-64 data disk. It is rebuilt on every x64 run
+because the self-test writes `/TMP/NOTE.TXT` into it and no user data is
+expected to survive; its seed files are `HELLO.TXT`, `PATTERN.BIN`,
+`USER.ELF` and `X64MOD.HKM`.
+
 `python build.py inspect` (default: `build/haku_fs.img`) lists the root
 directory and FAT summary without touching the image; `--chains` also prints
 cluster chains, `--cat NAME.EXT` / `--dump NAME.EXT OUT.BIN` extract a file,
@@ -155,9 +172,10 @@ lists just work.
 
 `.github/workflows/ci.yml` runs on every push to `main`, every pull request,
 and manual dispatch. It uses `ubuntu-latest`, installs NASM, Clang/LLD, and
-QEMU from apt, runs `python build.py headless` through the
-`clang-cl`/`lld-link` path in `build.py`, and uploads `haku.img`, the data
-image, serial/QEMU logs, and any crash screenshots as artifacts even when the
+QEMU from apt, runs `python build.py headless` (x86-64) and then
+`python build.py headless --arch=i386` (the 32-bit suite) through the
+`clang-cl`/`lld-link` path in `build.py`, and uploads both images, the data
+images, serial/QEMU logs, and any crash screenshots as artifacts even when a
 boot check fails. A missing marker, an unexpected `*-FAIL` marker, or
 `KERNEL PANIC` fails the job.
 
@@ -178,27 +196,30 @@ built outside Haku's toolchain and packed into the initramfs as `/init`; the
 and asserts `HAKU-BOOT-OK`, `INITRAMFS-UNPACK-OK`, `INIT-READ-OK name=init`,
 `USERMODE-ENTER`, and the requested marker.
 
-`.github/workflows/release.yml` runs for `v*` tags. It repeats the headless
-check, deletes the mutated test image, rebuilds a pristine
-`build/haku_fs.img`, and publishes `Haku-<tag>.zip` containing `haku.img`,
-`haku_fs.img`, `README.md`, `LICENSE`, and `SHA256SUMS.txt`:
+`.github/workflows/release.yml` runs for `v*` tags. It repeats both headless
+checks, deletes the mutated test images, rebuilds pristine `build/haku64_fs.img`
+and `build/haku_fs.img`, and publishes `Haku-<tag>.zip` containing
+`haku64.img`, `haku64_fs.img`, `haku.img`, `haku_fs.img`, `README.md`,
+`LICENSE`, and `SHA256SUMS.txt`:
 
 ```bash
 git tag v0.2.0
 git push origin v0.2.0
 ```
 
-Slow runners can tune headless timing with `HAKU_BOOT_DELAY` (seconds before
-the injected key, default 1) and `HAKU_HEADLESS_TIMEOUT` (seconds to wait for
-guest shutdown, default 30).
+Slow runners can tune the checks with `HAKU_BOOT_DELAY` (seconds before the
+injected key, default 1), `HAKU_HEADLESS_TIMEOUT` (seconds to wait for the
+32-bit guest shutdown, default 30) and `HAKU_X64_TIMEOUT` (seconds to wait for
+`HAKU64-SELFTEST-OK`, default 60).
 
 ## Manual testing and image recovery
 
-`python build.py run` boots the floppy in a QEMU window with the same disks
-as the automated run, so the whole flow can be driven by hand: the injected
-key only exists in `headless`, so press any key yourself at the read prompt.
-`build/serial.log` is only written by `headless`; in a windowed run the same
-text appears on the VGA/framebuffer console.
+`python build.py run` boots `haku64.img` in a QEMU window with the same disks
+as the automated x64 run; `python build.py run --arch=i386` boots the 32-bit
+image. The whole 32-bit flow can be driven by hand: the injected key only
+exists in `headless`, so press any key yourself at the read prompt.
+`build/serial.log` and `build/serial64.log` are only written by the headless
+runs; in a windowed run the same text appears on the VGA/framebuffer console.
 
 A data image that a test corrupted can be thrown away safely: delete
 `build/haku_fs.img` or run `python build.py --fresh` (add `headless` to also

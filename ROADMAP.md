@@ -65,14 +65,17 @@ compatibility is not a short-term goal.
   park with interrupts off; the bootstrap processor still runs every task.
 - [x] Loadable ring-0 modules (`haku module`): `tools/mkhakumod.py` packs
   relocatable objects into a flat `.hkm` container (image, BSS, entry/exit
-  offsets, `R_386_32`/`R_386_PC32` relocations, import names), and
-  `init_module`/`delete_module` (Linux i386 128/129) validate, relocate and
-  run it against an eleven-entry kernel export table. The host tool accepts a
-  NASM ELF32 object unchanged and links COFF/i386 objects (MSVC or clang-cl),
-  folding COMDAT duplicates, resolving internal symbols and dropping the
-  sections the entry point cannot reach. Modules are written in C against
+  offsets, relocations, import names); the header version records the
+  architecture (1 = i386, 2 = x86-64). The 32-bit loader
+  (`init_module`/`delete_module`, Linux i386 128/129) validates, relocates and
+  runs it against an eleven-entry kernel export table. The host tool accepts a
+  NASM ELF32 object unchanged and links COFF/i386 or COFF/amd64 objects (MSVC
+  or clang-cl), folding COMDAT duplicates, resolving internal symbols and
+  dropping the sections the entry point cannot reach. Modules are written in C
+  against
   `include/haku/module.h` and link `libhakumod`
-  (`kernel/module/lib/module_lib.c` + `runtime.asm`), which supplies the
+  (`kernel/module/lib/module_lib.c` + `runtime.asm` on i386, `runtime64.asm`
+  on x86-64), which supplies the
   string routines, the 64-bit multiply/divide/shift helpers and the stack
   probes the compiler expects, so a module needs no libc. A four-slot table
   with `LOADING`/`LIVE`/`UNLOADING` states refuses duplicate and overlapping
@@ -88,8 +91,13 @@ compatibility is not a short-term goal.
   with `hello.c` also checking the linked runtime (`HELLO-LIB-OK`) alongside the
   original NASM `MODULE.HKM` (`USER-MODULE-OK`,
   `MODULE-LOAD-OK name=HAKU-DEMO`, `MODULE-UNLOAD-OK name=HAKU-DEMO`,
-  `HAKU-MODULE-OK`, `HAKU-MODULE-EXIT`). Modules are trusted ring-0 code and the
-  x86-64 kernel does not load them yet.
+  `HAKU-MODULE-OK`, `HAKU-MODULE-EXIT`). The x86-64 loader
+  (`kernel/arch/x86_64/kernel/module64.c`, syscalls 175/176) loads the same
+  container in version 2, relocates `R_64_ABS`/`R_64_PC32`, and is exercised by
+  `X64MOD.HKM` read from the FAT12 disk (`HAKU64-MODULE-LOAD-OK`,
+  `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK`). Its logging, tick and
+  heap exports work; device/filesystem registration answers `-ENOSYS` until a
+  64-bit VFS exists. Modules are trusted ring-0 code.
 - [x] A statically linked musl binary booted as `/init` in Linux CI
   (`musl_probe`, `MUSL-PROBE-OK`): Linux-shaped initial stack and auxiliary
   vector, Linux-shaped `set_thread_area`, and the `_llseek`/`readv`/`writev`/
@@ -116,15 +124,17 @@ compatibility is not a short-term goal.
   markers. The console also answers busybox's `ESC[6n` cursor-position query
   (the prompt is `$ `, not `$ [6n`) and implements `\b`/`\r` for its line
   editor.
-- [x] An x86-64 (long mode) target built from the same tree — `python
-  build.py x64` produces `haku64.img` — with a long-mode entry, four-level
-  paging and a 2 MiB-page physmap of all RAM (so no 1020 MiB ceiling), an
-  E820 frame allocator, a kernel heap, a GDT/TSS with IST stacks, a 64-bit
-  IDT, the 8259 remapped to `0x20`/`0x28`, a 100 Hz PIT, a round-robin
-  scheduler, ring 3 with the Linux syscall convention, an ELF64 loader, a
-  FAT12 disk behind a page cache, and `fork`/`wait4` with default-action
-  signals. `haku.img` is still the default image and the only one that runs
-  the full userland.
+- [x] An x86-64 (long mode) kernel from the same tree, now the primary
+  target: `python build.py`, `run` and `headless` build and boot
+  `haku64.img`, while `--arch=i386` still builds `haku.img`. It has a
+  long-mode entry, four-level paging and a 2 MiB-page physmap of all RAM (so
+  no 1020 MiB ceiling), an E820 frame allocator, a kernel heap, a GDT/TSS
+  with IST stacks, a 64-bit IDT, the 8259 remapped to `0x20`/`0x28`, a 100 Hz
+  PIT, a round-robin scheduler, ring 3 with the Linux syscall convention, an
+  ELF64 loader, a FAT12 disk behind a page cache, `fork`/`wait4` with
+  default-action signals, and a version 2 module loader that logs, reads
+  ticks and uses the heap. The 32-bit image remains the only one that runs
+  the full userland, the shell and the capability modules.
 
 ## Proposed Milestones
 
@@ -583,17 +593,18 @@ linking, and shared libraries stay out of scope.
 
 ### 8. x86-64 (long mode)
 
-The 32-bit kernel remains the default image; this milestone adds a 64-bit
-boot path and ports the kernel onto it in stages. Every stage must leave
-`python build.py headless` green, so the two targets stay independent until
-the port is complete.
+This milestone ported the kernel onto the 64-bit boot path. x86-64 is now the
+default target: `python build.py headless` runs the 64-bit suite and
+`python build.py headless --arch=i386` runs the 32-bit one, and both must stay
+green. The stages below are checked as they landed; the remaining gap is the
+64-bit userland (libc, VFS/devfs, shell).
 
 - [x] Boot into IA-32e long mode and run 64-bit C.
   `kernel/arch/x86_64/boot/entry64.asm` sets `CR4.PAE`, `EFER.LME`, builds a
   PML4/PDPT/PD identity map of the first 1 GiB with 2 MiB pages, and
   far-jumps to a 64-bit code segment; `kernel/arch/x86_64/kernel/boot64.c` is
   the first C code the 64-bit path runs, which also proves the Microsoft x64
-  calling convention across the asm/C boundary. `python build.py x64` reuses
+  calling convention across the asm/C boundary. The x64 build reuses
   the existing stage1/stage2 floppy, and `tools/pe2bin.py` now converts PE32+
   images as well as PE32.
 - [x] Memory: four-level paging helpers, a supervisor physmap of all RAM at
@@ -694,9 +705,10 @@ the port is complete.
   `getcwd` reports, and that every path call resolves against; a thread
   reads its group leader's. Limits: 8.3 names, 65-byte paths, no symlinks,
   no write-through, no pipes, and modes/owners are accepted but not stored.
-  `build.py x64` generates
+  `build.py` generates
   `build/haku64_fs.img` with `tools/mkfat12.py --empty`, seeds `HELLO.TXT`,
-  `PATTERN.BIN` and `USER.ELF`, attaches it to QEMU, and verifies the image
+  `PATTERN.BIN`, `USER.ELF` and `X64MOD.HKM`, attaches it to QEMU, and verifies
+  the image
   with `tools/lsfat12.py --check` after the run; the ring-3 test creates
   `/TMP`, writes and re-reads `NOTE.TXT`, and the kernel re-reads the file
   after close (`HAKU64-DISK-OK`).
@@ -818,12 +830,29 @@ the port is complete.
   refuses six malformed variants, checks the BSS page starts zero, and then
   runs the image, whose BSS store proves execution. Markers:
   `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK`.
+- [x] Modules on x86-64: the same `.hkm` container in version 2,
+  `kernel/arch/x86_64/kernel/module64.c` relocates `R_64_ABS`/`R_64_PC32`
+  (a stored amd64 pointer becomes a 4-byte absolute relocation because the
+  image, the kernel and the exports all live below 4 GiB), resolves the same
+  eleven export names against `libhakumod`, and keeps the four-slot lifecycle
+  under an atomic lock. User space reaches it through `init_module` (175) and
+  `delete_module` (176); the image length is bounded by the container's worst
+  case and copied page by page. `X64MOD.HKM` from `x64demo.c` is seeded on the
+  FAT12 disk, so the boot test reads it back, loads, unloads and rejects a
+  duplicate, truncated and bad-magic image
+  (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`, `HAKU64-MODULE-LOAD-OK`,
+  `HAKU64-MODULE-REJECT-OK`, `HAKU64-MODULE-UNLOAD-OK`). The utilities
+  (log, ticks, heap) work; device/filesystem registration and the struct
+  fillers answer `-ENOSYS` until a 64-bit VFS and devfs exist.
 - [ ] Userland: a 64-bit build of `user/lib` and `musl-gcc` binaries in the
   probe.
 
-**Acceptance criteria:** `python build.py x64` boots to a 64-bit user process
-running the same test suite as the 32-bit image, with its own headless marker
-set; the 32-bit image keeps working from the same tree.
+**Acceptance criteria:** `python build.py headless` boots x86-64 to a 64-bit
+user process running the same test suite as the 32-bit image, with its own
+marker set (`X64 CHECK PASSED`), and `python build.py headless --arch=i386`
+keeps the 32-bit suite green from the same tree. Everything except the 64-bit
+userland has landed; that item stays open until the image runs a 64-bit `/init`
+instead of a kernel-side self-test.
 
 ## Out of Scope for This Roadmap
 

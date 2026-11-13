@@ -1,11 +1,11 @@
 <h1 align="center">
- Haku v0.2.0 — a tiny x86 operating system in C
+ Haku v0.2.0 — a tiny x86-64 operating system in C
 </h1>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Language-C-A8B9CC?style=for-the-badge&logo=c&logoColor=white" alt="C" />
   <img src="https://img.shields.io/badge/Assembly-NASM-333333?style=for-the-badge" alt="NASM" />
-  <img src="https://img.shields.io/badge/Architecture-x86%20%2F%20i386-0071C5?style=for-the-badge" alt="x86" />
+  <img src="https://img.shields.io/badge/Architecture-x86--64%20%2F%20i386-0071C5?style=for-the-badge" alt="x86-64 and i386" />
   <img src="https://img.shields.io/badge/Kernel-Bare%20Metal-222222?style=for-the-badge" alt="Bare Metal" />
 </p>
 
@@ -21,13 +21,14 @@
     <img src="https://img.shields.io/github/actions/workflow/status/ParsaAzima/HakuKernel/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI status" />
   </a>
   <img src="https://img.shields.io/badge/Filesystem-FAT12-4CAF50?style=for-the-badge" alt="FAT12" />
-  <img src="https://img.shields.io/badge/ABI-i386%20Syscalls-455A64?style=for-the-badge" alt="i386 syscall ABI" />
+  <img src="https://img.shields.io/badge/ABI-x86--64%20%2F%20i386%20Syscalls-455A64?style=for-the-badge" alt="x86-64 and i386 syscall ABI" />
 </p>
 
-A NASM bootloader loads a C kernel and switches the CPU to 32-bit protected
-mode. The kernel sets up paging, interrupts, and a GDT/TSS, then runs ELF32
-programs from a FAT12 volume on an ATA disk at ring 3 behind an i386-style
-syscall gate. There is no C runtime inside the kernel and no hosted library
+A NASM bootloader loads a C kernel, switches the CPU to long mode and runs
+ELF64 programs at ring 3 behind the Linux x86-64 syscall ABI. The same source
+tree still builds the original 32-bit kernel (`python build.py --arch=i386`),
+which is where the static musl/busybox userland, the user C library and the
+shell live. There is no C runtime inside the kernel and no hosted library
 under it: MSVC (or clang-cl) and NASM produce freestanding objects that
 `link.exe`/`lld-link` combine into a flat boot image, and QEMU boots it.
 
@@ -56,7 +57,7 @@ control and pipelines working.
   subset, validated user pointers, `-errno` results, and the 64-byte i386
   `struct stat` family that glibc and musl expect.
 - **Modules** — `haku module`: a packed `.hkm` container (built on the host by
-  `tools/mkhakumod.py` from NASM ELF32 or COFF/i386 objects) loaded with
+  `tools/mkhakumod.py` from NASM ELF32 or COFF i386/amd64 objects) loaded with
   `init_module`, relocated against an eleven-entry kernel export table, and
   unloaded with `delete_module`. A module can register a `/dev` character
   device or a filesystem backend and mount it at its own prefix; the kernel
@@ -64,8 +65,10 @@ control and pipelines working.
   (`-EBUSY`), and detaches everything before the image is freed. C modules are
   first-class: `include/haku/module.h` declares the services and `libhakumod`
   supplies the string and 64-bit helpers the compiler calls, with the packer
-  dropping whatever a module does not reach. Modules are trusted ring-0 code;
-  the 32-bit kernel loads them today.
+  dropping whatever a module does not reach. Modules are trusted ring-0 code.
+  Both kernels load versioned containers; the x86-64 loader provides logging,
+  ticks and the kernel heap, while the device/filesystem registration calls
+  answer `-ENOSYS` until a 64-bit VFS exists.
 - **Storage** — ATA PIO on both legacy channels with reset/retry recovery, a
   writable FAT12 driver, a VFS with per-process descriptors, `ramfs` root,
   `initramfs` (cpio newc), `/dev`, and a generated `/proc`.
@@ -73,48 +76,52 @@ control and pipelines working.
   mirror, CSI sequence handling with DSR replies, kernel-log display latch.
 - **Userland** — freestanding C library (`user/lib`), busybox/musl as PID 1,
   headless self-tests for every subsystem listed above.
-- **x86-64** — in progress: long-mode entry, four-level paging with a physmap,
-  frame allocator, heap, GDT/TSS with IST stacks, IDT/PIC, timer, RTC wall
-  clock, round-robin scheduler, ring 3 with `SYSCALL`/`SYSRET` and the Linux
-  syscall convention, NX enforcement, an ELF64 loader, a FAT12 disk with file
-  writes behind a page cache that file-backed `mmap` maps from,
+- **x86-64** — the primary target: long-mode entry, four-level paging with a
+  physmap, frame allocator, heap, GDT/TSS with IST stacks, IDT/PIC, timer, RTC
+  wall clock, round-robin scheduler, ring 3 with `SYSCALL`/`SYSRET` and the
+  Linux syscall convention, NX enforcement, an ELF64 loader, a FAT12 disk with
+  file writes behind a page cache that file-backed `mmap` maps from,
   `fork`/`wait4` with copy-on-write pages and default-action signals,
   `dup`/`dup2` over a shared file
   description, `nanosleep`, `execve` of an ELF64 file from the disk with
   `argc`/`argv`/`envp` on the new stack, threads: `clone` with
   `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`, `gettid`, and `futex` wait/wake,
-  and the ported i386 syscall table on the x86-64 ABI: `stat`/`statx`,
+  the ported i386 syscall table on the x86-64 ABI (`stat`/`statx`,
   `getdents64`, `rename`/`unlink`/`truncate`, `chdir`/`getcwd`/`openat`,
   `pread`/`pwrite`, `mprotect`/`brk`/`madvise`, `poll`/`select`, `fcntl`/
   `ioctl`/`dup3`, `uname`/`times`/`getrusage`/`getrlimit` and the identity,
-  `prctl` and `getrandom` calls.
-  No signal handlers, pipes, or 64-bit libc yet.
+  `prctl` and `getrandom` calls), and a module loader for version 2
+  containers.
+  No 64-bit libc, VFS/devfs, shell or signal handlers yet.
 
 ## Quick start
 
-Requirements: Visual Studio 2022 with **Desktop development with C++** (for the
-x86 `cl.exe`), NASM, QEMU (i386), and Python 3. CI uses clang-cl/lld-link on
-Ubuntu with the same `build.py`.
+Requirements: Visual Studio 2022 with **Desktop development with C++** (both
+the x86 and x64 `cl.exe`), NASM, QEMU (i386 and x86-64), and Python 3. CI uses
+clang-cl/lld-link on Ubuntu with the same `build.py`.
 
 ```cmd
-python build.py                 :: build haku.img only (data image preserved)
+python build.py                 :: build haku64.img only (x86-64)
 python build.py run             :: build + boot in a QEMU window
-python build.py headless        :: fresh data image + boot headless, verify
-python build.py shell           :: boot a busybox ash shell (interactive)
+python build.py headless        :: build + boot headless, verify
+python build.py shell           :: boot a busybox ash shell (32-bit image)
 python build.py shell --check   :: scripted shell run, assert its markers
-python build.py probe --init=X  :: boot an external ELF as /init, check markers
+python build.py probe --init=X  :: boot an external ELF32 as /init (32-bit)
+python build.py headless --arch=i386   :: the full 32-bit headless suite
 ```
 
-`headless` prints `HEADLESS CHECK PASSED` after the serial log shows the boot,
-storage, process, syscall, signal, and memory self-test markers. `shell
---check` prints `SHELL CHECK PASSED` after a forked foreground pipeline and a
-PATH lookup run inside `sh -i -c`. Both exit nonzero on a missing marker, an
-unexpected `*-FAIL`, or `KERNEL PANIC`.
+`headless` prints `X64 CHECK PASSED` after the serial log shows the boot,
+storage, process, syscall, memory and module self-test markers.
+`headless --arch=i386` prints `HEADLESS CHECK PASSED` for the 32-bit suite.
+`shell --check` prints `SHELL CHECK PASSED` after a forked foreground pipeline
+and a PATH lookup run inside `sh -i -c`. All exit nonzero on a missing marker,
+an unexpected `*-FAIL`, or `KERNEL PANIC`.
 
-`build/haku_fs.img` is the ATA data disk and is user data: it is reused
-untouched unless you pass `--fresh`, and `python build.py inspect --check`
-verifies its BPB, FAT mirrors, and cluster chains without modifying it. Report
-a damaged image rather than deleting it out of hand.
+`build/haku_fs.img` and `build/haku64_fs.img` are the ATA data disks. The
+32-bit image is user data: it is reused untouched unless you pass `--fresh`,
+and `python build.py inspect --check` verifies its BPB, FAT mirrors, and
+cluster chains without modifying it. Report a damaged image rather than
+deleting it out of hand. The x64 seed disk is rebuilt on every run.
 
 ## Documentation
 
@@ -122,7 +129,7 @@ a damaged image rather than deleting it out of hand.
 |---|---|
 | [docs/](docs/README.md) | Documentation index. |
 | [Building and running](docs/building.md) | Prerequisites, every build target, image lifecycle, CI, releases, manual runs. |
-| [Architecture](docs/architecture.md) | Boot chain, memory map, IDT, frame allocator, x86-64 progress. |
+| [Architecture](docs/architecture.md) | Boot chain, memory map, IDT, frame allocator, the x86-64 port, and modules. |
 | [Processes and scheduling](docs/processes.md) | Process creation, COW forks, scheduler, job control, accounting. |
 | [System calls](docs/syscalls.md) | The syscall ABI, the call table, mmap/brk/mprotect, POSIX subset. |
 | [Userland](docs/userland.md) | User C library, busybox/musl, the shell image. |
@@ -136,15 +143,16 @@ a damaged image rather than deleting it out of hand.
 ## Project layout
 
 ```
+kernel/arch/x86_64/  long-mode entry and kernel (primary target)
 kernel/arch/x86/     boot stages, entry/ISR, GDT/IDT/PIC/PIT, paging, frames, ELF
-kernel/arch/x86_64/  long-mode entry and bring-up (work in progress)
 kernel/drivers/      ATA, terminal, display backends, serial, keyboard
 kernel/fs/           VFS, FAT12, ramfs, devfs, procfs, initramfs, fs self-tests
 kernel/kernel/       startup, scheduler, syscalls, locking, klog, panic, heap
+kernel/module/       .hkm container, 32-bit loader, libhakumod, demo modules
 user/lib/            freestanding user C library and CRT
 user/tests/          C library self-test and the portable musl probe
 include/haku/        shared ABI (abi.h/abi.inc) and user headers
-tools/               pe2bin, pe2elf, mkimg, mkfat12, mkcpio
+tools/               pe2bin, pe2elf, mkimg, mkfat12, mkcpio, mkhakumod
 build.py             the whole build, test, and QEMU orchestration
 ```
 
@@ -152,16 +160,16 @@ build.py             the whole build, test, and QEMU orchestration
 
 Haku does not claim POSIX compatibility. It implements a subset aimed at
 statically linked Linux binaries, on a single CPU, without demand paging,
-swap, or networking. The 32-bit image and the x86-64 port both have
-`clone`/`futex` threads and bring the application processors online with their
-own TSS and the shared IDT, but the application processors are parked: every
-task still runs on the bootstrap processor. Kernel spinlocks are atomic across
-CPUs, but the scheduler state is not per-CPU yet. The x86-64 port also lacks
-signal handlers. FAT12
+swap, or networking. Both images have `clone`/`futex` threads and bring the
+application processors online with their own TSS and the shared IDT, but the
+application processors are parked: every task still runs on the bootstrap
+processor. Kernel spinlocks are atomic across CPUs, but the scheduler state is
+not per-CPU yet. The x86-64 kernel also lacks signal handlers, pipes, a VFS,
+devfs and a 64-bit libc, so it runs its self-test from the kernel rather than
+a 64-bit `/init`; module capability registration answers `ENOSYS` there. FAT12
 has 8.3 names, no timestamps, and no
-permission bits. The x86-64 image is a bring-up milestone, not a usable
-system: its filesystem cache holds eight paths of at most 128 KiB each, and
-its signals only terminate. Everything beyond the implemented subset returns `ENOSYS`
+permission bits. Haku's filesystem cache holds eight paths of at most 128 KiB
+each. Everything beyond the implemented subset returns `ENOSYS`
 rather than pretending to work.
 
 ## Policies
