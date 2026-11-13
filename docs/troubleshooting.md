@@ -40,6 +40,21 @@ The build and boot failures that come up most often, and what causes them.
   there is the NX bit plus a present page, because address 0 is inside the
   kernel's identity-map slot that every space borrows; QEMU's `-d int` log
   shows the last `ADDQ` operand and the faulting `CS:RIP`.
+- **x64: `#GP` (`vector=13 error=0x0`) at boot, right after the first interrupt
+  is enabled** — GS.base is no longer the per-CPU block. In ring 0 the kernel
+  reads "this CPU" as `gs:[0]`, so anything that reloads GS with a plain
+  `mov gs, ax` resets the hidden base to zero and the next `k64_cpu()` returns
+  whatever the IVT holds there (a non-canonical address, hence the `#GP` on
+  the first `[gs:0]` load). `gdt64_load` therefore loads DS/ES/SS and leaves
+  FS and GS alone; swapping GS must go through `SWAPGS` on the paths that
+  cross the ring boundary (see the SWAPGS invariant in
+  [architecture](architecture.md#stage-d-per-cpu-scheduling-x86-64)).
+- **`LNK1164: section alignment greater than section size`** — a static was
+  declared `__declspec(align(64))` and the kernel is linked with `/ALIGN:16`
+  for the flat image the boot loader expects, so a 64-byte-aligned section is
+  rejected. Cache-line-aligned data (the per-CPU blocks) is stored with
+  `align(16)` and rounded up once at run time instead
+  (`percpu_align` in `percpu64.c`).
 - **kernel exceeds 448 KiB** — the stage-2 loader deliberately stops below
   the bootstrap stack. Move to a memory-backed or later-stage loading design
   before increasing this limit.

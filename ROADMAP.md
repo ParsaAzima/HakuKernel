@@ -21,7 +21,7 @@ next milestone that needs new kernel work is 2.
 | Area | x86-64 (primary, `python build.py`) | i386 (`--arch=i386`) |
 |---|---|---|
 | Boot and memory | long-mode entry, four-level paging, 2 MiB physmap, frame allocator, 8 MiB heap | 32-bit protected mode, two-level paging, direct map |
-| Interrupts | 64-bit IDT/TSS with IST, 8259 + PIT, RTC, SMP AP bring-up (APs parked) | same stages on 32 bits |
+| Interrupts | 64-bit IDT/TSS with IST, 8259 + PIT, RTC; SMP bring-up with per-CPU scheduling, LAPIC timers and TLB shootdown | same bring-up stages on 32 bits, APs parked |
 | Ring 3 | `SYSCALL`/`SYSRET` + `INT 0x80`, page-by-page user copies, NX | `INT 0x80`, page-by-page user copies |
 | Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads, `futex` | same, plus signals, job control and wait queues |
 | Syscalls | ported subset on the x86-64 numbers; no pipes, no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
@@ -50,7 +50,7 @@ marker set does not prove.
 | 2 | 64-bit VFS, devfs and module capabilities | 1 | `HAKU64-VFS-OK` |
 | 3 | Pipes, signals and job control | 1 | `HAKU64-PIPE-OK`, `HAKU64-SIGNAL-OK` |
 | 4 | Interactive x86-64 userland: console, TTY, busybox | 2, 3 | `X64 SHELL CHECK PASSED` |
-| 5 | True SMP scheduling | 4 | `HAKU64-SMP-SCHED-OK` |
+| 5 | True SMP scheduling — delivered (see below) | — | `HAKU64-SMP-SCHED-OK` |
 | 6 | Networking: loopback, then virtio-net | 4 | `NET-TCP-OK` |
 | 7 | Hardening: SMEP/SMAP, W^X, syscall fuzzing | 2, 5 | `HAKU64-FUZZ-OK` |
 | 8 | Tooling, tracing and performance measurement | any | `BENCH-OK` |
@@ -184,25 +184,38 @@ usable interactive shell without serial; the i386 suite stays green.
 **Goal.** The application processors stop being parked: tasks run on every CPU,
 with per-CPU scheduling state and correct cross-CPU memory invalidation.
 
-**Work.**
+**Work.** Delivered in four stages; A–C (AP bring-up, atomic locks, per-CPU
+descriptor tables) are described in
+[architecture](docs/architecture.md#smp-acpi-the-local-apic-and-application-processors).
 
-- [ ] Per-CPU state: current task, idle task, run queue, `need_resched`, and a
-      GS-based accessor instead of global variables.
-- [ ] A local-APIC timer per CPU (or TSC-deadline), and IPIs for reschedule,
-      halt and TLB shootdown.
-- [ ] Scheduling on APs: pick, switch and idle (`HLT`) independently; move
-      wake-ups to the CPU that owns the target or the least-loaded one.
-- [ ] Lock audit: every shared structure gets a documented lock order; no
-      sleeping with a spinlock held; interrupt-state discipline stated at each
-      call site.
-- [ ] TLB shootdown on `munmap`, `mprotect` and COW breaks that touch another
-      CPU's address space.
-- [ ] A one-CPU mode that still passes (a `--smp=1` flag added with this
-      milestone) so the scheduler can be bisected.
+- [x] Per-CPU state: current task, idle task, round-robin cursor, tick and
+      switch counters, active address space, and a GS-based accessor
+      (`k64_cpu()`) instead of globals.
+- [x] A local-APIC timer per CPU, calibrated once against the PIT, plus IPIs
+      for reschedule and TLB shootdown (vectors `0x40`–`0x42`).
+- [x] Scheduling on APs: each CPU picks, switches and idles (`HLT`)
+      independently, and each AP owns an idle task.
+- [x] Lock audit: one interrupt-owning spin lock, documented as such; the
+      scheduler, frame allocator, heap, TLB round and disk mutex use it and
+      nothing blocking happens under it.
+- [x] TLB shootdown on `munmap`, `mprotect` and COW breaks that touch another
+      CPU's address space, targeting only CPUs whose CR3 names the space.
+- [x] A one-CPU mode that still passes (`--smp=1`) so the scheduler can be
+      bisected.
+- [ ] User tasks on APs: pin a ring-3 task to an AP and prove it survives
+      preemption, syscalls and exit there, so the syscall layer's bookkeeping
+      (current task, `FS`-relative TLS, signal delivery) is exercised on more
+      than the bootstrap processor.
+- [ ] Run queues instead of a pinned scan, with wake-up placement and
+      migration, once tasks may move between CPUs.
+- [ ] PCID/ASID tagging, so a shootdown can flush a single address space
+      instead of reloading CR3.
 
-**Acceptance.** `HAKU64-SMP-SCHED-OK` (two threads provably run in parallel and
-a shared atomic counter reaches the expected value), `HAKU64-SMP-TLB-OK`, and
-the whole suite green with `-smp 1`, `-smp 2` and `-smp 4`.
+**Acceptance.** `HAKU64-SMP-SCHED-OK` (a pinned worker per AP proves every CPU
+dispatches from the shared task table) and `HAKU64-SMP-TLB-OK` (`targets=`
+equals the number of other CPUs, `flushes=` matches, `timeouts=0`), with the
+whole suite green at `--smp=1` (`…-SKIP` markers), `--smp=2` and `--smp=4`.
+Met.
 
 ## 6. Networking
 

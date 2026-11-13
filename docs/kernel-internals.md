@@ -45,12 +45,19 @@ processor cannot both succeed. Interrupts are still what serialises a task
 against its own timer preemption on one CPU, so the interrupt-save variant
 keeps `cli`.
 
-The state *inside* the critical sections is still per-machine, not per-CPU:
+The state *inside* the critical sections is per-machine on the 32-bit build:
 the scheduler keeps one current task, one run-state bitmap and one tick
-counter, and only the bootstrap processor takes timer interrupts. Running
-tasks on a second CPU needs per-CPU blocks and a per-CPU timer; that is the
-remaining SMP work in the
-[roadmap](../ROADMAP.md#5-true-smp-scheduling).
+counter, and only the bootstrap processor takes timer interrupts. On x86-64
+that state is per-CPU — a `k64_percpu_t` block reached through `GS.base`, with
+its own current task, idle task, tick and switch counters, a per-CPU LAPIC
+timer, and TLB shootdown plus reschedule IPIs — and there is one spin lock
+(`spinlock64_t`) instead of the four primitives above. It saves `RFLAGS`,
+disables interrupts, then claims the word with a locked exchange, so it is both
+cross-CPU atomic and non-preemptible on the CPU that holds it; the unlock
+restores the caller's flags. The 64-bit scheduler table, frame allocator,
+heap, TLB round and disk mutex all use it, and nothing blocking (no sleeping
+mutex, no I/O wait) happens while it is held. See
+[stage D](architecture.md#stage-d-per-cpu-scheduling-x86-64).
 
 The locking rules per subsystem:
 

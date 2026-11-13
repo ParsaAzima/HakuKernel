@@ -59,14 +59,27 @@ kernel stack are reclaimed after execution has moved to another stack. When
 no user process is runnable, the scheduler runs a dedicated kernel idle
 context.
 
-Scheduling is single-CPU. Both builds bring the application processors online,
-give each one a private descriptor table and TSS plus the shared IDT, and park
-them (see [SMP](architecture.md#smp-acpi-the-local-apic-and-application-processors)).
-Only the bootstrap processor takes timer interrupts and selects the next task,
-so the scheduler, wait queues and run-state bitmap still need no per-CPU
-replication. Letting an AP schedule requires per-CPU current-task state and a
-per-CPU timer; that is the next SMP stage in the
-[roadmap](../ROADMAP.md#5-true-smp-scheduling).
+Scheduling is single-CPU on the 32-bit build. Both builds bring the
+application processors online and give each one a private descriptor table and
+TSS plus the shared IDT (see
+[SMP](architecture.md#smp-acpi-the-local-apic-and-application-processors));
+on 32-bit the APs then stay parked.
+On 32-bit only the bootstrap processor takes timer interrupts and selects the
+next task, so the scheduler, wait queues and run-state bitmap need no per-CPU
+replication.
+
+On x86-64 every CPU schedules. A task is pinned to the CPU it was created on
+and is never migrated, so each CPU picks from its own subset of the task table
+and keeps `current`, its round-robin cursor and its switch counter in a
+per-CPU block reached through `GS.base` (`k64_cpu()`). The BSP keeps the PIT as
+the wall clock; each AP uses its own local APIC timer, calibrated once against
+the PIT at boot. A CPU with nothing ready runs a per-CPU idle task that halts.
+A kill, a signal or a futex wake that makes a task runnable on another CPU
+sends it a reschedule IPI, and every page-table change that another CPU could
+have cached is followed by a TLB shootdown (see
+[architecture](architecture.md#stage-d-per-cpu-scheduling-x86-64)). The
+scheduling stages, the `--smp=N` flag and the markers the headless run
+asserts are described there too.
 
 `kernel/arch/x86/kernel/gdt.c` installs flat ring-0/ring-3 code and data descriptors plus a
 32-bit TSS. `kernel/arch/x86/mm/paging.c` gives each process supervisor-only kernel

@@ -440,14 +440,15 @@ The boot proves the exception path with an `INT3` self-test.
 
 ### SMP: ACPI, the local APIC and application processors
 
-SMP bring-up is staged, and stages A through C are implemented: both kernels
+SMP bring-up is staged, and stages A through D are implemented: both kernels
 discover the machine's processors, enable the local APIC, start every
 application processor, give it its own descriptor table, TSS and the shared
-IDT, and park it. Stages A and B are the bring-up itself; stage C is the
-shared state a second CPU needs — atomic spinlocks and per-CPU descriptor
-tables. Scheduling on the APs is still stage D, so all tasks run on the
-bootstrap processor (BSP) and the APs sit in a `cli`/`hlt` loop on a private
-stack.
+IDT, and then let it schedule tasks of its own. Stages A and B are the
+bring-up itself, stage C is the shared state a second CPU needs (atomic
+spinlocks and per-CPU descriptor tables), and stage D gives every CPU a
+private scheduler state block, its own tick and its own idle task, so two
+CPUs run two tasks at the same time. Section "Per-CPU scheduling" below
+describes stage D on x86-64; the 32-bit build stops after stage C.
 
 Three pieces are shared by both builds:
 
@@ -511,9 +512,11 @@ Three things had to change before an AP could do anything beyond parking.
   `tss.rsp0` (`esp0` on 32-bit) points at that CPU's kernel stack. Both
   tables describe identical segments, so the cached CS/SS stay valid and
   `gdt_load` does not reload them. The x86-64 build allocates the table, TSS
-  and two IST stacks with the frame allocator *on the BSP* — the allocator is
-  not yet cross-CPU safe — and the AP only executes `LGDT`/`LTR`, reached
-  through the shared physmap.
+  and two IST stacks with the frame allocator *on the BSP*, before the AP is
+  released, and the AP only executes `LGDT`/`LTR`, reached through the shared
+  physmap. The allocator itself became cross-CPU safe in stage D; building
+  the table early keeps the AP's first instructions to "load what already
+  exists" and avoids the question of which CPU owns a half-built TSS.
 - **AP IDT.** An AP starts with `IDTR` zero, so its first exception would be a
   triple fault. Both builds load the shared table on the AP right after the
   new descriptor table.
@@ -528,9 +531,92 @@ CPU. Markers: `SMP-LOCK-OK counter=100000 expected=100000` and
 loop, so the BSP runs its share while the AP is still working and the two
 loops overlap.
 
-What is *not* shared yet: the scheduler's current-task pointer, run-state
-bitmap and tick counters are still one set of globals, the timer still runs on
-the BSP, and nothing dispatches a task to an AP. Those are stage D.
+What is *not* shared, even in stage C: the scheduler's current-task pointer,
+its run-state bitmap and its tick counters were one set of globals, the timer
+ran on the BSP, and nothing dispatched a task to an AP. Those are stage D.
+
+#### Stage D: per-CPU scheduling (x86-64)
+
+Stage D is what turns "an AP that runs C code" into "a CPU that runs tasks".
+It is x86-64 only; the 32-bit scheduler is still single-CPU by design, and the
+32-bit boot asserts nothing about AP scheduling.
+
+- **The per-CPU block.** `kernel/arch/x86_64/kernel/percpu64.c` owns one
+  128-byte `k64_percpu_t` per CPU: a self pointer, the ring-0 stack pointer,
+  the ring-3 stack scratch slot, the index and APIC id, the current task, the
+  idle task, an online flag, tick and switch counters, the address space this
+  CPU has in CR3, and the shootdown sequence numbers. Blocks are cache-line
+  aligned so `ticks` on one CPU never invalidates a neighbour's line.
+  `IA32_GS_BASE` points at the block, so `k64_cpu()` is one instruction
+  (`mov rax, [gs:0]`) and every other field is a normal C load; the two
+  offsets the assembly hardcodes (`rsp0` at 8, `user_rsp` at 16) are checked
+  against the compiler's layout at boot.
+- **The SWAPGS invariant.** In ring 0 `GS.base` is the block and
+  `IA32_KERNEL_GS_BASE` is zero; in ring 3 it is the other way round. The
+  interrupt stub swaps iff the interrupted CS says ring 3, the resume path
+  swaps iff the frame it is about to `IRETQ` says ring 3, and the syscall
+  entry swaps unconditionally because it is only ever entered from ring 3.
+  Keeping "GS is always the block" instead would hand userland a writable
+  `gs:[off]`, and kernel memory is mapped in every address space, so a ring-3
+  store would hit the kernel's own state. `gdt64_load` deliberately does not
+  reload FS or GS: `mov gs, ax` resets the hidden base to zero and drops the
+  block, and the selector already in the register stays valid.
+- **Interrupt-owning spin locks.** `spin64_lock` saves `RFLAGS`, disables
+  interrupts and then claims the word with a locked exchange; `spin64_unlock`
+  releases it and restores the caller's flags. Combined take-then-mask is the
+  point: a lock taken with IF on and a tick arriving between the test and the
+  store would let the interrupted critical section re-enter itself on the same
+  CPU. The scheduler table, the frame allocator, the heap, the TLB round and
+  the disk mutex all use this lock, so a lock is never held across a blocking
+  wait.
+- **Pinned tasks.** A task records the CPU it may run on at creation and is
+  never migrated, which is why the per-CPU run state is a scan of the task
+  table filtered by that field rather than a shared run queue. Nothing has to
+  be consistent across CPUs to pick the next task: each CPU walks its own
+  subset, and `current`, the round-robin cursor and the switch counter live in
+  the block.
+- **Every CPU gets an idle task.** The BSP keeps the original boot-context
+  idle; each AP is handed one that halts in a loop, so a CPU with no ready
+  task always has a valid frame to switch to and never needs a "nothing to
+  run" special case. APs come up parked with interrupts off and spin on a
+  release flag; the BSP builds the idle task *after* `sched64_init`, then sets
+  the flag, and the AP adopts the task and `IRETQ`s into it.
+- **A timer per CPU.** IRQ0 on the BSP stays the wall clock, but an AP does
+  not receive it, so each CPU programs its own local APIC timer. The divisor
+  is calibrated once on the BSP against the PIT (mask the LAPIC timer, wait
+  100 ms of PIT ticks, divide), with a fixed fallback if the measurement looks
+  impossible. The APs' tick therefore has the same period as the BSP's without
+  a second clock source.
+- **Cross-CPU wake-ups and TLB coherence.** Two new IDT vectors carry the
+  work: `0x40` is the per-CPU timer, `0x41` asks a CPU to reschedule (a kill,
+  a signal or a futex wake that made a task runnable elsewhere) and `0x42` is
+  a TLB shootdown. A page-table edit only invalidates the editing CPU, so
+  `paging64_map_space`, `protect_space`, `unmap_space` and the copy-on-write
+  break call `smp64_tlb_shootdown(space)`, which arms the target CPUs' slots
+  before sending any IPI, waits a bounded number of spins for the
+  acknowledgements, and counts timeouts rather than ignoring them. Because the
+  port has no PCIDs, a CPU only holds stale entries for a space it has had
+  loaded, so the shootdown targets only CPUs whose `active_space` matches and
+  a space nobody else runs costs no IPI at all.
+- **Releasing an address space** (`paging64_destroy_space`) still does not
+  shoot down: it runs after the last task using that space has been reaped, so
+  no CR3 names it, and a shootdown could not help because the frames about to
+  be freed are the page tables a stale entry would point at.
+
+`python build.py headless` boots with two CPUs by default and asserts
+`HAKU64-PERCPU-OK`, `HAKU64-SMP-SCHED-OK: cpus=2 workers=1` and
+`HAKU64-SMP-TLB-OK: targets=1 flushes=1 timeouts=0`; `--smp=4` moves the same
+markers to `cpus=4 workers=3 targets=3`, and `--smp=1` skips the two
+scheduling tests with an explicit `…-SKIP: uniprocessor`. The scheduling test
+pins one worker per AP and waits for every worker's counter, which can only
+advance if that AP dispatched from the shared task table.
+
+What stage D does *not* do: there is no load balancing or migration (affinity
+is fixed at creation), no PCID/ASID tagging, and user-space concurrency is
+still exercised on the BSP — the fork/exec tests drive ring-3 tasks that are
+pinned there, so a user task preempted on one CPU and resumed on another is
+not yet a supported pattern. The per-CPU state it would need is in place; the
+syscall layer's own bookkeeping is the next piece of work (see `ROADMAP.md`).
 
 ### Haku modules
 

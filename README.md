@@ -49,10 +49,12 @@ control and pipelines working.
   8 KiB kernel stacks, `spawn`/`fork`/`vfork`/`execve`/`wait4`, real process
   groups and sessions, `kill(-pgid)`, foreground group on the console, signals,
   and `clone`-created threads that share one address space and descriptor table.
-- **SMP bring-up** — ACPI MADT discovery, a local-APIC driver and INIT-SIPI
-  trampolines that bring the application processors online on both kernels,
-  with atomic spinlocks and a private GDT/TSS per processor; the APs park with
-  interrupts off and the bootstrap CPU keeps scheduling.
+- **SMP** — ACPI MADT discovery, a local-APIC driver and INIT-SIPI trampolines
+  that bring the application processors online on both kernels, with atomic
+  spinlocks and a private GDT/TSS per processor. On x86-64 every CPU also
+  schedules: a GS-based per-CPU block, a local-APIC timer per CPU, per-CPU idle
+  tasks, reschedule IPIs and TLB shootdown, so tasks run in parallel. On i386
+  the APs park with interrupts off and the bootstrap CPU keeps scheduling.
 - **Syscalls** — the i386 numbers for a working file/process/memory/time/signal
   subset, validated user pointers, `-errno` results, and the 64-byte i386
   `struct stat` family that glibc and musl expect.
@@ -163,13 +165,16 @@ build.py             the whole build, test, and QEMU orchestration
 ## Limitations
 
 Haku does not claim POSIX compatibility. It implements a subset aimed at
-statically linked Linux binaries, on a single CPU, without demand paging,
-swap, or networking. Both images have `clone`/`futex` threads and bring the
-application processors online with their own TSS and the shared IDT, but the
-application processors are parked: every task still runs on the bootstrap
-processor. Kernel spinlocks are atomic across CPUs, but the scheduler state is
-not per-CPU yet. The x86-64 kernel also lacks signal handlers, pipes, a VFS,
-devfs, a console device and a keyboard, so its userland is a C library
+statically linked Linux binaries, without demand paging, swap, or networking.
+Both images have `clone`/`futex` threads and bring the application processors
+online with their own TSS and the shared IDT. On x86-64 the processors also
+schedule: each CPU has its own current task, idle task and timer, and wakes
+other CPUs with an IPI. Tasks are pinned to the CPU that created them, there
+is no load balancing or migration, and the user-space concurrency tests still
+run on the bootstrap processor, so a ring-3 task running on an AP is not yet
+covered. On i386 the application processors stay parked and every task runs on
+the bootstrap processor. The x86-64 kernel also lacks signal handlers, pipes, a
+VFS, devfs, a console device and a keyboard, so its userland is a C library
 (`user/lib64`) plus the `/INIT.ELF` self-test rather than a shell; module
 capability registration answers `ENOSYS` there. FAT12
 has 8.3 names, no timestamps, and no
