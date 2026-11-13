@@ -45,28 +45,35 @@ processor cannot both succeed. Interrupts are still what serialises a task
 against its own timer preemption on one CPU, so the interrupt-save variant
 keeps `cli`.
 
-The state *inside* the critical sections is per-machine on the 32-bit build:
-the scheduler keeps one current task, one run-state bitmap and one tick
-counter, and only the bootstrap processor takes timer interrupts. On x86-64
-that state is per-CPU — a `k64_percpu_t` block reached through `GS.base`, with
-its own current task, idle task, tick and switch counters, a per-CPU LAPIC
-timer, and TLB shootdown plus reschedule IPIs — and there is one spin lock
-(`spinlock64_t`) instead of the four primitives above. It saves `RFLAGS`,
-disables interrupts, then claims the word with a locked exchange, so it is both
-cross-CPU atomic and non-preemptible on the CPU that holds it; the unlock
-restores the caller's flags. The 64-bit scheduler table, frame allocator,
-heap, TLB round and disk mutex all use it, and nothing blocking (no sleeping
-mutex, no I/O wait) happens while it is held. See
-[stage D](architecture.md#stage-d-per-cpu-scheduling-x86-64).
+The state *inside* the critical sections is per-CPU on both ports: each CPU
+keeps its own current task, tick and switch counters, an idle context and a
+local APIC timer, and adds a reschedule IPI plus a TLB shootdown round to the
+cross-CPU vocabulary. On x86-64 the block is a `k64_percpu_t` reached through
+`GS.base` and there is one spin lock (`spinlock64_t`) instead of the four
+primitives above. It saves `RFLAGS`, disables interrupts, then claims the word
+with a locked exchange, so it is both cross-CPU atomic and non-preemptible on
+the CPU that holds it; the unlock restores the caller's flags. The 64-bit
+scheduler table, frame allocator, heap, TLB round and disk mutex all use it,
+and nothing blocking (no sleeping mutex, no I/O wait) happens while it is
+held. The 32-bit scheduler adds one lock of its own, `sched_lock`, around the
+transitions two CPUs really share — reserving a slot, releasing a reaped one,
+publishing a kernel task — and keeps the per-CPU hot path under the
+interrupt-flag rule. It is always taken before a task frame lock, never the
+other way round. See
+[stage D](architecture.md#stage-d-per-cpu-scheduling).
 
 The locking rules per subsystem:
 
-- **Scheduler**: every task-array mutation runs with interrupts disabled (in an
-  IRQ handler or under `irq_lock`), so no lock is needed. A task-context lock
-  must never be taken with interrupts disabled — a preempted holder would
-  never run again to release it. `scheduler_spawn` therefore reserves a task
-  slot, then re-enables interrupts for `vfs_inherit` before publishing the
-  task as runnable.
+- **Scheduler**: a task only ever runs on the CPU that owns its slot, so the
+  RUNNABLE/BLOCKED flips and the saved frame pointer are serialised by that
+  CPU's interrupt flag alone (in an IRQ handler, or under `irq_lock`). The
+  slot table itself is shared — an AP's kernel worker is reserved by one CPU
+  and freed by the bootstrap processor — so reserving, reaping and publishing
+  a kernel task take `sched_lock` (interrupt-save), which is always taken
+  before a task frame lock. A task-context lock must never be taken with
+  interrupts disabled — a preempted holder would never run again to release
+  it. `scheduler_spawn` therefore reserves a task slot, then re-enables
+  interrupts for `vfs_inherit` before publishing the task as runnable.
 - **Allocators** (`kernel/arch/x86/mm/frame.c`, `kernel/kernel/heap.c`): IRQ-save
   spinlocks. The free-list/bitmap updates are short and the holder cannot be
   preempted, so the allocators are safe from both task and interrupt context.

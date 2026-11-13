@@ -14,6 +14,9 @@ Haku/
                         GDT/TSS load, ring-3 transition + syscalls
                         cpu/gdt/idt/pic/pit/kbd: port I/O, descriptor tables,
                         PIC/PIT, and the PS/2 keyboard driver
+                        smp.c: ACPI MADT, local APIC, AP bring-up, LAPIC
+                        timer calibration and TLB shootdown
+                        percpu.c: one GS-addressed block per CPU
       mm/               paging.c/.h: i386 page tables (identity + sized direct map + user)
                         frame.c/.h: E820-backed physical page inventory
       elf/              elf.c/.h: validated ELF32 PT_LOAD loader + user spaces

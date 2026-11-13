@@ -28,7 +28,7 @@ python build.py shell           :: 32-bit busybox ash shell (interactive)
 python build.py shell --check   :: scripted shell run, assert its markers
 python build.py probe --init=X  :: boot an external ELF32 as /init (32-bit)
 python build.py --memory=1024   :: guest RAM in MiB (default 512, 32-bit map cap 1000)
-python build.py --smp=4         :: guest CPUs for the x86-64 image (1..8, default 2)
+python build.py --smp=4         :: guest CPUs (x86-64 1..8, 32-bit 1..4; default 2)
 python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
@@ -72,24 +72,32 @@ that registers and mounts a read-only filesystem (`USER-ROMFS-OK`,
 Both QEMU runs ask for two CPUs by default. The kernel parses the ACPI MADT,
 enables its local APIC and starts the second processor through a real-mode
 trampoline; the AP comes online, loads a private GDT/TSS and the shared IDT,
-and then (on x86-64) schedules tasks of its own, while the bootstrap processor
-keeps the PIT as the wall clock. The headless check asserts
+and then schedules tasks of its own, while the bootstrap processor keeps the
+PIT as the wall clock. The headless check asserts
 `SMP-OK cpus=2` and `SMP-AP-OK cpu=1` (32-bit) or `HAKU64-SMP-OK: cpus=2` and
 `HAKU64-SMP-AP-OK cpu=1` (x86-64), so a machine that silently stayed
 uniprocessor fails the run. It also runs a cross-CPU lock test — each CPU
 increments a plain counter under the spinlock — and asserts
 `SMP-LOCK-OK counter=100000 expected=100000` plus `SMP-AP-GDT-OK` (the
 `HAKU64-` prefixed markers on x86-64), which catches a non-atomic lock or a TSS
-that still belongs to the bootstrap processor.
+that still belongs to the bootstrap processor. The per-CPU stage is asserted
+the same way: `PERCPU-OK`/`SMP-PERCPU-OK`, then
+`SMP-SCHED-OK: cpus=2 workers=1` and `SMP-TLB-OK: targets=1 flushes=1
+timeouts=0` (the `HAKU64-` prefixed ones on x86-64), which can only appear if
+the AP dispatched a task from the shared table and a shootdown reached it.
 
-`--smp=N` (1–8, x86-64 only) sizes the QEMU guest. The default run is the one
-to keep green; `--smp=4` is a useful soak because three APs schedule at once.
-It must still report `HAKU64-PERCPU-OK`, `HAKU64-SMP-SCHED-OK: cpus=4
-workers=3` (one pinned worker per AP, so three CPUs had to dispatch from the
-shared task table) and `HAKU64-SMP-TLB-OK: targets=3 flushes=3 timeouts=0`.
-With `--smp=1` there are no APs to schedule, so the run prints
-`HAKU64-SMP-SCHED-SKIP: uniprocessor` and `HAKU64-SMP-TLB-SKIP: uniprocessor`
-and the marker list drops the `HAKU64-SMP*` entries.
+`--smp=N` (1–8 on x86-64, 1–4 on 32-bit) sizes the QEMU guest. The default run
+is the one to keep green; `--smp=4` is a useful soak because three APs schedule
+at once. It must still report `HAKU64-PERCPU-OK`,
+`HAKU64-SMP-SCHED-OK: cpus=4 workers=3` (one pinned worker per AP, so three
+CPUs had to dispatch from the shared task table) and
+`HAKU64-SMP-TLB-OK: targets=3 flushes=3 timeouts=0`; the 32-bit run asserts
+`SMP-SCHED-OK: cpus=4 workers=3` and `SMP-TLB-OK: targets=3 flushes=3`.
+Four is the 32-bit ceiling because its process table has exactly four slots
+and the boot test needs one per AP; `build.py` rejects a larger value instead
+of silently clamping it. With `--smp=1` there are no APs to schedule, so the
+run prints `HAKU64-SMP-SCHED-SKIP: uniprocessor` (or `SMP-SCHED-SKIP`) and
+`…-TLB-SKIP: uniprocessor`, and the marker list drops the `SMP*` entries.
 
 `python build.py headless` builds and boots `haku64.img`, the default run. That
 run starts a fresh FAT12 data disk (`build/haku64_fs.img`) seeded with

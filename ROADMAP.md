@@ -4,8 +4,11 @@ HakuKernel is a small, freestanding x86 operating system: a NASM bootloader, a
 C kernel built with MSVC or clang-cl, ring-3 programs, a Linux-inspired syscall
 ABI and loadable ring-0 modules. This roadmap covers the work after v0.2.0.
 x86-64 is the primary architecture, so the first goal is to make the 64-bit
-side carry a real userland; the later goals add the capabilities the 32-bit
-side never had either (true SMP, networking, hardening, measurement).
+side carry a real userland; the later goals add capabilities neither side had
+(networking, hardening, measurement).
+
+Every capability is expected to exist on both architectures: whatever lands on
+one port is a deliverable on the other, with a marker of its own.
 
 Detailed history of everything that is already done lives in
 [the roadmap history](docs/roadmap-history.md). This file only tracks open
@@ -21,7 +24,7 @@ next milestone that needs new kernel work is 2.
 | Area | x86-64 (primary, `python build.py`) | i386 (`--arch=i386`) |
 |---|---|---|
 | Boot and memory | long-mode entry, four-level paging, 2 MiB physmap, frame allocator, 8 MiB heap | 32-bit protected mode, two-level paging, direct map |
-| Interrupts | 64-bit IDT/TSS with IST, 8259 + PIT, RTC; SMP bring-up with per-CPU scheduling, LAPIC timers and TLB shootdown | same bring-up stages on 32 bits, APs parked |
+| Interrupts | 64-bit IDT/TSS with IST, 8259 + PIT, RTC; SMP bring-up with per-CPU scheduling, LAPIC timers and TLB shootdown | same, including per-CPU scheduling on the APs (`--smp=1..4`) |
 | Ring 3 | `SYSCALL`/`SYSRET` + `INT 0x80`, page-by-page user copies, NX | `INT 0x80`, page-by-page user copies |
 | Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads, `futex` | same, plus signals, job control and wait queues |
 | Syscalls | ported subset on the x86-64 numbers; no pipes, no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
@@ -50,7 +53,7 @@ marker set does not prove.
 | 2 | 64-bit VFS, devfs and module capabilities | 1 | `HAKU64-VFS-OK` |
 | 3 | Pipes, signals and job control | 1 | `HAKU64-PIPE-OK`, `HAKU64-SIGNAL-OK` |
 | 4 | Interactive x86-64 userland: console, TTY, busybox | 2, 3 | `X64 SHELL CHECK PASSED` |
-| 5 | True SMP scheduling — delivered (see below) | — | `HAKU64-SMP-SCHED-OK` |
+| 5 | True SMP scheduling — delivered on both architectures (see below) | — | `HAKU64-SMP-SCHED-OK`, `SMP-SCHED-OK` |
 | 6 | Networking: loopback, then virtio-net | 4 | `NET-TCP-OK` |
 | 7 | Hardening: SMEP/SMAP, W^X, syscall fuzzing | 2, 5 | `HAKU64-FUZZ-OK` |
 | 8 | Tooling, tracing and performance measurement | any | `BENCH-OK` |
@@ -184,38 +187,43 @@ usable interactive shell without serial; the i386 suite stays green.
 **Goal.** The application processors stop being parked: tasks run on every CPU,
 with per-CPU scheduling state and correct cross-CPU memory invalidation.
 
-**Work.** Delivered in four stages; A–C (AP bring-up, atomic locks, per-CPU
-descriptor tables) are described in
+**Work.** Delivered in four stages on both architectures; A–C (AP bring-up,
+atomic locks, per-CPU descriptor tables) are described in
 [architecture](docs/architecture.md#smp-acpi-the-local-apic-and-application-processors).
 
 - [x] Per-CPU state: current task, idle task, round-robin cursor, tick and
       switch counters, active address space, and a GS-based accessor
-      (`k64_cpu()`) instead of globals.
+      (`k64_cpu()` on x86-64, `percpu_self()` through GDT entry 7 on 32-bit)
+      instead of globals.
 - [x] A local-APIC timer per CPU, calibrated once against the PIT, plus IPIs
       for reschedule and TLB shootdown (vectors `0x40`–`0x42`).
 - [x] Scheduling on APs: each CPU picks, switches and idles (`HLT`)
-      independently, and each AP owns an idle task.
+      independently, and each AP owns an idle task. On 32-bit a kernel worker
+      hands its slot back (`scheduler_kernel_exit`/`scheduler_join_kernel`)
+      because the process table only has four entries.
 - [x] Lock audit: one interrupt-owning spin lock, documented as such; the
       scheduler, frame allocator, heap, TLB round and disk mutex use it and
-      nothing blocking happens under it.
+      nothing blocking happens under it. The 32-bit scheduler adds
+      `sched_lock` for slot reservation/reaping only.
 - [x] TLB shootdown on `munmap`, `mprotect` and COW breaks that touch another
       CPU's address space, targeting only CPUs whose CR3 names the space.
 - [x] A one-CPU mode that still passes (`--smp=1`) so the scheduler can be
-      bisected.
+      bisected, on both architectures.
 - [ ] User tasks on APs: pin a ring-3 task to an AP and prove it survives
       preemption, syscalls and exit there, so the syscall layer's bookkeeping
       (current task, `FS`-relative TLS, signal delivery) is exercised on more
-      than the bootstrap processor.
+      than the bootstrap processor. On 32-bit this also needs per-AP user
+      address-space switching and a wider process table.
 - [ ] Run queues instead of a pinned scan, with wake-up placement and
       migration, once tasks may move between CPUs.
 - [ ] PCID/ASID tagging, so a shootdown can flush a single address space
       instead of reloading CR3.
 
-**Acceptance.** `HAKU64-SMP-SCHED-OK` (a pinned worker per AP proves every CPU
-dispatches from the shared task table) and `HAKU64-SMP-TLB-OK` (`targets=`
-equals the number of other CPUs, `flushes=` matches, `timeouts=0`), with the
-whole suite green at `--smp=1` (`…-SKIP` markers), `--smp=2` and `--smp=4`.
-Met.
+**Acceptance.** `HAKU64-SMP-SCHED-OK`/`SMP-SCHED-OK` (a pinned worker per AP
+proves every CPU dispatches from the shared task table) and
+`HAKU64-SMP-TLB-OK`/`SMP-TLB-OK` (`targets=` equals the number of other CPUs,
+`flushes=` matches, `timeouts=0`), with the whole suite green at `--smp=1`
+(`…-SKIP` markers), `--smp=2` and `--smp=4` on both architectures. Met.
 
 ## 6. Networking
 

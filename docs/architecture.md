@@ -440,15 +440,15 @@ The boot proves the exception path with an `INT3` self-test.
 
 ### SMP: ACPI, the local APIC and application processors
 
-SMP bring-up is staged, and stages A through D are implemented: both kernels
-discover the machine's processors, enable the local APIC, start every
-application processor, give it its own descriptor table, TSS and the shared
-IDT, and then let it schedule tasks of its own. Stages A and B are the
+SMP bring-up is staged, and stages A through D are implemented on both
+kernels: they discover the machine's processors, enable the local APIC, start
+every application processor, give it its own descriptor table, TSS and the
+shared IDT, and then let it schedule tasks of its own. Stages A and B are the
 bring-up itself, stage C is the shared state a second CPU needs (atomic
 spinlocks and per-CPU descriptor tables), and stage D gives every CPU a
 private scheduler state block, its own tick and its own idle task, so two
 CPUs run two tasks at the same time. Section "Per-CPU scheduling" below
-describes stage D on x86-64; the 32-bit build stops after stage C.
+describes stage D and how the two ports reach the same state.
 
 Three pieces are shared by both builds:
 
@@ -488,8 +488,9 @@ slot 384. The two windows are why the 64-bit identity-mapped probe used by the
 exception self-test lives in slot 416.
 
 `python build.py headless --arch=i386` and `python build.py headless` both boot
-with `-smp 2` and assert `SMP-OK cpus=2`/`SMP-AP-OK cpu=1` and
-`HAKU64-SMP-OK: cpus=2`/`HAKU64-SMP-AP-OK cpu=1` respectively.
+with two CPUs by default (both take `--smp=N`) and assert
+`SMP-OK cpus=2`/`SMP-AP-OK cpu=1` and `HAKU64-SMP-OK: cpus=2`/
+`HAKU64-SMP-AP-OK cpu=1` respectively.
 
 #### Stage C: state a second CPU can share
 
@@ -535,40 +536,54 @@ What is *not* shared, even in stage C: the scheduler's current-task pointer,
 its run-state bitmap and its tick counters were one set of globals, the timer
 ran on the BSP, and nothing dispatched a task to an AP. Those are stage D.
 
-#### Stage D: per-CPU scheduling (x86-64)
+#### Stage D: per-CPU scheduling
 
 Stage D is what turns "an AP that runs C code" into "a CPU that runs tasks".
-It is x86-64 only; the 32-bit scheduler is still single-CPU by design, and the
-32-bit boot asserts nothing about AP scheduling.
+Both ports implement it: the state is the same shape, and how a CPU reaches it
+is what differs.
 
-- **The per-CPU block.** `kernel/arch/x86_64/kernel/percpu64.c` owns one
-  128-byte `k64_percpu_t` per CPU: a self pointer, the ring-0 stack pointer,
-  the ring-3 stack scratch slot, the index and APIC id, the current task, the
-  idle task, an online flag, tick and switch counters, the address space this
-  CPU has in CR3, and the shootdown sequence numbers. Blocks are cache-line
-  aligned so `ticks` on one CPU never invalidates a neighbour's line.
-  `IA32_GS_BASE` points at the block, so `k64_cpu()` is one instruction
-  (`mov rax, [gs:0]`) and every other field is a normal C load; the two
-  offsets the assembly hardcodes (`rsp0` at 8, `user_rsp` at 16) are checked
-  against the compiler's layout at boot.
-- **The SWAPGS invariant.** In ring 0 `GS.base` is the block and
-  `IA32_KERNEL_GS_BASE` is zero; in ring 3 it is the other way round. The
-  interrupt stub swaps iff the interrupted CS says ring 3, the resume path
-  swaps iff the frame it is about to `IRETQ` says ring 3, and the syscall
-  entry swaps unconditionally because it is only ever entered from ring 3.
-  Keeping "GS is always the block" instead would hand userland a writable
-  `gs:[off]`, and kernel memory is mapped in every address space, so a ring-3
-  store would hit the kernel's own state. `gdt64_load` deliberately does not
-  reload FS or GS: `mov gs, ax` resets the hidden base to zero and drops the
-  block, and the selector already in the register stays valid.
-- **Interrupt-owning spin locks.** `spin64_lock` saves `RFLAGS`, disables
-  interrupts and then claims the word with a locked exchange; `spin64_unlock`
-  releases it and restores the caller's flags. Combined take-then-mask is the
-  point: a lock taken with IF on and a tick arriving between the test and the
-  store would let the interrupted critical section re-enter itself on the same
-  CPU. The scheduler table, the frame allocator, the heap, the TLB round and
-  the disk mutex all use this lock, so a lock is never held across a blocking
-  wait.
+- **The per-CPU block.** Each CPU owns one 128-byte block: a self pointer, the
+  ring-0 stack pointer, the index and APIC id, the current task, an online
+  flag, tick and switch counters, the address space this CPU has in CR3, and
+  the shootdown sequence numbers. Blocks are cache-line aligned so `ticks` on
+  one CPU never invalidates a neighbour's line. On x86-64
+  (`kernel/arch/x86_64/kernel/percpu64.c`) `IA32_GS_BASE` points at it, so
+  `k64_cpu()` is one instruction (`mov rax, [gs:0]`); the two offsets the
+  assembly hardcodes (`rsp0` at 8, `user_rsp` at 16) are checked against the
+  compiler's layout at boot. On 32-bit (`kernel/arch/x86/kernel/percpu.c`) the
+  block is reached through GDT entry 7 (`CPU_GS`, selector `0x38`), so
+  `percpu_self()` is `mov eax, gs:[0]` (`65 A1 00 00 00 00`) and FS keeps
+  carrying the user thread pointer for `set_thread_area`. The 32-bit linker
+  runs at `/ALIGN:16`, which rejects a 64-byte alignment in `.data`, so the
+  blocks are declared 16-byte aligned and rounded up to a cache line when the
+  first one is installed.
+- **Keeping GS on the block.** On x86-64 the invariant is: in ring 0
+  `GS.base` is the block and `IA32_KERNEL_GS_BASE` is zero, in ring 3 it is
+  the other way round. The interrupt stub swaps iff the interrupted CS says
+  ring 3, the resume path swaps iff the frame it is about to `IRETQ` says ring
+  3, and the syscall entry swaps unconditionally because it is only ever
+  entered from ring 3. `gdt64_load` deliberately does not reload FS or GS.
+  32-bit has no SWAPGS: a segment's base is a GDT entry, so the per-CPU base
+  is installed once by `gdt_init`/`gdt_init_ap` and never changes while the
+  CPU is in ring 0. `gdt_load` does reload `GS=0x38` after the flat selectors,
+  because `mov gs, ax` would reset the base to zero. `SAVE_SEGMENTS` reloads
+  `0x38` only for a frame whose saved CS has ring-3 privilege, so an
+  interrupt that arrived in ring 0 keeps the base, and a kernel task's
+  synthetic frame stores `CPU_GS` rather than `KERNEL_DS` so resuming it does
+  not clear the base either. Ring 3 loads `GS=USER_DS` (base 0), so a
+  userland `gs:[off]` would fault instead of reaching kernel state.
+- **Interrupt-owning spin locks.** `spin64_lock`/`spin_lock_irqsave` save the
+  flags word, disable interrupts and then claim the word with a locked
+  exchange; the unlock releases it and restores the caller's flags. Combined
+  take-then-mask is the point: a lock taken with IF on and a tick arriving
+  between the test and the store would let the interrupted critical section
+  re-enter itself on the same CPU. The frame allocator, the heap, the TLB
+  round and the disk mutex all use this lock, so a lock is never held across
+  a blocking wait. The 32-bit scheduler adds one more, `sched_lock`, for the
+  transitions that two CPUs really share — reserving a slot, releasing a
+  reaped slot, publishing a kernel task — while the hot path (pick the next
+  task, flip RUNNABLE/BLOCKED) stays on the per-CPU side, protected by that
+  CPU's interrupt flag alone, because a task only ever runs on its own CPU.
 - **Pinned tasks.** A task records the CPU it may run on at creation and is
   never migrated, which is why the per-CPU run state is a scan of the task
   table filtered by that field rather than a shared run queue. Nothing has to
@@ -579,44 +594,69 @@ It is x86-64 only; the 32-bit scheduler is still single-CPU by design, and the
   idle; each AP is handed one that halts in a loop, so a CPU with no ready
   task always has a valid frame to switch to and never needs a "nothing to
   run" special case. APs come up parked with interrupts off and spin on a
-  release flag; the BSP builds the idle task *after* `sched64_init`, then sets
-  the flag, and the AP adopts the task and `IRETQ`s into it.
+  release flag; on x86-64 the BSP builds the idle task *after* `sched64_init`,
+  then sets the flag, and the AP adopts the task and `IRETQ`s into it. On
+  32-bit the idle context is a per-CPU record (`idle_tasks[cpu]`, laid out like
+  any other task) that `scheduler_prepare_ap` builds before the release; the
+  AP's `scheduler_start_ap` sets its own `current` to the idle index, points
+  the TSS at that stack, starts its LAPIC timer and `iret`s into the loop.
+  Because the 32-bit process table has only four slots, the boot test's kernel
+  workers do not stay resident: `scheduler_kernel_exit` marks the slot
+  `TASK_REAP_PENDING`, the AP's next tick switches it to idle, and the BSP's
+  `scheduler_join_kernel` frees the slot once no CPU is standing on it.
 - **A timer per CPU.** IRQ0 on the BSP stays the wall clock, but an AP does
   not receive it, so each CPU programs its own local APIC timer. The divisor
   is calibrated once on the BSP against the PIT (mask the LAPIC timer, wait
   100 ms of PIT ticks, divide), with a fixed fallback if the measurement looks
   impossible. The APs' tick therefore has the same period as the BSP's without
-  a second clock source.
+  a second clock source. On 32-bit the BSP's scheduler tick is still IRQ0 from
+  the 8259, and only the APs use the LAPIC.
 - **Cross-CPU wake-ups and TLB coherence.** Two new IDT vectors carry the
-  work: `0x40` is the per-CPU timer, `0x41` asks a CPU to reschedule (a kill,
-  a signal or a futex wake that made a task runnable elsewhere) and `0x42` is
-  a TLB shootdown. A page-table edit only invalidates the editing CPU, so
-  `paging64_map_space`, `protect_space`, `unmap_space` and the copy-on-write
-  break call `smp64_tlb_shootdown(space)`, which arms the target CPUs' slots
-  before sending any IPI, waits a bounded number of spins for the
-  acknowledgements, and counts timeouts rather than ignoring them. Because the
-  port has no PCIDs, a CPU only holds stale entries for a space it has had
-  loaded, so the shootdown targets only CPUs whose `active_space` matches and
-  a space nobody else runs costs no IPI at all.
+  work on both ports: `0x40` is the per-CPU timer, `0x41` asks a CPU to
+  reschedule (a kill, a signal or a futex wake that made a task runnable
+  elsewhere) and `0x42` is a TLB shootdown. A page-table edit only
+  invalidates the editing CPU, so `paging64_map_space`, `protect_space`,
+  `unmap_space` and the copy-on-write break call
+  `smp64_tlb_shootdown(space)` on x86-64, and the 32-bit `paging_map`/
+  `paging_protect`/`paging_unmap` paths call `smp_tlb_shootdown` through
+  `paging_space_changed`. The shootdown arms the target CPUs' slots before
+  sending any IPI, waits a bounded number of spins for the acknowledgements,
+  and counts timeouts rather than ignoring them. Because neither port uses
+  PCIDs, a CPU only holds stale entries for a space it has had loaded, so the
+  shootdown targets only CPUs whose `active_space` matches and a space nobody
+  else runs costs no IPI at all.
 - **Releasing an address space** (`paging64_destroy_space`) still does not
   shoot down: it runs after the last task using that space has been reaped, so
   no CR3 names it, and a shootdown could not help because the frames about to
   be freed are the page tables a stale entry would point at.
+- **Housekeeping stays on one CPU.** On 32-bit, reaping a slot, waking
+  sleepers and re-scanning wait queues all run from CPU 0's tick, and the
+  post-user FS check (`fs_error_self_test`) only runs on CPU 0's idle loop:
+  the console writer has no lock of its own and only the BSP edits user page
+  tables, so doing that work in one place keeps the diagnostics and the
+  address-space teardown single-threaded.
 
-`python build.py headless` boots with two CPUs by default and asserts
-`HAKU64-PERCPU-OK`, `HAKU64-SMP-SCHED-OK: cpus=2 workers=1` and
-`HAKU64-SMP-TLB-OK: targets=1 flushes=1 timeouts=0`; `--smp=4` moves the same
-markers to `cpus=4 workers=3 targets=3`, and `--smp=1` skips the two
-scheduling tests with an explicit `…-SKIP: uniprocessor`. The scheduling test
-pins one worker per AP and waits for every worker's counter, which can only
-advance if that AP dispatched from the shared task table.
+Both builds are checked with the same three shapes. `python build.py headless`
+boots two CPUs by default and asserts `HAKU64-PERCPU-OK`,
+`HAKU64-SMP-SCHED-OK: cpus=2 workers=1` and
+`HAKU64-SMP-TLB-OK: targets=1 flushes=1 timeouts=0`;
+`python build.py headless --arch=i386` asserts the same three moments as
+`PERCPU-OK`, `SMP-PERCPU-OK`, `SMP-SCHED-OK: cpus=2 workers=1` and
+`SMP-TLB-OK: targets=1 flushes=1 timeouts=0`. `--smp=4` moves the markers to
+`cpus=4 workers=3 targets=3` on both (the 32-bit table is why its ceiling is
+four CPUs), and `--smp=1` skips the two scheduling tests with an explicit
+`…-SKIP: uniprocessor`. The scheduling test pins one worker per AP and waits
+for every worker's counter, which can only advance if that AP dispatched from
+the shared task table.
 
 What stage D does *not* do: there is no load balancing or migration (affinity
 is fixed at creation), no PCID/ASID tagging, and user-space concurrency is
 still exercised on the BSP — the fork/exec tests drive ring-3 tasks that are
 pinned there, so a user task preempted on one CPU and resumed on another is
-not yet a supported pattern. The per-CPU state it would need is in place; the
-syscall layer's own bookkeeping is the next piece of work (see `ROADMAP.md`).
+not yet a supported pattern. On 32-bit, APs only run kernel-mode tasks: there
+is no per-AP user address space switching yet. The per-CPU state it would need
+is in place; the syscall layer's own bookkeeping is the next piece of work
+(see `ROADMAP.md`).
 
 ### Haku modules
 

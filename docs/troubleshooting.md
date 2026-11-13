@@ -48,13 +48,21 @@ The build and boot failures that come up most often, and what causes them.
   the first `[gs:0]` load). `gdt64_load` therefore loads DS/ES/SS and leaves
   FS and GS alone; swapping GS must go through `SWAPGS` on the paths that
   cross the ring boundary (see the SWAPGS invariant in
-  [architecture](architecture.md#stage-d-per-cpu-scheduling-x86-64)).
+  [architecture](architecture.md#stage-d-per-cpu-scheduling)).
+- **i386: `percpu_self()` returns 0, or an interrupt handler reads address 0 as
+  its CPU block** — a `mov gs, ax` in a stub, or `gdt_load`'s flat-selector
+  reload, reset the hidden base. On 32-bit the per-CPU base is GDT entry 7
+  (`CPU_GS`, selector `0x38`), so every path that reloads GS with a plain
+  selector must use `0x38` afterwards, and `SAVE_SEGMENTS` must only reload it
+  for a frame that came from ring 3 — a ring-0 interrupt keeps the base it
+  already had. A kernel task's synthetic frame also stores `CPU_GS`, not
+  `KERNEL_DS`, or `RESTORE_SEGMENTS` clears the base on resume.
 - **`LNK1164: section alignment greater than section size`** — a static was
   declared `__declspec(align(64))` and the kernel is linked with `/ALIGN:16`
   for the flat image the boot loader expects, so a 64-byte-aligned section is
   rejected. Cache-line-aligned data (the per-CPU blocks) is stored with
   `align(16)` and rounded up once at run time instead
-  (`percpu_align` in `percpu64.c`).
+  (`percpu_align` in `percpu64.c`, `percpu_init_bsp` in `percpu.c`).
 - **kernel exceeds 448 KiB** — the stage-2 loader deliberately stops below
   the bootstrap stack. Move to a memory-backed or later-stage loading design
   before increasing this limit.
