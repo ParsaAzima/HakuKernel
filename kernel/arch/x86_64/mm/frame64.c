@@ -25,6 +25,15 @@ static u32 *usable_bitmap;
 static u64 frame_count;
 static u64 frame_hint;
 
+/* Two CPUs take frames at the same time once every AP schedules: a
+ * copy-on-write fault on one and a fork on the other both want a page. The
+ * bitmaps and the hint are shared mutable state, so one lock covers them.
+ * The internal helpers below assume it is held; ref_entry() allocates from
+ * inside it, which is why the public frame64_alloc() cannot be called there. */
+static spinlock64_t frame_lock = SPINLOCK64_INIT;
+
+static u64 alloc_frame_locked(void);
+
 /* Copy-on-write reference counts: one byte per frame, allocated in 4 KiB
  * chunks as sharing appears. A chunk covers 4096 frames (16 MiB of RAM), so
  * a machine that never forks pays only the chunk-pointer array: 32 KiB on a
@@ -47,7 +56,7 @@ static u8 *ref_entry(u64 frame, int create) {
         u64 phys;
 
         if (!create) return 0;
-        phys = frame64_alloc();
+        phys = alloc_frame_locked();
         if (!phys) return 0;
         chunk = (u8 *)phys_to_virt64(phys);
         memset(chunk, 0, K64_PAGE_SIZE);
@@ -157,7 +166,8 @@ static u64 find_free(u64 start) {
     return frame_count;
 }
 
-u64 frame64_alloc(void) {
+/* Lock held. */
+static u64 alloc_frame_locked(void) {
     u64 frame = find_free(frame_hint);
     if (frame >= frame_count) return 0;
     bit_set(used_bitmap, frame);
@@ -165,7 +175,8 @@ u64 frame64_alloc(void) {
     return frame << 12;
 }
 
-void frame64_free(u64 phys) {
+/* Lock held. */
+static void free_frame_locked(u64 phys) {
     u64 frame;
     if ((phys & (K64_PAGE_SIZE - 1ull)) != 0) return;
     frame = phys >> 12;
@@ -175,22 +186,41 @@ void frame64_free(u64 phys) {
     if (frame < frame_hint) frame_hint = frame;
 }
 
+u64 frame64_alloc(void) {
+    u64 flags = spin64_lock(&frame_lock);
+    u64 phys = alloc_frame_locked();
+
+    spin64_unlock(&frame_lock, flags);
+    return phys;
+}
+
+void frame64_free(u64 phys) {
+    u64 flags = spin64_lock(&frame_lock);
+
+    free_frame_locked(phys);
+    spin64_unlock(&frame_lock, flags);
+}
+
 /* fork maps a private frame in one more space. The first share records the
  * owner too, so the count goes straight to two; later forks add one each.
  * A frame that is already counted keeps its owner's claim. */
 void frame64_ref_share(u64 phys) {
     u64 frame;
     u8 *entry;
+    u64 flags;
 
     if ((phys & (K64_PAGE_SIZE - 1ull)) != 0) return;
     frame = phys >> 12;
     if (frame >= frame_count) return;
+    flags = spin64_lock(&frame_lock);
     entry = ref_entry(frame, 1);
-    if (!entry) return;
-    if (*entry == 0)
-        *entry = 2;
-    else if (*entry != 0xFFu)
-        (*entry)++;
+    if (entry) {
+        if (*entry == 0)
+            *entry = 2;
+        else if (*entry != 0xFFu)
+            (*entry)++;
+    }
+    spin64_unlock(&frame_lock, flags);
 }
 
 /* One space stopped mapping a frame. A counted frame drops by one and is
@@ -199,43 +229,58 @@ void frame64_ref_share(u64 phys) {
 void frame64_user_release(u64 phys) {
     u64 frame;
     u8 *entry;
+    u64 flags;
 
     if ((phys & (K64_PAGE_SIZE - 1ull)) != 0) return;
     frame = phys >> 12;
     if (frame >= frame_count) return;
+    flags = spin64_lock(&frame_lock);
     entry = ref_entry(frame, 0);
     if (!entry || *entry == 0) {
-        frame64_free(phys);
-        return;
+        free_frame_locked(phys);
+    } else {
+        (*entry)--;
+        if (*entry == 0) free_frame_locked(phys);
     }
-    (*entry)--;
-    if (*entry == 0) frame64_free(phys);
+    spin64_unlock(&frame_lock, flags);
 }
 
 /* Current share count of a frame, for the boot self-test. */
 u32 frame64_ref_count(u64 phys) {
     u64 frame;
     u8 *entry;
+    u64 flags;
 
     if ((phys & (K64_PAGE_SIZE - 1ull)) != 0) return 0;
     frame = phys >> 12;
     if (frame >= frame_count) return 0;
+    flags = spin64_lock(&frame_lock);
     entry = ref_entry(frame, 0);
-    return entry ? *entry : 0;
+    {
+        u32 value = entry ? *entry : 0;
+        spin64_unlock(&frame_lock, flags);
+        return value;
+    }
 }
 
 u64 frame64_free_count(void) {
     u64 count = 0;
+    u64 flags = spin64_lock(&frame_lock);
+
     for (u64 frame = 0; frame < frame_count; frame++)
         if (bit_test(usable_bitmap, frame) && !bit_test(used_bitmap, frame))
             count++;
+    spin64_unlock(&frame_lock, flags);
     return count;
 }
 
 u64 frame64_usable_count(void) {
     u64 count = 0;
+    u64 flags = spin64_lock(&frame_lock);
+
     for (u64 frame = 0; frame < frame_count; frame++)
         if (bit_test(usable_bitmap, frame)) count++;
+    spin64_unlock(&frame_lock, flags);
     return count;
 }
 
@@ -247,10 +292,16 @@ u64 frame64_limit(void) {
  * reaches the top of installed RAM rather than just the low window. */
 u64 frame64_highest_free(void) {
     u64 frame = frame_count;
+    u64 result = 0;
+    u64 flags = spin64_lock(&frame_lock);
+
     while (frame > 0) {
         frame--;
-        if (bit_test(usable_bitmap, frame) && !bit_test(used_bitmap, frame))
-            return frame << 12;
+        if (bit_test(usable_bitmap, frame) && !bit_test(used_bitmap, frame)) {
+            result = frame << 12;
+            break;
+        }
     }
-    return 0;
+    spin64_unlock(&frame_lock, flags);
+    return result;
 }

@@ -18,6 +18,7 @@
  * sched64_init() it returns the same frame, so the timer self-test still
  * works without a scheduler.
  */
+#include "apic.h"
 #include "haku64.h"
 
 static idt64_entry_t idt[K64_IDT_ENTRIES];
@@ -42,6 +43,11 @@ extern u8 irq64_8[];  extern u8 irq64_9[];  extern u8 irq64_10[]; extern u8 irq6
 extern u8 irq64_12[]; extern u8 irq64_13[]; extern u8 irq64_14[]; extern u8 irq64_15[];
 
 extern u8 isr64_default[];
+
+/* The local-APIC vectors: timer 0x40, reschedule IPI 0x41, TLB IPI 0x42. */
+extern u8 isr64_64[];
+extern u8 isr64_65[];
+extern u8 isr64_66[];
 
 static u64 exc_addrs[32];
 static u64 irq_addrs[16];
@@ -108,6 +114,14 @@ void idt64_init(void) {
         set_gate(K64_IRQ_BASE + i, irq_addrs[i], K64_KERNEL_CS, K64_GATE_INT, 0);
     for (u32 i = K64_IRQ_BASE + K64_IRQ_COUNT; i < K64_IDT_ENTRIES; i++)
         set_gate(i, (u64)isr64_default, K64_KERNEL_CS, K64_GATE_INT, 0);
+
+    /* The per-CPU vectors are installed after the catch-all loop so it
+     * cannot overwrite them with the default gate. */
+    set_gate(K64_VEC_LAPIC_TIMER, (u64)isr64_64, K64_KERNEL_CS,
+             K64_GATE_INT, 0);
+    set_gate(K64_VEC_RESCHED, (u64)isr64_65, K64_KERNEL_CS,
+             K64_GATE_INT, 0);
+    set_gate(K64_VEC_TLB, (u64)isr64_66, K64_KERNEL_CS, K64_GATE_INT, 0);
 
     /* The one gate ring 3 may call. Everything else stays DPL 0, so an
      * INT from user mode to any other vector is a #GP. */
@@ -285,12 +299,29 @@ static regs64_t *handle_irq(regs64_t *r) {
     return r;
 }
 
+/* The local-APIC vectors. The EOI goes to this CPU's local unit, not to the
+ * 8259 (that one is for IRQ0..15 only). The timer and the reschedule IPI both
+ * mean "look at the task table now", so they share the scheduler entry point
+ * the PIT tick uses. */
+static regs64_t *handle_lapic(regs64_t *r) {
+    u32 vector = (u32)r->vector;
+
+    apic_eoi();
+    if (vector == K64_VEC_LAPIC_TIMER || vector == K64_VEC_RESCHED)
+        return sched64_tick(r);
+    smp64_tlb_ipi();
+    return r;
+}
+
 regs64_t *isr64_dispatch(regs64_t *r) {
     u32 vector = (u32)r->vector;
     if (vector < 32) return handle_exception(r);
     if (vector == K64_SYSCALL_VECTOR) return sys64_dispatch(r);
     if (vector >= K64_IRQ_BASE && vector < K64_IRQ_BASE + K64_IRQ_COUNT)
         return handle_irq(r);
+    if (vector == K64_VEC_LAPIC_TIMER || vector == K64_VEC_RESCHED ||
+        vector == K64_VEC_TLB)
+        return handle_lapic(r);
 
     k64_puts("HAKU64-EXC-UNEXPECTED: vector=");
     k64_dec(vector);

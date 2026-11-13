@@ -30,6 +30,7 @@ typedef struct {
     u32 id;
     int parent;     /* task index that may reap this task, -1 for none */
     u32 tgid;       /* task index of the thread-group leader (getpid) */
+    u32 cpu;        /* CPU this task is pinned to; never changes */
     u64 space;      /* PML4 physical address this task runs under */
     u64 stack_base; /* kernel heap block the 16 KiB stack was carved from */
     u64 stack_top;  /* kernel stack, i.e. TSS.RSP0 while the task runs */
@@ -46,9 +47,27 @@ typedef struct {
 } task64_t;
 
 static task64_t tasks[K64_TASK_MAX];
-static int current_index = -1;
 static u32 enabled;
-static u64 switch_count;
+
+/* One lock for the task table. The slots, the mapping records and the
+ * address-space reference counts are read by every CPU (a kill from the
+ * bootstrap processor touches a task that an AP is running), so the state
+ * transitions are serialised even though a switch itself needs no lock: once
+ * switch_to() has updated the per-CPU `current` and the frame pointer, the
+ * outgoing CPU is done with the table until it is interrupted again. */
+static spinlock64_t sched_lock = SPINLOCK64_INIT;
+
+/* The CPU this code runs on and the task slot it is running. The task table
+ * is indexed by slot, so "current" is per CPU and no longer a single global:
+ * two CPUs run two different tasks at the same time. */
+static k64_percpu_t *this_cpu(void) {
+    return k64_cpu();
+}
+
+static int cur_task(void) {
+    k64_percpu_t *cpu = this_cpu();
+    return cpu ? (int)cpu->current : 0;
+}
 
 /* Threads share one address space, so the PML4, the mapping records and the
  * anonymous bump pointer are owned by one task slot and every thread points
@@ -141,11 +160,20 @@ static void prepare_sse(int id) {
     memcpy(fxsave_areas[id], fxsave_default, sizeof(fxsave_default));
 }
 
+/* Reset the task table and start scheduling on the bootstrap processor.
+ *
+ * This wipes every slot, so it must run before smp64_release_aps() hands the
+ * application processors their idle tasks. The boot order guarantees that:
+ * the single-CPU scheduler self-test calls it, the SMP test releases the APs
+ * afterwards. The per-CPU fields it owns are CPU 0's, not a global cursor. */
 void sched64_init(void) {
+    k64_percpu_t *cpu = this_cpu();
+    u64 flags;
+
+    flags = spin64_lock(&sched_lock);
+
     memset(tasks, 0, sizeof(tasks));
     memset(mappings, 0, sizeof(mappings));
-    current_index = 0;
-    switch_count = 0;
 
     for (u32 i = 0; i < K64_TASK_MAX; i++) {
         space_owner[i] = (int)i;
@@ -159,6 +187,7 @@ void sched64_init(void) {
     tasks[0].state = K64_TASK_RUNNING;
     tasks[0].parent = -1;
     tasks[0].tgid = 0;
+    tasks[0].cpu = 0;
     tasks[0].space = read_cr3_64() & K64_PAGE_MASK;
     tasks[0].stack_base = 0;
     tasks[0].stack_top = 0;        /* ring 0 only, so RSP0 is not used */
@@ -176,25 +205,49 @@ void sched64_init(void) {
     space_refs[0] = 1;
     memcpy(fxsave_areas[0], fxsave_default, sizeof(fxsave_default));
 
+    if (cpu) {
+        cpu->current = 0;
+        cpu->idle = 0;                 /* task 0 doubles as the BSP idle */
+        cpu->cursor = 0;
+        cpu->switches = 0;
+        cpu->ticks = 0;
+        cpu->active_space = tasks[0].space;
+    }
+
     enabled = 1;
+    spin64_unlock(&sched_lock, flags);
 }
 
-int task64_create_kernel(void (*entry)(void)) {
+/* Create a kernel task on `cpu`. The whole record is filled before the state
+ * becomes READY, so a scheduler tick that sees the slot ready also sees a
+ * complete task; the lock covers that publication. */
+int task64_create_kernel_on(u32 cpu_affinity, void (*entry)(void)) {
     int id;
     u8 *stack;
     u64 top;
+    u64 flags;
 
-    if (!enabled) return -1;
+    if (!enabled || cpu_affinity >= K64_SMP_MAX_CPUS) return -1;
+    if (!cpus64[cpu_affinity].online) return -1;
+
+    flags = spin64_lock(&sched_lock);
     id = find_free();
-    if (id < 0) return -1;
+    if (id < 0) {
+        spin64_unlock(&sched_lock, flags);
+        return -1;
+    }
 
     stack = (u8 *)kmalloc64(K64_TASK_STACK_SIZE);
-    if (!stack) return -1;
+    if (!stack) {
+        spin64_unlock(&sched_lock, flags);
+        return -1;
+    }
     top = ((u64)stack + K64_TASK_STACK_SIZE) & ~15ull;
 
     tasks[id].id = (u32)id;
     tasks[id].parent = -1;
     tasks[id].tgid = (u32)id;
+    tasks[id].cpu = cpu_affinity;
     tasks[id].space = read_cr3_64() & K64_PAGE_MASK;
     tasks[id].stack_base = (u64)stack;
     tasks[id].stack_top = top;
@@ -213,7 +266,15 @@ int task64_create_kernel(void (*entry)(void)) {
     space_refs[id] = 1;
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
+    spin64_unlock(&sched_lock, flags);
+
+    /* A remote CPU has no reason to look at the table until it is told to. */
+    if (cpu_affinity != k64_cpu_index()) smp64_resched_cpu(cpu_affinity);
     return id;
+}
+
+int task64_create_kernel(void (*entry)(void)) {
+    return task64_create_kernel_on(k64_cpu_index(), entry);
 }
 
 int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
@@ -221,13 +282,22 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     u8 *stack;
     u64 top;
     regs64_t *frame;
+    u64 flags;
 
     if (!enabled || !space) return -1;
+
+    flags = spin64_lock(&sched_lock);
     id = find_free();
-    if (id < 0) return -1;
+    if (id < 0) {
+        spin64_unlock(&sched_lock, flags);
+        return -1;
+    }
 
     stack = (u8 *)kmalloc64(K64_TASK_STACK_SIZE);
-    if (!stack) return -1;
+    if (!stack) {
+        spin64_unlock(&sched_lock, flags);
+        return -1;
+    }
     top = ((u64)stack + K64_TASK_STACK_SIZE) & ~15ull;
 
     frame = frame_on_stack(top, entry);
@@ -242,6 +312,11 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].id = (u32)id;
     tasks[id].parent = -1;
     tasks[id].tgid = (u32)id;
+    /* User tasks stay on the CPU that created them. The syscall layer's
+     * global state (the descriptor table, the filesystem) is not locked yet,
+     * so letting a user process float between CPUs would race it; pinning is
+     * the honest alternative to pretending it is safe. */
+    tasks[id].cpu = k64_cpu_index();
     tasks[id].space = space;
     tasks[id].stack_base = (u64)stack;
     tasks[id].stack_top = top;
@@ -260,21 +335,43 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     space_refs[id] = 1;
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
+    spin64_unlock(&sched_lock, flags);
     return id;
 }
 
-/* Round-robin from the current task. The caller is the task that just ran
- * (or is running), so the scan starts one slot past it. */
-static int pick_ready(void) {
-    for (u32 step = 1; step < K64_TASK_MAX; step++) {
-        int idx = (current_index + (int)step) % (int)K64_TASK_MAX;
-        if (tasks[idx].state == K64_TASK_READY) return idx;
+/* Round-robin on one CPU. The cursor is per CPU, so two CPUs scanning the
+ * shared table do not have to agree on where the last dispatch ended, and the
+ * affinity check keeps a CPU from running a task pinned elsewhere. The scan
+ * is bounded by K64_TASK_MAX (8) and runs with the table lock held. */
+static int pick_ready(u32 cpu_index) {
+    k64_percpu_t *cpu = &cpus64[cpu_index];
+    int start = (int)cpu->cursor;
+
+    if (start < 0 || start >= (int)K64_TASK_MAX) start = 0;
+    for (u32 step = 1; step <= K64_TASK_MAX; step++) {
+        int idx = (start + (int)step) % (int)K64_TASK_MAX;
+
+        if (tasks[idx].state != K64_TASK_READY) continue;
+        if (tasks[idx].cpu != cpu_index) continue;
+        cpu->cursor = (u32)idx;
+        return idx;
     }
     return -1;
 }
 
+/* The task this CPU should run when the current one cannot continue: another
+ * ready task, or the CPU's idle task. -1 means "park". */
+static int pick_or_idle(u32 cpu_index) {
+    int next = pick_ready(cpu_index);
+
+    if (next >= 0) return next;
+    if (cpus64[cpu_index].idle == (u32)-1) return -1;
+    return (int)cpus64[cpu_index].idle;
+}
+
 static regs64_t *switch_to(int next, int save_current) {
-    int old = current_index;
+    k64_percpu_t *cpu = this_cpu();
+    int old = (int)cpu->current;
 
     if (save_current && old >= 0 && tasks[old].state == K64_TASK_RUNNING)
         fxsave64(fxsave_areas[old]);
@@ -282,103 +379,166 @@ static regs64_t *switch_to(int next, int save_current) {
     if (old >= 0 && tasks[old].state == K64_TASK_RUNNING)
         tasks[old].state = K64_TASK_READY;
     tasks[next].state = K64_TASK_RUNNING;
-    current_index = next;
-    switch_count++;
+    cpu->current = (u32)next;
+    cpu->switches++;
 
     /* The incoming area belongs to the kernel heap, which is identity
      * mapped in every space, so this is valid before the CR3 write too. */
     fxrstor64(fxsave_areas[next]);
-    write_cr3_64(tasks[next].space);
-    gdt64_set_rsp0(tasks[next].stack_top);
+    if (tasks[next].space) {
+        write_cr3_64(tasks[next].space);
+        cpu->active_space = tasks[next].space;
+    }
+    /* Two stacks matter: the TSS one is what a ring-3 trap switches to and
+     * the per-CPU copy is what SYSCALL loads before it has a stack. Both must
+     * describe the task this CPU is about to run. Task 0 has no kernel stack
+     * of its own, so it keeps whatever the previous task left. */
+    if (tasks[next].stack_top) {
+        gdt64_set_rsp0_cpu(cpu->index, tasks[next].stack_top);
+        cpu->rsp0 = tasks[next].stack_top;
+    }
     return tasks[next].frame;
 }
 
+/* The timer (or a reschedule IPI) interrupted this CPU. Save the frame and
+ * hand back the one to resume, which may belong to another task. */
 regs64_t *sched64_tick(regs64_t *frame) {
-    int next;
+    k64_percpu_t *cpu = this_cpu();
+    int me, next;
+    regs64_t *result;
+    u64 flags;
 
-    if (!enabled) return frame;
-    if (current_index >= 0 && tasks[current_index].state == K64_TASK_RUNNING)
-        tasks[current_index].frame = frame;
+    if (!enabled || !cpu) return frame;
+    me = (int)cpu->current;
+    if (me < 0) return frame;          /* CPU is not scheduling yet */
 
-    next = pick_ready();
-    if (next < 0) return frame;     /* nothing else to run: stay here */
-    return switch_to(next, 1);
+    flags = spin64_lock(&sched_lock);
+    cpu->ticks++;
+    if (tasks[me].state == K64_TASK_RUNNING) tasks[me].frame = frame;
+
+    next = pick_ready(cpu->index);
+    if (next < 0) {
+        spin64_unlock(&sched_lock, flags);
+        return frame;                  /* nothing else to run: stay here */
+    }
+    result = switch_to(next, 1);
+    /* Unlock on the outgoing stack: the frame returned above is popped by
+     * the assembly after this function has already returned. */
+    spin64_unlock(&sched_lock, flags);
+    return result;
 }
 
 /* sched_yield(): give another READY task the CPU and resume at the caller's
  * syscall return. With no other runnable task the caller simply continues,
  * which is what POSIX allows. */
 regs64_t *sched64_yield(regs64_t *frame) {
-    int next;
+    k64_percpu_t *cpu = this_cpu();
+    int me, next;
+    regs64_t *result;
+    u64 flags;
 
-    if (!enabled || current_index < 0) return frame;
-    if (tasks[current_index].state == K64_TASK_RUNNING)
-        tasks[current_index].frame = frame;
-    next = pick_ready();
-    if (next < 0) return frame;
-    return switch_to(next, 1);
+    if (!enabled || !cpu) return frame;
+    me = (int)cpu->current;
+    if (me < 0) return frame;
+
+    flags = spin64_lock(&sched_lock);
+    if (tasks[me].state == K64_TASK_RUNNING) tasks[me].frame = frame;
+    next = pick_ready(cpu->index);
+    if (next < 0) {
+        spin64_unlock(&sched_lock, flags);
+        return frame;
+    }
+    result = switch_to(next, 1);
+    spin64_unlock(&sched_lock, flags);
+    return result;
+}
+
+/* Switch away from a task that can no longer run (exited, blocked, faulted or
+ * signalled). The idle task is the floor: with nothing ready and no idle task
+ * this CPU has nothing to return to, which is reported rather than silently
+ * resuming a dead frame. Runs with the task lock, which it takes itself
+ * because the callers release it after publishing their state change. */
+static regs64_t *switch_away(const char *halt_message) {
+    k64_percpu_t *cpu = this_cpu();
+    int next;
+    regs64_t *result;
+    u64 flags;
+
+    flags = spin64_lock(&sched_lock);
+    next = pick_or_idle(cpu->index);
+    if (next < 0 || next == (int)cpu->current) {
+        spin64_unlock(&sched_lock, flags);
+        k64_puts(halt_message);
+        cli64();
+        for (;;) cpu_halt64();
+    }
+    result = switch_to(next, 0);
+    spin64_unlock(&sched_lock, flags);
+    return result;
 }
 
 /* Called from the system call handler for SYS_EXIT. The exit frame is not
  * saved because the task never resumes; a process that wants to continue
  * after a syscall just returns through the normal path. */
 regs64_t *sched64_exit(regs64_t *frame) {
-    int next;
+    k64_percpu_t *cpu = this_cpu();
+    int me;
+    u64 flags;
 
-    if (!enabled || current_index < 0) return frame;
-    tasks[current_index].state = K64_TASK_DONE;
-    tasks[current_index].term_signal = 0;
+    if (!enabled || !cpu || (int)cpu->current < 0) return frame;
+    me = (int)cpu->current;
+
+    flags = spin64_lock(&sched_lock);
+    tasks[me].state = K64_TASK_DONE;
+    tasks[me].term_signal = 0;
     /* exit()/exit_group() pass the status in RDI; the frame is not saved
      * because the task never resumes, but the value is what a parent would
      * read back. */
-    tasks[current_index].exit_status = frame->rdi;
+    tasks[me].exit_status = frame->rdi;
+    spin64_unlock(&sched_lock, flags);
 
-    next = pick_ready();
-    if (next < 0) {
-        k64_puts("HAKU64-TASK-HALT: no runnable task after exit\r\n");
-        cli64();
-        for (;;) cpu_halt64();
-    }
-    return switch_to(next, 0);
+    return switch_away("HAKU64-TASK-HALT: no runnable task after exit\r\n");
 }
 
 /* A ring-3 exception ends the task: there is no signal model on the 64-bit
  * port, so the closest honest behaviour is a terminated process. The fault
  * reason is kept for the boot test (and a future parent). */
 regs64_t *sched64_fault(regs64_t *frame, u32 vector, u64 address) {
-    int next;
+    k64_percpu_t *cpu = this_cpu();
+    int me;
+    u64 flags;
 
-    if (!enabled || current_index < 0) return frame;
-    tasks[current_index].state = K64_TASK_DONE;
-    tasks[current_index].term_signal = K64_SIGSEGV;
-    tasks[current_index].fault_vector = vector;
-    tasks[current_index].fault_address = address;
+    if (!enabled || !cpu || (int)cpu->current < 0) return frame;
+    me = (int)cpu->current;
 
-    next = pick_ready();
-    if (next < 0) {
-        k64_puts("HAKU64-TASK-HALT: no runnable task after a user fault\r\n");
-        cli64();
-        for (;;) cpu_halt64();
-    }
-    return switch_to(next, 0);
+    flags = spin64_lock(&sched_lock);
+    tasks[me].state = K64_TASK_DONE;
+    tasks[me].term_signal = K64_SIGSEGV;
+    tasks[me].fault_vector = vector;
+    tasks[me].fault_address = address;
+    spin64_unlock(&sched_lock, flags);
+
+    return switch_away("HAKU64-TASK-HALT: no runnable task after a user"
+                       " fault\r\n");
 }
 
 /* End the current task because a signal has no handler on this port. The
  * exit status is not used; wait4 reports the signal instead. */
 regs64_t *sched64_terminate(regs64_t *frame, u32 signal) {
-    int next;
+    k64_percpu_t *cpu = this_cpu();
+    int me;
+    u64 flags;
 
-    if (!enabled || current_index < 0) return frame;
-    tasks[current_index].state = K64_TASK_DONE;
-    tasks[current_index].term_signal = signal;
+    if (!enabled || !cpu || (int)cpu->current < 0) return frame;
+    me = (int)cpu->current;
 
-    next = pick_ready();
-    if (next < 0) {
-        k64_puts("HAKU64-TASK-HALT: no runnable task after a signal\r\n");
-        cli64();
-        for (;;) cpu_halt64();
-    }
-    return switch_to(next, 0);
+    flags = spin64_lock(&sched_lock);
+    tasks[me].state = K64_TASK_DONE;
+    tasks[me].term_signal = signal;
+    spin64_unlock(&sched_lock, flags);
+
+    return switch_away("HAKU64-TASK-HALT: no runnable task after a"
+                       " signal\r\n");
 }
 
 /* Mark a task finished from outside (the boot self-test does this to the
@@ -386,8 +546,17 @@ regs64_t *sched64_terminate(regs64_t *frame, u32 signal) {
  * never killed this way, because it would then have no frame to return
  * from. */
 void task64_kill(int id) {
-    if (!valid_id(id) || id == current_index) return;
+    u32 owner;
+    u64 flags;
+
+    if (!valid_id(id) || id == cur_task()) return;
+    flags = spin64_lock(&sched_lock);
     tasks[id].state = K64_TASK_DONE;
+    owner = tasks[id].cpu;
+    spin64_unlock(&sched_lock, flags);
+    /* If another CPU is running it, the state change alone will not make it
+     * switch: nudge it. */
+    smp64_resched_cpu(owner);
 }
 
 int task64_state(int id) {
@@ -675,7 +844,7 @@ static void finalize_task(int id) {
 }
 
 regs64_t *sched64_fork(regs64_t *frame) {
-    int parent = current_index;
+    int parent = cur_task();
     int child;
     u64 space;
     u8 *stack;
@@ -688,7 +857,15 @@ regs64_t *sched64_fork(regs64_t *frame) {
         return frame;
     }
 
-    child = find_free();
+    /* Claim the slot before the slow part. DONE is never scheduled, so the
+     * half-built record stays invisible to another CPU's scheduler until the
+     * READY store at the end of this function. */
+    {
+        u64 claim = spin64_lock(&sched_lock);
+        child = find_free();
+        if (child >= 0) tasks[child].state = K64_TASK_DONE;
+        spin64_unlock(&sched_lock, claim);
+    }
     if (child < 0) {
         frame->rax = (u64)0 - 11;
         return frame;
@@ -697,6 +874,7 @@ regs64_t *sched64_fork(regs64_t *frame) {
     space = paging64_clone_space(tasks[parent].space, fork_shared,
                                  (void *)(u64)parent);
     if (!space) {
+        tasks[child].state = K64_TASK_UNUSED;
         frame->rax = (u64)0 - 12;          /* ENOMEM */
         return frame;
     }
@@ -705,6 +883,7 @@ regs64_t *sched64_fork(regs64_t *frame) {
     if (!stack) {
         paging64_free_space_frames(space, fork_shared, (void *)(u64)parent);
         paging64_destroy_space(space);
+        tasks[child].state = K64_TASK_UNUSED;
         frame->rax = (u64)0 - 12;
         return frame;
     }
@@ -725,6 +904,10 @@ regs64_t *sched64_fork(regs64_t *frame) {
      * the child and not the parent it was copied from. Only clone() with
      * CLONE_THREAD shares a group id. */
     tasks[child].tgid = (u32)child;
+    /* Inherit the CPU: the child's address space is a copy and the syscall
+     * layer's shared state is not locked, so the child must not run beside
+     * its parent on another CPU. */
+    tasks[child].cpu = tasks[parent].cpu;
     tasks[child].space = space;
     tasks[child].stack_base = (u64)stack;
     tasks[child].stack_top = top;
@@ -775,7 +958,7 @@ regs64_t *sched64_fork(regs64_t *frame) {
  * RIP as the caller (right after the syscall) with RAX=0 and the caller's
  * requested stack. It is reapable by the task that created it. */
 regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
-    int parent = current_index;
+    int parent = cur_task();
     int child, owner;
     u8 *stack;
     u64 top;
@@ -796,7 +979,12 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
         return frame;
     }
 
-    child = find_free();
+    {
+        u64 claim = spin64_lock(&sched_lock);
+        child = find_free();
+        if (child >= 0) tasks[child].state = K64_TASK_DONE;
+        spin64_unlock(&sched_lock, claim);
+    }
     if (child < 0) {
         frame->rax = (u64)0 - 11;          /* EAGAIN */
         return frame;
@@ -804,6 +992,7 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
 
     stack = (u8 *)kmalloc64(K64_TASK_STACK_SIZE);
     if (!stack) {
+        tasks[child].state = K64_TASK_UNUSED;
         frame->rax = (u64)0 - 12;          /* ENOMEM */
         return frame;
     }
@@ -824,6 +1013,7 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
     tasks[child].parent = parent;
     tasks[child].tgid = (flags & K64_CLONE_THREAD) ? tasks[parent].tgid
                                                    : (u32)child;
+    tasks[child].cpu = tasks[parent].cpu;
     tasks[child].space = tasks[owner].space;
     tasks[child].stack_base = (u64)stack;
     tasks[child].stack_top = top;
@@ -865,29 +1055,30 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
  * changes, because the task is not RUNNING any more when switch_to looks at
  * it, yet a wake must resume it through that exact frame. */
 regs64_t *sched64_futex_wait(regs64_t *frame, u64 address) {
-    int id = current_index;
-    int next;
+    k64_percpu_t *cpu = this_cpu();
+    int id;
+    u64 flags;
 
-    if (!enabled || id <= 0) {
+    if (!enabled || !cpu) {
+        frame->rax = (u64)0 - 22;          /* EINVAL */
+        return frame;
+    }
+    id = (int)cpu->current;
+    if (id <= 0) {
         frame->rax = (u64)0 - 22;          /* EINVAL */
         return frame;
     }
 
     fxsave64(fxsave_areas[id]);
     frame->rax = 0;
+    flags = spin64_lock(&sched_lock);
     tasks[id].frame = frame;
     tasks[id].futex_addr = address;
     tasks[id].state = K64_TASK_WAIT;
+    spin64_unlock(&sched_lock, flags);
 
-    next = pick_ready();
-    if (next < 0) {
-        /* Nobody can ever wake this task: report the deadlock instead of
-         * spinning. The boot test never takes this path. */
-        k64_puts("HAKU64-TASK-HALT: every task is blocked on a futex\r\n");
-        cli64();
-        for (;;) cpu_halt64();
-    }
-    return switch_to(next, 0);
+    return switch_away("HAKU64-TASK-HALT: every task is blocked on a"
+                       " futex\r\n");
 }
 
 /* Wake up to `count` tasks parked on `address`. The match is on the virtual
@@ -896,16 +1087,28 @@ regs64_t *sched64_futex_wait(regs64_t *frame, u64 address) {
  * contract (the waiter re-checks the word) while a missed one deadlocks. */
 int sched64_futex_wake(int id, u64 address, int count) {
     int woken = 0;
+    u32 cpus_mask = 0;
+    u64 flags;
 
     if (!valid_id(id) || count <= 0) return 0;
+
+    flags = spin64_lock(&sched_lock);
     for (int i = 1; i < (int)K64_TASK_MAX; i++) {
         if (tasks[i].state != K64_TASK_WAIT) continue;
         if (tasks[i].futex_addr != address) continue;
         tasks[i].futex_addr = 0;
         tasks[i].brk = 0;
         tasks[i].state = K64_TASK_READY;
+        if (tasks[i].cpu < K64_SMP_MAX_CPUS)
+            cpus_mask |= 1u << tasks[i].cpu;
         if (++woken >= count) break;
     }
+    spin64_unlock(&sched_lock, flags);
+
+    /* A waiter on another CPU only notices the state change when its own
+     * scheduler next runs, so ask each affected CPU to reschedule now. */
+    for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
+        if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
     return woken;
 }
 
@@ -967,12 +1170,23 @@ int task64_reap(int parent, int pid, u64 *status) {
  * because the dispatcher has to know it must not resume the frame; kill()
  * of the caller goes through exit() instead. */
 int task64_signal(int id, u32 signal) {
+    u32 owner;
+    u64 flags;
+
     if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return -3;
-    if (id == current_index) return -22;   /* EINVAL: use exit() */
+    if (id == cur_task()) return -22;      /* EINVAL: use exit() */
     if (signal == 0) return 0;
-    if (tasks[id].state == K64_TASK_DONE) return 0;
+
+    flags = spin64_lock(&sched_lock);
+    if (tasks[id].state == K64_TASK_DONE) {
+        spin64_unlock(&sched_lock, flags);
+        return 0;
+    }
     tasks[id].term_signal = signal;
     tasks[id].state = K64_TASK_DONE;
+    owner = tasks[id].cpu;
+    spin64_unlock(&sched_lock, flags);
+    smp64_resched_cpu(owner);
     return 0;
 }
 
@@ -981,10 +1195,75 @@ int task64_parent(int id) {
     return tasks[id].parent;
 }
 
+/* Total across CPUs: the self-test asserts that switching happened, and with
+ * a per-CPU counter that question only has a machine-wide answer. */
 u64 sched64_switches(void) {
-    return switch_count;
+    u64 total = 0;
+
+    for (u32 i = 0; i < K64_SMP_MAX_CPUS; i++) total += cpus64[i].switches;
+    return total;
 }
 
 int sched64_current(void) {
-    return current_index;
+    return cur_task();
+}
+
+/* ------------------------------------------------------- application CPUs
+ * An AP starts with no task: `current` is (u32)-1 until the bootstrap
+ * processor has built its idle task and released it. The idle task is a
+ * normal kernel task that never exits, so every later switch has somewhere to
+ * land, and `isr64_resume64` is the one-time lie that "this CPU was
+ * preempted right there". */
+
+static void k64_idle_main(void) {
+    /* The frame is built with IF set, so HLT sleeps until the local timer or
+     * an IPI wakes the CPU; the interrupt stub returns here afterwards. */
+    for (;;) cpu_halt64();
+}
+
+/* Runs on the bootstrap processor, before that AP is released. The stack is
+ * allocated from the shared kernel heap while one CPU is still the only
+ * allocator user, which is what makes the hand-off simple. */
+int sched64_prepare_ap(u32 cpu_index) {
+    int id;
+
+    if (cpu_index == 0 || cpu_index >= K64_SMP_MAX_CPUS) return -1;
+    if (cpus64[cpu_index].idle != (u32)-1) return (int)cpus64[cpu_index].idle;
+
+    id = task64_create_kernel_on(cpu_index, k64_idle_main);
+    if (id < 0) return -1;
+    cpus64[cpu_index].idle = (u32)id;
+    return id;
+}
+
+/* Runs on the AP. Never returns: the CPU is now a task context, so every
+ * later entry into the kernel is an ordinary interrupt frame. */
+void sched64_start_ap(u32 cpu_index) {
+    k64_percpu_t *cpu = &cpus64[cpu_index];
+    int idle;
+    u64 flags;
+
+    if (cpu_index == 0 || cpu_index >= K64_SMP_MAX_CPUS || !cpu->online) return;
+
+    flags = spin64_lock(&sched_lock);
+    idle = (int)cpu->idle;
+    if (idle < 0) {
+        spin64_unlock(&sched_lock, flags);
+        return;
+    }
+    cpu->current = (u32)idle;
+    cpu->cursor = (u32)idle;
+    cpu->active_space = tasks[idle].space;
+    tasks[idle].state = K64_TASK_RUNNING;
+    if (tasks[idle].stack_top) {
+        gdt64_set_rsp0_cpu(cpu_index, tasks[idle].stack_top);
+        cpu->rsp0 = tasks[idle].stack_top;
+    }
+    /* Leave interrupts off across the unwind: a tick arriving between the
+     * state above and the IRETQ would save a frame from the parking loop as
+     * the idle task's context. The frame restores IF itself. */
+    spin64_unlock(&sched_lock, 0);
+
+    timer64_lapic_start_local();
+    isr64_resume64(tasks[idle].frame);
 }

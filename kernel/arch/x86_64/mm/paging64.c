@@ -192,6 +192,18 @@ static u64 table_phys(const u64 *table) {
     return (u64)table - K64_PHYS_MAP_BASE;
 }
 
+/* A page-table edit only invalidates this CPU's TLB. While one CPU ran every
+ * task that was the whole story; now another CPU may be running `space` and
+ * would keep the old translation (a stale writable mapping after mprotect, or
+ * a freed frame after munmap). The shootdown itself skips CPUs whose CR3 does
+ * not name this space, so the common "nobody else has it" case costs only the
+ * bookkeeping. */
+static void space_changed(u64 space) {
+    if (!space) return;
+    if (space == (read_cr3_64() & K64_PAGE_MASK)) return;
+    smp64_tlb_shootdown(space);
+}
+
 static int user_address(u64 virt) {
     return virt >= K64_USER_BASE && virt < K64_USER_END;
 }
@@ -261,9 +273,8 @@ int paging64_map_space(u64 space, u64 virt, u64 phys, int writable, int user,
              (writable ? PAGE_WRITABLE : 0) |
              (user ? PAGE_USER : 0) |
              (executable ? 0 : PAGE_NX);
-    /* Harmless for a non-current space: the TLB only has entries for the
-     * current CR3, and a CR3 write flushes the rest. */
     invlpg64(virt);
+    space_changed(space);
     return 1;
 }
 
@@ -344,6 +355,7 @@ int paging64_protect_space(u64 space, u64 virt, int writable, int executable) {
     else
         *entry |= PAGE_NX;
     invlpg64(virt);
+    space_changed(space);
     return 1;
 }
 
@@ -358,12 +370,18 @@ u64 paging64_unmap_space(u64 space, u64 virt) {
     phys = *entry & K64_PHYS_MASK;
     *entry = 0;
     invlpg64(virt);
+    space_changed(space);
     return phys;
 }
 
 /* Free the user-half tables and the PML4. The frames the maps pointed at
  * belong to the caller: freeing them here would make a "destroy" that also
- * releases user memory, which is a separate decision. */
+ * releases user memory, which is a separate decision.
+ *
+ * No shootdown here: this runs after the last task using the space has been
+ * reaped, so no CPU's CR3 names it. A shootdown could not help anyway, since
+ * the frames it would be about to free are exactly the page tables a stale
+ * entry would point at. */
 void paging64_destroy_space(u64 space) {
     u64 *pml4, *pdpt, *pd, *pt;
     u32 i, j;
@@ -536,6 +554,7 @@ int paging64_break_cow(u64 space, u64 virt) {
     if (frame64_ref_count(frame) <= 1) {
         *entry = (pte & ~(PAGE_COW | PAGE_COW_RW)) | PAGE_WRITABLE;
         invlpg64(virt);
+        space_changed(space);
         return 1;
     }
 
@@ -553,6 +572,7 @@ int paging64_break_cow(u64 space, u64 virt) {
              (pte & ~(K64_PHYS_MASK | PAGE_COW | PAGE_COW_RW)) |
              PAGE_WRITABLE;
     invlpg64(virt);
+    space_changed(space);
     frame64_user_release(frame);
     return 1;
 }
@@ -586,5 +606,12 @@ void paging64_free_space_frames(u64 space,
 }
 
 void paging64_switch_space(u64 space) {
+    k64_percpu_t *cpu;
+
     write_cr3_64(space);
+    /* A CR3 write flushes this CPU's TLB, so no invalidation is needed here;
+     * what it does have to do is record which space this CPU now holds, which
+     * is how a shootdown decides whom to interrupt. */
+    cpu = k64_cpu();
+    if (cpu) cpu->active_space = space & K64_PAGE_MASK;
 }

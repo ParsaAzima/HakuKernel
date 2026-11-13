@@ -53,14 +53,8 @@ static void apic_send(uint32_t dest, uint32_t command) {
 
 int apic_init(void) {
     if (!apic_map()) return 0;
+    apic_enable_local();
 
-    apic_arch_enable();
-
-    /* Spurious vector 0xFF also turns the unit on. The vector is only
-     * delivered for a spurious interrupt, which the IDT catch-all reports at
-     * debug level instead of panicking. */
-    apic_write(APIC_SVR, APIC_SVR_ENABLE | APIC_SVR_VECTOR);
-    apic_write(APIC_TPR, 0);
     /* The 8259 arrives on LINT0. ExtINT delivery means "ask the PIC". */
     apic_write(APIC_LVT_LINT0, APIC_DM_EXTINT);
     /* LINT1 is the NMI pin. Leave it masked: nothing here has an NMI
@@ -73,6 +67,38 @@ int apic_init(void) {
     /* Drop anything left in service by the firmware. */
     apic_write(APIC_EOI, 0);
     return 1;
+}
+
+/* Everything here is per CPU. An application processor cannot rely on the
+ * bootstrap processor's SVR write: APICBASE.EN and the spurious-vector
+ * register belong to the unit inside this core. */
+void apic_enable_local(void) {
+    apic_arch_enable();
+
+    /* Spurious vector 0xFF also turns the unit on. The vector is only
+     * delivered for a spurious interrupt, which the IDT catch-all reports at
+     * debug level instead of panicking. */
+    apic_write(APIC_SVR, APIC_SVR_ENABLE | APIC_SVR_VECTOR);
+    apic_write(APIC_TPR, 0);
+}
+
+void apic_send_ipi(uint32_t dest, uint32_t vector) {
+    /* Delivery mode 000 (fixed), edge triggered: the vector alone. */
+    apic_send(dest, vector & 0xFFu);
+}
+
+void apic_timer_program(uint32_t vector, uint32_t initial, uint32_t divide,
+                        uint32_t flags) {
+    /* An initial count of zero stops the timer; program the LVT first so a
+     * restart never delivers a stale vector. */
+    apic_write(APIC_TIMER_DIVIDE, divide);
+    apic_write(APIC_LVT_TIMER, (vector & 0xFFu) | flags | APIC_LVT_MASKED);
+    apic_write(APIC_TIMER_INIT, initial);
+    apic_write(APIC_LVT_TIMER, (vector & 0xFFu) | flags);
+}
+
+uint32_t apic_timer_current(void) {
+    return apic_read(APIC_TIMER_CURRENT);
 }
 
 uint32_t apic_id(void) {

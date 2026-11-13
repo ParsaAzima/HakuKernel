@@ -195,11 +195,59 @@ static int test_heap(void) {
     return 1;
 }
 
+/* The per-CPU block is what makes gs:[off] mean "this CPU", so the test has
+ * to prove three separate things: the compiler's field offsets still match
+ * the two the assembly hardcodes, GS.base really points at this CPU's block,
+ * and the interrupt-owning spin lock restores the caller's flag state instead
+ * of leaving interrupts on. It runs before anything uses the block. */
+static int test_percpu(void) {
+    k64_percpu_t *cpu = k64_cpu();
+    u64 gs_base;
+    u64 flags;
+    spinlock64_t probe = SPINLOCK64_INIT;
+
+    if (!percpu64_offsets_ok()) return 0;
+    if (!cpu) return 0;
+    if (cpu->self != (u64)cpu) return 0;
+    if (cpu->index != 0 || k64_cpu_index() != 0) return 0;
+    if (!cpu->online) return 0;
+    /* Adjacent CPUs must not share a cache line. */
+    if (((u64)cpu & 63ull) != 0) return 0;
+
+    gs_base = read_msr64(K64_MSR_GS_BASE);
+    if (gs_base != (u64)cpu) return 0;
+    /* Ring 0 keeps the user half empty; the SWAPGS invariant depends on it. */
+    if (read_msr64(K64_MSR_KERNEL_GS_BASE) != 0) return 0;
+
+    /* Locking owns interrupts: the flags come back exactly as they were. */
+    sti64();
+    flags = spin64_lock(&probe);
+    if ((flags & 0x200ull) == 0) return 0;      /* IF was on when taken */
+    if (!probe.locked) return 0;
+    spin64_unlock(&probe, flags);
+    if (probe.locked) return 0;
+    if ((read_rflags64() & 0x200ull) == 0) return 0;
+    /* ...and taking it with IF already clear leaves IF clear. */
+    cli64();
+    flags = spin64_lock(&probe);
+    spin64_unlock(&probe, flags);
+    if (read_rflags64() & 0x200ull) return 0;
+    sti64();
+
+    k64_puts("HAKU64-PERCPU-OK: cpu=0 self=");
+    k64_hex(cpu->self);
+    k64_puts(" rsp0_off=");
+    k64_dec((u64)((u8 *)&cpu->rsp0 - (u8 *)cpu));
+    k64_puts(" user_rsp_off=");
+    k64_dec((u64)((u8 *)&cpu->user_rsp - (u8 *)cpu));
+    k64_puts("\r\n");
+    return 1;
+}
+
 /* The table layout, as opposed to "an interrupt happened": every gate is a
  * DPL-0 interrupt gate except the system call vector, #DF and NMI get their
  * own IST stacks, the rest share the interrupted stack, each vector has its
- * own stub, and the unused vectors all fall through to the catch-all. */
-static int test_idt_table(void) {
+ * own stub, and the unused vectors all fall through to the catch-all. */static int test_idt_table(void) {
     u32 v;
 
     for (v = 0; v < K64_IDT_ENTRIES; v++) {
@@ -396,6 +444,129 @@ static int test_tasks(void) {
 
     task64_kill(a);
     task64_kill(b);
+    return 1;
+}
+
+/* --------------------------------------------------- per-CPU scheduling
+ * One worker per application processor. Each increments the counter for the
+ * CPU it is running on, which is only possible if the AP dispatched a task of
+ * its own: nothing migrates a task, so a hit on CPU n proves CPU n ran a
+ * task from the shared table. The worker then spins until the bootstrap
+ * processor releases it; it never returns, because a kernel task that
+ * returned would run off the end of its stack. */
+static volatile u32 smp_hits[K64_SMP_MAX_CPUS];
+static volatile u32 smp_stop;
+
+static void smp_worker(void) {
+    u32 me = k64_cpu_index();
+
+    if (me < K64_SMP_MAX_CPUS) smp_hits[me]++;
+    while (!smp_stop) {
+        for (u32 spin = 0; spin < 100000; spin++) cpu_pause64();
+    }
+    for (;;) cpu_halt64();
+}
+
+/* Hand every AP its idle task and start it scheduling, then prove that two
+ * CPUs ran two tasks at the same time: the workers are created after the
+ * release, and each only ever runs on the AP it was pinned to. */
+static int test_smp_sched(void) {
+    u32 cpus = smp64_cpu_count();
+    u64 deadline;
+    int created = 0;
+
+    if (cpus < 2) {
+        k64_puts("HAKU64-SMP-SCHED-SKIP: uniprocessor\r\n");
+        return 1;
+    }
+
+    smp_stop = 0;
+    for (u32 i = 0; i < K64_SMP_MAX_CPUS; i++) smp_hits[i] = 0;
+
+    /* The AP tick is derived from the PIT, so the measurement has to happen
+     * while IRQ0 is the only tick source in the system. */
+    timer64_lapic_calibrate();
+    if (smp64_release_aps() != (int)cpus - 1) return 0;
+
+    for (u32 i = 1; i < cpus; i++) {
+        if (task64_create_kernel_on(i, smp_worker) < 0) return 0;
+        created++;
+    }
+
+    deadline = timer64_ticks() + 300;   /* 3 s at 100 Hz, bounded */
+    for (;;) {
+        u32 seen = 0;
+
+        for (u32 i = 1; i < cpus; i++)
+            if (smp_hits[i]) seen++;
+        if (seen == cpus - 1) break;
+        if (timer64_ticks() >= deadline) return 0;
+        cpu_pause64();
+    }
+
+    /* Per-CPU, not a shared counter: only the APs have workers. */
+    for (u32 i = 0; i < K64_SMP_MAX_CPUS; i++) {
+        if (i >= 1 && i < cpus) {
+            if (!smp_hits[i]) return 0;
+        } else if (smp_hits[i]) {
+            return 0;
+        }
+    }
+    /* The bootstrap processor kept switching between its own tasks too. */
+    if (sched64_switches() < 4) return 0;
+
+    k64_puts("HAKU64-SMP-SCHED-OK: cpus=");
+    k64_dec(cpus);
+    k64_puts(" workers=");
+    k64_dec(created);
+    k64_puts(" lapic_hz=");
+    k64_dec(timer64_lapic_counts_per_sec());
+    k64_puts("\r\n");
+
+    /* Leave the workers running: killing a task another CPU is executing is
+     * exactly the case the reschedule IPI exists for, and the boot tests do
+     * not need that slot back. */
+    smp_stop = 1;
+    return 1;
+}
+
+/* No address space is ever mapped at this physical address: frames come from
+ * RAM below the physmap limit, so a shootdown naming it must reach nobody. */
+#define SMP64_BOGUS_SPACE 0x0000FFFF00000000ull
+
+/* A full-space shootdown has to reach every other CPU that could have the
+ * space cached, be acknowledged, and not be a silent no-op. The counters are
+ * per CPU for the same reason the hits above are. */
+static int test_smp_tlb(void) {
+    u32 cpus = smp64_cpu_count();
+    u32 targets;
+    u32 timeouts;
+    u64 before = 0;
+    u64 after = 0;
+
+    if (cpus < 2) {
+        k64_puts("HAKU64-SMP-TLB-SKIP: uniprocessor\r\n");
+        return 1;
+    }
+    for (u32 i = 0; i < cpus; i++) before += cpus64[i].flushes;
+    timeouts = smp64_tlb_timeouts();
+
+    /* A space no CPU runs costs one sequence number and no IPI. */
+    if (smp64_tlb_shootdown(SMP64_BOGUS_SPACE) != 0) return 0;
+    if (smp64_tlb_timeouts() != timeouts) return 0;
+
+    targets = smp64_tlb_shootdown(0);          /* every other CPU */
+    if (targets != cpus - 1) return 0;
+    if (smp64_tlb_timeouts() != timeouts) return 0;
+
+    for (u32 i = 0; i < cpus; i++) after += cpus64[i].flushes;
+    if (after - before != (u64)targets) return 0;
+
+    k64_puts("HAKU64-SMP-TLB-OK: targets=");
+    k64_dec(targets);
+    k64_puts(" flushes=");
+    k64_dec(after - before);
+    k64_puts(" timeouts=0\r\n");
     return 1;
 }
 
@@ -895,6 +1066,11 @@ void kernel64_main(void) {
 
     bootmem64_init();
     if (!paging64_init(top)) k64_fail("no boot memory for the physmap");
+    /* The per-CPU block only needs a CR3 (it records the active space), and
+     * everything from the frame allocator onwards takes locks, so it is
+     * installed before those. Its self-test waits for the IDT: it turns
+     * interrupts on to check that a lock restores them. */
+    percpu64_init_bsp(0);
     k64_puts("HAKU64-PAGING-OK: physmap=");
     k64_dec(paging64_phys_map_bytes() >> 20);
     k64_puts("MiB at ");
@@ -962,6 +1138,7 @@ void kernel64_main(void) {
     smp64_init();
     sti64();
 
+    if (!test_percpu()) k64_fail("per-CPU block self-test");
     if (!test_exceptions()) k64_fail("exception dispatch self-test");
     k64_puts("HAKU64-EXC-OK: int3, page fault and divide error resumed\r\n");
 
@@ -991,6 +1168,9 @@ void kernel64_main(void) {
     k64_puts(" switches=");
     k64_dec(sched64_switches());
     k64_puts(" stacks=distinct\r\n");
+
+    if (!test_smp_sched()) k64_fail("per-CPU scheduler self-test");
+    if (!test_smp_tlb()) k64_fail("TLB shootdown self-test");
 
     if (!test_user()) k64_fail("ring-3 syscall self-test");
     k64_puts("HAKU64-USER-DONE: syscalls=");

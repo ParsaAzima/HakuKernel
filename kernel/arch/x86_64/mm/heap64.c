@@ -7,6 +7,12 @@
  * The window is identity mapped and reserved in the frame allocator, so it
  * is never handed out twice. A growable heap (backed by frames) is a later
  * step; 8 MiB is far more than the current kernel allocates.
+ *
+ * Once every CPU schedules, two of them can allocate at the same time (a
+ * syscall building a task stack on one, a copy-on-write fault on the other),
+ * so the free list is behind one lock. That lock is never held while calling
+ * into the scheduler, and the scheduler's own lock is the outer one where the
+ * two meet, so there is no order to get wrong.
  */
 #include "haku64.h"
 
@@ -22,6 +28,7 @@ typedef struct heap_block64 {
 } heap_block64_t;
 
 static heap_block64_t *heap_head;
+static spinlock64_t heap_lock = SPINLOCK64_INIT;
 
 static u64 align16(u64 value) {
     return (value + 15ull) & ~15ull;
@@ -40,8 +47,11 @@ int heap64_init(void) {
 
 u64 heap64_free_bytes(void) {
     u64 total = 0;
+    u64 flags = spin64_lock(&heap_lock);
+
     for (heap_block64_t *block = heap_head; block; block = block->next)
         if (block->magic == HEAP_MAGIC_FREE) total += block->size;
+    spin64_unlock(&heap_lock, flags);
     return total;
 }
 
@@ -60,27 +70,40 @@ static void split(heap_block64_t *block, u64 need) {
 }
 
 void *kmalloc64(u64 bytes) {
+    heap_block64_t *block;
+    u64 flags;
+
     if (bytes == 0) return 0;
     bytes = align16(bytes);
-    for (heap_block64_t *block = heap_head; block; block = block->next) {
+    if (bytes > K64_HEAP_SIZE) return 0;   /* can never fit: skip the scan */
+
+    flags = spin64_lock(&heap_lock);
+    for (block = heap_head; block; block = block->next) {
         if (block->magic == HEAP_MAGIC_FREE && block->size >= bytes) {
             split(block, bytes);
             block->magic = HEAP_MAGIC_USED;
+            spin64_unlock(&heap_lock, flags);
             return (void *)(block + 1);
         }
     }
+    spin64_unlock(&heap_lock, flags);
     return 0;
 }
 
 void kfree64(void *ptr) {
     heap_block64_t *block;
     u64 address = (u64)ptr;
+    u64 flags;
 
     if (!ptr || address < K64_HEAP_START + sizeof(heap_block64_t) ||
         address >= K64_HEAP_START + K64_HEAP_SIZE)
         return;
+    flags = spin64_lock(&heap_lock);
     block = (heap_block64_t *)ptr - 1;
-    if (block->magic != HEAP_MAGIC_USED) return; /* double free or corruption */
+    if (block->magic != HEAP_MAGIC_USED) {   /* double free or corruption */
+        spin64_unlock(&heap_lock, flags);
+        return;
+    }
     block->magic = HEAP_MAGIC_FREE;
 
     if (block->next && block->next->magic == HEAP_MAGIC_FREE) {
@@ -93,4 +116,5 @@ void kfree64(void *ptr) {
         block->prev->next = block->next;
         if (block->next) block->next->prev = block->prev;
     }
+    spin64_unlock(&heap_lock, flags);
 }

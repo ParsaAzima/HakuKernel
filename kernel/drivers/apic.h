@@ -32,6 +32,11 @@
 #define APIC_ICR_LEVEL_TRIGGER 0x00008000u
 #define APIC_ICR_DELIVERY_PENDING 0x00001000u
 #define APIC_LVT_MASKED    0x00010000u
+#define APIC_LVT_PERIODIC  0x00020000u
+#define APIC_LVT_ONE_SHOT  0x00000000u
+#define APIC_TIMER_INIT    0x380u
+#define APIC_TIMER_CURRENT 0x390u
+#define APIC_TIMER_DIVIDE  0x3E0u
 
 /* Architecture hooks. apic_map() installs the MMIO page in the current
  * address space; apic_arch_enable() sets APICBASE.EN in the MSR. */
@@ -40,9 +45,21 @@ void apic_arch_enable(void);
 size_t apic_mmio_base(void);
 
 int apic_init(void);
+/* Turn on the local unit the calling CPU will receive interrupts on.
+ * APICBASE and the SVR enable bit are per processor, so every AP runs this
+ * even though the bootstrap processor already enabled its own. */
+void apic_enable_local(void);
 uint32_t apic_id(void);
 void apic_send_init(uint32_t dest);
 void apic_send_sipi(uint32_t dest, uint32_t vector);
+/* Fixed-delivery IPI to one 8-bit APIC id. */
+void apic_send_ipi(uint32_t dest, uint32_t vector);
+/* Program the local-APIC timer. `flags` is APIC_LVT_PERIODIC or
+ * APIC_LVT_MASKED (a masked timer still counts, which is what calibration
+ * uses). `divide` is the TDCR encoding: 0x3 is divide by 16. */
+void apic_timer_program(uint32_t vector, uint32_t initial, uint32_t divide,
+                        uint32_t flags);
+uint32_t apic_timer_current(void);
 void apic_eoi(void);
 void apic_delay(uint32_t loops);
 
