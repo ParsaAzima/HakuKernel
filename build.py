@@ -852,9 +852,9 @@ def main():
     if mode in ("build", "run", "headless") and arch == "x64":
         build_x64(nasm, py, memory_mb, smp_cpus, mode)
         return
-    if smp_explicit:
-        sys.exit("--smp=N only applies to the x86-64 image; the 32-bit "
-                 "scheduler runs every task on the bootstrap processor")
+    if smp_explicit and arch == "i386" and smp_cpus > 4:
+        sys.exit("--smp=N takes 1..4 for the 32-bit image: its task table "
+                 "has four slots and the boot test needs one per AP")
 
     cc, linker, toolchain = detect_toolchain()
     qemu = find_tool("qemu-system-i386",
@@ -1138,7 +1138,7 @@ def main():
         f.truncate(1474560)
 
     disk = [qemu, "-m", str(memory_mb),
-            "-smp", "2",
+            "-smp", str(smp_cpus),
             "-drive", f"file={img},format=raw,if=floppy,index=0",
             "-drive", f"file={filesystem_image},format=raw,if=ide,index=0,media=disk",
             "-drive", f"file={spare_image},format=raw,if=ide,index=2,media=disk",
@@ -1243,6 +1243,21 @@ def main():
         # Commit-by-commit boot proof: every marker below must be present.
         # `probe` boots a program built elsewhere (a musl binary) and only
         # asserts the boot path plus the markers the caller named.
+        # Per-CPU stage: one block per CPU, two CPUs scheduling two tasks,
+        # and a TLB shootdown that reaches every other CPU. A uniprocessor
+        # run reports the two scheduling tests as skipped and has no AP
+        # markers at all, so the list is built from the CPU count.
+        smp_markers = ["PERCPU-OK", "SMP-PERCPU-OK"]
+        if smp_cpus >= 2:
+            smp_markers += [f"SMP-OK cpus={smp_cpus}",
+                            "SMP-AP-OK cpu=1",  # trampoline, then per-CPU GDT
+                            "SMP-LOCK-OK",      # one lock across CPUs
+                            "SMP-AP-GDT-OK",    # AP loaded its own TSS/IDT
+                            "SMP-SCHED-OK",     # an AP ran its own task
+                            "SMP-TLB-OK"]       # shootdown reached every CPU
+        else:
+            smp_markers += ["SMP-OK cpus=1", "SMP-LOCK-OK",
+                            "SMP-SCHED-SKIP", "SMP-TLB-SKIP"]
         headless_expected = [
             "HAKU-BOOT-OK",  # kernel_main reached
             "IDT-OK",        # 48 IDT gates loaded
@@ -1254,10 +1269,7 @@ def main():
             "E820-OK",       # stage2 INT 15h map handoff verified
             "FRAME-OK",      # frame_alloc/free self-test passed
             "MEM-OK",        # direct map and frame pool sized from E820
-            "SMP-OK cpus=2",  # ACPI MADT found both CPUs
-            "SMP-AP-OK cpu=1",# the AP ran the trampoline and parked on its stack
-            "SMP-LOCK-OK",    # both CPUs incremented one lock-protected counter
-            "SMP-AP-GDT-OK",  # the AP loaded its own GDT/TSS and the shared IDT
+            *smp_markers,
             "GDT-OK",        # kernel/user selectors and ring-0 TSS stack loaded
             "ELF-REJECT-OK", # malformed images and W+X segments were rejected
             "ELF-LOAD-OK",   # valid ELF32 PT_LOAD segments loaded to fresh CR3
