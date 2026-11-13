@@ -43,8 +43,11 @@ Memory map:
 x86-64 is the primary architecture: `python build.py`, `run` and `headless`
 produce and boot `haku64.img` from the same stage1/stage2 floppy, with a
 64-bit kernel entry. The original 32-bit image is still built with
-`--arch=i386`, and it remains the one that carries busybox, the user C library
-and the probes. Stage 2 leaves the CPU in 32-bit protected mode;
+`--arch=i386`, and it remains the one that carries busybox, the shell and the
+signals/pipes/job-control subset; each architecture has its own user C library
+(`user/lib` on 32 bits, `user/lib64` on x86-64, see
+[the x86-64 C library](libc64.md)). Stage 2 leaves the CPU in 32-bit protected
+mode;
 `kernel/arch/x86_64/boot/entry64.asm` takes over from there, enables PAE and
 `EFER.LME`, installs a PML4/PDPT/PD identity map of the first 1 GiB with 2 MiB
 pages, and far-jumps to a 64-bit code segment.
@@ -332,15 +335,15 @@ ready returns 0 rather than blocking. Pipes, symlinks and real signal
 handlers are still missing; the syscall port that is there covers what the
 tests and a static libc probe need.
 
-The 64-bit path now has an ELF64 loader, a FAT12 data disk, the syscall table
-and a module loader, but no 64-bit libc, no VFS/devfs and no bootable root
-filesystem image. The boot self-test still runs from the kernel rather than a
-64-bit `/init`, so `haku64.img` is the primary image while the full shell and
-userland remain on the 32-bit side. [The roadmap](../ROADMAP.md) (milestones 1
-to 4) lists the remaining stages: a 64-bit libc and `/init`, a VFS/devfs with
-module capabilities, pipes and signals, and the interactive shell. The 64-bit
-sources are excluded from the 32-bit link line, so both targets build from one
-tree.
+The 64-bit path now has an ELF64 loader, a FAT12 data disk, the syscall table,
+a module loader and a user C library (`user/lib64`) with `/INIT.ELF` as the
+first real ring-3 program, but no VFS/devfs, no console device and no bootable
+root filesystem image. A shell therefore still requires the 32-bit side, which
+is where the full userland lives. [The roadmap](../ROADMAP.md) (milestones 1
+to 4) lists the remaining stages: a TLS base and the musl probe for milestone
+1, then a VFS/devfs with module capabilities, pipes and signals, and the
+interactive shell. The 64-bit sources are excluded from the 32-bit link line,
+so both targets build from one tree.
 
 `kernel/arch/x86_64/elf/elf64.c` follows the 32-bit loader's rules — validate
 the whole image before mapping, accept only static `ET_EXEC`, require

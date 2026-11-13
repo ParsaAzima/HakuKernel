@@ -30,6 +30,16 @@ The build and boot failures that come up most often, and what causes them.
   `i486-linux-musl` compiler and asserts `ELF32`/`Intel 80386` before booting
   it. Other reasons in that line name the exact check that refused the image.
 - **NASM not found** — install it, then open a fresh terminal (PATH refresh).
+- **x64: a ring-3 program jumps to address 0 right after `fork`** — a
+  copy-on-write break installed a leaf that names the wrong frame. The new
+  physical address has to be cleared out of the reused bits before the copy is
+  OR-ed in (`paging64_break_cow`): OR-ing a frame into a leaf that still holds
+  the old one produces a third, unrelated address, and the process then reads
+  some other frame's contents — typically a zeroed return address, which shows
+  up as `HAKU64-USER-FAULT: vector=14 error=0x15 rip=0x0 cr2=0x0`. `error=0x15`
+  there is the NX bit plus a present page, because address 0 is inside the
+  kernel's identity-map slot that every space borrows; QEMU's `-d int` log
+  shows the last `ADDQ` operand and the faulting `CS:RIP`.
 - **kernel exceeds 448 KiB** — the stage-2 loader deliberately stops below
   the bootstrap stack. Move to a memory-backed or later-stage loading design
   before increasing this limit.

@@ -17,6 +17,7 @@ describe how both are built and how they work in detail.
 | [Processes and scheduling](processes.md) | `spawn`/`fork`/`vfork`/`execve`, copy-on-write address spaces, the 100 Hz scheduler, job control, and resource accounting. |
 | [System calls and the POSIX subset](syscalls.md) | The i386 syscall ABI and the x86-64 numbers, the syscall table, memory-management calls, the implemented POSIX surface, and the self-tests that cover them. |
 | [Userland](userland.md) | The freestanding user C library, busybox/musl on top of the ABI, and the shell image. |
+| [x86-64 C library](libc64.md) | `user/lib64`: the Microsoft x64 ABI decision, the `_start` stack image, the implemented call set, the `/INIT.ELF` self-test, and its deliberate limits. |
 | [Terminal, display, and input](terminal.md) | Console backends, keyboard input, the kernel log display latch, and panic/crash reporting. |
 | [Storage and filesystems](storage.md) | ATA PIO, FAT12, the VFS layer, the boot namespace, and why the filesystem is deliberately small. |
 | [Kernel internals](kernel-internals.md) | Locking primitives, the sector cache, ELF32/ELF64 program loading, Haku module packing and loading on both architectures, and the `link.exe` + `tools/pe2bin.py` build strategy. |

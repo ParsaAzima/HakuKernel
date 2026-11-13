@@ -5,6 +5,13 @@
 The freestanding user C library and the busybox/musl userland that runs as
 PID 1.
 
+Two libraries exist, one per ABI: `user/lib` for the 32-bit kernel described
+below, and `user/lib64` for the x86-64 kernel, which is documented separately
+in [the x86-64 C library](libc64.md). They share conventions — `-errno`
+translated to `-1` plus `errno`, a fixed-base PE repacked as an ELF by a
+`tools/pe2*.py` script — but no source file, because the structures and the
+syscall entry differ at every level.
+
 ## User C library
 
 `include/haku/` doubles as a freestanding C SDK: `<haku/haku.h>` includes the

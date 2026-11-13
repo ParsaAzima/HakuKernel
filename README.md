@@ -90,9 +90,11 @@ control and pipelines working.
   `getdents64`, `rename`/`unlink`/`truncate`, `chdir`/`getcwd`/`openat`,
   `pread`/`pwrite`, `mprotect`/`brk`/`madvise`, `poll`/`select`, `fcntl`/
   `ioctl`/`dup3`, `uname`/`times`/`getrusage`/`getrlimit` and the identity,
-  `prctl` and `getrandom` calls), and a module loader for version 2
-  containers.
-  No 64-bit libc, VFS/devfs, shell or signal handlers yet.
+  `prctl` and `getrandom` calls), a module loader for version 2
+  containers, and a 64-bit userland built on `user/lib64`: a freestanding C
+  library (string/memory, `printf`, `malloc`, files, `fork`, `mmap`, `errno`)
+  whose self-test the kernel loads from the FAT12 volume as `/INIT.ELF`.
+  No VFS/devfs, console device, shell, pipes or signal handlers yet.
 
 ## Quick start
 
@@ -133,6 +135,7 @@ deleting it out of hand. The x64 seed disk is rebuilt on every run.
 | [Processes and scheduling](docs/processes.md) | Process creation, COW forks, scheduler, job control, accounting. |
 | [System calls](docs/syscalls.md) | The syscall ABI, the call table, mmap/brk/mprotect, POSIX subset. |
 | [Userland](docs/userland.md) | User C library, busybox/musl, the shell image. |
+| [x86-64 C library](docs/libc64.md) | `user/lib64`, the Microsoft x64 ABI, the `/INIT.ELF` self-test and its limits. |
 | [Terminal and display](docs/terminal.md) | Console backends, input, logging latch, panic/crash reports. |
 | [Storage](docs/storage.md) | ATA PIO, FAT12, VFS, boot namespace, design limits. |
 | [Kernel internals](docs/kernel-internals.md) | Locking, sector cache, ELF loading, the PE-to-binary build. |
@@ -149,10 +152,11 @@ kernel/drivers/      ATA, terminal, display backends, serial, keyboard
 kernel/fs/           VFS, FAT12, ramfs, devfs, procfs, initramfs, fs self-tests
 kernel/kernel/       startup, scheduler, syscalls, locking, klog, panic, heap
 kernel/module/       .hkm container, 32-bit loader, libhakumod, demo modules
-user/lib/            freestanding user C library and CRT
-user/tests/          C library self-test and the portable musl probe
-include/haku/        shared ABI (abi.h/abi.inc) and user headers
-tools/               pe2bin, pe2elf, mkimg, mkfat12, mkcpio, mkhakumod
+user/lib/            freestanding user C library and CRT (32-bit ABI)
+user/lib64/          x86-64 user C library and CRT (Microsoft x64 ABI)
+user/tests/          C library self-tests (LIB.ELF, INIT.ELF) and the musl probe
+include/haku/        shared ABI (abi.h/abi.inc, abi64.h/abi64.inc), user headers
+tools/               pe2bin, pe2elf, pe2elf64, mkimg, mkfat12, mkcpio, mkhakumod
 build.py             the whole build, test, and QEMU orchestration
 ```
 
@@ -165,8 +169,9 @@ application processors online with their own TSS and the shared IDT, but the
 application processors are parked: every task still runs on the bootstrap
 processor. Kernel spinlocks are atomic across CPUs, but the scheduler state is
 not per-CPU yet. The x86-64 kernel also lacks signal handlers, pipes, a VFS,
-devfs and a 64-bit libc, so it runs its self-test from the kernel rather than
-a 64-bit `/init`; module capability registration answers `ENOSYS` there. FAT12
+devfs, a console device and a keyboard, so its userland is a C library
+(`user/lib64`) plus the `/INIT.ELF` self-test rather than a shell; module
+capability registration answers `ENOSYS` there. FAT12
 has 8.3 names, no timestamps, and no
 permission bits. Haku's filesystem cache holds eight paths of at most 128 KiB
 each. Everything beyond the implemented subset returns `ENOSYS`

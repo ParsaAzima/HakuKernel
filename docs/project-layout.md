@@ -92,9 +92,17 @@ Haku/
   user/
     lib/              errno.c, fsabi.c, memory.c, mman.c, signal.c, stdio.c,
                       string.c, unistd.c, crt0.asm, syscall.asm: user C library
+                      (32-bit ABI)
+    lib64/            errno64.c, memory64.c, mman64.c, stdio64.c, string64.c,
+                      unistd64.c, crt64.asm, syscall64.asm, haku_stdarg.h:
+                      x86-64 user C library (Microsoft x64 ABI)
     tests/            libtest.c: C library self-test installed as LIB.ELF
+                      init64.c: x86-64 C library self-test installed as
+                      INIT.ELF and started by the kernel
                       musl_probe.c: portable probe built by the CI musl job
-  include/haku/         abi.h + abi.inc + abi64.inc: shared user/kernel ABI constants
+  include/haku/         abi.h + abi.inc + abi64.h + abi64.inc: shared
+                        user/kernel ABI constants (the 64-bit pair carries the
+                        x86-64 numbers and layouts)
                         types/errno/string/stdlib/unistd/fcntl/stat/stdio/
                         signal/mman/dirent/poll/termios/resource.h: user
                         library headers
@@ -108,6 +116,8 @@ Haku/
   tools/mkfat12.py     FAT12 image builder for the user ELF
   tools/mkcpio.py      cpio "newc" initramfs builder (INITRD on the FAT volume)
   tools/pe2elf.py      fixed-base PE32 to ELF32 (RX/R/RW) for user C
+  tools/pe2elf64.py    fixed-base PE32+ to ELF64 (RX/R/RW) for the 64-bit user
+                      C library and /INIT.ELF
   tools/mkelf64.py     flat x86-64 binary → static ELF64 (RX code + RW BSS) for
                       the 64-bit loader test
   tools/mkhakumod.py   relocatable objects (NASM ELF32 or COFF i386/amd64) →

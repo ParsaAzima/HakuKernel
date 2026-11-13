@@ -32,7 +32,7 @@ python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
 x86-64 is the primary target. `shell` and `probe` force the 32-bit image
-because the 64-bit side has no libc, VFS, shell or user C library yet; passing
+because the 64-bit side has no VFS, console device or shell yet; passing
 `--arch=x64` with either is an error rather than a silent switch.
 
 The kernel does not assume a memory size: it reads the E820 map, sizes the
@@ -83,8 +83,9 @@ that still belongs to the bootstrap processor.
 
 `python build.py headless` builds and boots `haku64.img`, the default run. That
 run starts a fresh FAT12 data disk (`build/haku64_fs.img`) seeded with
-`HELLO.TXT`, `PATTERN.BIN`, the `USER.ELF` program the test execs, and
-`X64MOD.HKM`, the packed x86-64 module. It ends with
+`HELLO.TXT`, `PATTERN.BIN`, the `USER.ELF` program the test execs, `INIT.ELF`
+(the C program built against `user/lib64`) and `X64MOD.HKM`, the packed
+x86-64 module. It ends with
 `HAKU64-ELF-REJECT-OK` (six malformed ELF64 images refused with a reason),
 `HAKU64-ELF-OK` (the embedded static executable mapped into a fresh address
 space), `HAKU64-ELF-RUN-OK` (the program ran in ring 3, stored its BSS word
@@ -112,10 +113,13 @@ loads `X64MOD.HKM` from the FAT12 volume: the module logs, reads ticks, uses
 the heap and exits (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`,
 `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`), while a duplicate load, a
 truncated file and a bad magic must be refused before
-`HAKU64-MODULE-REJECT-OK`.
+`HAKU64-MODULE-REJECT-OK`. Finally `HAKU64-LIBC-OK`: the kernel loads
+`/INIT.ELF` off the volume, and that program — written in ordinary C against
+`user/lib64` — prints, allocates, reads and writes files, forks a
+copy-on-write child, maps memory and reads the clock before exiting 0.
 After QEMU exits, `tools/lsfat12.py --check` verifies the volume the guest
 just wrote. The 32-bit `haku.img` is still built with `--arch=i386`, and it
-remains the only image with the user land, shell and capability modules.
+remains the only image with the shell and capability modules.
 
 `python build.py shell` boots something else entirely: a real static
 `busybox` (musl, i386) as PID 1, so the guest comes up in `ash` instead of
@@ -157,7 +161,7 @@ host side.
 `build/haku64_fs.img` is the x86-64 data disk. It is rebuilt on every x64 run
 because the self-test writes `/TMP/NOTE.TXT` into it and no user data is
 expected to survive; its seed files are `HELLO.TXT`, `PATTERN.BIN`,
-`USER.ELF` and `X64MOD.HKM`.
+`USER.ELF`, `INIT.ELF` and `X64MOD.HKM`.
 
 `python build.py inspect` (default: `build/haku_fs.img`) lists the root
 directory and FAT summary without touching the image; `--chains` also prints

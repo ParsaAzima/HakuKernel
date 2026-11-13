@@ -11,6 +11,11 @@ Detailed history of everything that is already done lives in
 [the roadmap history](docs/roadmap-history.md). This file only tracks open
 work.
 
+Milestone 1 is mostly landed: the x86-64 side has its own C library
+(`user/lib64`) and `/INIT.ELF` runs from the FAT12 volume as a real ring-3
+program. What is left in it is a TLS base and a third-party musl probe; the
+next milestone that needs new kernel work is 2.
+
 ## Where the project stands
 
 | Area | x86-64 (primary, `python build.py`) | i386 (`--arch=i386`) |
@@ -22,7 +27,7 @@ work.
 | Syscalls | ported subset on the x86-64 numbers; no pipes, no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
 | Storage | ATA PIO + FAT12 behind a page cache, file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
 | Modules | version 2 loader: log, ticks, heap; capability calls return `-ENOSYS` | version 1 loader with device and filesystem registration |
-| Userland | kernel-side self-test; no libc, no shell, no console device | freestanding user C library, `busybox ash`, probes |
+| Userland | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device | freestanding user C library, `busybox ash`, probes |
 
 Verified on every push by CI and locally:
 
@@ -62,27 +67,37 @@ the work on its behalf.
 
 **Work.**
 
-- [ ] Split the user library along the ABI, not by copying it: one `user/lib`
-      tree, an architecture layer for the syscall stub (`int 0x80` on i386,
-      `syscall` with `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` on x86-64) and for
-      `crt0`.
-- [ ] Add a 64-bit C ABI header (`include/haku/abi64.h`) with the x86-64
+- [x] Split the user library along the ABI instead of `#ifdef`-ing one tree.
+      The structures and the syscall entry differ at every level, so x86-64
+      gets its own `user/lib64` (documented in
+      [the x86-64 C library](docs/libc64.md)) and `user/lib` stays 32-bit.
+- [x] Add a 64-bit C ABI header (`include/haku/abi64.h`) with the x86-64
       `struct stat` (144 bytes), `iovec`, `timespec` and syscall numbers, and
-      keep `include/haku/abi64.inc` in step with it; the build's ABI-sync check
-      should cover both architectures.
-- [ ] Implement the missing 64-bit entry state: `argc`/`argv`/`envp` on the
-      stack (already there), a TLS base through `arch_prctl` (158) or a
-      descriptor, and the minimal auxv a static libc reads.
-- [ ] Port `user/tests/libtest.c` to 64-bit and make it the first ring-3
-      program the boot test runs from the FAT12 volume: print, allocate,
-      `fork`/`wait4`, read a file, exit with a checked status.
-- [ ] Add the x86-64 musl probe to CI, so a third-party static library that the
-      project did not write also runs.
+      keep `include/haku/abi64.inc` in step with it; the build's ABI-sync
+      check covers both architectures.
+- [x] The 64-bit entry state: `argc`/`argv`/`envp` on the stack, and the
+      minimal auxv (`AT_PAGESZ`, `AT_ENTRY`, `AT_NULL`) for `execve`. A forked
+      child leads its own thread group, so `getpid()` reports the child.
+- [x] The user library itself: string/memory, formatted output, a `brk`
+      allocator, the file and process calls, `mmap`, `errno`, and the raw
+      syscall stubs.
+- [x] The user test is the first ring-3 program the boot test runs from the
+      FAT12 volume: `user/tests/init64.c` as `/INIT.ELF`, started by the
+      kernel, printed to the serial console, checked through
+      `HAKU64-LIBC-OK` and its exit status.
+- [ ] A small auxv-driven TLS: `arch_prctl(158)` or a mapping the program can
+      put the `%fs` base in, so a compiler-generated `__declspec(thread)`
+      variable works.
+- [ ] The x86-64 third-party probe: the i386 suite builds a static musl
+      binary and runs it; the 64-bit side should prove the same thing with an
+      `x86_64-linux-musl` build, so the ABI is tested by code the project did
+      not write.
 
-**Acceptance.** `HAKU64-LIBC-OK` and `HAKU64-INIT-USER-OK` in the x64 serial
-log (the existing `HAKU64-USER-OK` keeps covering the hand-written ring-3
-test); the i386 suite unchanged; the boot test no longer needs a kernel-side C
-self-test to prove that C works at ring 3.
+**Acceptance.** `HAKU64-LIBC-START`, `HAKU64-LIBC-OK` and
+`HAKU64-LIBC-RUN-OK` in the x64 serial log (the existing `HAKU64-USER-OK`
+keeps covering the small hand-written ring-3 test); the i386 suite unchanged.
+The check list is now in the marker set, so a regression in the library fails
+the build instead of only changing an exit status.
 
 ## 2. 64-bit VFS, devfs and module capabilities
 
