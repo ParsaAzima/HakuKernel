@@ -24,6 +24,8 @@
  * sequence finishes the CPU halts with interrupts enabled.
  */
 #include "haku64.h"
+#include "haku/abi.h"
+#include "haku_module.h"
 
 typedef struct {
     u32 base_low;
@@ -646,6 +648,54 @@ static int test_disk_note(void) {
     return 1;
 }
 
+/* X64MOD.HKM is the packed x86-64 demo. Reading it from the volume and
+ * loading it exercises the whole host-to-ring-0 path: CONTAINER header,
+ * relocation of amd64 data and call sites, export lookup, then a call into
+ * module code that logs, reads ticks and uses the heap. The duplicate-name,
+ * bad-magic and truncated-size loads prove the loader rejects what it should
+ * instead of trusting the file. */
+static int test_module(void) {
+    u8 *image;
+    u64 size;
+    int file;
+    int ok = 1;
+
+    file = fs64_lookup("/X64MOD.HKM");
+    if (file < 0) return 0;
+    size = fs64_size(file);
+    if (size < HAKU_MODULE_HEADER_SIZE || size > HAKU_MODULE_MAX_FILE)
+        return 0;
+    image = (u8 *)kmalloc64(size);
+    if (!image) return 0;
+    if (fs64_read(file, 0, image, size) != size) {
+        kfree64(image);
+        return 0;
+    }
+
+    if (module64_load(image, (u32)size) != 0 || module64_count() != 1)
+        ok = 0;
+    else if (module64_load(image, (u32)size) != -HAKU_EEXIST)
+        ok = 0;
+    else if (module64_load(image, HAKU_MODULE_HEADER_SIZE - 1u) != -HAKU_EINVAL)
+        ok = 0;
+    else {
+        image[0] ^= 0xFFu;
+        if (module64_load(image, (u32)size) != -HAKU_EINVAL)
+            ok = 0;
+        image[0] ^= 0xFFu;
+    }
+    if (ok && module64_unload("HAKU-X64") != 0) ok = 0;
+    if (ok && module64_count() != 0) ok = 0;
+    if (ok && module64_unload("HAKU-X64") != -HAKU_ENOENT) ok = 0;
+
+    kfree64(image);
+    if (!ok) return 0;
+
+    k64_puts("HAKU64-MODULE-REJECT-OK: duplicate, truncated and bad magic"
+             " refused\r\n");
+    return 1;
+}
+
 static int test_elf64(void) {
     loaded_elf64_t loaded;
     u64 size = (u64)(user64_image_end - user64_image);
@@ -856,10 +906,11 @@ void kernel64_main(void) {
 
     if (!test_elf64()) k64_fail("ELF64 loader self-test");
     if (!test_disk_note()) k64_fail("FAT12 disk write self-test");
+    if (!test_module()) k64_fail("x86-64 module loader self-test");
 
     k64_puts("HAKU64-SELFTEST-OK: physmap, frames, 4 KiB mapping, heap, "
              "FAT12 disk, exceptions, timer, RTC, spaces, tasks, ring 3, "
-             "syscalls, fork/wait, NX, ELF64\r\n");
+             "syscalls, fork/wait, NX, ELF64, modules\r\n");
     k64_puts("HAKU64-READY: interrupts online, 32-bit kernel still boots "
              "the system\r\n");
     for (;;) cpu_halt64();

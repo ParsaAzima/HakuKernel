@@ -12,14 +12,23 @@ kernel/module/haku_module.h.
 Two host formats are accepted:
 
   * ELF32 (`nasm -f elf32`): exactly one input, R_386_32 / R_386_PC32.
-  * COFF/i386 (`cl.exe` or `clang-cl`): one or more inputs, linked here.
+  * COFF/i386 (`cl.exe` or `clang-cl`) and COFF/amd64 (the x64 tools of the
+    same compilers): one or more inputs, linked here. On i386
     IMAGE_REL_I386_DIR32 becomes R_386_32 and IMAGE_REL_I386_REL32 becomes
     R_386_PC32 (subtracting the 4-byte field the PC-relative form already
-    accounted for). Merging several objects is what lets a C module link the
-    module library: internal symbols resolve to their section offset,
-    undefined symbols become kernel imports, duplicate COMDAT definitions are
-    folded, and code the entry point cannot reach is dropped, so a module
-    only ships the helpers it actually calls.
+    accounted for); on amd64 IMAGE_REL_AMD64_ADDR32 and DIR64 become the
+    32-bit absolute form and IMAGE_REL_AMD64_REL32 the PC-relative one.
+    Merging several objects is what lets a C module link the module library:
+    internal symbols resolve to their section offset, undefined symbols
+    become kernel imports, duplicate COMDAT definitions are folded, and code
+    the entry point cannot reach is dropped, so a module only ships the
+    helpers it actually calls.
+
+The amd64 container is version 2; version 1 is the i386 one. Kernel, heap and
+export addresses all sit below 4 GiB, so an amd64 64-bit pointer is packed as
+its low 32 bits with an absolute relocation and a zeroed upper half. The
+metadata sections a 64-bit compiler emits for unwinding (`.pdata`, `.xdata`)
+are dropped: the loader never unwinds a module frame.
 
 Nothing larger than the kernel's limits is accepted (64 KiB image and BSS,
 256 relocations, 4096 bytes of import names), and the only relocation types
@@ -31,7 +40,8 @@ import struct
 import sys
 
 MAGIC = b"HAKUMOD\0"
-VERSION = 1
+VERSION_386 = 1
+VERSION_X64 = 2
 HEADER_SIZE = 72
 NAME_MAX = 24
 SYMBOL_MAX = 48
@@ -45,6 +55,8 @@ NO_OFFSET = 0xFFFFFFFF
 
 R_386_32 = 1
 R_386_PC32 = 2
+R_64_ABS = 3
+R_64_PC32 = 4
 
 # ELF32 relocatable objects.
 SHT_PROGBITS = 1
@@ -57,8 +69,10 @@ SHF_ALLOC = 0x2
 SHN_UNDEF = 0
 SHN_ABS = 0xFFF1
 
-# COFF/i386 objects.
+# COFF objects. The packer links both machines; the machine also picks the
+# container version and the relocation vocabulary.
 COFF_MACHINE_I386 = 0x14C
+COFF_MACHINE_AMD64 = 0x8664
 COFF_SYMBOL_SIZE = 18
 COFF_SECTION_SIZE = 40
 COFF_SECTION_ALIGN_SHIFT = 20
@@ -78,9 +92,17 @@ SYM_UNDEFINED = 0
 SYM_ABSOLUTE = -1
 REL_I386_DIR32 = 0x6
 REL_I386_REL32 = 0x14
+REL_AMD64_ADDR64 = 0x1
+REL_AMD64_ADDR32 = 0x2
+REL_AMD64_ADDR32NB = 0x3
+REL_AMD64_REL32 = 0x4
+REL_AMD64_DIR64 = 0xA
 COMDAT_SELECT_ANY = 2
 # Offset of the "Selection" byte inside a section-definition aux record.
 COMDAT_SELECTION_OFFSET = 14
+# Bookkeeping a 64-bit compiler emits for exceptions and debug info. Haku
+# never unwinds a module frame, so these are not part of the image.
+AMD64_DROP_SECTIONS = (".pdata", ".xdata")
 
 ENTRY_NAMES = ("haku_module_init", "_haku_module_init")
 EXIT_NAMES = ("haku_module_exit", "_haku_module_exit")
@@ -103,6 +125,8 @@ class Module:
         self.strings = bytearray()
         self.imports = {}
         self.placed = False
+        # Container format: 1 = i386, 2 = x86-64.
+        self.version = VERSION_386
 
     def add_section(self, name, size, align, data):
         """Append one section; `data` is None for uninitialized storage."""
@@ -148,7 +172,7 @@ class Module:
         self.imports[text] = offset
         return offset
 
-    def relocate(self, section, offset, target, kind, pc_bias=0):
+    def relocate(self, section, offset, target, kind, pc_bias=0, width=4):
         """Record one relocation.
 
         `target` is ("base", section, value) for code or data inside the
@@ -158,21 +182,36 @@ class Module:
         ELF already stores S + A - P with A field-relative, while COFF stores
         the target offset for a field that the linker subtracts P + 4 from,
         so a COFF REL32 addend loses those 4 bytes.
+
+        `width` is 8 for an amd64 pointer. The value is still below 4 GiB, so
+        the loader writes its low half and the upper half stays zero; the
+        addend is checked to fit before anything is written.
         """
         location = self.offsets[section] + offset
         total = len(self.image) + self.bss
-        if location > total or total - location < 4:
+        if location > total or total - location < width:
             fail(f"relocation at {location:#x} is outside the module image")
-        addend = 0
-        if location < len(self.image):
-            addend, = struct.unpack_from("<i", self.image, location)
-            struct.pack_into("<I", self.image, location, 0)
+        if width == 8:
+            if location < len(self.image):
+                addend, = struct.unpack_from("<q", self.image, location)
+                struct.pack_into("<Q", self.image, location, 0)
+            else:
+                addend = 0
+            if not -(1 << 31) <= addend < (1 << 32):
+                fail(f"a 64-bit addend at {location:#x} does not fit in "
+                     "the 32-bit container")
+        else:
+            if location < len(self.image):
+                addend, = struct.unpack_from("<i", self.image, location)
+                struct.pack_into("<I", self.image, location, 0)
+            else:
+                addend = 0
         if target[0] == "base":
             symbol = SYM_BASE
             addend += self.offsets[target[1]] + target[2]
         else:
             symbol = self.import_offset(target[1])
-        if kind == R_386_PC32:
+        if kind in (R_386_PC32, R_64_PC32):
             addend -= pc_bias
         if len(self.relocs) >= MAX_RELOCS:
             fail(f"more than {MAX_RELOCS} relocations")
@@ -184,7 +223,7 @@ class Module:
         reloc_offset = HEADER_SIZE + len(self.image)
         string_offset = reloc_offset + 16 * len(self.relocs)
         header = MAGIC + struct.pack(
-            "<IIIIIIIIII", VERSION, len(self.image), self.bss, entry,
+            "<IIIIIIIIII", self.version, len(self.image), self.bss, entry,
             exit_offset, len(self.relocs), reloc_offset, len(self.strings),
             string_offset, len(name) + 1)
         header += name.ljust(NAME_MAX, b"\0")
@@ -223,6 +262,9 @@ def read_elf(path, data):
         fail(f"{path}: not an ELF file (truncated header)")
     if data[:4] != b"\x7fELF":
         fail(f"{path}: not an ELF file")
+    if data[4] == 2:
+        fail(f"{path}: ELF64 modules are not supported; build x64 modules "
+             "from COFF/amd64 objects (cl.exe or clang-cl)")
     if data[4] != 1 or data[5] != 1:
         fail(f"{path}: expected a 32-bit little-endian object")
     e_type, e_machine = struct.unpack_from("<HH", data, 16)
@@ -375,8 +417,10 @@ class CoffObject:
             fail(f"{path}: not a COFF object (truncated header)")
         machine, count, _, symptr, nsyms, optsize, _ = \
             struct.unpack_from("<HHIIIHH", data, 0)
-        if machine != COFF_MACHINE_I386:
-            fail(f"{path}: COFF machine {machine:#x} is not i386")
+        if machine not in (COFF_MACHINE_I386, COFF_MACHINE_AMD64):
+            fail(f"{path}: COFF machine {machine:#x} is not i386 or amd64")
+        self.machine = machine
+        self.is_x64 = machine == COFF_MACHINE_AMD64
         if optsize:
             fail(f"{path}: unexpected optional header in an object file")
         if symptr + nsyms * COFF_SYMBOL_SIZE > len(data):
@@ -413,6 +457,9 @@ class CoffObject:
             kept = bool(chars & (SCN_CNT_CODE | SCN_CNT_INITIALIZED_DATA |
                                  SCN_CNT_UNINITIALIZED_DATA))
             if chars & (SCN_LNK_INFO | SCN_LNK_REMOVE | SCN_MEM_DISCARDABLE):
+                kept = False
+            # Unwind and debug metadata: the kernel never unwinds a module.
+            if self.is_x64 and name in AMD64_DROP_SECTIONS:
                 kept = False
             if kept:
                 if chars & SCN_CNT_UNINITIALIZED_DATA and raw_ptr == 0:
@@ -474,6 +521,12 @@ class CoffObject:
 
 def link_coff(objects, module):
     """Merge COFF objects: fold COMDAT duplicates, drop unreachable code."""
+    if not objects:
+        fail("no COFF objects")
+    is_x64 = objects[0].is_x64
+    if any(obj.is_x64 != is_x64 for obj in objects):
+        fail("cannot mix i386 and amd64 objects in one module")
+    module.version = VERSION_X64 if is_x64 else VERSION_386
     located = {}        # (object, section) -> section index in `module`
     external = {}       # external name -> (object, section, value, selection)
 
@@ -534,8 +587,9 @@ def link_coff(objects, module):
                 return base_target(known[0], known[1], known[2],
                                    record["name"])
             name = record["name"]
-            if name.startswith("_"):
-                name = name[1:]
+            if not is_x64:
+                if name.startswith("_"):
+                    name = name[1:]
             if not name or "@" in name:
                 fail(f"{obj.path}: symbol {record['name']} is decorated for "
                      "stdcall/fastcall; modules use the cdecl convention")
@@ -608,10 +662,21 @@ def link_coff(objects, module):
             if key not in located:
                 continue
             for target, symbol_index, kind in section["relocations"]:
-                if kind == REL_I386_DIR32:
-                    reloc_kind = R_386_32
+                width = 4
+                if is_x64:
+                    if kind == REL_AMD64_REL32:
+                        reloc_kind, pc_bias = R_64_PC32, 4
+                    elif kind in (REL_AMD64_ADDR64, REL_AMD64_DIR64):
+                        reloc_kind, pc_bias, width = R_64_ABS, 0, 8
+                    elif kind == REL_AMD64_ADDR32:
+                        reloc_kind, pc_bias = R_64_ABS, 0
+                    else:
+                        fail(f"{obj.path}: amd64 relocation type {kind:#x} "
+                             f"in {section['name']} is not supported")
+                elif kind == REL_I386_DIR32:
+                    reloc_kind, pc_bias = R_386_32, 0
                 elif kind == REL_I386_REL32:
-                    reloc_kind = R_386_PC32
+                    reloc_kind, pc_bias = R_386_PC32, 4
                 else:
                     fail(f"{obj.path}: relocation type {kind:#x} in "
                          f"{section['name']} is not supported")
@@ -621,7 +686,7 @@ def link_coff(objects, module):
                          "index that is not a symbol")
                 module.relocate(located[key], target,
                                 target_of(object_index, record), reloc_kind,
-                                pc_bias=4)
+                                pc_bias=pc_bias, width=width)
 
     entry = module.offsets[located[entry_node]] + external[entry_key][2]
     exit_offset = NO_OFFSET

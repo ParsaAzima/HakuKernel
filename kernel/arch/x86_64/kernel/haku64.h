@@ -167,6 +167,8 @@ typedef signed long long s64;
 #define K64_SYS_KILL          62u
 #define K64_SYS_MKDIR         83u
 #define K64_SYS_GETPPID       110u
+#define K64_SYS_INIT_MODULE   175u
+#define K64_SYS_DELETE_MODULE 176u
 #define K64_SYS_GETTID        186u
 #define K64_SYS_FUTEX         202u
 #define K64_SYS_CLOCK_GETTIME 228u
@@ -763,6 +765,17 @@ int fs64_fd_entry(int task, int fd, u32 index, char name[13], u32 *ino,
                   int *is_dir, u32 *next_index);
 int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
                      int *is_dir, u32 *next_index);
+
+/* module64.c: the x86-64 loader for the container in
+ * kernel/module/haku_module.h. It accepts version 2 only, applies the two
+ * 32-bit-word relocations module code produces, and exports logging, ticks
+ * and the heap. The capability exports (device/fs registration, mount,
+ * stat/dirent fillers) resolve but answer -ENOSYS because the 64-bit kernel
+ * has no VFS or devfs yet. `file` is kernel memory holding the whole .hkm
+ * image and is not retained. */
+int module64_load(const u8 *file, u32 size);
+int module64_unload(const char *name);
+u32 module64_count(void);
 
 /* syscall64.c: SYSCALL/SYSRET dispatch */
 void syscall64_init(void);

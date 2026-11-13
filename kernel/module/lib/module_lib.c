@@ -22,7 +22,7 @@ void *memset(void *destination, int value, unsigned int count) {
     unsigned char *bytes = (unsigned char *)destination;
     unsigned char byte = (unsigned char)value;
     haku_u32 word = (haku_u32)byte * 0x01010101u;
-    while (count && ((haku_u32)bytes & 3u)) {
+    while (count && ((haku_u64)bytes & 3u)) {
         *bytes++ = byte;
         count--;
     }
@@ -38,8 +38,8 @@ void *memset(void *destination, int value, unsigned int count) {
 void *memcpy(void *destination, const void *source, unsigned int count) {
     unsigned char *to = (unsigned char *)destination;
     const unsigned char *from = (const unsigned char *)source;
-    if ((((haku_u32)to ^ (haku_u32)from) & 3u) == 0) {
-        while (count && ((haku_u32)to & 3u)) {
+    if ((((haku_u64)to ^ (haku_u64)from) & 3u) == 0) {
+        while (count && ((haku_u64)to & 3u)) {
             *to++ = *from++;
             count--;
         }

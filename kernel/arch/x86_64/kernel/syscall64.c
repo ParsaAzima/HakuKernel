@@ -23,6 +23,7 @@
  * copy loops below only touch physical frames through the physmap.
  */
 #include "haku64.h"
+#include "haku_module.h"
 
 #define SYS64_MAX_WRITE   4096ull
 #define SYS64_IOV_MAX     8u
@@ -2183,6 +2184,43 @@ static u64 sys64_tgkill(u64 tgid, u64 tid, u64 signal) {
     return (u64)task64_signal((int)tid - 1, (u32)signal);
 }
 
+/* init_module(image, length): copy the container into kernel memory and let
+ * module64_load validate and map it. Length is bounded by the format's own
+ * worst case before a single byte is copied, so a hostile size cannot ask the
+ * heap for more than a legal image; the copy itself walks one page table
+ * entry per page. The temporary buffer is released either way. */
+static u64 sys64_init_module(u64 image, u64 length) {
+    void *buffer;
+    s64 result;
+
+    if (image == 0 || length < HAKU_MODULE_HEADER_SIZE ||
+        length > HAKU_MODULE_MAX_FILE)
+        return (u64)0 - SYS64_EINVAL;
+    buffer = kmalloc64(length);
+    if (!buffer) return (u64)0 - SYS64_ENOMEM;
+    if (!copy_from_user64(current_space(), buffer, image, length)) {
+        kfree64(buffer);
+        return (u64)0 - SYS64_EFAULT;
+    }
+    result = (s64)module64_load((const u8 *)buffer, (u32)length);
+    kfree64(buffer);
+    return (u64)result;
+}
+
+/* delete_module(name, flags): names are at most HAKU_MODULE_NAME_MAX bytes,
+ * so the whole string fits one small stack buffer and needs no allocation. */
+static u64 sys64_delete_module(u64 name, u64 flags) {
+    char buffer[HAKU_MODULE_NAME_MAX + 1];
+    int length;
+
+    if (flags != 0) return (u64)0 - SYS64_EINVAL;
+    if (name == 0) return (u64)0 - SYS64_EFAULT;
+    length = copy_user_string64(current_space(), name, buffer, sizeof(buffer));
+    if (length < 0) return (u64)0 - SYS64_EFAULT;
+    if (length == 0) return (u64)0 - SYS64_ENAMETOOLONG;
+    return (u64)(s64)module64_unload(buffer);
+}
+
 regs64_t *sys64_dispatch(regs64_t *frame) {
     u32 in_user = ((u32)frame->cs & 3u) == 3u;
     u32 wrote = 0;
@@ -2575,6 +2613,14 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     case K64_SYS_CLOCK_GETTIME:
         result = sys64_clock_gettime(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_INIT_MODULE:
+        result = sys64_init_module(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_DELETE_MODULE:
+        result = sys64_delete_module(frame->rdi, frame->rsi);
         break;
 
     case K64_SYS_EXIT:

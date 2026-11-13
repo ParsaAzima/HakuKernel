@@ -2,12 +2,21 @@
  *
  * A module is not an ELF or COFF object. The kernel has no object-file writer
  * and does not need to learn one: `tools/mkhakumod.py` reads the relocatable
- * objects on the host — a single NASM ELF32 object, or the COFF/i386 objects a
- * C compiler emits, which it links — and packs the allocatable sections, the
- * BSS size, the entry/exit offsets, and the handful of relocations into the
- * `.hkm` layout below. The loader then only has to copy the image, resolve a
- * few named imports against the export table, and apply R_386_32 /
- * R_386_PC32.
+ * objects on the host — a single NASM ELF32 object, the COFF/i386 objects a
+ * C compiler emits, or the COFF/amd64 objects an x64 compiler emits — and
+ * packs the allocatable sections, the BSS size, the entry/exit offsets, and
+ * the handful of relocations into the `.hkm` layout below. The loader then
+ * only has to copy the image, resolve a few named imports against the export
+ * table, and apply an absolute or PC-relative word relocation.
+ *
+ * The container carries the architecture in `version`: version 1 is the
+ * i386 image the 32-bit kernel loads, version 2 is x86-64. A loader refuses
+ * the other version, so a 32-bit module cannot be jumped into from long mode
+ * (or the reverse). Version 2 relocations are still 32 bits wide because the
+ * kernel image, the module heap and every export live below 4 GiB; the
+ * packer turns an amd64 64-bit pointer into a 32-bit absolute relocation and
+ * zeroes the upper half, so an x64 module must be built with the small code
+ * model (the compiler's default for this kernel).
  *
  * Layout (all integers little-endian, the header is 72 bytes):
  *
@@ -68,6 +77,11 @@
  * A module may register one device and one readonly-or-readwrite
  * filesystem, and mount that filesystem once at a non-root prefix. The exit
  * hook runs after the kernel detaches them and cannot register new ones.
+ *
+ * The x86-64 kernel has neither the VFS nor devfs yet, so its loader exports
+ * only the logging, tick, heap and struct-fill helpers; the registration
+ * calls exist and answer -ENOSYS. An x64 module can therefore compute and
+ * log, but cannot add a namespace until the 64-bit filesystem stack exists.
  */
 #ifndef HAKU_MODULE_H
 #define HAKU_MODULE_H
@@ -75,7 +89,10 @@
 #include "cpu.h"
 
 #define HAKU_MODULE_MAGIC0 'H'
-#define HAKU_MODULE_VERSION 1u
+/* Container versions: 1 = i386, 2 = x86-64. */
+#define HAKU_MODULE_VERSION_386 1u
+#define HAKU_MODULE_VERSION_X64 2u
+#define HAKU_MODULE_VERSION HAKU_MODULE_VERSION_386
 
 #define HAKU_MODULE_HEADER_SIZE 72u
 #define HAKU_MODULE_IMAGE_OFFSET 72u
@@ -98,9 +115,14 @@
  * then holds the section-relative address of the target. */
 #define HAKU_MODULE_SYM_BASE 0xFFFFFFFEu
 
-/* Relocation types: the two i386 ELF types a NASM object emits. */
+/* Relocation types: the two i386 ELF types a NASM object emits, plus the
+ * two x86-64 container forms. All four store a 32-bit word; the x64 forms
+ * are named separately so a loader can prove it is applying the arithmetic
+ * its own architecture expects. */
 #define HAKU_MODULE_R_386_32 1u
 #define HAKU_MODULE_R_386_PC32 2u
+#define HAKU_MODULE_R_64_ABS 3u
+#define HAKU_MODULE_R_64_PC32 4u
 
 /* Worst-case file: everything at its limit. init_module rejects a larger
  * buffer with E2BIG before copying it into the kernel heap. */
