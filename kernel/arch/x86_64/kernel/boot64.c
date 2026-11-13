@@ -696,6 +696,105 @@ static int test_module(void) {
     return 1;
 }
 
+/* Copy bytes into a mapped user address space. Every page the caller names
+ * must already be mapped; paging64_translate_space returns the physical
+ * address including the in-page offset, so a chunk ends at the page edge. */
+static int write_user64(u64 space, u64 address, const void *source, u64 size) {
+    const u8 *bytes = (const u8 *)source;
+
+    while (size) {
+        u64 phys = paging64_translate_space(space, address);
+        u64 chunk = K64_PAGE_SIZE - (address & (K64_PAGE_SIZE - 1));
+
+        if (!phys) return 0;
+        if (chunk > size) chunk = size;
+        memcpy(phys_to_virt64(phys), bytes, chunk);
+        bytes += chunk;
+        address += chunk;
+        size -= chunk;
+    }
+    return 1;
+}
+
+/* /INIT.ELF is the C program built against user/lib64. The kernel reads it
+ * from the FAT12 volume, loads it through the ELF64 loader, puts argc/argv on
+ * the stack elf64_load allocated and starts it at ring 3. Everything the
+ * program prints after that comes from the user library: printf, malloc,
+ * open/read/write, fork/wait4, mmap and clock_gettime. The marker
+ * HAKU64-LIBC-OK is written by the program itself, not by this test.
+ *
+ * The stack words are the kernel-launched form of the execve layout:
+ * argc, argv[0], NULL (argv terminator), NULL (empty envp). execve adds the
+ * auxiliary vector; a program started by the kernel is not expected to need
+ * one, and crt64.asm reads only argc/argv/envp.
+ */
+static int test_libc64(void) {
+    static const char path[] = "/INIT.ELF";
+    u64 words[4];
+    u64 sp;
+    u64 size;
+    u64 deadline;
+    u8 *image;
+    int file, id;
+    loaded_elf64_t loaded;
+
+    file = fs64_lookup(path);
+    if (file < 0) return 0;
+    size = fs64_size(file);
+    if (size == 0 || size > 0x20000u) return 0;
+    image = (u8 *)kmalloc64(size);
+    if (!image) return 0;
+    if (fs64_read(file, 0, image, size) != size) {
+        kfree64(image);
+        return 0;
+    }
+    if (!elf64_load(image, size, &loaded)) {
+        k64_puts("HAKU64-LIBC-FAIL: ");
+        k64_puts(elf64_last_error());
+        k64_puts("\r\n");
+        kfree64(image);
+        return 0;
+    }
+    kfree64(image);
+
+    sp = loaded.stack_top - 64;
+    words[0] = 1;                    /* argc */
+    words[1] = sp + 32;              /* argv[0] points at the string above */
+    words[2] = 0;                    /* argv terminator */
+    words[3] = 0;                    /* envp terminator */
+    if (!write_user64(loaded.space, sp, words, sizeof(words)) ||
+        !write_user64(loaded.space, sp + 32, path, sizeof(path))) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    id = task64_create_user(loaded.entry, sp, loaded.space);
+    if (id < 0) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    deadline = timer64_ticks() + 400;
+    while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
+        cpu_pause64();
+    if (task64_state(id) != K64_TASK_DONE) {
+        k64_puts("HAKU64-LIBC-FAIL: /INIT.ELF did not finish\r\n");
+        elf64_unload(&loaded);
+        return 0;
+    }
+    if (task64_exit_status(id) != 0) {
+        k64_puts("HAKU64-LIBC-FAIL: /INIT.ELF exit=");
+        k64_dec(task64_exit_status(id));
+        k64_puts("\r\n");
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    k64_puts("HAKU64-LIBC-RUN-OK: /INIT.ELF exit=0\r\n");
+    elf64_unload(&loaded);
+    return 1;
+}
+
 static int test_elf64(void) {
     loaded_elf64_t loaded;
     u64 size = (u64)(user64_image_end - user64_image);
@@ -905,6 +1004,7 @@ void kernel64_main(void) {
     k64_puts("HAKU64-ELF-REJECT-OK: six malformed images refused\r\n");
 
     if (!test_elf64()) k64_fail("ELF64 loader self-test");
+    if (!test_libc64()) k64_fail("x86-64 user library self-test");
     if (!test_disk_note()) k64_fail("FAT12 disk write self-test");
     if (!test_module()) k64_fail("x86-64 module loader self-test");
 

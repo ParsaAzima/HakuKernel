@@ -211,6 +211,42 @@ def verify_abi_headers(include_dir):
         sys.exit("C and NASM ABI headers are missing or out of sync")
 
 
+def verify_abi64_headers(include_dir):
+    """The x86-64 C ABI header must not drift from the NASM constants.
+
+    abi64.inc carries extra NASM-only values (clone flags, poll events), so
+    this check requires every HAKU64_* the C header defines to exist in the
+    .inc with the same number, rather than requiring the sets to be equal.
+    """
+    header = os.path.join(include_dir, "haku", "abi64.h")
+    nasm_include = os.path.join(include_dir, "haku", "abi64.inc")
+    number = r"(-?(?:0x[0-9A-Fa-f]+|\d+))"
+    c_pattern = re.compile(
+        r"^\s*#define\s+(HAKU64_\w+)\s+" + number +
+        r"u?\s*(?:/\*.*\*/)?\s*$")
+    nasm_pattern = re.compile(
+        r"^\s*%define\s+(HAKU64_\w+)\s+" + number + r"\s*(?:;.*)?\s*$")
+
+    def read_definitions(path, pattern):
+        values = {}
+        with open(path, encoding="ascii") as source:
+            for line in source:
+                match = pattern.match(line)
+                if match:
+                    values[match.group(1)] = int(match.group(2), 0)
+        return values
+
+    c_values = read_definitions(header, c_pattern)
+    nasm_values = read_definitions(nasm_include, nasm_pattern)
+    if not c_values:
+        sys.exit("the x86-64 C ABI header defines no HAKU64_* constants")
+    missing = sorted(name for name, value in c_values.items()
+                     if nasm_values.get(name) != value)
+    if missing:
+        sys.exit("abi64.h and abi64.inc are out of sync: "
+                 + ", ".join(missing))
+
+
 def find_msvc():
     """Find an x86-hosted cl.exe from any VS 2022+ installation.
 
@@ -366,17 +402,19 @@ def build_shell_image(py, user_elf, busybox, command):
     return image
 
 
-def build_x64_fs(py, image, exec_elf, module_image):
-    """Seed the x86-64 data disk: four files the kernel reads at boot.
+def build_x64_fs(py, image, exec_elf, module_image, init_elf):
+    """Seed the x86-64 data disk: five files the kernel reads at boot.
 
     HELLO.TXT carries the 16-byte marker the ELF64 self-test prints,
     PATTERN.BIN is three pages so a file mapping and a multi-page read both
     have data on every page, USER.ELF is the program the test execs from
     the disk (the kernel image does not contain it, so running it proves the
-    exec path), and X64MOD.HKM is the packed module the loader test reads and
-    relocates. The pattern is the same (offset*37+11) & 0xFF formula
-    boot64.c uses to verify it. The image is rebuilt on every x64 run because
-    the kernel also creates /TMP and writes NOTE.TXT into it.
+    exec path), INIT.ELF is the C program built against user/lib64 that the
+    kernel starts as the first ring-3 image, and X64MOD.HKM is the packed
+    module the loader test reads and relocates. The pattern is the same
+    (offset*37+11) & 0xFF formula boot64.c uses to verify it. The image is
+    rebuilt on every x64 run because the kernel also creates /TMP and writes
+    NOTE.TXT into it.
     """
     hello = b"HAKU64-FILE-OK\r\n"
     pattern = bytes(((i * 37 + 11) & 0xFF) for i in range(3 * 4096))
@@ -389,7 +427,8 @@ def build_x64_fs(py, image, exec_elf, module_image):
 
     run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
-         f"USER.ELF={exec_elf}", f"X64MOD.HKM={module_image}"])
+         f"USER.ELF={exec_elf}", f"INIT.ELF={init_elf}",
+         f"X64MOD.HKM={module_image}"])
     log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes)")
 
 
@@ -407,6 +446,7 @@ def build_x64(nasm, py, memory_mb, mode):
     cc, linker, label = find_x64_toolchain()
     log(f"x64 toolchain: {label}")
     verify_abi_headers(os.path.join(ROOT, "include"))
+    verify_abi64_headers(os.path.join(ROOT, "include"))
 
     arch32 = os.path.join(ROOT, "kernel", "arch", "x86")
     arch64 = os.path.join(ROOT, "kernel", "arch", "x86_64")
@@ -515,6 +555,37 @@ def build_x64(nasm, py, memory_mb, mode):
     run([py, os.path.join(ROOT, "tools", "mkelf64.py"),
          exec_flat, exec_elf, f"--base={user_base:#x}"])
 
+    # 1c. the x86-64 user C library and /INIT.ELF, the first ring-3 program
+    #     built with it. Same pipeline as the 32-bit userland: compile C and
+    #     the NASM stubs into a fixed-base PE32+, then repack it as ELF64.
+    #     The program is stored on the FAT12 volume rather than linked into
+    #     the kernel, so the boot test exercises the disk and ELF loaders.
+    lib64_dir = os.path.join(ROOT, "user", "lib64")
+    lib64_sources = sorted(glob.glob(os.path.join(lib64_dir, "*.c")))
+    init64_source = os.path.join(ROOT, "user", "tests", "init64.c")
+    init64_pe = os.path.join(BUILD, "init64.exe")
+    init64_elf = os.path.join(BUILD, "INIT.ELF")
+    lib64_objects = []
+    for source in sorted(glob.glob(os.path.join(lib64_dir, "*.asm"))):
+        obj = os.path.join(BUILD, "u64asm_" +
+                           os.path.splitext(os.path.basename(source))[0] + ".obj")
+        run([nasm, "-f", "win64", source, "-o", obj])
+        lib64_objects.append(obj)
+    for source in lib64_sources + [init64_source]:
+        obj = os.path.join(BUILD, "u64lib_" +
+                           os.path.splitext(os.path.basename(source))[0] + ".obj")
+        run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Os", "/W3",
+                  "/I" + os.path.join(ROOT, "include"), "/Fo" + obj, source])
+        lib64_objects.append(obj)
+    run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:CONSOLE",
+                  "/ENTRY:_start", f"/BASE:{user_base:#x}", "/FIXED",
+                  "/DYNAMICBASE:NO", "/NXCOMPAT:NO", "/ALIGN:4096",
+                  "/FILEALIGN:512", "/NODEFAULTLIB", "/OUT:" + init64_pe]
+        + lib64_objects)
+    run([py, os.path.join(ROOT, "tools", "pe2elf64.py"),
+         init64_pe, init64_elf])
+    log("x86-64 user libc built, /INIT.ELF packed as ELF64")
+
     run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:NATIVE",
                   "/ENTRY:entry64", "/BASE:0x10000", "/ALIGN:16", "/FIXED",
                   "/NODEFAULTLIB", "/OUT:" + kernel_pe,
@@ -545,7 +616,7 @@ def build_x64(nasm, py, memory_mb, mode):
     # 4. a fresh FAT12 volume for the disk filesystem test. The kernel
     #    creates /TMP and writes NOTE.TXT during the run, so the seed files
     #    are rebuilt every time rather than reused.
-    build_x64_fs(py, fs_img, exec_elf, x64_module_image)
+    build_x64_fs(py, fs_img, exec_elf, x64_module_image, init64_elf)
 
     # 5. boot it when asked. qemu-system-i386 refuses long mode without a
     #    64-bit CPU model, so every x64 boot uses the x86_64 binary;
@@ -595,7 +666,8 @@ def build_x64(nasm, py, memory_mb, mode):
                 "HAKU64-THREAD-OK", "HAKU64-PORT-OK",
                 "HAKU64-MODULE-OK", "HAKU64-MODULE-LIB-OK",
                 "HAKU64-MODULE-LOAD-OK", "HAKU64-MODULE-REJECT-OK",
-                "HAKU64-MODULE-UNLOAD-OK", "HAKU64-SELFTEST-OK"]
+                "HAKU64-MODULE-UNLOAD-OK", "HAKU64-LIBC-OK",
+                "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():
