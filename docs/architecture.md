@@ -336,9 +336,11 @@ The 64-bit path now has an ELF64 loader, a FAT12 data disk, the syscall table
 and a module loader, but no 64-bit libc, no VFS/devfs and no bootable root
 filesystem image. The boot self-test still runs from the kernel rather than a
 64-bit `/init`, so `haku64.img` is the primary image while the full shell and
-userland remain on the 32-bit side. [The roadmap](../ROADMAP.md) (Milestone 8)
-lists the remaining stages. The 64-bit sources are excluded from the 32-bit
-link line, so both targets build from one tree.
+userland remain on the 32-bit side. [The roadmap](../ROADMAP.md) (milestones 1
+to 4) lists the remaining stages: a 64-bit libc and `/init`, a VFS/devfs with
+module capabilities, pipes and signals, and the interactive shell. The 64-bit
+sources are excluded from the 32-bit link line, so both targets build from one
+tree.
 
 `kernel/arch/x86_64/elf/elf64.c` follows the 32-bit loader's rules — validate
 the whole image before mapping, accept only static `ET_EXEC`, require

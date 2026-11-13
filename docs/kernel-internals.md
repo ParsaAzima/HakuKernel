@@ -50,7 +50,7 @@ the scheduler keeps one current task, one run-state bitmap and one tick
 counter, and only the bootstrap processor takes timer interrupts. Running
 tasks on a second CPU needs per-CPU blocks and a per-CPU timer; that is the
 remaining SMP work in the
-[roadmap](../ROADMAP.md#4-concurrency-and-memory-management).
+[roadmap](../ROADMAP.md#5-true-smp-scheduling).
 
 The locking rules per subsystem:
 

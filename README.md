@@ -138,7 +138,7 @@ deleting it out of hand. The x64 seed disk is rebuilt on every run.
 | [Kernel internals](docs/kernel-internals.md) | Locking, sector cache, ELF loading, the PE-to-binary build. |
 | [Project layout](docs/project-layout.md) | Source tree and generated artifacts. |
 | [Troubleshooting](docs/troubleshooting.md) | Common build and boot failures. |
-| [Roadmap](ROADMAP.md) | Current status, milestones, and acceptance criteria. |
+| [Roadmap](ROADMAP.md) | Open milestones, acceptance markers, and the release train. |
 
 ## Project layout
 

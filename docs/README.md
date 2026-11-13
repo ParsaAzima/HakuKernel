@@ -26,7 +26,8 @@ describe how both are built and how they work in detail.
 ## Project pages
 
 - [README](../README.md) — what Haku is and how to start it.
-- [Roadmap](../ROADMAP.md) — current status, milestones, and acceptance criteria.
+- [Roadmap](../ROADMAP.md) — open milestones, acceptance markers, and the release train.
+- [Roadmap history](roadmap-history.md) — the detailed roadmap through v0.2.0, kept for its decisions and markers.
 - [Contributing](../CONTRIBUTING.md) — development setup and pull request guidance.
 - [Security policy](../SECURITY.md) — private vulnerability reporting guidance.
 - [Support](../SUPPORT.md) — where to ask questions and report reproducible issues.

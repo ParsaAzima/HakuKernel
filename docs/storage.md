@@ -92,7 +92,8 @@ decision does not have to be re-derived:
   contiguous; every create, rename, unlink, and directory-growth path would
   have to maintain that chain, and a torn write leaves an orphaned fragment.
   Haku's userland root is moving to an in-memory filesystem with real long
-  names and permission bits (see [the roadmap](../ROADMAP.md) milestone 7), which leaves FAT12
+  names and permission bits (see [the roadmap history](roadmap-history.md)),
+  which leaves FAT12
   as an interchange format for small data disks where 8.3 names are enough.
   Paying LFN complexity in the interchange format buys nothing the userland
   filesystem does not already provide.
