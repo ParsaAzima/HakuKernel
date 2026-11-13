@@ -53,6 +53,8 @@ void idt_load_ap(void);
 regs_t *isr_handler(regs_t *r);
 regs_t *irq_handler(regs_t *r);
 regs_t *syscall_handler(regs_t *r);
+/* Local-APIC timer / reschedule / TLB entries (vectors SMP_VEC_*). */
+regs_t *apic_irq_handler(regs_t *r);
 
 /* IRQ subscribers (drivers register here; vectors 32..47 map to IRQ 0..15). */
 typedef void (*irq_fn_t)(regs_t *r);

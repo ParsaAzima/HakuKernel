@@ -4,7 +4,9 @@
 #include "gdt.h"
 #include "klog.h"
 #include "paging.h"
+#include "percpu.h"
 #include "pit.h"
+#include "smp.h"
 #include "sync.h"
 #include "usermode.h"
 #include "vfs.h"
@@ -43,6 +45,7 @@ typedef struct {
     uint32_t space_owner;   /* pid of the task holding the heap/mmap table */
     uint32_t space_users;   /* live tasks sharing the owned address space */
     uint32_t is_thread;     /* created by clone(CLONE_THREAD) */
+    uint32_t cpu;           /* the CPU this task is pinned to */
     uint32_t clear_child_tid; /* CLONE_CHILD_CLEARTID word, 0 when unused */
     task_state_t state;
     loaded_elf_t program;
@@ -87,11 +90,28 @@ typedef struct {
 
 #define SCHEDULER_IDLE_INDEX ((int)SCHEDULER_MAX_PROCESSES)
 static task_t tasks[SCHEDULER_MAX_PROCESSES];
-static task_t idle_task;
-static int current_task = -1;
+/* One idle task per CPU: an idle task's frame and kernel stack belong to the
+ * CPU that halts in it, so the bootstrap processor's cannot be shared. */
+static task_t idle_tasks[SMP_MAX_CPUS];
 static int scheduler_started;
 static int timer_marker_written;
 static int waitq_marker_written;
+
+/* The task slot this CPU is running: -1 before it schedules anything and
+ * SCHEDULER_IDLE_INDEX while it runs its idle task. The field is int32_t so
+ * the existing range checks keep working, and it is an lvalue so the switch
+ * below can assign to it. Two CPUs therefore have two current tasks. */
+#define current_task (percpu_self()->current)
+#define idle_task (idle_tasks[percpu_self_index()])
+
+/* One lock for the slot table. A slot is reserved, released and reaped by a
+ * different CPU than the one running some of it (the bootstrap processor
+ * reaps an AP's kernel worker), so those transitions are serialised. The hot
+ * path — picking the next task, flipping RUNNABLE and BLOCKED — is per-CPU
+ * state on a pinned task and keeps the original interrupts-off rule: a task
+ * only ever runs on the CPU that owns its slot, so no other CPU can be
+ * looking at it. */
+static spinlock_t sched_lock = SPINLOCK_INIT;
 
 wait_queue_t scheduler_activity = WAIT_QUEUE_INIT;
 
@@ -199,8 +219,13 @@ static void scheduler_idle_loop(void) {
         /* Runs only while no user task is runnable, so this is the
          * post-user hook: verify FS error reporting once, then idle.
          * The volume stays usable for the test because every user
-         * file I/O check has already finished. */
-        fs_error_self_test();
+         * file I/O check has already finished.
+         *
+         * Only the bootstrap processor runs it: the hook walks the task
+         * table and touches the VFS, neither of which is an application
+         * processor's business, and two CPUs running it at once could both
+         * see the same "all tasks done" state. */
+        if (percpu_self_index() == 0) fs_error_self_test();
         __asm {
             sti
             hlt
@@ -208,7 +233,12 @@ static void scheduler_idle_loop(void) {
     }
 }
 
-static int initialize_stack(task_t *task, int user_mode) {
+/* Build the initial interrupt frame on a task's kernel stack. `user_mode`
+ * chooses the ring, the selectors and whether the frame carries a user
+ * stack; `entry` is where the iret lands. A kernel task's saved GS is the
+ * per-CPU selector, not KERNEL_DS: RESTORE_SEGMENTS reloads it, and a base
+ * of zero would make percpu_self() read linear address 0 on resume. */
+static int initialize_stack_entry(task_t *task, int user_mode, uint32_t entry) {
     uint32_t stack_bytes = TASK_KERNEL_STACK_PAGES * FRAME_SIZE;
     uint32_t stack_top;
     regs_t *frame;
@@ -228,14 +258,13 @@ static int initialize_stack(task_t *task, int user_mode) {
     stack_top = (uint32_t)PHYS_TO_VIRT(task->kernel_stack) + stack_bytes;
     frame = (regs_t *)(stack_top - sizeof(regs_t));
     memset(frame, 0, sizeof(*frame));
-    frame->gs = user_mode ? USER_DS : KERNEL_DS;
+    frame->gs = user_mode ? USER_DS : CPU_GS;
     frame->fs = user_mode ? USER_FS : KERNEL_DS;
     frame->es = user_mode ? USER_DS : KERNEL_DS;
     frame->ds = user_mode ? USER_DS : KERNEL_DS;
     frame->int_no = 0;
     frame->err_code = 0;
-    frame->eip = user_mode ? task->program.entry :
-                             (uint32_t)scheduler_idle_loop;
+    frame->eip = entry;
     frame->cs = user_mode ? USER_CS : KERNEL_CS;
     frame->eflags = 0x202u;
     if (user_mode) {
@@ -246,7 +275,19 @@ static int initialize_stack(task_t *task, int user_mode) {
     return 1;
 }
 
+static int initialize_stack(task_t *task, int user_mode) {
+    return initialize_stack_entry(task, user_mode,
+                                  user_mode ? task->program.entry
+                                            : (uint32_t)scheduler_idle_loop);
+}
+
+/* Round-robin over this CPU's own slots. A task pinned to another processor
+ * is invisible here, which is what lets two CPUs pick two tasks at the same
+ * instant without a lock: the slot index each one walks is disjoint. The scan
+ * is bounded by SCHEDULER_MAX_PROCESSES (four). */
 static int find_next_task(void) {
+    uint32_t me = percpu_self_index();
+
     for (uint32_t offset = 1; offset <= SCHEDULER_MAX_PROCESSES; offset++) {
         uint32_t selected_index;
         if (current_task == SCHEDULER_IDLE_INDEX)
@@ -254,10 +295,12 @@ static int find_next_task(void) {
         else
             selected_index = ((uint32_t)current_task + offset) %
                              SCHEDULER_MAX_PROCESSES;
+        if (tasks[selected_index].cpu != me) continue;
         if (tasks[selected_index].state == TASK_RUNNABLE)
             return (int)selected_index;
     }
     if (current_task >= 0 && current_task < SCHEDULER_IDLE_INDEX &&
+        tasks[current_task].cpu == me &&
         tasks[current_task].state == TASK_RUNNABLE)
         return current_task;
     return SCHEDULER_IDLE_INDEX;
@@ -265,6 +308,8 @@ static int find_next_task(void) {
 
 static void activate_task(int selected_index) {
     task_t *task;
+    percpu_t *cpu = percpu_self();
+
     /* Count the switch out of the previous task here, where it actually
      * happens: a runnable task preempted by the timer is involuntary,
      * while blocking/sleeping/waiting tasks yielded voluntarily. Exiting
@@ -279,17 +324,26 @@ static void activate_task(int selected_index) {
             previous->voluntary_switches++;
     }
     current_task = selected_index;
+    if (cpu) cpu->switches++;
     if (selected_index == SCHEDULER_IDLE_INDEX) {
         task = &idle_task;
         paging_activate_kernel_space();
     } else {
         task = &tasks[selected_index];
-        paging_activate_user_space(&task->program.address_space);
-        /* The user FS segment carries the thread pointer: the GDT entry
-         * must match the task that is about to run before its iret
-         * reloads the segment. */
-        gdt_set_user_fs_base(task->fs_base);
+        if (task->program.address_space.directory_phys) {
+            paging_activate_user_space(&task->program.address_space);
+            /* The user FS segment carries the thread pointer: the GDT entry
+             * must match the task that is about to run before its iret
+             * reloads the segment. */
+            gdt_set_user_fs_base(task->fs_base);
+        } else {
+            /* A kernel task (an application processor's boot worker) has no
+             * user program to activate. */
+            paging_activate_kernel_space();
+        }
     }
+    /* Both of these act on the calling CPU's private GDT/TSS entry, which is
+     * the right one because the task is pinned here. */
     gdt_set_kernel_stack((uint32_t)PHYS_TO_VIRT(task->kernel_stack) +
                          TASK_KERNEL_STACK_PAGES * FRAME_SIZE);
 }
@@ -312,26 +366,43 @@ static void release_task_resources(task_t *task) {
     task->frame = 0;
 }
 
+/* 1 when some CPU is inside slot `slot`. A slot a processor is running can
+ * never be released: its kernel stack is that processor's own call stack.
+ * Eight slots by eight CPUs is a fixed, tiny scan. */
+static int task_is_running_anywhere(uint32_t slot) {
+    for (uint32_t i = 0; i < SMP_MAX_CPUS; i++)
+        if (cpus[i].current == (int32_t)slot) return 1;
+    return 0;
+}
+
 /* Free the slots of children that their parent already reaped. The
  * timer-driven reap does this too, but a new task must not depend on a
  * timer tick landing in the right window: the process table would
- * otherwise run out of slots while a freed one is still pending. */
+ * otherwise run out of slots while a freed one is still pending.
+ *
+ * The caller holds sched_lock: the reaper runs on the bootstrap processor
+ * while an application processor may be running (or leaving) the slot. */
 static void release_reaped_slots(void) {
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
         task_t *task = &tasks[i];
-        if (task->state != TASK_REAP_PENDING || (int)i == current_task)
+        if (task->state != TASK_REAP_PENDING ||
+            task_is_running_anywhere(i))
             continue;
         release_task_resources(task);
         memset(task, 0, sizeof(*task));
     }
 }
 
+/* Called from the bootstrap processor's timer tick, with sched_lock held.
+ * Every CPU's housekeeping runs there on purpose: klog.c has no lock of its
+ * own and only one CPU edits user page tables, so the diagnostic line and
+ * the address-space teardown stay single-threaded. */
 static void reap_completed_tasks(void) {
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
         task_t *task = &tasks[i];
         if ((task->state != TASK_ZOMBIE &&
              task->state != TASK_REAP_PENDING) ||
-            (int)i == current_task)
+            task_is_running_anywhere(i))
             continue;
         release_task_resources(task);
         if (task->state == TASK_REAP_PENDING) {
@@ -348,12 +419,18 @@ static void reap_completed_tasks(void) {
  * identity a fork/clone inherits. Returns 0 when the table is full. The
  * caller builds the rest (address space, stack, descriptors) with
  * interrupts enabled; until it flips the state to RUNNABLE the scheduler
- * ignores the slot. */
+ * ignores the slot.
+ *
+ * The new task is pinned to the CPU that is reserving it. That is the
+ * parent's CPU (the caller is the parent's syscall), so a child never
+ * migrates before it has even started, and its slot is invisible to every
+ * other processor. */
 static task_t *reserve_task_slot(const task_t *parent) {
     irqflags_t flags;
     task_t *child = 0;
+    uint32_t cpu = percpu_self_index();
 
-    flags = irq_lock();
+    flags = spin_lock_irqsave(&sched_lock);
     release_reaped_slots();
     for (uint32_t slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
         if (tasks[slot].state == TASK_UNUSED) {
@@ -369,10 +446,11 @@ static task_t *reserve_task_slot(const task_t *parent) {
         child->tgid = pid;
         child->space_owner = pid;
         child->space_users = 1;
+        child->cpu = cpu;
         child->state = TASK_STARTING;
         inherit_task_identity(child, parent);
     }
-    irq_unlock(flags);
+    spin_unlock_irqrestore(&sched_lock, flags);
     return child;
 }
 
@@ -382,7 +460,10 @@ int scheduler_init(loaded_elf_t *initial_program) {
         return 0;
 
     memset(tasks, 0, sizeof(tasks));
-    memset(&idle_task, 0, sizeof(idle_task));
+    /* Only the bootstrap processor's idle task is rebuilt here. An AP's was
+     * created by scheduler_prepare_ap and that CPU is standing on the stack
+     * right now: wiping the record would lose the frame it resumes into. */
+    memset(&idle_tasks[0], 0, sizeof(idle_tasks[0]));
     current_task = -1;
     scheduler_started = 0;
     timer_marker_written = 0;
@@ -395,6 +476,7 @@ int scheduler_init(loaded_elf_t *initial_program) {
     tasks[0].tgid = 1;
     tasks[0].space_owner = 1;
     tasks[0].space_users = 1;
+    tasks[0].cpu = 0;               /* user processes stay on the BSP */
     tasks[0].state = TASK_RUNNABLE;
     tasks[0].program = *initial_program;
     init_task_identity(&tasks[0]);
@@ -402,8 +484,9 @@ int scheduler_init(loaded_elf_t *initial_program) {
     /* The initial process owns the standard descriptors; every spawned
      * child inherits them from its parent. */
     if (!vfs_open_stdio(tasks[0].pid)) goto fail;
-    idle_task.state = TASK_RUNNABLE;
-    if (!initialize_stack(&idle_task, 0)) goto fail;
+    idle_tasks[0].cpu = 0;
+    idle_tasks[0].state = TASK_RUNNABLE;
+    if (!initialize_stack(&idle_tasks[0], 0)) goto fail;
     initial_program->address_space.directory_phys = 0;
 
     klog_prefix();
@@ -419,10 +502,10 @@ fail:
         frame_free_pages((void *)tasks[0].kernel_stack,
                          TASK_KERNEL_STACK_PAGES);
     memset(&tasks[0], 0, sizeof(tasks[0]));
-    if (idle_task.kernel_stack)
-        frame_free_pages((void *)idle_task.kernel_stack,
+    if (idle_tasks[0].kernel_stack)
+        frame_free_pages((void *)idle_tasks[0].kernel_stack,
                          TASK_KERNEL_STACK_PAGES);
-    memset(&idle_task, 0, sizeof(idle_task));
+    memset(&idle_tasks[0], 0, sizeof(idle_tasks[0]));
     return 0;
 }
 
@@ -439,48 +522,241 @@ void scheduler_start(void) {
     for (;;) __asm hlt
 }
 
-/* The scheduler's own state is protected by the IRQ-save rule below:
- * every task-array mutation runs with interrupts disabled (either in an IRQ
- * handler or under irq_lock()), so no spinlock is needed here. Never take a
- * task-context spinlock (VFS, ATA) with interrupts disabled: a preempted
- * holder would never run again to release it. */
+/* ------------------------------------------------------- application CPUs
+ * An AP starts with no task: its per-CPU `current` is -1 until the bootstrap
+ * processor has built its idle task and the AP enters it. The idle task is a
+ * normal kernel task that never exits, so every later switch has somewhere to
+ * land, and scheduler_enter_frame is the one-time lie that "this CPU was
+ * preempted right there".
+ *
+ * Nothing here touches another CPU's slot: the AP's own slots are the only
+ * ones it can see, because every task is pinned. */
+
+/* Halt with interrupts on, which is what an idle CPU should do: the next
+ * local-APIC tick or IPI wakes it and the stub returns here. */
+static void scheduler_kernel_park(void) {
+    for (;;) {
+        __asm {
+            sti
+            hlt
+        }
+    }
+}
+
+int32_t scheduler_create_kernel_on(uint32_t cpu, void (*entry)(void)) {
+    irqflags_t flags;
+    task_t *task = 0;
+    int32_t slot = -1;
+
+    /* Slot 0 belongs to the bootstrap processor's initial process, so a
+     * kernel task always takes a nonzero slot like any child. */
+    if (!entry || cpu == 0 || cpu >= SMP_MAX_CPUS)
+        return -(int32_t)HAKU_EINVAL;
+    if (idle_tasks[cpu].state != TASK_RUNNABLE)
+        return -(int32_t)HAKU_EINVAL;
+
+    flags = spin_lock_irqsave(&sched_lock);
+    release_reaped_slots();
+    for (uint32_t i = 1; i < SCHEDULER_MAX_PROCESSES; i++) {
+        if (tasks[i].state == TASK_UNUSED) {
+            task = &tasks[i];
+            break;
+        }
+    }
+    if (task) {
+        uint32_t pid = (uint32_t)(task - tasks) + 1u;
+        memset(task, 0, sizeof(*task));
+        task->pid = pid;
+        task->pgrp = pid;
+        task->sid = pid;
+        task->tgid = pid;
+        task->space_owner = pid;
+        task->cpu = cpu;
+        init_task_identity(task);
+        if (!initialize_stack_entry(task, 0, (uint32_t)entry)) {
+            memset(task, 0, sizeof(*task));
+        } else {
+            task->state = TASK_RUNNABLE;   /* published under the lock */
+            slot = (int32_t)(task - tasks);
+        }
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    if (slot < 0) return -(int32_t)HAKU_ENOMEM;
+
+    /* The AP may be asleep in its idle loop: wake it now instead of at its
+     * next tick, which is what makes the boot test's measurement short. */
+    smp_resched_cpu(cpu);
+    return slot;
+}
+
+/* A kernel task ends from its own entry point. It cannot free its stack
+ * while standing on it, so it marks the slot for the reaper and stops: the
+ * next interrupt finds nothing runnable here, switches this CPU to its idle
+ * task, and the bootstrap processor frees the slot from its own timer. */
+void scheduler_kernel_exit(void) {
+    irqflags_t flags;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        scheduler_kernel_park();
+    flags = spin_lock_irqsave(&sched_lock);
+    tasks[current_task].state = TASK_REAP_PENDING;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    scheduler_kernel_park();
+}
+
+/* Bootstrap processor: wait for a kernel task created by
+ * scheduler_create_kernel_on() to leave its slot, then free it.
+ *
+ * A kernel task cannot release the stack it is standing on, so it marks the
+ * slot REAP_PENDING and parks; this CPU's tick switches the AP to its idle
+ * task. Only then does the slot stop being a live call stack, which is what
+ * release_reaped_slots() checks, and only then may the two pages go back to
+ * the allocator. The boot test uses this because its workers must not keep a
+ * slot in the four-entry process table once userland runs.
+ *
+ * The spin is bounded: a CPU that never leaves its worker fails the test
+ * instead of hanging the boot. */
+int scheduler_join_kernel(int32_t slot) {
+    for (uint32_t spin = 0; spin < 2000000u; spin++) {
+        irqflags_t flags;
+
+        if (slot < 0 || slot >= SCHEDULER_MAX_PROCESSES) return 0;
+        flags = spin_lock_irqsave(&sched_lock);
+        reap_completed_tasks();
+        if (tasks[slot].state == TASK_UNUSED) {
+            spin_unlock_irqrestore(&sched_lock, flags);
+            return 1;
+        }
+        spin_unlock_irqrestore(&sched_lock, flags);
+        cpu_pause();
+    }
+    return 0;
+}
+
+/* Bootstrap processor: build `cpu`'s idle task before that AP is released.
+ * The frames come from the shared allocator while the AP still has
+ * interrupts off, so it cannot be running anything. */
+int scheduler_prepare_ap(uint32_t cpu) {
+    task_t *idle;
+
+    if (cpu == 0 || cpu >= SMP_MAX_CPUS) return -1;
+    idle = &idle_tasks[cpu];
+    if (idle->state == TASK_RUNNABLE) return (int)cpu;
+    memset(idle, 0, sizeof(*idle));
+    idle->cpu = cpu;
+    idle->state = TASK_RUNNABLE;
+    if (!initialize_stack_entry(idle, 0, (uint32_t)scheduler_idle_loop)) {
+        memset(idle, 0, sizeof(*idle));
+        return -1;
+    }
+    return (int)cpu;
+}
+
+/* Application processor: enter this CPU's idle task. Never returns. */
+void scheduler_start_ap(uint32_t cpu) {
+    task_t *idle;
+    percpu_t *self = percpu_self();
+
+    if (cpu == 0 || cpu >= SMP_MAX_CPUS || !self) {
+        for (;;) __asm {
+            cli
+            hlt
+        }
+    }
+    idle = &idle_tasks[cpu];
+    if (idle->state != TASK_RUNNABLE || !idle->frame) {
+        for (;;) __asm {
+            cli
+            hlt
+        }
+    }
+    /* This CPU's first switch: from "not scheduling" straight to idle. */
+    self->current = SCHEDULER_IDLE_INDEX;
+    self->idle = 1;
+    gdt_set_kernel_stack((uint32_t)PHYS_TO_VIRT(idle->kernel_stack) +
+                         TASK_KERNEL_STACK_PAGES * FRAME_SIZE);
+    paging_activate_kernel_space();
+    /* Now that this CPU owns its idle context it may take its own timer,
+     * which is what turns "parked" into "scheduling". */
+    smp_start_timer();
+    scheduler_enter_frame(idle->frame);
+    for (;;) __asm hlt
+}
+
+/* The scheduler's own state is protected by two rules:
+ *
+ *  - a task only ever runs on its pinned CPU, so its slot's RUNNABLE/BLOCKED
+ *    flips and its frame pointer are serialised by that CPU's interrupt
+ *    state alone (the timer is an interrupt gate: it cannot nest on the same
+ *    processor);
+ *  - the slot table itself is shared — the bootstrap processor reaps an AP's
+ *    kernel worker — so every scan that can see another CPU's slot runs
+ *    under sched_lock, which also disables interrupts on the CPU holding it.
+ *
+ * Never take a task-context spinlock (VFS, ATA) with interrupts disabled: a
+ * preempted holder would never run again to release it. */
 regs_t *scheduler_preempt(regs_t *frame) {
+    percpu_t *cpu = percpu_self();
+    irqflags_t flags;
+    regs_t *result;
     int next;
 
-    if (!scheduler_started || !frame)
+    if (!frame || !cpu)
         return frame;
+    /* A CPU that has not entered its idle task yet is not scheduling. The
+     * bootstrap processor only starts once scheduler_start() has announced
+     * the first user task; an AP starts as soon as scheduler_start_ap() put
+     * it in its idle task, which happens before userland runs. */
+    if (cpu->current < 0)
+        return frame;
+    if (!scheduler_started && cpu->index == 0)
+        return frame;
+
+    flags = spin_lock_irqsave(&sched_lock);
     /* Attribute this timer tick to the interrupted task. The frame's CS
      * tells us whether it was running in ring 3 or in a syscall/IRQ. */
-    if (current_task >= 0 && current_task < SCHEDULER_IDLE_INDEX) {
-        task_t *current = &tasks[current_task];
+    if (cpu->current >= 0 && cpu->current < SCHEDULER_IDLE_INDEX) {
+        task_t *current = &tasks[cpu->current];
         if ((frame->cs & 3u) == 3u)
             current->user_ticks++;
         else
             current->kernel_ticks++;
     }
-    if (!timer_marker_written) {
-        klog_prefix();
-        klog_write("sched: SCHED-TIMER-OK: timer interrupts reach scheduler\n");
-        timer_marker_written = 1;
-    }
+    if (cpu->index == 0) {
+        /* Global housekeeping: it walks every slot, prints, and releases
+         * address spaces. One CPU does all of it, which is what keeps the
+         * unlocked klog and the single-writer page tables honest. */
+        if (!timer_marker_written) {
+            klog_prefix();
+            klog_write("sched: SCHED-TIMER-OK: timer interrupts reach "
+                       "scheduler\n");
+            timer_marker_written = 1;
+        }
 
-    reap_completed_tasks();
-    wake_expired_sleepers();
-    /* The timer is the clock for a parked poll(2)/select(2): it re-scans
-     * readiness and checks its deadline once per tick. */
-    wait_queue_wake_all(&scheduler_activity);
-    if (current_task == SCHEDULER_IDLE_INDEX) {
-        idle_task.frame = frame;
-    } else if (current_task >= 0 &&
-               current_task < SCHEDULER_IDLE_INDEX) {
-        tasks[current_task].frame = frame;
+        reap_completed_tasks();
+        wake_expired_sleepers();
+        /* The timer is the clock for a parked poll(2)/select(2): it re-scans
+         * readiness and checks its deadline once per tick. */
+        wait_queue_wake_all(&scheduler_activity);
     }
+    if (cpu->current == SCHEDULER_IDLE_INDEX) {
+        idle_task.frame = frame;
+    } else if (cpu->current >= 0 &&
+               cpu->current < SCHEDULER_IDLE_INDEX) {
+        tasks[cpu->current].frame = frame;
+    }
+    if (cpu) cpu->ticks++;
 
     next = find_next_task();
+    if (next == cpu->current) {
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return frame;
+    }
     /* Observable proof that a blocked task is off the run queue: when a
      * task parks on a wait queue and nothing else is runnable, the idle
      * context is selected instead of scheduling that task again. */
-    if (!waitq_marker_written && next == SCHEDULER_IDLE_INDEX) {
+    if (cpu->index == 0 && !waitq_marker_written &&
+        next == SCHEDULER_IDLE_INDEX) {
         for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
             if (tasks[i].state != TASK_BLOCKED) continue;
             klog_prefix();
@@ -491,12 +767,14 @@ regs_t *scheduler_preempt(regs_t *frame) {
             break;
         }
     }
-    if (next == current_task)
-        return frame;
 
     activate_task(next);
-    return next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
-                                          tasks[next].frame;
+    result = next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
+                                            tasks[next].frame;
+    /* Unlock before returning: the caller still runs on the outgoing
+     * stack until the frame this returns is popped by the assembly. */
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return result;
 }
 
 /* Hand the wait result to the parent: the exit status and, when the
@@ -1384,19 +1662,27 @@ int32_t scheduler_set_comm(const char *name) {
 }
 
 regs_t *scheduler_yield(regs_t *frame) {
+    irqflags_t flags;
     int next;
     if (!scheduler_started || !frame || current_task < 0 ||
         current_task >= SCHEDULER_IDLE_INDEX)
         return frame;
     /* The caller stays runnable: a yield only hands the CPU to another
      * ready task. Remember its frame so the switch can come straight back
-     * to it when it is selected again. */
+     * to it when it is selected again. The lock keeps the timer from
+     * switching in the middle of the decision: the IRQ handler takes the
+     * same lock, so it either runs entirely before or entirely after. */
+    flags = spin_lock_irqsave(&sched_lock);
     tasks[current_task].frame = frame;
     next = find_next_task();
-    if (next == current_task)
+    if (next == current_task) {
+        spin_unlock_irqrestore(&sched_lock, flags);
         return frame;
+    }
     activate_task(next);
-    return next == SCHEDULER_IDLE_INDEX ? idle_task.frame : tasks[next].frame;
+    frame = next == SCHEDULER_IDLE_INDEX ? idle_task.frame : tasks[next].frame;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return frame;
 }
 
 void scheduler_note_syscall(void) {

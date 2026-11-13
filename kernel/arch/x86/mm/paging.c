@@ -12,6 +12,8 @@
 #include "paging.h"
 #include "frame.h"
 #include "heap.h"
+#include "percpu.h"
+#include "smp.h"
 #include "sync.h"
 
 #define DIR  ((uint32_t *)PAGING_DIR_PHYS)
@@ -30,6 +32,10 @@
 static uint32_t direct_map_bytes_;
 static uint32_t direct_map_tables_;
 static uint32_t phys_limit_;
+
+/* Defined with the address-space activation below; every page-table edit
+ * calls it so another CPU running the same space drops its stale entry. */
+static void paging_space_changed(uint32_t space);
 
 static int alloc_page_table(void) {
     void *frame = frame_alloc();
@@ -361,6 +367,7 @@ int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
 
     current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
     if (current) paging_invlpg(virtual_addr);
+    paging_space_changed(space->directory_phys);
     return 1;
 }
 
@@ -419,6 +426,7 @@ int paging_protect_user_range(address_space_t *space, uint32_t virtual_addr,
         page_addr += 0x1000u;
     }
     if (current) paging_invlpg(virtual_addr);
+    paging_space_changed(space->directory_phys);
     return 1;
 }
 
@@ -486,6 +494,9 @@ int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
     if (space->mapped_pages) space->mapped_pages--;
     current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
     if (current) paging_invlpg(virtual_addr);
+    /* The frame goes back to the allocator below, so every other CPU that
+     * may have this space loaded has to drop the translation first. */
+    paging_space_changed(space->directory_phys);
     frame_ref_drop(pte);
 
     /* Drop a now-empty page table so release returns the whole 4 KiB. */
@@ -543,6 +554,10 @@ void paging_activate_user_space(const address_space_t *space) {
         mov eax, [eax]
         mov cr3, eax
     }
+    /* A CR3 write already dropped this CPU's translations; recording the
+     * space is what lets a TLB shootdown from another CPU skip (or target)
+     * this one correctly. */
+    percpu_note_active_space(space->directory_phys);
 }
 
 void paging_activate_kernel_space(void) {
@@ -550,6 +565,19 @@ void paging_activate_kernel_space(void) {
         mov eax, PAGING_DIR_PHYS
         mov cr3, eax
     }
+    percpu_note_active_space(PAGING_DIR_PHYS);
+}
+
+/* A page-table edit only invalidates this CPU's TLB. While one CPU ran every
+ * task that was the whole story; now another CPU may have `space` loaded and
+ * would keep the old translation (a stale writable mapping after mprotect,
+ * or a freed frame after munmap). The shootdown itself skips CPUs whose CR3
+ * does not name this space, so the common "nobody else runs it" case costs
+ * only the bookkeeping. */
+static void paging_space_changed(uint32_t space) {
+    if (!space) return;
+    if (space == (paging_get_cr3() & 0xFFFFF000u)) return;
+    smp_tlb_shootdown(space);
 }
 
 int paging_share_user_space(address_space_t *source,

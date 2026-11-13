@@ -14,6 +14,7 @@
 #include "paging.h"
 #include "frame.h"
 #include "panic.h"
+#include "percpu.h"
 #include "pic.h"
 #include "pit.h"
 #include "gdt.h"
@@ -135,6 +136,12 @@ void kernel_main(void) {
     }
     klog_log(KLOG_INFO, "GDT-OK: ring3 code/data loaded, TSS esp0 configured\n");
 
+    /* The per-CPU block has to exist before anything reads percpu_self():
+     * gdt_init put its address into GDT entry 7, and this fills it in. The
+     * bootstrap processor's slot is CPU 0. */
+    percpu_init_bsp();
+    klog_log(KLOG_INFO, "PERCPU-OK: bootstrap block installed on gs\n");
+
     if (!usermode_init()) {
         panic("usermode setup failed");
     }
@@ -157,6 +164,14 @@ void kernel_main(void) {
 
     pic_clear_mask(0);
     cpu_sti();
+
+    /* Prove the per-CPU stage: a block reached through gs, an AP running a
+     * task of its own, and a TLB shootdown that reaches every other CPU.
+     * Interrupts are on and IRQ0 is the tick source, which the AP timer
+     * calibration measures against. */
+    if (!smp_self_test()) {
+        panic("SMP-FAIL: per-CPU scheduling self-test failed");
+    }
 
     klog_log(KLOG_INFO, "input: press one key for the read() test...\n");
     usermode_run();

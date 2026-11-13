@@ -1,6 +1,7 @@
 #include "gdt.h"
 #include "frame.h"
 #include "paging.h"
+#include "percpu.h"
 
 #pragma pack(push, 1)
 typedef struct {
@@ -36,7 +37,7 @@ typedef struct {
 } tss_t;
 #pragma pack(pop)
 
-static gdt_entry_t gdt[7];
+static gdt_entry_t gdt[8];
 static gdtr_t gdtr;
 static tss_t tss;
 
@@ -45,7 +46,7 @@ static tss_t tss;
  * RSP0 and IST stacks. Index 0 is unused (the BSP keeps the table above),
  * and the selector values are the same because the indices match. */
 #define GDT_AP_MAX 8u
-static gdt_entry_t ap_gdt[GDT_AP_MAX][7];
+static gdt_entry_t ap_gdt[GDT_AP_MAX][8];
 static gdtr_t ap_gdtr[GDT_AP_MAX];
 static tss_t ap_tss[GDT_AP_MAX];
 static volatile uint32_t ap_gdt_ready[GDT_AP_MAX];
@@ -80,6 +81,10 @@ int gdt_init(void) {
      * changes its base, and every task switch restores the base of the
      * task that is about to run. */
     gdt_set(6, 0, 0xFFFFFu, 0xF2u, 0xCFu); /* ring-3 data with a base */
+    /* The per-CPU GS block. The base is a linear address, cached when
+     * gdt_load selects 0x38; it stays valid across every later reload
+     * because those tables carry the same entry. */
+    gdt_set(7, (uint32_t)percpu_block(0), 0xFFFFFu, 0x92u, 0xCFu);
 
     tss.ss0 = KERNEL_DS;
     tss.esp0 = (uint32_t)PHYS_TO_VIRT(stack) + FRAME_SIZE;
@@ -94,7 +99,12 @@ int gdt_init(void) {
 }
 
 void gdt_set_kernel_stack(uint32_t stack_top) {
-    tss.esp0 = stack_top;
+    uint32_t cpu = percpu_self_index();
+
+    if (cpu == 0)
+        tss.esp0 = stack_top;
+    else if (cpu < GDT_AP_MAX)
+        ap_tss[cpu].esp0 = stack_top;
 }
 
 /* Per-AP GDT/TSS. The AP runs this on its own stack with the trampoline's
@@ -119,6 +129,9 @@ int gdt_init_ap(uint32_t cpu, uint32_t kernel_stack_top) {
     gdt_entry_set(table, 3, 0, 0xFFFFFu, 0xFAu, 0xCFu);
     gdt_entry_set(table, 4, 0, 0xFFFFFu, 0xF2u, 0xCFu);
     gdt_entry_set(table, 6, 0, 0xFFFFFu, 0xF2u, 0xCFu);
+    /* This CPU's per-CPU block; gdt_load below caches its base in GS. */
+    gdt_entry_set(table, 7, (uint32_t)percpu_block(cpu), 0xFFFFFu, 0x92u,
+                  0xCFu);
 
     ap->ss0 = KERNEL_DS;
     ap->esp0 = kernel_stack_top;
@@ -141,16 +154,27 @@ uint32_t gdt_ap_tss_esp0(uint32_t cpu) {
 /* Move the user FS segment to a new base (the thread pointer). The
  * segment register of the running task keeps its cached base until it is
  * reloaded, which happens on the next iret into user mode, so the change
- * takes effect for the caller without reloading the register here. */
+ * takes effect for the caller without reloading the register here.
+ *
+ * Tasks are pinned to a CPU, so only that CPU's table is rewritten and only
+ * that CPU reloads it. Reloading another CPU's table here would move this
+ * CPU's GS base onto that CPU's block. */
 void gdt_set_user_fs_base(uint32_t base) {
+    uint32_t cpu = percpu_self_index();
+    gdt_entry_t *table;
+    gdtr_t *descriptor;
+
+    if (cpu >= GDT_AP_MAX) return;
+    table = cpu == 0 ? gdt : ap_gdt[cpu];
+    descriptor = cpu == 0 ? &gdtr : &ap_gdtr[cpu];
     /* The entry is only rewritten when the base really changes, so a task
      * switch does not reload the GDT every time. */
-    if (gdt[6].base_low == (uint16_t)(base & 0xFFFFu) &&
-        gdt[6].base_mid == (uint8_t)((base >> 16) & 0xFFu) &&
-        gdt[6].base_high == (uint8_t)((base >> 24) & 0xFFu))
+    if (table[6].base_low == (uint16_t)(base & 0xFFFFu) &&
+        table[6].base_mid == (uint8_t)((base >> 16) & 0xFFu) &&
+        table[6].base_high == (uint8_t)((base >> 24) & 0xFFu))
         return;
-    gdt_set(6, base, 0xFFFFFu, 0xF2u, 0xCFu);
-    gdtr.limit = (uint16_t)(sizeof(gdt) - 1u);
-    gdtr.base = (uint32_t)&gdt;
-    gdt_load((uint32_t)&gdtr);
+    gdt_entry_set(table, 6, base, 0xFFFFFu, 0xF2u, 0xCFu);
+    descriptor->limit = (uint16_t)(sizeof(gdt) - 1u);
+    descriptor->base = (uint32_t)table;
+    gdt_load((uint32_t)descriptor);
 }

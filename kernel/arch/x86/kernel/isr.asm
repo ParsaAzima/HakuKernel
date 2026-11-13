@@ -13,7 +13,9 @@
 
 global _idt_load, _cpu_sti, _cpu_cli
 global _syscall128
+global _apic_timer, _apic_resched, _apic_tlb
 extern _isr_handler, _irq_handler, _syscall_handler
+extern _apic_irq_handler
 extern _scheduler_signal_deliver
 
 section .text
@@ -56,9 +58,10 @@ _gdt_load:                       ; void gdt_load(uint32_t gdtr_addr)
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
+    mov ax, 0x38                  ; ring-0 data: base = this CPU's block
     mov gs, ax
     cld                           ; kernel C code always runs with DF clear
-    mov ss, ax
     jmp 0x08:.reload_cs
 .reload_cs:
     ret
@@ -170,7 +173,17 @@ _syscall128:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    ; GS is the per-CPU block in ring 0. Reloading it unconditionally would
+    ; zero the base when the interrupted context was already ring 0 (the
+    ; interrupt gate does not change segment registers), so only a frame
+    ; that came from ring 3 switches to the kernel selector. CS sits 60
+    ; bytes above the saved GS slot: popa (32) + four segments (16) + the
+    ; stub's vector/error words (8) + eip (4).
+    test byte [esp+60], 3
+    jz %%gs_ready
+    mov ax, 0x38
     mov gs, ax
+%%gs_ready:
     cld                           ; C code must not inherit user DF state
 %endmacro
 
@@ -196,6 +209,34 @@ _syscall128:
     call _scheduler_signal_deliver
     add esp, 4
 %endmacro
+
+; ---- local-APIC interrupts ---------------------------------------------------
+; Vectors 0x40..0x42 sit above the 8259's remapped range. They are ordinary
+; interrupt gates, so IF is already clear on entry; the C dispatcher
+; acknowledges the unit and decides whether the frame changed hands.
+%macro APIC_ENTRY 2
+global %1
+%1:
+    cli
+    push 0
+    push %2
+    jmp apic_common
+%endmacro
+
+APIC_ENTRY _apic_timer,   0x40
+APIC_ENTRY _apic_resched, 0x41
+APIC_ENTRY _apic_tlb,     0x42
+
+apic_common:
+    SAVE_SEGMENTS
+    push esp
+    call _apic_irq_handler
+    add esp, 4
+    DELIVER_SIGNALS
+    mov esp, eax                 ; the timer/resched handler may switch tasks
+    RESTORE_SEGMENTS
+    add esp, 8
+    iret
 
 _scheduler_enter_frame:         ; void scheduler_enter_frame(regs_t *frame)
     mov eax, [esp+4]

@@ -43,6 +43,24 @@ void wait_queue_cancel(wait_queue_t *queue);
 int wait_queue_wake_all(wait_queue_t *queue);
 
 int scheduler_init(loaded_elf_t *initial_program);
+/* Per-CPU scheduling. Every processor runs its own current task, its own
+ * idle task and its own timer; a task is pinned to the CPU that created it
+ * (user processes to the bootstrap processor), so no task ever migrates and
+ * the task table needs one lock only for slot allocation and reaping. */
+int scheduler_prepare_ap(uint32_t cpu);
+/* Enter this CPU's idle task. Runs on the application processor itself and
+ * never returns. */
+void scheduler_start_ap(uint32_t cpu);
+/* A kernel-mode task pinned to `cpu` (1..SMP_MAX_CPUS-1): the SMP boot test
+ * and, later, per-CPU kernel workers. Returns the task slot or -errno. */
+int32_t scheduler_create_kernel_on(uint32_t cpu, void (*entry)(void));
+/* End a kernel-mode task from its own entry point. The CPU parks until its
+ * next interrupt switches it to the idle task, and the bootstrap processor
+ * frees the slot: a task cannot release the stack it is standing on. */
+void scheduler_kernel_exit(void);
+/* Boot-time handshake for the task above: wait until the slot is free again
+ * and free it. Returns 1 when the slot is gone. */
+int scheduler_join_kernel(int32_t slot);
 int scheduler_user_tasks_done(void);
 /* 1 while the scheduler is running and at least one user task can still
  * make progress. The timer heartbeat stays off the console while it is 1. */

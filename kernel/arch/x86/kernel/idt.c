@@ -6,11 +6,13 @@
  */
 #include "crash.h"
 #include "idt.h"
+#include "apic.h"
 #include "klog.h"
 #include "paging.h"
 #include "panic.h"
 #include "pic.h"
 #include "scheduler.h"
+#include "smp.h"
 #include "usermode.h"
 
 static idt_entry_t idt[IDT_ENTRIES];
@@ -37,6 +39,10 @@ DECLARE_IRQ(12); DECLARE_IRQ(13); DECLARE_IRQ(14); DECLARE_IRQ(15);
 
 extern void isr_default(void);
 extern void syscall128(void);
+/* Local-APIC entries from isr.asm (vectors SMP_VEC_*). */
+extern void apic_timer(void);
+extern void apic_resched(void);
+extern void apic_tlb(void);
 
 static void (*isr_addrs[32])(void) = {
     isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7,
@@ -79,6 +85,12 @@ void idt_init(void) {
         idt_set_gate((uint8_t)(32 + i), (uint32_t)irq_addrs[i], KERNEL_CS, GATE_INT32);
     for (uint16_t i = 48; i < 256; i++)
         idt_set_gate((uint8_t)i, (uint32_t)isr_default, KERNEL_CS, GATE_INT32);
+    /* Local-APIC timer, reschedule IPI and TLB shootdown replace three of
+     * the catch-all entries above. */
+    idt_set_gate(SMP_VEC_TIMER, (uint32_t)apic_timer, KERNEL_CS, GATE_INT32);
+    idt_set_gate(SMP_VEC_RESCHED, (uint32_t)apic_resched, KERNEL_CS,
+                 GATE_INT32);
+    idt_set_gate(SMP_VEC_TLB, (uint32_t)apic_tlb, KERNEL_CS, GATE_INT32);
     idt_set_gate(HAKU_SYSCALL_VECTOR, (uint32_t)syscall128, KERNEL_CS,
                  GATE_USER_INT32);
     /* Mask the PIC until drivers unmask what they own (pic.c remaps first). */
@@ -213,5 +225,17 @@ regs_t *irq_handler(regs_t *r) {
     pic_send_eoi(irq);
     if (irq == 0)
         return scheduler_preempt(r);
+    return r;
+}
+
+/* Local-APIC vectors. The unit needs its EOI before the handler runs (the
+ * timer would otherwise stay in service), and the timer/reschedule entries
+ * return the frame to resume because the preemption may switch tasks. The
+ * TLB entry only flushes and reports back. */
+regs_t *apic_irq_handler(regs_t *r) {
+    apic_eoi();
+    if (r->int_no == SMP_VEC_TIMER || r->int_no == SMP_VEC_RESCHED)
+        return scheduler_preempt(r);
+    smp_tlb_ipi();
     return r;
 }
