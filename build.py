@@ -432,7 +432,7 @@ def build_x64_fs(py, image, exec_elf, module_image, init_elf):
     log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes)")
 
 
-def build_x64(nasm, py, memory_mb, mode):
+def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     """Build haku64.img, then boot it when `mode` asks for a run.
 
     The entry path, memory subsystem, interrupts, per-process address
@@ -625,7 +625,7 @@ def build_x64(nasm, py, memory_mb, mode):
     qemu = find_tool("qemu-system-x86_64",
                      [r"C:\Program Files\qemu\qemu-system-x86_64.exe"], "QEMU")
     base = [qemu, "-m", str(memory_mb), "-cpu", "qemu64",
-            "-smp", "2",
+            "-smp", str(smp_cpus),
             "-drive", f"file={img},format=raw,if=floppy,index=0",
             "-drive", f"file={fs_img},format=raw,if=ide,"
                       "index=0,media=disk,cache=writethrough",
@@ -651,12 +651,16 @@ def build_x64(nasm, py, memory_mb, mode):
     log("--- serial log (x64) ---")
     log(content)
     required = ["HAKU64-BOOT-OK", "HAKU64-E820-OK", "HAKU64-PAGING-OK",
-                "HAKU64-FRAME-OK", "HAKU64-HEAP-OK", "HAKU64-GDT-OK",
+                "HAKU64-PERCPU-OK", "HAKU64-FRAME-OK", "HAKU64-HEAP-OK",
+                "HAKU64-GDT-OK",
                 "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
-                "HAKU64-SMP-OK: cpus=2", "HAKU64-SMP-AP-OK cpu=1",
+                f"HAKU64-SMP-OK: cpus={smp_cpus}",
+                "HAKU64-SMP-AP-OK cpu=1",
                 "HAKU64-SMP-LOCK-OK",
                 "HAKU64-SMP-AP-GDT-OK",
-                "HAKU64-VM-OK", "HAKU64-PROC-OK", "HAKU64-USER-OK",
+                "HAKU64-VM-OK", "HAKU64-PROC-OK",
+                "HAKU64-SMP-SCHED-OK", "HAKU64-SMP-TLB-OK",
+                "HAKU64-USER-OK",
                 "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
                 "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",
                 "HAKU64-RTC-OK", "HAKU64-SYSCALL64-OK", "HAKU64-FS-OK",
@@ -668,6 +672,10 @@ def build_x64(nasm, py, memory_mb, mode):
                 "HAKU64-MODULE-LOAD-OK", "HAKU64-MODULE-REJECT-OK",
                 "HAKU64-MODULE-UNLOAD-OK", "HAKU64-LIBC-OK",
                 "HAKU64-SELFTEST-OK"]
+    if smp_cpus == 1:
+        # A uniprocessor run reports the two SMP scheduling tests as skipped,
+        # and the AP markers cannot appear at all.
+        required = [m for m in required if not m.startswith("HAKU64-SMP")]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():
@@ -756,6 +764,8 @@ def main():
     init_override = None
     expectations = []
     memory_mb = 512
+    smp_cpus = 2
+    smp_explicit = False
     busybox_path = None
     shell_command = None
     shell_check = False
@@ -793,9 +803,19 @@ def main():
                          "(the kernel clips its direct map at 1020 MiB)")
             memory_mb = int(value)
             continue
+        if flag.startswith("--smp="):
+            # The per-CPU scheduler is validated at the default two CPUs; the
+            # task table has sixteen slots and each CPU costs an idle task, so
+            # more than eight would not fit the kernel's own limit.
+            value = flag.split("=", 1)[1]
+            if not value.isdigit() or not 1 <= int(value) <= 8:
+                sys.exit("--smp=N takes 1..8 (the kernel's CPU limit)")
+            smp_cpus = int(value)
+            smp_explicit = True
+            continue
         if flag.startswith("-"):
             sys.exit(f"unknown flag: {flag} (use --arch=x64|i386, --fresh, "
-                     "--memory=MB, --init=PATH, --expect=MARKER, "
+                     "--memory=MB, --smp=N, --init=PATH, --expect=MARKER, "
                      "--busybox=PATH, --cmd=TEXT, --check)")
     fresh = "--fresh" in raw_args
     if len(positionals) > 1:
@@ -821,7 +841,7 @@ def main():
         sys.exit("--check only applies to `shell`")
 
     if mode == "x64":
-        build_x64(nasm, py, memory_mb, "headless")
+        build_x64(nasm, py, memory_mb, smp_cpus, "headless")
         return
 
     if mode in ("probe", "shell"):
@@ -830,8 +850,11 @@ def main():
                      "use --arch=i386")
         arch = "i386"
     if mode in ("build", "run", "headless") and arch == "x64":
-        build_x64(nasm, py, memory_mb, mode)
+        build_x64(nasm, py, memory_mb, smp_cpus, mode)
         return
+    if smp_explicit:
+        sys.exit("--smp=N only applies to the x86-64 image; the 32-bit "
+                 "scheduler runs every task on the bootstrap processor")
 
     cc, linker, toolchain = detect_toolchain()
     qemu = find_tool("qemu-system-i386",
