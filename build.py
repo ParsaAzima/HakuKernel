@@ -2,48 +2,52 @@
 """Haku build — one straightforward script, no shell-quoting games.
 
 Usage:
-    python build.py                 build haku.img only (data image preserved)
-    python build.py run             build + boot in a QEMU window
-    python build.py run --fresh     recreate the FAT12 data image, then boot
-    python build.py headless        fresh data image + boot headless, verify
-    python build.py x64             build haku64.img (64-bit kernel) and boot it
+    python build.py                 build haku64.img only (x86-64, no boot)
+    python build.py run             build + boot haku64.img in a QEMU window
+    python build.py headless        build + boot haku64.img headless, verify
+    python build.py x64             alias for the headless x86-64 check
+    python build.py ... --arch=i386 build/run the 32-bit kernel instead
     python build.py --memory=MB     guest RAM (default 512, max 1020)
     python build.py inspect ...     examine a FAT12 image (see --help there)
 
-Pipeline:
-    arch/x86/user/{user,child,fault,exec_target}.asm --nasm--> ELF files
-        --mkfat12--> haku_fs.img (fresh only)
-    kernel/**/*.c --cl--> kernel objects
-    + arch/x86/kernel/{entry,isr}.asm --nasm--> entry objects
-    kernel objects + entry objects --link--> kernel.pe --pe2bin--> kernel.bin
-    kernel/module/{demo,lib}/*.c + *.asm --cl/nasm--> module objects
-        --mkhakumod (ELF32 or COFF link)--> MODULE/HELLO/ROMFS.HKM
+    python build.py shell           busybox ash on the 32-bit kernel
+    python build.py probe --init=P --expect=M
+                                    run an ELF32 probe as /init (32-bit)
+    python build.py run --arch=i386 --fresh
+                                    recreate the 32-bit FAT12 data image first
+
+Pipeline (x86-64, the default):
+    kernel/arch/x86_64 C sources --cl--> x64 objects
+    + arch/x86_64/kernel/{entry64,isr64,ap_trampoline64}.asm --nasm-->
+    kernel64.pe --pe2bin--> kernel64.bin
+    kernel/module/{demo/x64demo.c,lib/*} --cl/nasm-->
+        x64 objects --mkhakumod (COFF/AMD64, container v2)--> X64MOD.HKM
     arch/x86/boot/stage1.asm --nasm--> stage1.bin (512 B)
     arch/x86/boot/stage2.asm --nasm (kernel entry + size from PE)--> stage2.bin
-    stage1 + stage2 + kernel.bin --mkimg--> haku.img (boot floppy)
-    QEMU boots haku.img and attaches haku_fs.img as primary-master ATA disk,
-    plus a generated spare disk on the secondary channel for device scanning
+    stage1 + stage2 + kernel64.bin --mkimg--> haku64.img
+    QEMU boots haku64.img and attaches build/haku64_fs.img as the
+    primary-master ATA disk, then verifies the volume after QEMU exits.
 
-`python build.py x64` is a separate pipeline: entry64.asm, isr64.asm and the
-kernel/arch/x86_64 C sources are compiled for x86-64, linked as a PE32+
-image, and booted from the same stage1/stage2 floppy as haku64.img. It also
-builds a fresh FAT12 seed disk (build/haku64_fs.img) with the shared ATA
-driver and filesystem sources, attaches it as the primary-master IDE disk,
-and verifies the volume after QEMU exits. It shares nothing with the i386
-link line, so neither target can break the other.
+The 32-bit pipeline (`--arch=i386`, `shell`, `probe`) builds haku.img from
+kernel/**/*.c and arch/x86, and attaches build/haku_fs.img plus a generated
+spare disk on the secondary channel. It remains the one with the user C
+library, busybox and the shell. `python build.py x64` is kept as an alias for
+the x64 headless check; it shares nothing with the i386 link line.
 
-The data image (build/haku_fs.img) is user data: an existing image is
+The 32-bit data image (build/haku_fs.img) is user data: an existing image is
 reused as-is so files from previous QEMU sessions survive the build, and
 it is recreated only when missing or with --fresh. headless always starts
 from a fresh image — its fault-injection tests need pristine state — and
-verifies the disk again after QEMU exits (tools/lsfat12.py --check).
+verifies the disk again after QEMU exits (tools/lsfat12.py --check). The x64
+seed disk is rebuilt on every run because the kernel writes NOTE.TXT into it.
 
 All tools are invoked with argument lists (never through cmd.exe), so paths
 with spaces just work. The C compiler and linker are the only host-specific
-piece: Windows uses VS2022's 32-bit cl.exe + link.exe, while other platforms
-use clang-cl + lld-link. Both accept the identical MSVC-style switches
-(/c, /Fo, /ENTRY, /ALIGN, /NODEFAULTLIB ...) and both emit 32-bit COFF/PE, so
-only tool discovery differs.
+piece: Windows uses VS2022's cl.exe + link.exe for both targets, while other
+platforms use clang-cl + lld-link. Both accept the identical MSVC-style
+switches (/c, /Fo, /ENTRY, /ALIGN, /NODEFAULTLIB ...); the architecture comes
+from the tool (x86 vs x64 cl.exe) or --target (clang-cl), so only tool
+discovery differs.
 """
 
 import glob
@@ -362,14 +366,15 @@ def build_shell_image(py, user_elf, busybox, command):
     return image
 
 
-def build_x64_fs(py, image, exec_elf):
-    """Seed the x86-64 data disk: three files the kernel reads at boot.
+def build_x64_fs(py, image, exec_elf, module_image):
+    """Seed the x86-64 data disk: four files the kernel reads at boot.
 
     HELLO.TXT carries the 16-byte marker the ELF64 self-test prints,
     PATTERN.BIN is three pages so a file mapping and a multi-page read both
-    have data on every page, and USER.ELF is the program the test execs from
+    have data on every page, USER.ELF is the program the test execs from
     the disk (the kernel image does not contain it, so running it proves the
-    exec path). The pattern is the same (offset*37+11) & 0xFF formula
+    exec path), and X64MOD.HKM is the packed module the loader test reads and
+    relocates. The pattern is the same (offset*37+11) & 0xFF formula
     boot64.c uses to verify it. The image is rebuilt on every x64 run because
     the kernel also creates /TMP and writes NOTE.TXT into it.
     """
@@ -384,21 +389,24 @@ def build_x64_fs(py, image, exec_elf):
 
     run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
-         f"USER.ELF={exec_elf}"])
+         f"USER.ELF={exec_elf}", f"X64MOD.HKM={module_image}"])
     log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes)")
 
 
-def build_x64(nasm, py, memory_mb):
-    """Build and boot haku64.img: the same floppy, with a 64-bit kernel.
+def build_x64(nasm, py, memory_mb, mode):
+    """Build haku64.img, then boot it when `mode` asks for a run.
 
     The entry path, memory subsystem, interrupts, per-process address
     spaces, the scheduler, ring-3 entry, the six-argument syscall ABI, the
-    ELF64 loader and a FAT12 disk (the same ATA driver and filesystem the
-    32-bit kernel uses, behind a small compatibility layer) are all 64-bit.
-    The 32-bit kernel is untouched and remains the default image.
+    ELF64 loader, a FAT12 disk (the same ATA driver and filesystem the
+    32-bit kernel uses, behind a small compatibility layer) and the module
+    loader are all 64-bit. `mode` is "build" (compile and lay out the
+    images), "run" (boot with a QEMU window) or "headless" (boot, capture
+    the serial log and assert the marker list).
     """
     cc, linker, label = find_x64_toolchain()
     log(f"x64 toolchain: {label}")
+    verify_abi_headers(os.path.join(ROOT, "include"))
 
     arch32 = os.path.join(ROOT, "kernel", "arch", "x86")
     arch64 = os.path.join(ROOT, "kernel", "arch", "x86_64")
@@ -434,6 +442,8 @@ def build_x64(nasm, py, memory_mb):
     #    instead of growing a second disk stack.
     include_dirs = [os.path.join(arch64, "kernel"), os.path.join(arch64, "mm"),
                     os.path.join(arch64, "compat"),
+                    os.path.join(ROOT, "include"),
+                    os.path.join(ROOT, "kernel", "module"),
                     os.path.join(ROOT, "kernel", "drivers"),
                     os.path.join(ROOT, "kernel", "fs", "fat12")]
     sources = sorted(glob.glob(os.path.join(arch64, "**", "*.c"),
@@ -456,6 +466,31 @@ def build_x64(nasm, py, memory_mb):
             + ["/Fo" + obj, src])
         objects.append(obj)
     log(f"{len(objects)} x64 C objects built")
+
+    # 1b. the module ABI for x86-64. Same libhakumod source as the 32-bit
+    #     build, but the runtime that supplies __chkstk is the 64-bit one and
+    #     the packer writes a version 2 container whose relocations fit the
+    #     amd64 COFF MSVC emits. X64MOD.HKM is seeded on the disk below, not
+    #     linked into the kernel, so loading it proves the on-disk path too.
+    module_dir = os.path.join(ROOT, "kernel", "module")
+    module_lib_dir = os.path.join(module_dir, "lib")
+    module_flags = (["/nologo", "/c", "/GS-", "/Zl", "/Os", "/Gy", "/W3"]
+                    + ["/I" + os.path.join(ROOT, "include"),
+                       "/I" + module_dir, "/I" + os.path.join(arch64, "compat")])
+    x64_modlib = os.path.join(BUILD, "x64_modlib.obj")
+    run(cc + module_flags +
+        ["/Fo" + x64_modlib, os.path.join(module_lib_dir, "module_lib.c")])
+    x64_modruntime = os.path.join(BUILD, "x64_modruntime.obj")
+    run([nasm, "-f", "win64",
+         os.path.join(module_lib_dir, "runtime64.asm"), "-o", x64_modruntime])
+    x64_demo = os.path.join(BUILD, "x64_demo.obj")
+    run(cc + module_flags +
+        ["/Fo" + x64_demo, os.path.join(module_dir, "demo", "x64demo.c")])
+    x64_module_image = os.path.join(BUILD, "X64MOD.HKM")
+    run([py, os.path.join(ROOT, "tools", "mkhakumod.py"),
+         x64_demo, x64_modlib, x64_modruntime, x64_module_image,
+         "--name", "HAKU-X64"])
+    log("libhakumod built for x86-64 (modlib + runtime64), X64MOD.HKM packed")
 
     # 2. the ring-3 test program: flat binary -> static ELF64 -> embedded
     #    .rdata object. The program outgrew one code page, so it carries its
@@ -510,23 +545,34 @@ def build_x64(nasm, py, memory_mb):
     # 4. a fresh FAT12 volume for the disk filesystem test. The kernel
     #    creates /TMP and writes NOTE.TXT during the run, so the seed files
     #    are rebuilt every time rather than reused.
-    build_x64_fs(py, fs_img, exec_elf)
+    build_x64_fs(py, fs_img, exec_elf, x64_module_image)
 
-    # 5. boot it. qemu-system-i386 refuses long mode without a 64-bit CPU
-    #    model, so this mode uses the x86_64 binary. writethrough keeps the
-    #    guest's disk writes in the host file when QEMU is killed.
+    # 5. boot it when asked. qemu-system-i386 refuses long mode without a
+    #    64-bit CPU model, so every x64 boot uses the x86_64 binary;
+    #    writethrough keeps the guest's disk writes in the host file when
+    #    QEMU is killed.
     qemu = find_tool("qemu-system-x86_64",
                      [r"C:\Program Files\qemu\qemu-system-x86_64.exe"], "QEMU")
+    base = [qemu, "-m", str(memory_mb), "-cpu", "qemu64",
+            "-smp", "2",
+            "-drive", f"file={img},format=raw,if=floppy,index=0",
+            "-drive", f"file={fs_img},format=raw,if=ide,"
+                      "index=0,media=disk,cache=writethrough",
+            "-boot", "order=a", "-no-reboot"]
+    if mode == "build":
+        log("x64 build ready: haku64.img + build/haku64_fs.img (not booted)")
+        return
+    if mode == "run":
+        log("Booting Haku x86-64 in QEMU (close the window to return)...")
+        subprocess.run(base)
+        return
+
     if os.path.exists(serial):
         os.remove(serial)
-    proc = subprocess.Popen([qemu, "-m", str(memory_mb), "-cpu", "qemu64",
-                             "-smp", "2",
-                             "-drive", f"file={img},format=raw,if=floppy,index=0",
-                             "-drive", f"file={fs_img},format=raw,if=ide,"
-                                       "index=0,media=disk,cache=writethrough",
-                             "-boot", "order=a", "-no-reboot",
-                             "-display", "none", "-serial", f"file:{serial}"])
-    reached = wait_for_serial(serial, "HAKU64-SELFTEST-OK", 30.0)
+    proc = subprocess.Popen(base + ["-display", "none",
+                                    "-serial", f"file:{serial}"])
+    reached = wait_for_serial(serial, "HAKU64-SELFTEST-OK",
+                              float(os.environ.get("HAKU_X64_TIMEOUT", "60")))
     proc.kill()
     proc.wait()
     with open(serial, errors="replace") as f:
@@ -546,7 +592,10 @@ def build_x64(nasm, py, memory_mb):
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
                 "HAKU64-COW-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",
-                "HAKU64-THREAD-OK", "HAKU64-PORT-OK", "HAKU64-SELFTEST-OK"]
+                "HAKU64-THREAD-OK", "HAKU64-PORT-OK",
+                "HAKU64-MODULE-OK", "HAKU64-MODULE-LIB-OK",
+                "HAKU64-MODULE-LOAD-OK", "HAKU64-MODULE-REJECT-OK",
+                "HAKU64-MODULE-UNLOAD-OK", "HAKU64-SELFTEST-OK"]
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():
@@ -608,27 +657,19 @@ def main():
         os.path.join(os.environ.get("LOCALAPPDATA", ""), r"bin\NASM\nasm.exe"),
         r"C:\Program Files\NASM\nasm.exe",
     ], "NASM  [winget install NASM.NASM]")
-    cc, linker, toolchain = detect_toolchain()
     py = sys.executable
-    qemu = find_tool("qemu-system-i386",
-                     [r"C:\Program Files\qemu\qemu-system-i386.exe"], "QEMU")
     log(f"NASM: {nasm}")
-    log(f"CC:   {' '.join(cc)}")
-    log(f"LINK: {' '.join(linker)}")
-    log(f"toolchain: {toolchain}")
-
-    # clang-cl inherits MSVC's /arch:SSE2 default and uses SSE2 for
-    # constant-size memory operations; MSVC keeps integer code scalar but
-    # may still emit SSE2 for other patterns. Haku never sets CR4.OSFXSR, so
-    # an SSE instruction faults with #UD at ring 0 and ring 3, and the kernel
-    # does not save XMM state across a task switch either. Build i386 objects
-    # for a CPU without vector registers, on both toolchains.
-    no_sse = (["/arch:IA32"] if toolchain.startswith("MSVC")
-              else ["-mno-sse", "-mno-sse2", "-mno-mmx"])
 
     raw_args = sys.argv[1:]
     positionals = [a for a in raw_args if not a.startswith("-")]
     mode = positionals[0] if positionals else "build"
+
+    # x86-64 is the primary image. --arch=i386 selects the original
+    # 32-bit pipeline, which still owns the shell, the user C library and the
+    # probes; those modes force it because their userland does not exist on
+    # the 64-bit side yet.
+    arch = "x64"
+    arch_explicit = False
 
     if mode == "inspect":
         # Read-only forensics: needs no toolchain, never builds anything.
@@ -664,6 +705,13 @@ def main():
         if flag.startswith("--expect="):
             expectations.append(flag.split("=", 1)[1])
             continue
+        if flag.startswith("--arch="):
+            value = flag.split("=", 1)[1]
+            if value not in ("x64", "i386"):
+                sys.exit("--arch takes x64 or i386")
+            arch = value
+            arch_explicit = True
+            continue
         if flag.startswith("--memory="):
             # The kernel sizes its direct map and frame pool from E820, so
             # the guest RAM is what it actually gets to use.
@@ -674,9 +722,9 @@ def main():
             memory_mb = int(value)
             continue
         if flag.startswith("-"):
-            sys.exit(f"unknown flag: {flag} (use --fresh, --memory=MB, "
-                     "--init=PATH, --expect=MARKER, --busybox=PATH, "
-                     "--cmd=TEXT, --check)")
+            sys.exit(f"unknown flag: {flag} (use --arch=x64|i386, --fresh, "
+                     "--memory=MB, --init=PATH, --expect=MARKER, "
+                     "--busybox=PATH, --cmd=TEXT, --check)")
     fresh = "--fresh" in raw_args
     if len(positionals) > 1:
         sys.exit(f"unexpected argument: {positionals[1]}")
@@ -701,8 +749,33 @@ def main():
         sys.exit("--check only applies to `shell`")
 
     if mode == "x64":
-        build_x64(nasm, py, memory_mb)
+        build_x64(nasm, py, memory_mb, "headless")
         return
+
+    if mode in ("probe", "shell"):
+        if arch_explicit and arch != "i386":
+            sys.exit("`probe` and `shell` run the 32-bit userland; "
+                     "use --arch=i386")
+        arch = "i386"
+    if mode in ("build", "run", "headless") and arch == "x64":
+        build_x64(nasm, py, memory_mb, mode)
+        return
+
+    cc, linker, toolchain = detect_toolchain()
+    qemu = find_tool("qemu-system-i386",
+                     [r"C:\Program Files\qemu\qemu-system-i386.exe"], "QEMU")
+    log(f"CC:   {' '.join(cc)}")
+    log(f"LINK: {' '.join(linker)}")
+    log(f"toolchain: {toolchain}")
+
+    # clang-cl inherits MSVC's /arch:SSE2 default and uses SSE2 for
+    # constant-size memory operations; MSVC keeps integer code scalar but
+    # may still emit SSE2 for other patterns. Haku never sets CR4.OSFXSR, so
+    # an SSE instruction faults with #UD at ring 0 and ring 3, and the kernel
+    # does not save XMM state across a task switch either. Build i386 objects
+    # for a CPU without vector registers, on both toolchains.
+    no_sse = (["/arch:IA32"] if toolchain.startswith("MSVC")
+              else ["-mno-sse", "-mno-sse2", "-mno-mmx"])
 
     kernel_dir = os.path.join(ROOT, "kernel")
     arch_dir = os.path.join(kernel_dir, "arch", "x86")
@@ -1231,7 +1304,8 @@ def main():
             sys.exit("HEADLESS CHECK FAILED: " + "; ".join(failures))
     elif mode != "build":
         sys.exit(f"unknown mode: {mode} "
-                 f"(use: build | run [--fresh] | headless | inspect [...])")
+                 f"(use: build | run [--fresh] | headless | shell | probe | "
+                 f"x64 | inspect [...]; --arch=i386 for the 32-bit kernel)")
 
 
 if __name__ == "__main__":
