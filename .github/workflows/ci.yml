@@ -18,6 +18,7 @@ env:
   # runners need more slack than a local workstation.
   HAKU_BOOT_DELAY: "3"
   HAKU_HEADLESS_TIMEOUT: "60"
+  HAKU_X64_TIMEOUT: "90"
 
 jobs:
   headless:
@@ -45,9 +46,13 @@ jobs:
           clang --version
           lld-link --version
           qemu-system-i386 --version
+          qemu-system-x86_64 --version
 
-      - name: Build and run headless tests
+      - name: Build and run the x86-64 headless test
         run: python build.py headless
+
+      - name: Build and run the 32-bit headless test
+        run: python build.py headless --arch=i386
 
       - name: Upload boot artifacts
         if: always()
@@ -55,6 +60,9 @@ jobs:
         with:
           name: haku-boot-${{ github.run_id }}
           path: |
+            haku64.img
+            build/haku64_fs.img
+            build/serial64.log
             haku.img
             build/haku_fs.img
             build/serial.log

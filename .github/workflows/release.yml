@@ -10,6 +10,7 @@ permissions:
 env:
   HAKU_BOOT_DELAY: "3"
   HAKU_HEADLESS_TIMEOUT: "60"
+  HAKU_X64_TIMEOUT: "90"
 
 jobs:
   release:
@@ -31,20 +32,26 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             nasm clang lld qemu-system-x86
 
-      - name: Build and run headless tests
+      - name: Build and run the x86-64 headless test
         run: python build.py headless
 
-      - name: Rebuild a pristine data image
+      - name: Build and run the 32-bit headless test
+        run: python build.py headless --arch=i386
+
+      - name: Rebuild pristine data images
         run: |
-          rm -f build/haku_fs.img
+          rm -f build/haku64_fs.img build/haku_fs.img
           python build.py
+          python build.py --arch=i386
 
       - name: Package release
         run: |
           set -euo pipefail
           mkdir -p package
-          cp haku.img README.md LICENSE build/haku_fs.img package/
-          (cd package && sha256sum haku.img haku_fs.img > SHA256SUMS.txt)
+          cp haku64.img build/haku64_fs.img haku.img build/haku_fs.img \
+             README.md LICENSE package/
+          (cd package && sha256sum haku64.img haku64_fs.img haku.img \
+             haku_fs.img > SHA256SUMS.txt)
           (cd package && zip -q -r "../Haku-${GITHUB_REF_NAME}.zip" .)
 
       - name: Publish release
