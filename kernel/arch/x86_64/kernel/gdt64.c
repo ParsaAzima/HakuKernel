@@ -32,10 +32,6 @@ static u64 gdt[GDT_ENTRIES];
 static table_desc64_t gdtr;
 static tss64_t tss;
 
-/* Kept equal to tss.rsp0: the SYSCALL entry stub has no kernel stack yet
- * when it starts, so isr64.asm loads RSP from this global. */
-u64 gdt64_rsp0_value;
-
 /* .bss, and part of the flat image: 28 KiB total, which the 448 KiB load
  * window at 0x10000 has plenty of room for. */
 static __declspec(align(16)) u8 ist_double_fault[8192];
@@ -76,7 +72,6 @@ void gdt64_init(void) {
 
     memset(&tss, 0, sizeof(tss));
     tss.rsp0 = (u64)(ring0_stack + sizeof(ring0_stack));
-    gdt64_rsp0_value = tss.rsp0;
     tss.ist[0] = (u64)(ist_double_fault + sizeof(ist_double_fault));
     tss.ist[1] = (u64)(ist_nmi + sizeof(ist_nmi));
     /* An I/O map base past the limit means "no bitmap": every port is
@@ -102,10 +97,10 @@ u64 gdt64_ist_top(u32 index) {
 }
 
 /* RSP0 is what the CPU loads when a ring-3 trap enters the kernel, so the
- * scheduler must repoint it at the task it is about to run. */
+ * scheduler must repoint it at the task it is about to run. This is the
+ * bootstrap processor's TSS; gdt64_set_rsp0_cpu dispatches per CPU. */
 void gdt64_set_rsp0(u64 top) {
     tss.rsp0 = top;
-    gdt64_rsp0_value = top;
 }
 
 u64 gdt64_rsp0(void) {
@@ -116,8 +111,9 @@ u64 gdt64_rsp0(void) {
  * A TSS is a single object, so every CPU needs its own. The table, the TSS
  * and the two IST stacks come from the frame allocator and are reached
  * through the physmap, which every address space shares. Preparation runs on
- * the bootstrap processor (the allocator is not cross-CPU safe yet);
- * loading runs on the AP itself. */
+ * the bootstrap processor before that AP is released, and loading runs on the
+ * AP itself; the split means the AP's first instructions only load what
+ * already exists. */
 typedef struct {
     u64 *table;
     tss64_t *tss;
@@ -189,4 +185,16 @@ int gdt64_load_ap(u32 cpu) {
 u64 gdt64_ap_rsp0(u32 cpu) {
     if (cpu >= K64_SMP_MAX_CPUS || !ap_tables[cpu].ready) return 0;
     return ap_tables[cpu].tss->rsp0;
+}
+
+/* The scheduler's per-CPU half of gdt64_set_rsp0: each CPU has its own TSS,
+ * so a ring-3 entry on that CPU lands on the running task's kernel stack
+ * instead of whatever the last CPU to switch happened to leave behind. */
+void gdt64_set_rsp0_cpu(u32 cpu, u64 top) {
+    if (cpu == 0) {
+        tss.rsp0 = top;
+        return;
+    }
+    if (cpu < K64_SMP_MAX_CPUS && ap_tables[cpu].ready)
+        ap_tables[cpu].tss->rsp0 = top;
 }

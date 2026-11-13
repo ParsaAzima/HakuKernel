@@ -138,6 +138,19 @@ typedef signed long long s64;
 #define K64_IRQ_COUNT   16u
 #define K64_SYSCALL_VECTOR 0x80u
 
+/* The three local-APIC vectors the per-CPU scheduler uses. They sit above
+ * the 8259's remapped 0x20..0x2F block so the PIC wiring is untouched. */
+#define K64_VEC_LAPIC_TIMER 0x40u
+#define K64_VEC_RESCHED     0x41u
+#define K64_VEC_TLB         0x42u
+
+/* Model-specific registers reached through read_msr64/write_msr64. GS.base
+ * holds the per-CPU block while the kernel runs and 0 in ring 3, so a
+ * SWAPGS on every privilege transition is what makes gs:[offset] mean "this
+ * CPU" (see percpu64.c). */
+#define K64_MSR_GS_BASE        0xC0000101u
+#define K64_MSR_KERNEL_GS_BASE 0xC0000102u
+
 /* System calls enter through SYSCALL: the CPU switches to the kernel code
  * and stack selectors from STAR, saves RIP in RCX and RFLAGS in R11, and
  * FMASK clears TF/DF/IF/AC. isr64.asm builds the same regs64_t frame the
@@ -380,6 +393,74 @@ typedef struct {
     u64 rip, cs, rflags, rsp, ss;
 } regs64_t;
 
+/* ------------------------------------------------------------- per-CPU block
+ * One of these per processor, reached through GS after a SWAPGS. The first
+ * three fields have fixed offsets because isr64.asm reads them with no help
+ * from the compiler:
+ *
+ *   +0   self      the block's own address, so gs:[0] is a plain pointer
+ *   +8   rsp0      kernel stack top the SYSCALL stub switches to
+ *   +16  user_rsp  scratch for the user stack pointer during that switch
+ *
+ * percpu64_offsets_ok() compares offsets (8, 16) with the constants in the
+ * assembly, so a reordering that broke them fails the boot test instead of
+ * corrupting a system call. Everything after +24 is ordinary kernel state.
+ *
+ * The block is 64-byte aligned and padded to 128 bytes: two adjacent CPUs
+ * never share a cache line, so `ticks` on one CPU does not invalidate the
+ * other's `current`. */
+typedef struct k64_percpu {
+    u64 self;
+    u64 rsp0;
+    u64 user_rsp;
+    u32 index;        /* 0 for the bootstrap processor */
+    u32 apic_id;      /* local APIC id, for IPIs */
+    u32 current;      /* task slot running here, (u32)-1 before scheduling */
+    u32 idle;         /* this CPU's idle task slot, (u32)-1 before it exists */
+    volatile u32 online;
+    u32 pad0;
+    u64 ticks;        /* local timer ticks delivered to this CPU */
+    u64 switches;     /* context switches taken by this CPU */
+    u64 active_space; /* PML4 physical address currently in CR3 */
+    volatile u32 tlb_ack;    /* shootdown round this CPU has completed */
+    volatile u32 tlb_target; /* round it was asked to complete */
+    u64 flushes;      /* TLB flushes this CPU performed for another */
+    u32 cursor;       /* last task slot this CPU dispatched (round robin) */
+    u32 pad1;
+    u8 pad2[32];
+} k64_percpu_t;
+
+/* A test-and-set lock that also owns interrupts. `flags` is the caller's
+ * RFLAGS from before the acquisition: unlocking restores them, so the lock
+ * nests inside interrupt-disabled code and re-enables interrupts only for
+ * the context that had them on. Two CPUs can contend; the same CPU cannot
+ * deadlock itself, because the holder never gets preempted with the lock
+ * held. */
+typedef struct {
+    volatile u32 locked;
+} spinlock64_t;
+
+#define SPINLOCK64_INIT { 0u }
+u64 spin64_lock(spinlock64_t *lock);
+void spin64_unlock(spinlock64_t *lock, u64 flags);
+
+/* percpu64.c. K64_SMP_MAX_CPUS bounds the per-CPU array, the AP descriptor
+ * tables and the task affinity field; eight slots is the smallest power of
+ * two that leaves room for the two such a QEMU run brings up plus the
+ * workers the scheduling test pins to them.
+ *
+ * The blocks are reached through a pointer rather than a plain array because
+ * they have to be cache-line aligned (see the layout comment above) and the
+ * kernel image is linked with /ALIGN:16, which rejects a 64-byte-aligned
+ * section; percpu64.c aligns the storage once at the first install. */
+#define K64_SMP_MAX_CPUS 8u
+extern k64_percpu_t *cpus64;
+void percpu64_init_bsp(u32 apic_id);
+void percpu64_init_ap(u32 index, u32 apic_id);
+void percpu64_set_apic_id(u32 index, u32 apic_id);
+u32 k64_cpu_index(void);
+int percpu64_offsets_ok(void);
+
 #pragma pack(push, 1)
 typedef struct {
     u16 offset_low;
@@ -448,6 +529,21 @@ extern u8 probe_load64_fault[];
 extern u8 probe_load64_resume[];
 extern u8 probe_div64_fault[];
 extern u8 probe_div64_resume[];
+
+/* Per-CPU state, MSR access and the two flag helpers. These are the only
+ * instructions MSVC cannot emit, so everything else about the per-CPU block
+ * is ordinary C. */
+k64_percpu_t *k64_cpu(void);
+u64 read_msr64(u32 msr);
+void write_msr64(u32 msr, u64 value);
+u64 read_rflags64(void);
+void write_rflags64(u64 flags);
+/* Unwind into a saved frame instead of returning to the caller; used to
+ * start an application processor's first task. Does not come back. */
+void isr64_resume64(regs64_t *frame);
+/* (rsp0 offset << 32) | user_rsp offset, so C can cross-check the layout the
+ * assembly hardcodes. */
+u64 isr64_percpu_offsets(void);
 
 /* Freestanding string/memory primitives: the compiler is allowed to emit
  * calls to these even with /Zl, so they must exist. */
@@ -611,9 +707,9 @@ u64 gdt64_tss_base(void);
 u64 gdt64_ist_top(u32 index);
 void gdt64_set_rsp0(u64 top);
 u64 gdt64_rsp0(void);
-/* Mirror of TSS.RSP0 that the SYSCALL entry stub loads before it has a
- * kernel stack. gdt64_set_rsp0 keeps it in step. */
-extern u64 gdt64_rsp0_value;
+/* Per-CPU RSP0: a ring-3 entry on `cpu` must land on the kernel stack of the
+ * task that CPU is running, so the scheduler calls this on every switch. */
+void gdt64_set_rsp0_cpu(u32 cpu, u64 top);
 
 /* task64.c: tasks and the preemptive round-robin scheduler.
  *
@@ -622,7 +718,12 @@ extern u64 gdt64_rsp0_value;
  * isr64_dispatch". New tasks start from a frame assembled on their own
  * kernel stack; a user task's frame carries CS=0x23/SS=0x1B and is
  * entered with IRETQ from the same path. */
-#define K64_TASK_MAX        8u
+/* 16 slots: the boot tests leak the slots of the tasks they finish (nothing
+ * reaps them), and every application processor now owns an idle task, so the
+ * eight slots the uniprocessor port needed no longer cover a test run. The
+ * static cost is about 1 KiB per slot, all of it per-task bookkeeping rather
+ * than stacks, which are allocated on demand. */
+#define K64_TASK_MAX        16u
 #define K64_TASK_STACK_SIZE 16384ull
 
 enum {
@@ -637,6 +738,15 @@ enum {
 
 void sched64_init(void);
 int task64_create_kernel(void (*entry)(void));
+/* Create a kernel task pinned to `cpu`. Affinity is explicit and fixed:
+ * nothing migrates a task, so a worker started on an AP stays there even if
+ * that AP is busy. Returns the slot or -1. */
+int task64_create_kernel_on(u32 cpu, void (*entry)(void));
+/* Build the idle task for `cpu` on the bootstrap processor. Returns its slot
+ * or -1. Called once per AP by smp64_release_aps(). */
+int sched64_prepare_ap(u32 cpu);
+/* Enter `cpu`'s idle task; runs on the AP and does not return. */
+void sched64_start_ap(u32 cpu);
 int task64_create_user(u64 entry, u64 user_stack_top, u64 space);
 regs64_t *sched64_tick(regs64_t *frame);
 regs64_t *sched64_exit(regs64_t *frame);
@@ -800,21 +910,39 @@ void pic64_set_mask(u8 irq);
 void pic64_clear_mask(u8 irq);
 void pic64_send_eoi(u8 irq);
 
-/* timer64.c: PIT on IRQ0 */
+/* timer64.c: PIT on IRQ0 for the bootstrap processor, local-APIC timer for
+ * the application processors. */
 void timer64_init(u32 hz);
 void timer64_tick(void);
 u64 timer64_ticks(void);
 u32 timer64_hz(void);
+/* Measure the local APIC timer against the PIT tick counter once, on the
+ * bootstrap processor with interrupts enabled. Returns counts/second. */
+u32 timer64_lapic_calibrate(void);
+u32 timer64_lapic_counts_per_sec(void);
+/* Start the periodic local-APIC timer on the calling CPU. */
+void timer64_lapic_start_local(void);
 
-/* smp64.c: ACPI + local APIC discovery and AP bring-up. Stage B keeps the
- * bootstrap processor as the only scheduling CPU; the APs come online and
- * park with interrupts off. Returns the online CPU count (1 when the
- * machine stayed uniprocessor). */
-#define K64_SMP_MAX_CPUS 8u
+/* smp64.c: ACPI + local APIC discovery, AP bring-up, IPIs and TLB shootdown.
+ * The APs come online parked; smp64_release_aps() hands them their idle task
+ * and lets the per-CPU scheduler take over. Returns the online CPU count (1
+ * when the machine stayed uniprocessor). */
 int smp64_init(void);
 u32 smp64_cpu_count(void);
 /* Entry point the long-mode trampoline calls on the AP. */
 void smp64_ap_entry(u64 cpu);
+/* Start scheduling on every AP: build its idle task on the bootstrap
+ * processor, then let the APs enter it. Called after sched64_init(). */
+int smp64_release_aps(void);
+/* Ask `cpu` to reschedule now (no-op for the caller's own CPU). */
+void smp64_resched_cpu(u32 cpu);
+/* Flush `space` from the TLB of every other CPU that could have it cached.
+ * 0 means "every online CPU", which is what a full space teardown wants.
+ * Returns the number of CPUs addressed. */
+u32 smp64_tlb_shootdown(u64 space);
+u32 smp64_tlb_timeouts(void);
+/* The K64_VEC_TLB handler body: flush this CPU and acknowledge. */
+void smp64_tlb_ipi(void);
 /* From isr64.asm: set APICBASE.EN in IA32_APIC_BASE. */
 void apic_msr_enable64(void);
 /* From isr64.asm: atomic exchange, returns the previous word. */

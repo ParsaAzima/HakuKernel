@@ -50,14 +50,28 @@ global probe_div64
 global probe_div64_fault
 global probe_div64_resume
 
+global k64_cpu
+global read_msr64
+global write_msr64
+global read_rflags64
+global write_rflags64
+global isr64_resume64
+global isr64_percpu_offsets
+
 extern isr64_dispatch
 extern sys64_dispatch
-extern gdt64_rsp0_value
 
 ; User selectors the SYSCALL stub writes into the frame it builds. They
 ; must match K64_USER_CS/K64_USER_DS in haku64.h, including RPL 3.
 %define USER_CS 0x23
 %define USER_SS 0x1B
+
+; Offsets inside k64_percpu_t that this file reads through GS. haku64.h
+; documents the layout and percpu64_offsets_ok() cross-checks these two
+; constants at boot, because a reordering there would silently switch a
+; system call onto the wrong stack.
+%define CPU_RSP0      8
+%define CPU_USER_RSP  16
 
 section .text
 
@@ -150,8 +164,25 @@ isr64_default:
     push qword 0xFF
     jmp isr64_common
 
+; Vectors the local APIC delivers: the per-CPU timer and the two IPIs. They
+; use the same frame as everything else, so a tick can preempt a task through
+; exactly the path IRQ0 uses.
+ISR_NOERR 64
+ISR_NOERR 65
+ISR_NOERR 66
+
 ; ------------------------------------------------------------- common path
 isr64_common:
+    ; A trap from ring 3 arrives with the *user* GS base, because entering
+    ; the kernel does not switch it. The per-CPU block is only reachable
+    ; after SWAPGS, and a trap from ring 0 (which is already running with it
+    ; loaded) must not swap. The frame's CS sits 24 bytes above RSP until
+    ; the general registers are pushed, and 144 bytes above once they are.
+    test byte [rsp + 24], 3
+    jz .same_ring
+    swapgs
+.same_ring:
+
     push rax
     push rbx
     push rcx
@@ -181,6 +212,8 @@ isr64_common:
     mov rsp, rbp
 
 ; Shared tail: RSP points at a regs64_t and IRETQ consumes its CPU frame.
+; Resuming a ring-3 frame has to hand GS back to the user value, mirroring
+; the entry swap; a ring-0 frame keeps the per-CPU block loaded.
 isr64_restore:
     pop r15
     pop r14
@@ -198,7 +231,19 @@ isr64_restore:
     pop rbx
     pop rax
     add rsp, 16                  ; vector + error code
+    test byte [rsp + 8], 3       ; frame->cs
+    jz .kernel_frame
+    swapgs
+.kernel_frame:
     iretq
+
+; void isr64_resume64(regs64_t *frame)   [Microsoft x64: frame in RCX]
+; Unwind into `frame` instead of returning. An application processor starts
+; its first task this way: there is no interrupted context to return to, so
+; it adopts the created frame as if it had been preempted there.
+isr64_resume64:
+    mov rsp, rcx
+    jmp isr64_restore
 
 ; ------------------------------------------------------- SYSCALL and SYSRET
 ; void syscall64_setup(u64 star, u64 lstar, u64 fmask)
@@ -232,23 +277,28 @@ syscall64_setup:
 
 ; SYSCALL entry. On arrival RCX holds the user RIP, R11 the user RFLAGS,
 ; RSP is still the user stack, and CS/SS already name the kernel segments.
-; This port keeps no per-CPU GS state, so no SWAPGS is involved.
+; SYSCALL does not switch GS, so the first thing the stub does is SWAPGS:
+; after it, gs:[K64_CPU_RSP0] is this CPU's kernel stack top and
+; gs:[K64_CPU_USER_RSP] is scratch for the user stack pointer. Both live in
+; the per-CPU block, which is what makes two CPUs taking a system call at the
+; same time independent.
 ;
 ; The handler wants the same regs64_t frame every interrupt builds, so the
-; stub manufactures one on the task's kernel stack (TSS.RSP0). The frame
+; stub manufactures one on the task's kernel stack (RSP0). The frame
 ; records vector 0x80 and the user selectors, which is what the C dispatcher
 ; already tests with `cs & 3`. Returning to ring 3 uses SYSRET: RCX/R11 are
 ; overwritten anyway by the SYSCALL ABI, so the values SYSRET needs are
 ; already where it wants them after the frame is popped.
 global syscall64_entry
 syscall64_entry:
-    mov [rel syscall64_user_rsp], rsp
-    mov rsp, [rel gdt64_rsp0_value]
+    swapgs
+    mov [gs:CPU_USER_RSP], rsp
+    mov rsp, [gs:CPU_RSP0]
     test rsp, rsp
     jz .no_stack
 
     push qword USER_SS
-    push qword [rel syscall64_user_rsp]
+    push qword [gs:CPU_USER_RSP]
     push r11                     ; user RFLAGS
     push qword USER_CS
     push rcx                     ; user RIP
@@ -301,6 +351,7 @@ syscall64_entry:
     mov rcx, [rsp]               ; user RIP
     mov r11, [rsp + 16]          ; user RFLAGS
     mov rsp, [rsp + 24]          ; user RSP
+    swapgs                       ; entry swapped in; hand GS back to ring 3
     o64 sysret                   ; 48 0F 07: SYSRETQ, returns in long mode
 
 .no_stack:
@@ -308,13 +359,6 @@ syscall64_entry:
 .hang:
     hlt
     jmp .hang
-
-section .data
-; Scratch for the user RSP between SYSCALL entry and the stack switch. One
-; CPU, interrupts masked on entry, and no nested syscall, so a single slot
-; is enough.
-syscall64_user_rsp: dq 0
-section .text
 
 
 ; ------------------------------------------------------------- primitives
@@ -332,14 +376,20 @@ isr64_load_idt:
 ; qemu64 model the test harness boots; it buys nothing, so it is not here.
 ; The constraint this leaves is that index 1 must stay the kernel code
 ; descriptor, which gdt64.c documents.)
+;
+; GS and FS are deliberately absent from the reload list. In long mode a
+; `mov gs, ax` reloads the *hidden* base from the descriptor, i.e. it would
+; reset GS.base to 0 and drop the per-CPU block that percpu64.c installed
+; with WRMSR. The selector that is already there (0x10, the boot data
+; descriptor) stays valid and only the base matters, so leaving the register
+; alone is what keeps gs:[off] = "this CPU" across a GDT load — including the
+; one an AP performs after installing its own block.
 gdt64_load:
     lgdt [rcx]
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov fs, ax
-    mov gs, ax
     ret
 
 ; void tss64_load(u16 selector)   [selector in CX]
@@ -420,6 +470,48 @@ fxrstor64:
 ; void cpu_pause64(void)
 cpu_pause64:
     pause
+    ret
+
+; k64_percpu_t *k64_cpu(void)
+; gs:[0] holds the block's own address (field `self`), so the accessor is one
+; load. Before percpu64_init_bsp() this returns NULL, which is why every
+; caller treats "no block yet" as "CPU 0".
+k64_cpu:
+    mov rax, [gs:0]
+    ret
+
+; u64 read_msr64(u32 msr)   [msr in ECX]
+read_msr64:
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    ret
+
+; void write_msr64(u32 msr, u64 value)   [msr in ECX, value in RDX]
+write_msr64:
+    mov rax, rdx
+    shr rdx, 32
+    wrmsr
+    ret
+
+; u64 read_rflags64(void) / void write_rflags64(u64 flags)
+; spin64_lock() saves the caller's interrupt state with these and restores it
+; on unlock, so a lock taken inside a system call does not turn interrupts on.
+read_rflags64:
+    pushfq
+    pop rax
+    ret
+
+write_rflags64:
+    push rcx
+    popfq
+    ret
+
+; u64 isr64_percpu_offsets(void)
+; (rsp0 << 32) | user_rsp, the two k64_percpu_t offsets this file hardcodes.
+; percpu64_offsets_ok() compares them against the compiler's view.
+isr64_percpu_offsets:
+    mov rax, ((CPU_RSP0 << 32) | CPU_USER_RSP)
     ret
 
 ; void outb64(u16 port, u8 value)   [port in CX, value in DL]
