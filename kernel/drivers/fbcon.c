@@ -4,8 +4,10 @@
  * must draw it identically, so the renderer lives here and knows nothing
  * about page tables: an arch glue file maps the aperture, describes the mode
  * and calls fbcon_init(). Everything after that -- glyphs, scrolling, the
- * status line, the cursor -- is this file.
+ * cursor -- is this file.
  *
+ * The screen is plain text, all of it: there is no status line, no reserved
+ * row and no overlay, so the grid is exactly the mode divided by the cell.
  * A one-byte shadow of the character grid is kept so the cursor underline can
  * be erased by repainting the cell underneath it instead of by guessing. That
  * is the only state that is not derivable from pixels, and it is bounded by
@@ -16,7 +18,7 @@
 #include "sync.h"
 
 /* 256x72 cells at 8x16 covers 2048x1152; the largest mode stage 2 selects is
- * 1024x768 (128x46 cells). The shadow is static because the renderer runs
+ * 1024x768 (128x48 cells). The shadow is static because the renderer runs
  * from interrupt context and must never allocate. */
 #define FBCON_MAX_COLS 256u
 #define FBCON_MAX_ROWS 72u
@@ -32,8 +34,6 @@ static uint32_t fb_pitch;
 static uint32_t fb_bytes_per_pixel;
 static uint32_t fb_cols;
 static uint32_t fb_rows;          /* total text rows on the screen */
-static uint32_t fb_text_rows;     /* rows the scrolling text area uses */
-static uint32_t fb_status_y;      /* first pixel row of the status bar */
 static uint32_t fb_cell_w;
 static uint32_t fb_cell_h;
 static uint32_t fb_cell_stride;
@@ -42,15 +42,7 @@ static uint32_t fb_cursor_x;
 static uint32_t fb_cursor_y;
 static uint32_t fb_fg;
 static uint32_t fb_bg;
-static uint32_t fb_status_fg;
-static uint32_t fb_status_bg;
 static uint32_t fb_cursor_fg;
-static uint32_t fb_signature;
-/* The status strings are copied in, because a caller's buffer may be a stack
- * frame that is gone by the time a later clear has to repaint the bar. */
-#define FBCON_STATUS_MAX 96u
-static char fb_status_left[FBCON_STATUS_MAX];
-static char fb_status_right[FBCON_STATUS_MAX];
 static uint32_t fb_r_size, fb_r_pos;
 static uint32_t fb_g_size, fb_g_pos;
 static uint32_t fb_b_size, fb_b_pos;
@@ -118,15 +110,6 @@ static void fb_fill(uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
     }
 }
 
-/* The signature block is the handshake the headless screendump checks for.
- * It lives in the unused second status row at the far right, so neither the
- * text area nor the status text can overwrite it. */
-static void fb_draw_signature(void) {
-    if (fb_status_y + fb_cell_h + 2u <= fb_height && fb_width >= 16u)
-        fb_fill(fb_width - 16u, fb_status_y + fb_cell_h, 16u, 2u,
-                fb_signature);
-}
-
 /* --- glyphs ------------------------------------------------------------ */
 
 /* Paint one cell in the requested colours. `ch` selects the glyph; the row
@@ -164,7 +147,7 @@ static char fb_shadow_get(uint32_t col, uint32_t row) {
 
 /* --- cursor ------------------------------------------------------------ */
 
-/* A two-pixel underline under the cell, in the status colour: visible on a
+/* A two-pixel underline under the cell, in the cursor colour: visible on a
  * dark console and gone the moment the cell is repainted. */
 static void fb_draw_cursor(void) {
     uint32_t y0 = fb_cursor_y * fb_cell_h + fb_cell_h - 2u;
@@ -184,65 +167,27 @@ static void fb_erase_cursor(void) {
                  fb_shadow_get(fb_cursor_x, fb_cursor_y));
 }
 
-/* --- status bar -------------------------------------------------------- */
-
-static void fb_status_copy(char *destination, const char *source) {
-    uint32_t i = 0;
-
-    if (source)
-        while (source[i] && i + 1u < FBCON_STATUS_MAX) {
-            destination[i] = source[i];
-            i++;
-        }
-    destination[i] = '\0';
-}
-
-/* Repaint the bar -- tinted background, both strings, signature block -- from
- * the cached copies. Called with fb_lock held from output, status and clear;
- * fbcon_init calls it once before fb_ready, when no other context can reach
- * the renderer yet, so a repaint never loses what the last caller set. */
-static void fb_draw_status_locked(void) {
-    uint32_t left_len = (uint32_t)strlen(fb_status_left);
-    uint32_t right_len = (uint32_t)strlen(fb_status_right);
-    uint32_t start;
-
-    fb_fill(0, fb_status_y, fb_width, fb_height - fb_status_y, fb_status_bg);
-    if (left_len > fb_cols) left_len = fb_cols;
-    for (uint32_t i = 0; i < left_len; i++)
-        fb_draw_glyph(i, fb_text_rows, fb_status_left[i],
-                      fb_status_fg, fb_status_bg);
-    /* The right string owns the end of the bar, so it wins a collision. */
-    if (right_len > fb_cols - left_len) right_len = fb_cols - left_len;
-    start = fb_cols - right_len;
-    for (uint32_t i = 0; i < right_len; i++)
-        fb_draw_glyph(start + i, fb_text_rows, fb_status_right[i],
-                      fb_status_fg, fb_status_bg);
-    fb_draw_signature();
-}
-
 /* --- scrolling --------------------------------------------------------- */
 
 static void fb_scroll(void) {
     uint32_t row_bytes = fb_pitch * fb_cell_h;
-    /* Move the text area up by one row; only the text area is copied so the
-     * status bar below it is never touched. */
-    uint32_t total = row_bytes * (fb_text_rows - 1u);
+    /* Move the whole screen up by one row and blank the last one. */
+    uint32_t total = row_bytes * (fb_rows - 1u);
     uint8_t *dst = fb_base;
     uint8_t *src = dst + row_bytes;
 
     memmove(dst, src, total);
-    for (uint32_t y = (fb_text_rows - 1u) * fb_cell_h;
-         y < fb_text_rows * fb_cell_h; y++)
+    for (uint32_t y = (fb_rows - 1u) * fb_cell_h;
+         y < fb_rows * fb_cell_h; y++)
         for (uint32_t x = 0; x < fb_width; x++)
             fb_put_pixel(x, y, fb_bg);
 
     if (fb_shadowed) {
         memmove(fbcon_shadow, fbcon_shadow + fb_cols,
-                fb_cols * (fb_text_rows - 1u));
-        memset(fbcon_shadow + fb_cols * (fb_text_rows - 1u), ' ',
-               fb_cols);
+                fb_cols * (fb_rows - 1u));
+        memset(fbcon_shadow + fb_cols * (fb_rows - 1u), ' ', fb_cols);
     }
-    fb_cursor_y = fb_text_rows - 1u;
+    fb_cursor_y = fb_rows - 1u;
     fb_cursor_x = 0;
 }
 
@@ -250,7 +195,7 @@ static void fb_scroll(void) {
 
 static void fb_newline(void) {
     fb_cursor_x = 0;
-    if (++fb_cursor_y >= fb_text_rows) fb_scroll();
+    if (++fb_cursor_y >= fb_rows) fb_scroll();
 }
 
 static void fb_advance(void) {
@@ -294,7 +239,6 @@ static void fbcon_clear(uint8_t color) {
     fb_fill(0, 0, fb_width, fb_height, fb_bg);
     if (fb_shadowed)
         memset(fbcon_shadow, ' ', fb_cols * fb_rows);
-    fb_draw_status_locked();
     fb_cursor_x = 0;
     fb_cursor_y = 0;
     fb_draw_cursor();
@@ -308,19 +252,6 @@ static void fbcon_putc(char c) {
     if (c == '\0') return;
     flags = spin_lock_irqsave(&fb_lock);
     fb_putc_locked(c);
-    spin_unlock_irqrestore(&fb_lock, flags);
-}
-
-/* Set the two halves of the status bar. A NULL half leaves that end as it is,
- * and both NULL is a no-op, so the ports can update only what they own. */
-static void fbcon_status(const char *left, const char *right) {
-    irqflags_t flags;
-
-    if (!fb_ready || (!left && !right)) return;
-    flags = spin_lock_irqsave(&fb_lock);
-    if (left) fb_status_copy(fb_status_left, left);
-    if (right) fb_status_copy(fb_status_right, right);
-    fb_draw_status_locked();
     spin_unlock_irqrestore(&fb_lock, flags);
 }
 
@@ -339,7 +270,6 @@ const display_ops_t fbcon_display = {
     "framebuffer",
     fbcon_clear,
     fbcon_putc,
-    fbcon_status,
     fbcon_cursor,
 };
 
@@ -349,7 +279,7 @@ int fbcon_active(void) { return fb_ready; }
 uint32_t fbcon_width(void) { return fb_width; }
 uint32_t fbcon_height(void) { return fb_height; }
 uint32_t fbcon_columns(void) { return fb_cols; }
-uint32_t fbcon_rows(void) { return fb_text_rows; }
+uint32_t fbcon_rows(void) { return fb_rows; }
 const char *fbcon_font_name(void) { return fb_font ? fb_font->name : "none"; }
 
 /* --- init -------------------------------------------------------------- */
@@ -375,10 +305,7 @@ int fbcon_init(const fbcon_mode_t *mode) {
 
     fb_cols = fb_width / fb_cell_w;
     fb_rows = fb_height / fb_cell_h;
-    if (!fb_cols || fb_rows < 3u) return 0;
-    /* Two rows are reserved for the status bar at the bottom. */
-    fb_text_rows = fb_rows - 2u;
-    fb_status_y = fb_text_rows * fb_cell_h;
+    if (!fb_cols || !fb_rows) return 0;
 
     fb_r_size = mode->red_size;     fb_r_pos = mode->red_pos;
     fb_g_size = mode->green_size;   fb_g_pos = mode->green_pos;
@@ -387,14 +314,12 @@ int fbcon_init(const fbcon_mode_t *mode) {
     if (!fb_g_size) { fb_g_size = 8; fb_g_pos = 8; }
     if (!fb_b_size) { fb_b_size = 8; fb_b_pos = 0; }
 
-    /* A light console grey reads better than pure white on a bitmap font, and
-     * the cursor shares the status colour so the two looked related. */
+    /* A light console grey on near-black, the same pairing the VGA text
+     * backend uses. The cursor underline is a brighter blue so it is visible
+     * without being mistaken for a character. */
     fb_fg = compose(0xD0u, 0xD0u, 0xD0u);
     fb_bg = compose(0x08u, 0x08u, 0x10u);
-    fb_status_fg = compose(0x40u, 0xC0u, 0xFFu);
-    fb_status_bg = compose(0x14u, 0x16u, 0x28u);
     fb_cursor_fg = compose(0x40u, 0xC0u, 0xFFu);
-    fb_signature = compose(0x20u, 0xA0u, 0xFFu);
 
     fb_shadowed = fb_cols <= FBCON_MAX_COLS && fb_rows <= FBCON_MAX_ROWS;
 
@@ -404,7 +329,6 @@ int fbcon_init(const fbcon_mode_t *mode) {
 
     memset(fbcon_shadow, ' ', sizeof(fbcon_shadow));
     fb_fill(0, 0, fb_width, fb_height, fb_bg);
-    fb_draw_status_locked();
     fb_draw_cursor();
     return 1;
 }

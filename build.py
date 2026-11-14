@@ -705,17 +705,13 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
             if "HAKU64-FAIL" in line:
                 sys.exit(f"X64 CHECK FAILED: {line.strip()}")
     if "HAKU64-FB-OK" in content:
-        # The renderer's signature block must be in the captured pixels: a
-        # console that reported the mode but painted nothing is a failure the
-        # serial log cannot see. The status-bar tint proves the reserved rows
-        # were painted rather than left as a black band.
+        # The console must have painted glyphs, not just reported the mode. The
+        # foreground colour is the proof: the screen is a plain text grid, so a
+        # few hundred pixels of it can only come from the font.
         if not os.path.exists(ppm):
             missing.append("framebuffer active but no screendump captured")
-        elif not ppm_has_color(ppm, (0x20, 0xA0, 0xFF)):
-            missing.append("framebuffer signature color missing from the"
-                           " screendump")
-        elif not ppm_has_color(ppm, (0x14, 0x16, 0x28)):
-            missing.append("status bar missing from the screendump")
+        elif not ppm_count_color(ppm, (0xD0, 0xD0, 0xD0), 200):
+            missing.append("no console text in the screendump")
     elif "HAKU64-FB-SKIP" not in content:
         missing.append("no framebuffer status line in the serial log")
     if missing or not reached:
@@ -738,8 +734,11 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
-def ppm_has_color(path, rgb):
-    """True when a binary PPM (P6) contains the given RGB triple."""
+def ppm_count_color(path, rgb, minimum):
+    """True when a binary PPM (P6) holds at least `minimum` pixels of an RGB
+    triple. Used to prove the console painted glyphs rather than just
+    reporting the mode: one character is already dozens of pixels, so a small
+    threshold separates "text drawn" from "a stray pixel"."""
     with open(path, "rb") as f:
         data = f.read()
     if not data.startswith(b"P6"):
@@ -762,10 +761,13 @@ def ppm_has_color(path, rgb):
     width, height, _maxval = fields
     pixels = data[index + 1:]
     red, green, blue = rgb
+    count = 0
     for offset in range(0, min(len(pixels), width * height * 3) - 2, 3):
         if (pixels[offset] == red and pixels[offset + 1] == green
                 and pixels[offset + 2] == blue):
-            return True
+            count += 1
+            if count >= minimum:
+                return True
     return False
 
 
@@ -1398,16 +1400,13 @@ def main():
         if "KERNEL PANIC" in content:
             missing.append("kernel panicked during the headless run")
         # The framebuffer console proves itself on the screen: when the
-        # graphics mode is live the signature block the driver draws and the
-        # status bar under the log must show up in the captured framebuffer.
+        # graphics mode is live the log's own glyphs must show up in the
+        # captured pixels, in the renderer's foreground colour.
         if "FB-OK" in content:
             if not os.path.exists(ppm):
                 missing.append("framebuffer active but no screendump captured")
-            elif not ppm_has_color(ppm, (0x20, 0xA0, 0xFF)):
-                missing.append("framebuffer signature color missing from the"
-                               " screendump")
-            elif not ppm_has_color(ppm, (0x14, 0x16, 0x28)):
-                missing.append("status bar missing from the screendump")
+            elif not ppm_count_color(ppm, (0xD0, 0xD0, 0xD0), 200):
+                missing.append("no console text in the screendump")
         elif "FB-SKIP" not in content:
             missing.append("no framebuffer status line in the serial log")
         unexpected = [m for m in ("USER-SYSCALL-FAIL",

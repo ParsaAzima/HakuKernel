@@ -47,8 +47,8 @@ Haku/
                         rtc64.c: CMOS wall clock;
                         smp64.c: ACPI MADT, local APIC and AP bring-up;
                         module64.c: .hkm version 2 loader, exports and slots;
-                        console64.c: serial+display console tee, status bar
-                        and console read;
+                        console64.c: serial+display console tee and
+                        console read;
                         fb64.c: maps the VBE aperture into K64_FB_VIRT;
                         kbd64.c: PS/2 set-1 keyboard IRQ1 decoder and queue
       elf/              elf64.c: validated static ELF64 PT_LOAD loader that
@@ -65,8 +65,8 @@ Haku/
                         display.c/.h: shared display backend API
                         vga_text.c/.h: VGA text backend (fallback)
                         framebuffer.c/.h: VBE probe/mapping glue (32-bit port)
-                        fbcon.c/.h: shared VBE text renderer, scrolling and
-                        status bar (both ports)
+                        fbcon.c/.h: shared VBE text renderer and scrolling
+                        (both ports)
                         font.h, font_terminus.c: bitmap font descriptor and the
                         generated Terminus 8x16 table
                         fbhandover.h: the stage-2 VBE record both ports read

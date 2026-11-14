@@ -4,7 +4,6 @@
 #include "pic.h"
 #include "pit.h"
 #include "scheduler.h"
-#include "terminal.h"
 
 #define PIT_CH0 0x40
 #define PIT_CMD 0x43
@@ -21,29 +20,13 @@ static void pit_tick(regs_t *r) {
         seconds++;
         /* The line goes through klog, which stops mirroring to the display
          * once userland owns the console, so only the serial boot timeline
-         * keeps it. The corner counter is boot progress too and would sit on
-         * top of the shell's text, so it stops at the same point. */
+         * keeps it. Nothing is painted on the screen from here: the console
+         * is plain scrolling text, and an uptime overlay would sit on top of
+         * the shell's own output. */
         klog_prefix();
         klog_write("T+");
         klog_dec(seconds);
         klog_write("s: timer heartbeat\n");
-        if (scheduler_user_tasks_live()) return;
-        /* Heartbeat in the top-right corner (redrawn every second). */
-        char buf[16];
-        uint32_t v = seconds;
-        int len = 0;
-        buf[len++] = 'T';
-        buf[len++] = '+';
-        char rev[10];
-        int n = 0;
-        do {
-            rev[n++] = (char)('0' + (v % 10));
-            v /= 10;
-        } while (v && n < 10);
-        while (n--) buf[len++] = rev[n];
-        buf[len++] = 's';
-        buf[len] = 0;
-        terminal_corner(buf);
     }
 }
 

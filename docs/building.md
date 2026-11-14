@@ -136,15 +136,15 @@ truncated file and a bad magic must be refused before
 `user/lib64` — prints, allocates, reads and writes files, forks a
 copy-on-write child, maps memory and reads the clock before exiting 0.
 The display stack is checked too: `HAKU64-FB-OK` names the VBE mode the shared
-renderer took over (`grid=128x46 font=terminus-8x16`), `HAKU64-TERMINAL-OK`
+renderer took over (`grid=128x48 font=terminus-8x16`), `HAKU64-TERMINAL-OK`
 names the backend, and `HAKU64-KBD-OK` proves the PS/2 set-1 decoder. The run
 types `x` into the guest through the QEMU monitor (port 5556; the 32-bit run
 keeps 5555) as soon as the ring-3 program prints `HAKU64-KEY-READY`, so
 `HAKU64-KEY-OK` shows a console `read()` that was parked with `-EAGAIN` and
 resumed by IRQ1. The screen is captured as `build/screen64.ppm` before QEMU is
-killed, and the check fails if the framebuffer signature block or the
-status-bar tint is missing from those pixels: a console that reported its mode
-but painted nothing cannot pass on the serial log alone. `build/screen.ppm` is
+killed, and the check fails unless those pixels hold a few hundred of the
+renderer's foreground-grey pixels: a console that reported its mode but painted
+no glyphs cannot pass on the serial log alone. `build/screen.ppm` is
 the 32-bit capture, taken at the end of its run.
 After QEMU exits, `tools/lsfat12.py --check` verifies the volume the guest
 just wrote. The 32-bit `haku.img` is still built with `--arch=i386`, and it

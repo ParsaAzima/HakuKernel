@@ -139,13 +139,6 @@ void kernel_main(void) {
         klog_write("\n");
     }
 
-    /* Keep the machine's identity on the left half of the status bar; the
-     * PIT puts its "T+Ns" heartbeat on the right half. */
-    display_status(fbcon_active()
-                       ? "Haku i386   terminus-8x16   framebuffer"
-                       : "Haku i386   vga-text   80x25",
-                   0);
-
     if (!gdt_init()) {
         panic("GDT-FAIL: TSS initialization failed");
     }

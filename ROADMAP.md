@@ -29,7 +29,7 @@ next milestone that needs new kernel work is 2.
 | Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads, `futex` | same, plus signals, job control and wait queues |
 | Syscalls | ported subset on the x86-64 numbers; no pipes, no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
 | Storage | ATA PIO + FAT12 behind a page cache, file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
-| Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16, VGA text fallback, PS/2 keyboard, status bar with uptime | the same renderer and font, plus the terminal line discipline and CSI handling |
+| Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
 | Modules | version 2 loader: log, ticks, heap; capability calls return `-ENOSYS` | version 1 loader with device and filesystem registration |
 | Userland | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device | freestanding user C library, `busybox ash`, probes |
 
@@ -166,10 +166,9 @@ with the 32-bit image available as a fallback.
 **Work.**
 
 - [x] A 64-bit console: the shared VBE renderer (`kernel/drivers/fbcon.c`)
-      draws the same Terminus 8x16 cells on both ports, VGA text stays the
-      fallback when stage 2 hands over no linear framebuffer, and a status bar
-      carries the machine identity and the uptime (`HAKU64-FB-OK`,
-      `HAKU64-TERMINAL-OK`).
+      draws the same Terminus 8x16 cells on both ports as plain full-screen
+      text, VGA text stays the fallback when stage 2 hands over no linear
+      framebuffer (`HAKU64-FB-OK`, `HAKU64-TERMINAL-OK`).
 - [x] A PS/2 keyboard driver for x86-64 with the 32-bit set-1 scancode
       translation (`kbd64.c`, IRQ1) feeding a queue that console `read()`
       drains; an empty queue parks the task with `-EAGAIN` and IRQ1 wakes it

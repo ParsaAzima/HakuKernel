@@ -141,10 +141,6 @@ void terminal_write_serial(const char *s) {
     serial_output_end(flags);
 }
 
-void terminal_corner(const char *s) {
-    display_status(0, s);
-}
-
 /* --- self-test --------------------------------------------------------- */
 
 /* "ESC [ <row> ; <col> R" with at least one digit on both sides. */

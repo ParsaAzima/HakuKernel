@@ -21,7 +21,7 @@ on the terminal's wait queue until IRQ1 wakes them. Neither the keyboard
 driver nor the syscall layer knows about the other.
 
 Display backends implement the shared `display_ops_t` table in
-`kernel/drivers/display.h` (`name`, `clear`, `putc`, `status`, `cursor`). The
+`kernel/drivers/display.h` (`name`, `clear`, `putc`, `cursor`). The
 VGA text backend is selected at boot and stays the fallback; when the
 bootloader hands over a usable VBE mode, the arch glue
 (`kernel/drivers/framebuffer.c` on 32 bits, `kernel/arch/x86_64/kernel/fb64.c`
@@ -29,26 +29,23 @@ on 64) maps the aperture and calls `fbcon_init`, and the boot path switches the
 active backend with `display_use(&fbcon_display)`. Both arches read the mode
 from the same record (`kernel/drivers/fbhandover.h`, written by stage 2 at
 physical `0x6FC0`) and run the same renderer, so the two screens are the same
-pixels. Backend state is protected with IRQ-save spinlocks because a timer
-interrupt redraws the status bar: the 32-bit heartbeat stops when userland owns
-the console, while the 64-bit bar keeps its uptime ticking (see the notes
-below).
+pixels. Backend state is protected with IRQ-save spinlocks because output can
+come from task and interrupt context.
 
 `kernel/drivers/fbcon.c` owns the framebuffer console: a 256x72 shadow of the
 character grid (so the cursor underline can be erased by repainting the cell
-underneath it), glyph blitting through the font descriptor, scrolling of the
-text area only, and a status bar. The font is Terminus 8x16 bold, embedded as
+underneath it), glyph blitting through the font descriptor, and scrolling. The
+screen is plain text, all of it -- no status line, no reserved row and no
+overlay -- so the grid is exactly the mode divided by the cell: 128x48 at
+1024x768. The font is Terminus 8x16 bold, embedded as
 generated C data (`kernel/drivers/font_terminus.c`, produced from
 `ter-u16b.bdf` by `tools/mkfont.py`, SIL OFL 1.1, see
 `LICENSES/Terminus-OFL.txt`). Bitmaps are 256 glyphs in code page 437 order, so
 the byte the console prints indexes the glyph directly; the renderer is
 generic over the cell size, and `fbcon_init` rejects a font whose width is not
-a multiple of 8. Two rows at the bottom are reserved for the status bar:
-`display_status(left, right)` draws the two halves (either may be `0`) on a
-tinted band, and the hidden 16x2 signature block the headless screendump checks
-lives in the second of those rows. The renderer copies both strings, so a
-later `clear` repaints the bar instead of losing it. The 32-bit PIT puts
-`T+<n>s` on the right; the 64-bit console puts the uptime there from IRQ0.
+a multiple of 8. Scrolling moves the whole screen up one row and blanks the
+last one; the VGA text backend is the same 80x25 grid with nothing carved out
+of it.
 
 Console output is filtered for control codes on the 32-bit console: a CSI
 sequence (`ESC '[' params final`) is consumed instead of drawn, so an escape
@@ -111,13 +108,14 @@ test output. `klog_self_test` proves that `DEBUG` is suppressed at the
 default threshold and appears after lowering it (`KLOG-LEVELS-OK`).
 
 The timer heartbeat is boot progress, not a service: `pit_tick` prints
-`T+<n>s: timer heartbeat` once a second and puts `T+<n>s` on the right half of
-the status bar. The heartbeat follows the same console rule as every other
-kernel log (see below): the line goes to COM1 once userland owns the console,
-and the 32-bit heartbeat stops updating the bar at the same point. The serial log
-keeps the timeline, which is what the headless check asserts with its `T+1s`,
-`T+2s`, and `T+3s` markers. A console that never started a user task still
-shows the heartbeat.
+`T+<n>s: timer heartbeat` once a second on the serial log and paints nothing on
+the screen, because the console is plain scrolling text and an uptime overlay
+would sit on top of the shell's own output. The heartbeat follows the same
+console rule as every other kernel log (see below): the line goes to COM1 once
+userland owns the console. The serial log keeps the timeline, which is what the
+headless check asserts with its `T+1s`, `T+2s`, and `T+3s` markers. A console
+that never started a user task does not write anything extra to the screen
+either.
 
 Kernel log lines are a boot-time channel on the screen. `usermode_run` calls
 `klog_mirror_display(0)` right before `scheduler_start`, so from the first

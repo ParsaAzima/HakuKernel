@@ -583,10 +583,6 @@ int console64_ready(void);
 u32 console64_columns(void);
 u32 console64_rows(void);
 const char *console64_name(void);
-/* Repaint the status bar (machine name and geometry on the left, uptime on
- * the right). Called at console init and once a second from IRQ0; safe to
- * call before the console is up, where it does nothing. */
-void console64_status(void);
 
 /* fb64.c: map the VBE aperture stage 2 selected and start the shared
  * renderer. Returns 1 when the framebuffer console is live, 0 when the
