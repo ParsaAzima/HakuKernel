@@ -21,6 +21,7 @@ Memory map:
 
 | Address | Use |
 |---|---|
+| `0x6FC0` | VBE handover record from stage2 (`fb_handover_t`, magic `'HFB1'`) read by both arches |
 | `0x7C00` | boot sector (512 B) |
 | `0x10000–0x80000` | kernel load window (up to 448 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
 | `0x7000–0x7240` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
@@ -37,6 +38,8 @@ Memory map:
 | `0x60000000–0x70000000` | anonymous `mmap` region (lazily mapped) |
 | `0xBFFFE000–0xC0000000` | user stack (two pages initially, grows downward on fault up to 1 MiB) |
 | `0xB8000` | VGA text buffer |
+| `0xFFFF800000000000` | x86-64 physmap of all RAM (PML4 slot 256, 2 MiB pages) |
+| `0xFFFFF80000000000` | x86-64 framebuffer window (PML4 slot 496, 4 MiB, uncached) |
 
 ### x86-64: boot path, memory and interrupts (primary)
 
@@ -60,10 +63,12 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | paging | supervisor physmap of all RAM at `0xFFFF800000000000`, 2 MiB pages | `HAKU64-PAGING-OK` |
 | frames | E820-backed frame allocator, bitmaps sized from the detected limit | `HAKU64-FRAME-OK` |
 | heap | 8 MiB free-list `kmalloc64`/`kfree64` window | `HAKU64-HEAP-OK` |
+| console | VBE aperture mapped into `K64_FB_VIRT` (uncached, 4 MiB window), the shared renderer starts with Terminus 8x16, `COM1` keeps every byte | `HAKU64-FB-OK`, `HAKU64-TERMINAL-OK` |
 | GDT/TSS | kernel and user segments, a 64-bit TSS, IST1/IST2 stacks | `HAKU64-GDT-OK` |
 | IDT/PIC | 256 gates, 8259 remapped to `0x20`/`0x28`, IRQ0 unmasked | `HAKU64-IDT-OK` |
 | exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
+| keyboard | PC/8042 in set-1 mode: IRQ1 unmasked after a decode-only self-test | `HAKU64-KBD-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
 | files | FAT12 on an ATA disk, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
@@ -484,7 +489,9 @@ sets `EFER.LME|NXE`, enables paging and far-jumps into a 64-bit code segment.
 It reuses the BSP's PML4, so no page tables are built on the AP. The APIC page
 lives in its own uncached PML4 slot (`K64_LAPIC_VIRT`, PCD+PWT) and is copied
 into every per-process PML4; ACPI tables are read through a separate window in
-slot 384. The two windows are why the 64-bit identity-mapped probe used by the
+slot 384, and the VBE framebuffer at `K64_FB_VIRT` (slot 496, 4 MiB, uncached,
+also copied into every PML4 because a `write()` paints on the caller's CR3).
+The three windows are why the 64-bit identity-mapped probe used by the
 exception self-test lives in slot 416.
 
 `python build.py headless --arch=i386` and `python build.py headless` both boot

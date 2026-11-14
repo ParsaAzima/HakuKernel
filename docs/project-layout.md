@@ -28,10 +28,10 @@ Haku/
       boot/             entry64.asm: PAE + EFER.LME + PML4/PDPT/PD, far jump
                         into a 64-bit code segment, then call into C
       kernel/           boot64.c: bring-up sequence (E820 → physmap → frames
-                        → heap → GDT/TSS → IDT/PIC → timer → spaces → tasks
-                        → ring 3 → self-tests);
+                        → heap → console → GDT/TSS → IDT/PIC → timer → spaces
+                        → tasks → ring 3 → self-tests);
                         haku64.h: shared types, layout, asm declarations;
-                        serial64.c: COM1 output + memset/memcpy;
+                        serial64.c: COM1 output + the mem*/strlen helpers;
                         bootmem64.c: bump allocator for early tables;
                         gdt64.c: GDT, TSS and the IST stacks;
                         idt64.c: 256 gates + exception/IRQ/syscall dispatch;
@@ -46,7 +46,11 @@ Haku/
                         fs64.c: FAT12 page cache in front of the ATA disk;
                         rtc64.c: CMOS wall clock;
                         smp64.c: ACPI MADT, local APIC and AP bring-up;
-                        module64.c: .hkm version 2 loader, exports and slots
+                        module64.c: .hkm version 2 loader, exports and slots;
+                        console64.c: serial+display console tee, status bar
+                        and console read;
+                        fb64.c: maps the VBE aperture into K64_FB_VIRT;
+                        kbd64.c: PS/2 set-1 keyboard IRQ1 decoder and queue
       elf/              elf64.c: validated static ELF64 PT_LOAD loader that
                         maps segments into a per-process space
       user/             ring3_elf64.asm: ELF64 test program (write, BSS store,
@@ -60,7 +64,12 @@ Haku/
                         terminal.c/.h: text-I/O layer (output + input ring)
                         display.c/.h: shared display backend API
                         vga_text.c/.h: VGA text backend (fallback)
-                        framebuffer.c/.h: VBE framebuffer text backend
+                        framebuffer.c/.h: VBE probe/mapping glue (32-bit port)
+                        fbcon.c/.h: shared VBE text renderer, scrolling and
+                        status bar (both ports)
+                        font.h, font_terminus.c: bitmap font descriptor and the
+                        generated Terminus 8x16 table
+                        fbhandover.h: the stage-2 VBE record both ports read
                         serial.c/.h: COM1 output backend
     fs/
       fat12/            fat12.c/.h: writable FAT12 files, subdirectories, paths

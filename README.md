@@ -74,8 +74,10 @@ control and pipelines working.
 - **Storage** — ATA PIO on both legacy channels with reset/retry recovery, a
   writable FAT12 driver, a VFS with per-process descriptors, `ramfs` root,
   `initramfs` (cpio newc), `/dev`, and a generated `/proc`.
-- **Console** — VGA text and VBE framebuffer backends, PS/2 keyboard, serial
-  mirror, CSI sequence handling with DSR replies, kernel-log display latch.
+- **Console** — one framebuffer renderer shared by both ports, drawing the
+  Terminus 8x16 font over a VBE mode with a status bar and a VGA text fallback,
+  PS/2 keyboard, serial mirror, CSI sequence handling with DSR replies,
+  kernel-log display latch.
 - **Userland** — freestanding C library (`user/lib`), busybox/musl as PID 1,
   headless self-tests for every subsystem listed above.
 - **x86-64** — the primary target: long-mode entry, four-level paging with a
@@ -92,7 +94,9 @@ control and pipelines working.
   `getdents64`, `rename`/`unlink`/`truncate`, `chdir`/`getcwd`/`openat`,
   `pread`/`pwrite`, `mprotect`/`brk`/`madvise`, `poll`/`select`, `fcntl`/
   `ioctl`/`dup3`, `uname`/`times`/`getrusage`/`getrlimit` and the identity,
-  `prctl` and `getrandom` calls), a module loader for version 2
+  `prctl` and `getrandom` calls), a shared VBE framebuffer console drawing the
+  Terminus font with a status bar, a PS/2 keyboard whose queue a blocking
+  console `read()` drains, a module loader for version 2
   containers, and a 64-bit userland built on `user/lib64`: a freestanding C
   library (string/memory, `printf`, `malloc`, files, `fork`, `mmap`, `errno`)
   whose self-test the kernel loads from the FAT12 volume as `/INIT.ELF`.
@@ -174,9 +178,11 @@ is no load balancing or migration, and the user-space concurrency tests still
 run on the bootstrap processor, so a ring-3 task running on an AP is not yet
 covered. On i386 the application processors stay parked and every task runs on
 the bootstrap processor. The x86-64 kernel also lacks signal handlers, pipes, a
-VFS, devfs, a console device and a keyboard, so its userland is a C library
-(`user/lib64`) plus the `/INIT.ELF` self-test rather than a shell; module
-capability registration answers `ENOSYS` there. FAT12
+VFS, devfs, a console device, a line discipline and the kernel-log latch, so
+its userland is a C library (`user/lib64`) plus the `/INIT.ELF` self-test
+rather than a shell; its console and PS/2 keyboard are there so a program can
+read a line's worth of keys, and module capability registration answers
+`ENOSYS` there. FAT12
 has 8.3 names, no timestamps, and no
 permission bits. Haku's filesystem cache holds eight paths of at most 128 KiB
 each. Everything beyond the implemented subset returns `ENOSYS`
@@ -190,4 +196,6 @@ rather than pretending to work.
 - [Code of Conduct](CODE_OF_CONDUCT.md) — expectations for project spaces.
 - [Agent instructions](AGENTS.md) — repository-wide coding and validation rules.
 
-License: see [LICENSE](LICENSE).
+License: see [LICENSE](LICENSE). The Terminus font embedded in
+`kernel/drivers/font_terminus.c` keeps its own SIL Open Font License 1.1; see
+[LICENSES/Terminus-OFL.txt](LICENSES/Terminus-OFL.txt).
