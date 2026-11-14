@@ -310,12 +310,16 @@ captured first, while the old space is still current: each string is copied
 out in page-sized chunks (one page-table walk per page) into an 8-entry,
 128-byte-per-string, 768-byte-total kernel buffer, and a longer vector is
 `-E2BIG` rather than truncated. Once the new space exists, its stack gets
-`argc`, `argv[]`, `NULL`, `envp[]`, `NULL` and an auxiliary vector with
-`AT_PAGESZ` and `AT_ENTRY` (there is no `AT_PHDR` yet), and the task is
-resumed at the new entry with that stack and zeroed registers. Descriptors
-survive execve because there is no `O_CLOEXEC`. A failed call returns
-`-ENOENT`, `-ENOEXEC`, `-EIO`, `-E2BIG`, `-EFAULT` or `-ENOMEM` and leaves the
-caller running unchanged. A task whose space is shared with another thread
+`argc`, `argv[]`, `NULL`, `envp[]`, `NULL` and the Linux auxiliary vector
+(`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_FLAGS`,
+`AT_ENTRY`, the identity words, `AT_SECURE`, `AT_RANDOM`, `AT_EXECFN`,
+`AT_HWCAP`, `AT_NULL`), and the task is resumed at the new entry with that
+stack and zeroed registers. The kernel's own `/INIT.ELF` launch calls the same
+builder (`sys64_build_init_stack`) instead of hand-writing a smaller stack, so
+the first ring-3 program sees the same vector `execve` would give it.
+Descriptors survive execve because there is no `O_CLOEXEC`. A failed call
+returns `-ENOENT`, `-ENOEXEC`, `-EIO`, `-E2BIG`, `-EFAULT` or `-ENOMEM` and
+leaves the caller running unchanged. A task whose space is shared with another thread
 cannot exec at all: `task64_exec` refuses, because there is no way to stop the
 other threads, and the call reports `-EINVAL`.
 
@@ -327,6 +331,14 @@ pointer (so two threads never get the same range), and `munmap` edits the
 owner's records. The space is released once, when the last user is reaped; if
 the owner dies while a thread still runs, the records and the bump pointer
 move to that thread so a later `munmap` or the final exit still sees them.
+
+Per-thread state that is not part of the address space lives in the task slot:
+each task carries a user `fs_base` and `gs_base`. `arch_prctl` (158) reads and
+writes them, `switch_to` reloads `IA32_FS_BASE` and `IA32_KERNEL_GS_BASE` from
+the incoming task, `fork` and `clone` copy the parent's values, and `execve`
+clears both so a new image starts with no thread pointer. These are
+deliberately *not* routed through `space_owner`: two threads share a space but
+each has its own thread-local block.
 
 `clone` requires `CLONE_VM` and a 16-byte aligned child stack inside the user
 half; without `CLONE_VM` it falls back to `sched64_fork`, so a caller that
@@ -600,8 +612,10 @@ is what differs.
   blocks are declared 16-byte aligned and rounded up to a cache line when the
   first one is installed.
 - **Keeping GS on the block.** On x86-64 the invariant is: in ring 0
-  `GS.base` is the block and `IA32_KERNEL_GS_BASE` is zero, in ring 3 it is
-  the other way round. The interrupt stub swaps iff the interrupted CS says
+  `GS.base` is the block and `IA32_KERNEL_GS_BASE` holds the task's user GS
+  base (zero for a kernel task); in ring 3 it is the other way round, so
+  `gs:[...]` names the per-CPU block in the kernel and the task's TEB in user
+  space. The interrupt stub swaps iff the interrupted CS says
   ring 3, the resume path swaps iff the frame it is about to `IRETQ` says ring
   3, and the syscall entry swaps unconditionally because it is only ever
   entered from ring 3. `gdt64_load` deliberately does not reload FS or GS.

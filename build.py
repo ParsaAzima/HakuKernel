@@ -711,6 +711,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-PROCFS-OK",
                 "HAKU64-USER-DEV-OK", "HAKU64-USER-INITRAMFS-OK",
                 "HAKU64-USER-PROCFS-OK",
+                "HAKU64-USER-TLS-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
                 "HAKU64-COW-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",

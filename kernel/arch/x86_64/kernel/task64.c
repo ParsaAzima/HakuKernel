@@ -42,6 +42,8 @@ typedef struct {
     u64 mmap_next;   /* per-task bump pointer for anonymous mappings */
     u64 brk;         /* program break; 0 until the first brk() call */
     u64 futex_addr;  /* user address a K64_TASK_WAIT task is parked on */
+    u64 fs_base;     /* user FS base, arch_prctl(ARCH_SET_FS) */
+    u64 gs_base;     /* user GS base, arch_prctl(ARCH_SET_GS) */
     char cwd[K64_FS_PATH_MAX + 1]; /* working directory, canonical and absolute */
     char comm[16];   /* prctl(PR_SET_NAME) name, NUL-terminated */
 } task64_t;
@@ -198,6 +200,8 @@ void sched64_init(void) {
     tasks[0].fault_address = 0;
     tasks[0].mmap_next = 0;
     tasks[0].futex_addr = 0;
+    tasks[0].fs_base = 0;
+    tasks[0].gs_base = 0;
     tasks[0].brk = 0;
     tasks[0].cwd[0] = '/';
     tasks[0].cwd[1] = 0;
@@ -258,6 +262,8 @@ int task64_create_kernel_on(u32 cpu_affinity, void (*entry)(void)) {
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = 0;
     tasks[id].futex_addr = 0;
+    tasks[id].fs_base = 0;
+    tasks[id].gs_base = 0;
     tasks[id].brk = 0;
     tasks[id].cwd[0] = '/';
     tasks[id].cwd[1] = 0;
@@ -327,6 +333,8 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = K64_USER_MMAP_BASE;
     tasks[id].futex_addr = 0;
+    tasks[id].fs_base = 0;
+    tasks[id].gs_base = 0;
     tasks[id].brk = 0;
     tasks[id].cwd[0] = '/';
     tasks[id].cwd[1] = 0;
@@ -397,6 +405,13 @@ static regs64_t *switch_to(int next, int save_current) {
         gdt64_set_rsp0_cpu(cpu->index, tasks[next].stack_top);
         cpu->rsp0 = tasks[next].stack_top;
     }
+    /* The FS base is a plain MSR with no kernel meaning, so it can be loaded
+     * directly. The user GS base lives in KERNEL_GS_BASE while the kernel
+     * runs; the SWAPGS on the way back to ring 3 moves it into GS. A kernel
+     * task has both set to 0, which leaves gs:[...] naming the per-CPU block
+     * for as long as the task runs. */
+    write_msr64(K64_MSR_FS_BASE, tasks[next].fs_base);
+    write_msr64(K64_MSR_KERNEL_GS_BASE, tasks[next].gs_base);
     return tasks[next].frame;
 }
 
@@ -599,6 +614,25 @@ u64 task64_get_brk(int id) {
 
 void task64_set_brk(int id, u64 value) {
     if (valid_id(id)) tasks[as_owner(id)].brk = value;
+}
+
+/* The FS/GS bases are per-thread even when the address space is shared: a
+ * thread's thread pointer names its own TLS block, which is why CLONE_SETTLS
+ * exists. They are deliberately not routed through as_owner(). */
+u64 task64_fs_base(int id) {
+    return valid_id(id) ? tasks[id].fs_base : 0;
+}
+
+u64 task64_gs_base(int id) {
+    return valid_id(id) ? tasks[id].gs_base : 0;
+}
+
+void task64_set_fs_base(int id, u64 base) {
+    if (valid_id(id)) tasks[id].fs_base = base;
+}
+
+void task64_set_gs_base(int id, u64 base) {
+    if (valid_id(id)) tasks[id].gs_base = base;
 }
 
 /* Working-directory accessors. The path is stored canonical and absolute
@@ -918,6 +952,8 @@ regs64_t *sched64_fork(regs64_t *frame) {
     tasks[child].fault_address = 0;
     tasks[child].mmap_next = tasks[parent].mmap_next;
     tasks[child].futex_addr = 0;
+    tasks[child].fs_base = tasks[parent].fs_base;
+    tasks[child].gs_base = tasks[parent].gs_base;
     tasks[child].brk = 0;
     tasks[child].cwd[0] = '/';
     tasks[child].cwd[1] = 0;
@@ -1023,6 +1059,8 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
     tasks[child].fault_vector = 0;
     tasks[child].fault_address = 0;
     tasks[child].futex_addr = 0;
+    tasks[child].fs_base = tasks[parent].fs_base;
+    tasks[child].gs_base = tasks[parent].gs_base;
     tasks[child].brk = 0;
     {
         int source = as_owner(parent);
@@ -1156,6 +1194,13 @@ int task64_exec(int id, u64 space) {
     tasks[id].mmap_next = K64_USER_MMAP_BASE;
     tasks[id].fault_vector = 0;
     tasks[id].fault_address = 0;
+    /* The old image's thread pointer dies with it. Clearing the fields and
+     * the live MSRs means the new program sees FS/GS base 0 until it calls
+     * arch_prctl, exactly like a freshly exec'd Linux process. */
+    tasks[id].fs_base = 0;
+    tasks[id].gs_base = 0;
+    write_msr64(K64_MSR_FS_BASE, 0);
+    write_msr64(K64_MSR_KERNEL_GS_BASE, 0);
     return 1;
 }
 

@@ -99,6 +99,13 @@ int getppid(void) {
     return (int)haku64_syscall0(HAKU64_SYS_GETPPID);
 }
 
+/* arch_prctl(2): the x86-64 thread-pointer call. SET_* installs a user base,
+ * GET_* copies the current base through the pointer in `address`. */
+int arch_prctl(int code, unsigned long long address) {
+    return (int)haku64_errno_check(
+        haku64_syscall2(HAKU64_SYS_ARCH_PRCTL, code, (long long)address));
+}
+
 /* fork(2): the child returns 0 into the same instruction fault frame, so a
  * negative result means the call was refused and becomes errno. */
 int fork(void) {

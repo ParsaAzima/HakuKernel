@@ -9,10 +9,14 @@
  * created by paging64_create_space, and every leaf goes in through
  * paging64_map_space, which only accepts addresses in the user half.
  *
- * There is no AT_PHDR work here because there is no libc yet: the loaded
- * image gets a stack and its segments, nothing else. The struct still
- * records the writable page so the ring-3 self-test can check that the
- * program actually ran and wrote to its BSS.
+ * The struct also records the program header table when a PT_LOAD maps it.
+ * tools/pe2elf64.py emits a read-only header segment at the image base for
+ * exactly that reason: syscall64.c turns the recorded address into AT_PHDR,
+ * which is how the startup code finds PT_TLS without a fixed address. PT_TLS
+ * itself is metadata here; the segment is already part of the PT_LOAD that
+ * carries the template, and the user side copies it out. The writable page
+ * stays recorded so the ring-3 self-test can check that the program actually
+ * ran and wrote to its BSS.
  *
  * Frames mapped into a space are tracked by the loader for the duration of
  * a failed load. paging64_destroy_space frees tables only, so elf64_unload
@@ -214,6 +218,23 @@ int elf64_load(const u8 *image, u64 image_size, loaded_elf64_t *loaded) {
     loaded->image_high = image_high;
     loaded->writable = writable_page;
     loaded->pages = frame_count;
+    loaded->phent = header.phentsize;
+    loaded->phnum = header.phnum;
+    /* AT_PHDR has to point at a *mapped* copy of the table. The PE repacker
+     * emits a read-only PT_LOAD that covers the ELF header and phdrs at the
+     * image base, so this search finds it; an older image without that
+     * segment gets 0 and its startup code simply sees no AT_PHDR. */
+    loaded->phdr = 0;
+    for (u32 i = 0; i < load_count; i++) {
+        u64 table_end = header.phoff +
+                        (u64)header.phnum * header.phentsize;
+
+        if (header.phoff >= phdrs[i].offset &&
+            table_end <= phdrs[i].offset + phdrs[i].filesz) {
+            loaded->phdr = phdrs[i].vaddr + (header.phoff - phdrs[i].offset);
+            break;
+        }
+    }
     return 1;
 
 fail:

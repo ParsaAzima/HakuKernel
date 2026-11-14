@@ -15,6 +15,12 @@
 
 static int failures;
 
+/* The compiler emits these into the image's TLS template and accesses them
+ * through _tls_index and gs:[0x58]; the values below only work if the
+ * startup code built the block and installed the TEB. */
+__declspec(thread) int tls_counter = 7;
+__declspec(thread) int tls_zero;
+
 static void check(int condition, const char *what) {
     if (condition) return;
     printf("HAKU64-LIBC-FAIL: %s (line %d)\n", what, __LINE__);
@@ -228,6 +234,59 @@ static void test_devices(void) {
     printf("HAKU64-USER-DEV-OK: /dev/null, /dev/zero, /dev/console\n");
 }
 
+/* The TLS test runs before the fork test so a failure names the thread
+ * state, not the scheduler. The child writes its own copy-on-write TLS
+ * block; the parent must still see its original value afterwards. */
+static void test_tls(void) {
+    unsigned long long base = 0;
+    unsigned long long stack_address = (unsigned long long)&base;
+    int status = 0;
+    int child;
+    int before = failures;
+
+    check(tls_counter == 7, "TLS template initializer");
+    check(tls_zero == 0, "TLS template zero fill");
+    tls_counter = 11;
+    tls_zero = 3;
+    check(tls_counter == 11 && tls_zero == 3, "TLS read/write");
+
+    check(arch_prctl(HAKU64_ARCH_GET_GS,
+                     (unsigned long long)&base) == 0 && base != 0,
+          "ARCH_GET_GS");
+    check(arch_prctl(HAKU64_ARCH_GET_FS,
+                     (unsigned long long)&base) == 0 && base == 0,
+          "ARCH_GET_FS starts clear");
+    check(arch_prctl(HAKU64_ARCH_SET_FS, stack_address) == 0,
+          "ARCH_SET_FS");
+    base = 0;
+    check(arch_prctl(HAKU64_ARCH_GET_FS,
+                     (unsigned long long)&base) == 0 &&
+              base == stack_address, "ARCH_GET_FS readback");
+    check(arch_prctl(HAKU64_ARCH_SET_FS, 0) == 0, "ARCH_SET_FS clear");
+    check(arch_prctl(HAKU64_ARCH_SET_FS, 0x10000000000ull) == -1 &&
+              errno == HAKU64_EINVAL,
+          "ARCH_SET_FS rejects an address outside the user half");
+
+    child = fork();
+    check(child >= 0, "fork for TLS");
+    if (child == 0) {
+        int inherited = tls_counter == 11 && tls_zero == 3;
+
+        tls_counter = 42;
+        tls_zero = 9;
+        _exit(inherited && tls_counter == 42 && tls_zero == 9 ? 0 : 1);
+    }
+    if (child > 0) {
+        check(waitpid(child, &status, 0) == child, "wait for the TLS child");
+        check(((status >> 8) & 0xFF) == 0, "TLS child exit status");
+        check(tls_counter == 11 && tls_zero == 3,
+              "fork isolates the TLS block");
+    }
+
+    if (failures == before)
+        printf("HAKU64-USER-TLS-OK: arch_prctl FS/GS and __declspec(thread)\n");
+}
+
 static void test_processes(void) {
     int status = 0;
     int child;
@@ -424,6 +483,7 @@ int main(int argc, char **argv, char **envp) {
     test_initramfs();
     test_devices();
     test_procfs();
+    test_tls();
     test_processes();
     test_mappings_and_time();
     test_console();

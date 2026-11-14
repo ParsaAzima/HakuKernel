@@ -365,6 +365,18 @@ relocates the 64-bit forms. A 64-bit module can log, read ticks and use the
 kernel heap, but its capability calls answer `-ENOSYS` until there is a 64-bit
 VFS, so `delete_module` has nothing to detach.
 
+The x86-64 kernel also serves `arch_prctl` (158), the thread-pointer call the
+i386 side spells `set_thread_area`/`get_thread_area`. `ARCH_SET_FS` (0x1002)
+and `ARCH_SET_GS` (0x1001) store a user base, and `ARCH_GET_FS` (0x1003) and
+`ARCH_GET_GS` (0x1004) copy the current base through a user pointer; an
+address outside the user half, or a bad `GET` pointer, is `-EINVAL`/`-EFAULT`.
+The bases are per task: `fork` and `clone` inherit them, `execve` clears them,
+and the scheduler reloads `IA32_FS_BASE` and `IA32_KERNEL_GS_BASE` on every
+switch. The kernel never interprets what the program puts at the base, which is
+what lets `user/lib64` place a TEB there and makes a compiler-generated
+`__declspec(thread)` variable work. The startup stack that makes that possible
+is documented in [the x86-64 C library](libc64.md#thread-local-storage).
+
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
 rejects unmapped/kernel pointers, wraparound, invalid descriptors and

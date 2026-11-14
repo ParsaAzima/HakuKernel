@@ -25,6 +25,10 @@
 #include "haku64.h"
 #include "haku_module.h"
 
+/* Defined with getrandom() below; the start-stack builder uses the same
+ * generator for AT_RANDOM. */
+static u64 sys64_random_next(void);
+
 #define SYS64_MAX_WRITE   4096ull
 #define SYS64_IOV_MAX     8u
 #define SYS64_IOV_SIZE    16ull
@@ -1284,9 +1288,22 @@ static u64 sys64_dup2(u64 fd, u64 target) {
 #define SYS64_EXEC_BYTES_MAX 768u
 #define SYS64_EXEC_WORDS_MAX 64u
 
-#define SYS64_AT_NULL   0ull
-#define SYS64_AT_PAGESZ 6ull
-#define SYS64_AT_ENTRY  9ull
+#define SYS64_AT_NULL    0ull
+#define SYS64_AT_PHDR    3ull
+#define SYS64_AT_PHENT   4ull
+#define SYS64_AT_PHNUM   5ull
+#define SYS64_AT_PAGESZ  6ull
+#define SYS64_AT_BASE    7ull
+#define SYS64_AT_FLAGS   8ull
+#define SYS64_AT_ENTRY   9ull
+#define SYS64_AT_UID     11ull
+#define SYS64_AT_EUID    12ull
+#define SYS64_AT_GID     13ull
+#define SYS64_AT_EGID    14ull
+#define SYS64_AT_HWCAP   16ull
+#define SYS64_AT_SECURE  23ull
+#define SYS64_AT_RANDOM  25ull
+#define SYS64_AT_EXECFN  31ull
 
 typedef struct {
     u32 count;
@@ -1365,9 +1382,12 @@ static int place_vector64(u64 space, u64 bottom, const exec_vector64_t *v,
     return 0;
 }
 
-/* Lay out argc/argv/NULL/envp/NULL and a small auxiliary vector on the stack
- * elf64_load allocated. AT_PAGESZ and AT_ENTRY are what a static startup stub
- * asks for; there is no AT_PHDR because the loader does not expose it yet. */
+/* Lay out argc/argv/NULL/envp/NULL and the auxiliary vector on the stack
+ * elf64_load allocated. The vector is the Linux x86-64 one a static startup
+ * stub expects: the mapped program headers, page size, entry, identity ids,
+ * 16 random bytes and the exec path. AT_PHDR is omitted when the image does
+ * not map its own header table, because pointing a program at unmapped
+ * memory would be worse than leaving the entry out. */
 static int build_exec_stack64(loaded_elf64_t *loaded,
                               const exec_vector64_t *argv,
                               const exec_vector64_t *envp) {
@@ -1375,6 +1395,9 @@ static int build_exec_stack64(loaded_elf64_t *loaded,
     u64 envp_addresses[SYS64_EXEC_VEC_MAX];
     u64 words[SYS64_EXEC_WORDS_MAX];
     u64 count = 0, size, sp = loaded->stack_top;
+    u64 random_address = 0;
+    u64 execfn = 0;
+    u8 random_bytes[16];
     int error;
 
     error = place_vector64(loaded->space, loaded->stack_bottom, argv, &sp,
@@ -1383,18 +1406,65 @@ static int build_exec_stack64(loaded_elf64_t *loaded,
     error = place_vector64(loaded->space, loaded->stack_bottom, envp, &sp,
                            envp_addresses);
     if (error) return error;
+    if (argv->count) execfn = argv_addresses[0];
+
+    /* AT_RANDOM is 16 bytes the loader is expected to make unguessable.
+     * They sit above the word block so their address is fixed before the
+     * vector is written. */
+    if (sp < loaded->stack_bottom + sizeof(random_bytes)) return SYS64_E2BIG;
+    sp = (sp - sizeof(random_bytes)) & ~15ull;
+    if (sp < loaded->stack_bottom) return SYS64_E2BIG;
+    for (u32 i = 0; i < 2; i++) {
+        u64 word = sys64_random_next();
+        memcpy(&random_bytes[i * 8], &word, 8);
+    }
+    if (!copy_to_user64(loaded->space, sp, random_bytes,
+                        sizeof(random_bytes)))
+        return SYS64_EIO;
+    random_address = sp;
 
     words[count++] = argv->count;
     for (u32 i = 0; i < argv->count; i++) words[count++] = argv_addresses[i];
     words[count++] = 0;
     for (u32 i = 0; i < envp->count; i++) words[count++] = envp_addresses[i];
     words[count++] = 0;
+    if (loaded->phdr) {
+        words[count++] = SYS64_AT_PHDR;
+        words[count++] = loaded->phdr;
+        words[count++] = SYS64_AT_PHENT;
+        words[count++] = loaded->phent;
+        words[count++] = SYS64_AT_PHNUM;
+        words[count++] = loaded->phnum;
+    }
     words[count++] = SYS64_AT_PAGESZ;
     words[count++] = K64_PAGE_SIZE;
+    words[count++] = SYS64_AT_BASE;
+    words[count++] = 0;
+    words[count++] = SYS64_AT_FLAGS;
+    words[count++] = 0;
     words[count++] = SYS64_AT_ENTRY;
     words[count++] = loaded->entry;
+    words[count++] = SYS64_AT_UID;
+    words[count++] = 0;
+    words[count++] = SYS64_AT_EUID;
+    words[count++] = 0;
+    words[count++] = SYS64_AT_GID;
+    words[count++] = 0;
+    words[count++] = SYS64_AT_EGID;
+    words[count++] = 0;
+    words[count++] = SYS64_AT_HWCAP;
+    words[count++] = 0;
+    words[count++] = SYS64_AT_SECURE;
+    words[count++] = 0;
+    words[count++] = SYS64_AT_RANDOM;
+    words[count++] = random_address;
+    if (execfn) {
+        words[count++] = SYS64_AT_EXECFN;
+        words[count++] = execfn;
+    }
     words[count++] = SYS64_AT_NULL;
     words[count++] = 0;
+    if (count > SYS64_EXEC_WORDS_MAX) return SYS64_E2BIG;
 
     size = count * 8ull;
     if (sp < loaded->stack_bottom + size) return SYS64_E2BIG;
@@ -1403,6 +1473,27 @@ static int build_exec_stack64(loaded_elf64_t *loaded,
     if (!copy_to_user64(loaded->space, sp, words, size)) return SYS64_EIO;
     loaded->stack_top = sp;
     return 0;
+}
+
+/* The kernel starts /INIT.ELF itself, so it has no execve() vectors to copy.
+ * Build the same image from one path: argv[0] and AT_EXECFN are the path and
+ * the environment stays empty. */
+int sys64_build_init_stack(loaded_elf64_t *loaded, const char *path) {
+    exec_vector64_t argv, envp;
+    u32 length = 0;
+
+    memset(&argv, 0, sizeof(argv));
+    memset(&envp, 0, sizeof(envp));
+    while (path && path[length]) length++;
+    if (!path || length == 0 || length + 1 > SYS64_EXEC_ARG_MAX ||
+        length + 1 > SYS64_EXEC_BYTES_MAX)
+        return SYS64_E2BIG;
+    argv.count = 1;
+    argv.length = length + 1;
+    argv.offsets[0] = 0;
+    argv.lengths[0] = length + 1;
+    memcpy(argv.strings, path, length + 1);
+    return build_exec_stack64(loaded, &argv, &envp);
 }
 
 /* execve(path, argv, envp): replace the caller's image with an ELF64 file
@@ -1979,6 +2070,41 @@ static u64 sys64_prctl(u64 option, u64 arg2, u64 arg3, u64 arg4, u64 arg5) {
     default:
         return 0;
     }
+}
+
+/* arch_prctl(2): the x86-64 thread-pointer call. FS and GS bases are the
+ * only values here; the kernel validates that the address is inside the user
+ * half and copies GET results through the normal user-pointer path. SET_GS
+ * writes KERNEL_GS_BASE because this code runs after the entry SWAPGS: the
+ * value is where the exit SWAPGS will look for the ring-3 base. */
+static u64 sys64_arch_prctl(u64 code, u64 address) {
+    int id = sched64_current();
+    u64 space = current_space();
+    u64 base;
+
+    switch (code) {
+    case K64_ARCH_SET_FS:
+        if (address >= K64_USER_END) return (u64)0 - SYS64_EINVAL;
+        task64_set_fs_base(id, address);
+        write_msr64(K64_MSR_FS_BASE, address);
+        return 0;
+    case K64_ARCH_SET_GS:
+        if (address >= K64_USER_END) return (u64)0 - SYS64_EINVAL;
+        task64_set_gs_base(id, address);
+        write_msr64(K64_MSR_KERNEL_GS_BASE, address);
+        return 0;
+    case K64_ARCH_GET_FS:
+        base = task64_fs_base(id);
+        break;
+    case K64_ARCH_GET_GS:
+        base = task64_gs_base(id);
+        break;
+    default:
+        return (u64)0 - SYS64_EINVAL;
+    }
+    if (!address || !copy_to_user64(space, address, &base, sizeof(base)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
 }
 
 /* --------------------------------------------------------- memory mapping
@@ -2622,6 +2748,10 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
     case K64_SYS_PRCTL:
         result = sys64_prctl(frame->rdi, frame->rsi, frame->rdx, frame->r10,
                              frame->r8);
+        break;
+
+    case K64_SYS_ARCH_PRCTL:
+        result = sys64_arch_prctl(frame->rdi, frame->rsi);
         break;
 
     case K64_SYS_GETRANDOM:

@@ -79,9 +79,13 @@ the work on its behalf.
       `struct stat` (144 bytes), `iovec`, `timespec` and syscall numbers, and
       keep `include/haku/abi64.inc` in step with it; the build's ABI-sync
       check covers both architectures.
-- [x] The 64-bit entry state: `argc`/`argv`/`envp` on the stack, and the
-      minimal auxv (`AT_PAGESZ`, `AT_ENTRY`, `AT_NULL`) for `execve`. A forked
-      child leads its own thread group, so `getpid()` reports the child.
+- [x] The 64-bit entry state: `argc`/`argv`/`envp` on the stack and the
+      Linux auxiliary vector (`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, `AT_PAGESZ`,
+      `AT_BASE`, `AT_FLAGS`, `AT_ENTRY`, the identity words, `AT_SECURE`,
+      `AT_RANDOM`, `AT_EXECFN`, `AT_HWCAP`). The kernel's own `/INIT.ELF`
+      launch uses the same builder `execve` does, so both paths agree. A
+      forked child leads its own thread group, so `getpid()` reports the
+      child.
 - [x] The user library itself: string/memory, formatted output, a `brk`
       allocator, the file and process calls, `mmap`, `errno`, and the raw
       syscall stubs.
@@ -89,9 +93,14 @@ the work on its behalf.
       FAT12 volume: `user/tests/init64.c` as `/INIT.ELF`, started by the
       kernel, printed to the serial console, checked through
       `HAKU64-LIBC-OK` and its exit status.
-- [ ] A small auxv-driven TLS: `arch_prctl(158)` or a mapping the program can
+- [x] A small auxv-driven TLS: `arch_prctl(158)` or a mapping the program can
       put the `%fs` base in, so a compiler-generated `__declspec(thread)`
-      variable works.
+      variable works. The x86-64 kernel serves `ARCH_SET_FS`/`ARCH_SET_GS`
+      and `ARCH_GET_FS`/`ARCH_GET_GS`, keeps the bases per task, and reloads
+      them on every switch; `user/lib64/tls64.c` finds `PT_TLS` through
+      `AT_PHDR`, copies the template, builds a TEB/TlsSlots block and installs
+      it as the user GS base before `main()`. `HAKU64-USER-TLS-OK` covers the
+      initializer, zero fill, read/write, both base calls and fork isolation.
 - [ ] The x86-64 third-party probe: the i386 suite builds a static musl
       binary and runs it; the 64-bit side should prove the same thing with an
       `x86_64-linux-musl` build, so the ABI is tested by code the project did

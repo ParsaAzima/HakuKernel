@@ -151,9 +151,12 @@ typedef signed long long s64;
 #define K64_VEC_TLB         0x42u
 
 /* Model-specific registers reached through read_msr64/write_msr64. GS.base
- * holds the per-CPU block while the kernel runs and 0 in ring 3, so a
- * SWAPGS on every privilege transition is what makes gs:[offset] mean "this
- * CPU" (see percpu64.c). */
+ * holds the per-CPU block while the kernel runs and the task's user GS base
+ * in ring 3, so a SWAPGS on every privilege transition is what makes
+ * gs:[offset] mean "this CPU" in the kernel and "this thread's TEB" in user
+ * space (see percpu64.c and task64.c). FS has no kernel use: its base is
+ * simply the task's user FS base and is reloaded on every switch. */
+#define K64_MSR_FS_BASE        0xC0000100u
 #define K64_MSR_GS_BASE        0xC0000101u
 #define K64_MSR_KERNEL_GS_BASE 0xC0000102u
 
@@ -186,12 +189,22 @@ typedef signed long long s64;
 #define K64_SYS_KILL          62u
 #define K64_SYS_MKDIR         83u
 #define K64_SYS_GETPPID       110u
+#define K64_SYS_ARCH_PRCTL    158u
 #define K64_SYS_INIT_MODULE   175u
 #define K64_SYS_DELETE_MODULE 176u
 #define K64_SYS_GETTID        186u
 #define K64_SYS_FUTEX         202u
 #define K64_SYS_CLOCK_GETTIME 228u
 #define K64_SYS_EXIT_GROUP    231u
+
+/* arch_prctl(2) subcommands. Haku follows Linux: SET_GS/SET_FS install a
+ * user GS/FS base and GET_* copy the current base back through a user
+ * pointer. The base is the only piece of the x86-64 thread state the kernel
+ * owns; what a program puts at that address is its own business. */
+#define K64_ARCH_SET_GS 0x1001u
+#define K64_ARCH_SET_FS 0x1002u
+#define K64_ARCH_GET_FS 0x1003u
+#define K64_ARCH_GET_GS 0x1004u
 
 /* The rest of the x86-64 Linux table this port answers. They are grouped
  * the way the kernel implements them: metadata and paths first, then the
@@ -702,7 +715,11 @@ typedef struct {
 
 /* What elf64_load produced. `writable` is the page-aligned start of the
  * first writable segment (0 when the image has none) and is what the
- * self-test reads back after ring 3 has run. */
+ * self-test reads back after ring 3 has run. `phdr` is the virtual address
+ * of the program header table when a PT_LOAD maps the file offset the table
+ * lives at (the PE repacker adds that header segment); a program with no
+ * mapped headers gets 0 and no AT_PHDR, because a pointer to unmapped
+ * memory would be worse than a missing entry. */
 typedef struct {
     u64 space;
     u64 entry;
@@ -711,7 +728,10 @@ typedef struct {
     u64 image_low;
     u64 image_high;
     u64 writable;
+    u64 phdr;
     u32 pages;
+    u32 phent;
+    u32 phnum;
 } loaded_elf64_t;
 
 int elf64_load(const u8 *image, u64 image_size, loaded_elf64_t *loaded);
@@ -820,6 +840,13 @@ u64 task64_fault_address(int id);
 u64 task64_mmap_base(int id);
 u64 task64_get_brk(int id);
 void task64_set_brk(int id, u64 value);
+/* Per-task user FS/GS bases, the addresses arch_prctl(158) reads and writes.
+ * The scheduler reloads both MSRs from these fields on every switch, so a
+ * fork inherits them and execve clears them with the rest of the old image. */
+u64 task64_fs_base(int id);
+u64 task64_gs_base(int id);
+void task64_set_fs_base(int id, u64 base);
+void task64_set_gs_base(int id, u64 base);
 u64 task64_mmap_reserve(int id, u64 pages);
 /* Mapping records: munmap has to know whether the frames in a range belong
  * to the mapping (anonymous or a private file copy) or to a cache page that
@@ -966,6 +993,9 @@ u32 module64_count(void);
 void syscall64_init(void);
 regs64_t *sys64_dispatch(regs64_t *frame);
 u64 sys64_count(void);
+/* Build the same argc/argv/envp/auxv stack image execve produces for a
+ * kernel-launched image. `path` becomes argv[0] and AT_EXECFN. */
+int sys64_build_init_stack(loaded_elf64_t *loaded, const char *path);
 
 /* idt64.c: gate table plus the C exception/IRQ dispatcher */
 void idt64_init(void);

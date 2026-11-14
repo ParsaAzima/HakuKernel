@@ -56,6 +56,7 @@
 %define HAKU64_SYS_RMDIR         84
 %define HAKU64_SYS_UNLINK        87
 %define HAKU64_SYS_GETPPID       110
+%define HAKU64_SYS_ARCH_PRCTL    158
 %define HAKU64_SYS_GETTID        186
 %define HAKU64_SYS_GETDENTS64    217
 %define HAKU64_SYS_CLOCK_GETTIME 228
@@ -69,6 +70,31 @@
 %define HAKU64_SYS_DUP3          292
 %define HAKU64_SYS_GETRANDOM     318
 %define HAKU64_SYS_STATX         332
+
+; arch_prctl(2) subcommands and the auxv keys the startup stub reads.
+%define HAKU64_ARCH_SET_GS 0x1001
+%define HAKU64_ARCH_SET_FS 0x1002
+%define HAKU64_ARCH_GET_FS 0x1003
+%define HAKU64_ARCH_GET_GS 0x1004
+
+%define HAKU64_AT_NULL   0
+%define HAKU64_AT_PHDR   3
+%define HAKU64_AT_PHENT  4
+%define HAKU64_AT_PHNUM  5
+%define HAKU64_AT_PAGESZ 6
+%define HAKU64_AT_BASE   7
+%define HAKU64_AT_FLAGS  8
+%define HAKU64_AT_ENTRY  9
+%define HAKU64_AT_UID    11
+%define HAKU64_AT_EUID   12
+%define HAKU64_AT_GID    13
+%define HAKU64_AT_EGID   14
+%define HAKU64_AT_HWCAP  16
+%define HAKU64_AT_SECURE 23
+%define HAKU64_AT_RANDOM 25
+%define HAKU64_AT_EXECFN 31
+
+%define HAKU64_PT_TLS 7
 
 ; errno values the C library and the 64-bit tests compare against.
 %define HAKU64_EPERM   1
