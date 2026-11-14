@@ -23,6 +23,9 @@ void terminal_write(const char *s);
  * the serial boot log keeps its timeline while the screen stays the
  * shell's. */
 void terminal_write_serial(const char *s);
+/* The right half of the status bar: the 32-bit PIT puts a "T+Ns" heartbeat
+ * there. The left half (machine identity) is set once at boot, and the two
+ * merge because the framebuffer renderer keeps both strings. */
 void terminal_corner(const char *s);
 
 /* Console device operations (VFS fd 0/1/2). read() returns after a newline

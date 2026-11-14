@@ -35,8 +35,8 @@ void display_clear(uint8_t color) {
     if (active) active->clear(color);
 }
 
-void display_status(const char *text) {
-    if (active && active->status) active->status(text);
+void display_status(const char *left, const char *right) {
+    if (active && active->status) active->status(left, right);
 }
 
 int display_cursor(uint32_t *row, uint32_t *col) {

@@ -142,7 +142,7 @@ void terminal_write_serial(const char *s) {
 }
 
 void terminal_corner(const char *s) {
-    display_status(s);
+    display_status(0, s);
 }
 
 /* --- self-test --------------------------------------------------------- */

@@ -6,6 +6,7 @@
  */
 #include "cpu.h"
 #include "display.h"
+#include "fbcon.h"
 #include "framebuffer.h"
 #include "heap.h"
 #include "idt.h"
@@ -110,14 +111,21 @@ void kernel_main(void) {
 
     /* Framebuffer console: the bootloader discovered a linear framebuffer
      * with the VBE BIOS calls; map it and draw the console there. Without
-     * one the VGA text buffer stays in use. */
+     * one the VGA text buffer stays in use. The renderer is shared with the
+     * 64-bit port (drivers/fbcon.c) and draws Terminus. */
     if (framebuffer_init()) {
-        display_use(&framebuffer_display);
+        display_use(&fbcon_display);
         if (klog_begin(KLOG_INFO)) {
             klog_write("FB-OK: vbe linear framebuffer ");
-            klog_dec(framebuffer_width());
+            klog_dec(fbcon_width());
             klog_write("x");
-            klog_dec(framebuffer_height());
+            klog_dec(fbcon_height());
+            klog_write(" grid=");
+            klog_dec(fbcon_columns());
+            klog_write("x");
+            klog_dec(fbcon_rows());
+            klog_write(" font=");
+            klog_write(fbcon_font_name());
             klog_write(" console active\n");
         }
     } else {
@@ -130,6 +138,13 @@ void kernel_main(void) {
         klog_write(display_name());
         klog_write("\n");
     }
+
+    /* Keep the machine's identity on the left half of the status bar; the
+     * PIT puts its "T+Ns" heartbeat on the right half. */
+    display_status(fbcon_active()
+                       ? "Haku i386   terminus-8x16   framebuffer"
+                       : "Haku i386   vga-text   80x25",
+                   0);
 
     if (!gdt_init()) {
         panic("GDT-FAIL: TSS initialization failed");
