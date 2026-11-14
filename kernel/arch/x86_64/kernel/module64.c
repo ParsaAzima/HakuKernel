@@ -20,6 +20,11 @@
 #include "haku64.h"
 #include "haku_module.h"
 #include "haku/abi.h"
+/* The module ABI's string runtime is libhakumod's, with 32-bit lengths. The
+ * kernel links its own 64-bit mem* (compat/cpu.h, reached through
+ * haku_module.h), so it must not also declare the module-side prototypes:
+ * this header would then hold two conflicting types for one symbol. */
+#define HAKU_MODULE_LIB_RUNTIME 1
 #include "haku/module.h"
 
 #define MODULE64_FREE      0u

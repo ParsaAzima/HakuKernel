@@ -148,11 +148,21 @@ void haku_module_fill_dirent(void *dirent, haku_u32 ino, haku_u32 type,
  * spellings that produce those exact symbols. There is deliberately no
  * printf, no allocation wrapper and no floating point; a module that needs
  * memory calls haku_module_alloc.
+ *
+ * A kernel translation unit that includes this header only for the types and
+ * constants above defines HAKU_MODULE_LIB_RUNTIME before it: the kernel has
+ * its own string routines, and on x86-64 those take `size_t` lengths where a
+ * module's runtime takes 32-bit ones. Two different prototypes for one
+ * symbol in one translation unit is a redefinition, so the side that owns
+ * the symbol declares it. The x64 loader (kernel/arch/x86_64/kernel/
+ * module64.c) is the only such unit today.
  */
+#ifndef HAKU_MODULE_LIB_RUNTIME
 void *memset(void *destination, int value, unsigned int count);
 void *memcpy(void *destination, const void *source, unsigned int count);
 void *memmove(void *destination, const void *source, unsigned int count);
 unsigned int strlen(const char *text);
 int strcmp(const char *left, const char *right);
+#endif
 
 #endif
