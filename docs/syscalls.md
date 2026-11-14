@@ -440,9 +440,9 @@ Deliberately absent: job-control stop/continue states (the group and session
 calls are real, but stop signals still end a process), hard links, file-backed
 mappings, `socket`, a user-facing `mount` (users cannot reparent the boot
 namespace; loadable modules mount their own prefix during init), networking,
-pipes on x86-64, most of the 64-bit namespace (FAT12 at `/` and devfs at
-`/dev` exist; ramfs, procfs and initramfs do not), and the capability half of
-the x64 module API (registration answers `-ENOSYS`).
+pipes on x86-64, the rest of the 64-bit namespace (FAT12 at `/disk`, the RAM
+initramfs at `/` and devfs at `/dev` exist; procfs does not), and the
+capability half of the x64 module API (registration answers `-ENOSYS`).
 `clone`-created threads are present: a thread shares the caller's address
 space, descriptors and signal dispositions, reports the process id from
 `getpid` and its own id from `gettid`, and the thread form is exercised as

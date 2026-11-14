@@ -315,6 +315,41 @@ static void test_console(void) {
     failures++;
 }
 
+/* The kernel unpacks a cpio archive from /disk/INITRD into RAM and mounts it
+ * at /. Reading a file that exists only in the archive proves the userland
+ * path reaches the RAM root, not the FAT12 volume: /etc/banner.txt is not
+ * present on the seed disk. */
+static void test_initramfs(void) {
+    char buffer[64];
+    haku64_stat_t status;
+    long long length;
+    int before = failures;
+    int fd;
+    ssize_t got = -1;
+
+    check(stat("/etc/banner.txt", &status) == 0, "stat /etc/banner.txt");
+    fd = open("/etc/banner.txt", HAKU64_O_RDONLY);
+    check(fd >= 0, "open /etc/banner.txt");
+    if (fd >= 0) {
+        memset(buffer, 0, sizeof(buffer));
+        got = read(fd, buffer, sizeof(buffer) - 1);
+        check(got > 0, "read /etc/banner.txt");
+        check(close(fd) == 0, "close /etc/banner.txt");
+        check(got >= 4 && memcmp(buffer, "Haku", 4) == 0,
+              "archive contents");
+    }
+    check(stat("/etc/banner.txt", &status) == 0 && status.st_size == got,
+          "archive file size");
+    check(open("/etc/missing.txt", HAKU64_O_RDONLY) < 0,
+          "archive lookup misses");
+
+    if (failures == before) {
+        length = (long long)got;
+        printf("HAKU64-USER-INITRAMFS-OK: /etc/banner.txt %lld bytes\n",
+               length);
+    }
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)envp;
 
@@ -328,6 +363,7 @@ int main(int argc, char **argv, char **envp) {
     test_memory();
     check(getcwd(NULL, 0) == NULL, "getcwd rejects a small buffer");
     test_files();
+    test_initramfs();
     test_devices();
     test_processes();
     test_mappings_and_time();

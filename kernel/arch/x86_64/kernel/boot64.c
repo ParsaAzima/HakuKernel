@@ -774,63 +774,83 @@ static int test_elf64_reject(void) {
     return ok;
 }
 
-/* The disk volume seeds two files: HELLO.TXT with the 16-byte marker and
- * PATTERN.BIN with three pages of a byte pattern. Reading both through the
- * FAT12 page cache proves the mount, the path walk and a multi-page file at
- * once; the 37/11 pattern is the same formula tools/mkfat12.py seeds. */
+/* The namespace root is the RAM initramfs, and the FAT12 volume is mounted
+ * at /disk. Both seed HELLO.TXT with the same 16-byte marker and PATTERN.BIN
+ * with three pages of a byte pattern, so reading all four through one cache
+ * proves the mount table, the path walk and a multi-page file at once; the
+ * 37/11 pattern is the formula tools/mkfat12.py and tools/mkcpio.py seed. */
 static u8 disk_pattern(u64 offset) {
     return (u8)((offset * 37u + 11u) & 0xFFu);
 }
 
-static int test_fs(void) {
-    static const char marker[16] = "HAKU64-FILE-OK\r\n";
-    char hello[16];
+static int check_pattern(const char *path, int pages) {
     u8 pattern[32];
-    int file;
+    int file = fs64_lookup(path);
 
-    file = fs64_lookup("/HELLO.TXT");
-    if (file < 0 || fs64_size(file) != sizeof(hello)) return 0;
-    if (fs64_read(file, 0, hello, sizeof(hello)) != sizeof(hello)) return 0;
-    if (memcmp(hello, marker, sizeof(hello)) != 0) return 0;
-    if (fs64_lookup("/missing.txt") >= 0) return 0;
-
-    file = fs64_lookup("/PATTERN.BIN");
-    if (file < 0 || fs64_pages(file) != 3) return 0;
+    if (file < 0 || fs64_pages(file) != (u64)pages) return 0;
     if (fs64_read(file, 0x1000, pattern, sizeof(pattern)) !=
         sizeof(pattern))
         return 0;
     for (u32 i = 0; i < sizeof(pattern); i++)
         if (pattern[i] != disk_pattern(0x1000 + i)) return 0;
+    fs64_release(file);
     return 1;
 }
 
-/* The mount table and the first non-disk backend. fs64_init() mounted FAT12
- * at "/" and devfs at "/dev", so a path now names a backend before it names
- * a file. The test runs before the scheduler exists, so it speaks to the
- * descriptor table for task 0, exactly as the FAT12 tests above do. */
+static int check_marker(const char *path) {
+    static const char marker[16] = "HAKU64-FILE-OK\r\n";
+    char hello[16];
+    int file = fs64_lookup(path);
+
+    if (file < 0 || fs64_size(file) != sizeof(hello)) return 0;
+    if (fs64_read(file, 0, hello, sizeof(hello)) != sizeof(hello)) return 0;
+    fs64_release(file);
+    return memcmp(hello, marker, sizeof(hello)) == 0;
+}
+
+static int test_fs(void) {
+    if (!check_marker("/HELLO.TXT")) return 0;
+    if (!check_marker("/disk/HELLO.TXT")) return 0;
+    if (fs64_lookup("/missing.txt") >= 0) return 0;
+    if (!check_pattern("/PATTERN.BIN", 3)) return 0;
+    if (!check_pattern("/disk/PATTERN.BIN", 3)) return 0;
+    return 1;
+}
+
+/* The mount table: /disk is the FAT12 volume, / is the RAM initramfs and
+ * /dev is devfs. fs64_init() built the table, and initramfs64_init() filled
+ * the RAM root, so a path now names a backend before it names a file. The
+ * test runs before the scheduler exists, so it speaks to the descriptor
+ * table for task 0, exactly as the tests above do. */
 static int test_vfs64(void) {
     static const char junk[] = "this is discarded";
     char buffer[8];
     char rel[VFS64_REL_MAX];
-    char name[13];
+    char name[FS64_NAME_MAX];
     u64 size;
     u32 ino, mount, next = 0;
-    int fd, error = 0, kind, entry_kind, result;
+    int fd, error = 0, kind, entry_kind, result, slot, note;
 
-    /* Two mounts, each winning exactly its own subtree: /dev must not claim
+    /* Three mounts, each winning exactly its own subtree: /dev must not claim
      * /device.txt, and a relative path names no mount at all. */
-    if (vfs64_mount_count() != 2) return 0;
-    if (memcmp(vfs64_mount_prefix(0), "/", 2) != 0 ||
+    if (vfs64_mount_count() != 3) return 0;
+    if (memcmp(vfs64_mount_prefix(0), "/disk", 6) != 0 ||
         vfs64_mount_kind(0) != VFS64_MOUNT_FAT)
         return 0;
-    if (memcmp(vfs64_mount_prefix(1), "/dev", 5) != 0 ||
-        vfs64_mount_kind(1) != VFS64_MOUNT_DEV)
+    if (memcmp(vfs64_mount_prefix(1), "/", 2) != 0 ||
+        vfs64_mount_kind(1) != VFS64_MOUNT_RAM)
+        return 0;
+    if (memcmp(vfs64_mount_prefix(2), "/dev", 5) != 0 ||
+        vfs64_mount_kind(2) != VFS64_MOUNT_DEV)
         return 0;
     if (vfs64_resolve("/dev/null", &mount, rel) != 0 ||
         mount != VFS64_MOUNT_DEV || memcmp(rel, "/null", 6) != 0)
         return 0;
-    if (vfs64_resolve("/DEVICE.TXT", &mount, rel) != 0 ||
-        mount != VFS64_MOUNT_FAT || memcmp(rel, "/DEVICE.TXT", 12) != 0)
+    if (vfs64_resolve("/disk/HELLO.TXT", &mount, rel) != 0 ||
+        mount != VFS64_MOUNT_FAT || memcmp(rel, "/HELLO.TXT", 11) != 0)
+        return 0;
+    if (vfs64_resolve("/device.txt", &mount, rel) != 0 ||
+        mount != VFS64_MOUNT_RAM || memcmp(rel, "/device.txt", 12) != 0)
         return 0;
     if (vfs64_resolve("dev/null", &mount, rel) == 0) return 0;
 
@@ -878,6 +898,9 @@ static int test_vfs64(void) {
     if (fs64_stat_path("/dev/null", &size, &ino, &kind) != 0 ||
         kind != FS64_KIND_CHAR || ino != VFS64_DEV_INO_BASE + 1u)
         return 0;
+    if (fs64_stat_path("/disk", &size, &ino, &kind) != 0 ||
+        kind != FS64_KIND_DIR)
+        return 0;
 
     /* Listing comes back in mount order and then ends. */
     result = fs64_dir_entries("/dev", 0, name, &ino, &entry_kind, &next);
@@ -892,31 +915,82 @@ static int test_vfs64(void) {
     if (fs64_dir_entries("/dev", next, name, &ino, &entry_kind, &next) != 0)
         return 0;
 
-    /* The namespace is read-only: a device is not a place to create,
-     * remove, rename or truncate things. */
+    /* The devices are read-only as a namespace: a device is not a place to
+     * create, remove, rename or truncate things. */
     if (fs64_unlink("/dev/null") != -HAKU_EACCES) return 0;
     if (fs64_create_dir("/dev/tmp") != -HAKU_EACCES) return 0;
     if (fs64_rename("/dev/null", "/NULL") != -HAKU_EACCES) return 0;
     if (fs64_rmdir("/dev") != -HAKU_EACCES) return 0;
     if (fs64_stat_path("/dev/missing", &size, &ino, &kind) != -HAKU_ENOENT)
         return 0;
+
+    /* The RAM root is writable: create, write, read back through a fresh
+     * lookup and unlink. A name that does not fit FAT12's 8.3 form proves
+     * the root really is not the disk. */
+    fd = fs64_open_fd(0, "/vfs-note.txt",
+                      K64_O_CREAT | K64_O_TRUNC | K64_O_RDWR, &error);
+    if (fd < 0) return 0;
+    slot = fs64_fd_file(0, fd);
+    if (slot < 0 ||
+        fs64_write(slot, 0, junk, sizeof(junk) - 1) != sizeof(junk) - 1) {
+        fs64_fd_close(0, fd);
+        return 0;
+    }
+    fs64_fd_close(0, fd);
+
+    note = fs64_lookup("/vfs-note.txt");
+    if (note < 0 || fs64_size(note) != sizeof(junk) - 1) return 0;
+    if (fs64_read(note, 0, buffer, 4) != 4 ||
+        memcmp(buffer, junk, 4) != 0) return 0;
+    fs64_release(note);
+    if (fs64_unlink("/vfs-note.txt") != 0) return 0;
+    if (fs64_lookup("/vfs-note.txt") >= 0) return 0;
     return 1;
 }
 
-/* The ring-3 program created /TMP and wrote NOTE.TXT, then closed it. A new
- * lookup therefore has to read the bytes back from the volume, not from a
- * descriptor that is still open: this is the disk-write proof. */
+/* The kernel writes /disk/NOTE.TXT through a descriptor and closes it: a new
+ * lookup then has to read the bytes back from the volume, not from the cache
+ * slot that is still open. The host check reads the same file with
+ * tools/lsfat12.py, so this is the on-disk write proof. */
 static int test_disk_note(void) {
     static const char expected[16] = "HAKU64-DISK-OK\r\n";
     char note[16];
-    int file = fs64_lookup("/TMP/NOTE.TXT");
+    int fd, file, slot, error = 0;
 
+    fd = fs64_open_fd(0, "/disk/NOTE.TXT",
+                      K64_O_CREAT | K64_O_TRUNC | K64_O_WRONLY, &error);
+    if (fd < 0) return 0;
+    slot = fs64_fd_file(0, fd);
+    if (slot < 0) {
+        fs64_fd_close(0, fd);
+        return 0;
+    }
+    if (fs64_write(slot, 0, expected, sizeof(note)) != sizeof(note)) {
+        fs64_fd_close(0, fd);
+        return 0;
+    }
+    fs64_fd_close(0, fd);
+
+    file = fs64_lookup("/disk/NOTE.TXT");
     if (file < 0 || fs64_size(file) != sizeof(note)) return 0;
     if (fs64_read(file, 0, note, sizeof(note)) != sizeof(note)) return 0;
+    fs64_release(file);
     if (memcmp(note, expected, sizeof(note)) != 0) return 0;
 
-    k64_puts("HAKU64-DISK-OK: /TMP/NOTE.TXT read back after close\r\n");
+    k64_puts("HAKU64-DISK-OK: /disk/NOTE.TXT read back after close\r\n");
     return 1;
+}
+
+/* Size of a path through the cache, releasing the lookup so the eight cache
+ * slots are not pinned by the boot report. */
+static u64 path_size64(const char *path) {
+    int file = fs64_lookup(path);
+    u64 size;
+
+    if (file < 0) return 0;
+    size = fs64_size(file);
+    fs64_release(file);
+    return size;
 }
 
 /* X64MOD.HKM is the packed x86-64 demo. Reading it from the volume and
@@ -1206,16 +1280,21 @@ void kernel64_main(void) {
     if (!test_heap()) k64_fail("heap self-test");
 
     if (!fs64_init()) k64_fail("FAT12 disk mount");
-    if (!test_fs()) k64_fail("FAT12 file self-test");
-    k64_puts("HAKU64-FS-OK: hello=");
-    k64_dec(fs64_size(fs64_lookup("/HELLO.TXT")));
+    if (!initramfs64_init()) k64_fail("initramfs unpack");
+    if (!test_fs()) k64_fail("filesystem self-test");
+    k64_puts("HAKU64-FS-OK: root hello=");
+    k64_dec(path_size64("/HELLO.TXT"));
     k64_puts(" pattern=");
-    k64_dec(fs64_size(fs64_lookup("/PATTERN.BIN")));
+    k64_dec(path_size64("/PATTERN.BIN"));
+    k64_puts(" disk hello=");
+    k64_dec(path_size64("/disk/HELLO.TXT"));
     k64_puts("\r\n");
 
     if (!test_vfs64()) k64_fail("VFS namespace self-test");
     k64_puts("HAKU64-VFS-OK: mounts=");
     k64_dec(vfs64_mount_count());
+    k64_puts(" root=");
+    k64_puts(vfs64_mount_kind(1) == VFS64_MOUNT_RAM ? "ram" : "fat");
     k64_puts(" devfs devices=");
     k64_dec(VFS64_DEV_COUNT);
     k64_puts("\r\n");

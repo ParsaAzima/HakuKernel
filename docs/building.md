@@ -102,9 +102,12 @@ run prints `HAKU64-SMP-SCHED-SKIP: uniprocessor` (or `SMP-SCHED-SKIP`) and
 
 `python build.py headless` builds and boots `haku64.img`, the default run. That
 run starts a fresh FAT12 data disk (`build/haku64_fs.img`) seeded with
-`HELLO.TXT`, `PATTERN.BIN`, the `USER.ELF` program the test execs, `INIT.ELF`
+`HELLO.TXT`, `PATTERN.BIN`, `INITRD` (the cpio archive unpacked into the RAM
+root), the `USER.ELF` program the test execs, `INIT.ELF`
 (the C program built against `user/lib64`) and `X64MOD.HKM`, the packed
-x86-64 module. It ends with
+x86-64 module. The archive carries the same files plus `etc/banner.txt` and the
+`tmp`, `dev` and `disk` directories, so `/` is the RAM root and `/disk` is the
+FAT12 volume. It ends with
 `HAKU64-ELF-REJECT-OK` (six malformed ELF64 images refused with a reason),
 `HAKU64-ELF-OK` (the embedded static executable mapped into a fresh address
 space), `HAKU64-ELF-RUN-OK` (the program ran in ring 3, stored its BSS word
@@ -128,14 +131,21 @@ ported table: `stat`/`fstat`/`statx`, `chdir`/`getcwd` with a relative open,
 `ftruncate`/`truncate`/`renameat`/`unlinkat`, `uname`/`times`/`getrlimit`/
 `clock_getres`, `prctl` names, two different `getrandom` words,
 `brk`+`mprotect`, `poll`/`select`, `sched_yield` and `dup3`/`fcntl`). It also
-loads `X64MOD.HKM` from the FAT12 volume: the module logs, reads ticks, uses
+`HAKU64-DISK-OK`, `HAKU64-VFS-OK` and `HAKU64-INITRAMFS-OK` (the kernel reads
+`/disk/INITRD`, unpacks the cpio archive into the RAM root, and reports the
+entry, file and byte counts while `/disk` stays the FAT12 volume), and
+`HAKU64-DEVFS-OK` (devfs at `/dev` with `null`, `zero` and `console`). It also
+loads `X64MOD.HKM` from the RAM root: the module logs, reads ticks, uses
 the heap and exits (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`,
 `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`), while a duplicate load, a
 truncated file and a bad magic must be refused before
 `HAKU64-MODULE-REJECT-OK`. Finally `HAKU64-LIBC-OK`: the kernel loads
-`/INIT.ELF` off the volume, and that program — written in ordinary C against
+`/INIT.ELF` from the RAM root, and that program — written in ordinary C against
 `user/lib64` — prints, allocates, reads and writes files, forks a
 copy-on-write child, maps memory and reads the clock before exiting 0.
+`HAKU64-USER-INITRAMFS-OK` shows that same ring-3 program opening
+`/etc/banner.txt`, a file that exists only in the archive and not on the seed
+disk, so the userland path really reaches the RAM root.
 The display stack is checked too: `HAKU64-FB-OK` names the VBE mode the shared
 renderer took over (`grid=128x48 font=terminus-8x16`), `HAKU64-TERMINAL-OK`
 names the backend, and `HAKU64-KBD-OK` proves the PS/2 set-1 decoder. The run
@@ -148,8 +158,11 @@ renderer's foreground-grey pixels: a console that reported its mode but painted
 no glyphs cannot pass on the serial log alone. `build/screen.ppm` is
 the 32-bit capture, taken at the end of its run.
 After QEMU exits, `tools/lsfat12.py --check` verifies the volume the guest
-just wrote. The 32-bit `haku.img` is still built with `--arch=i386`, and it
-remains the only image with the shell and capability modules.
+just wrote, and `--cat NOTE.TXT` re-reads the bytes the kernel wrote to
+`/disk/NOTE.TXT`, so the disk write is proven from the host's view and not
+just from the kernel's cache. The 32-bit `haku.img` is still built with
+`--arch=i386`, and it remains the only image with the shell and capability
+modules.
 
 `python build.py shell` boots something else entirely: a real static
 `busybox` (musl, i386) as PID 1, so the guest comes up in `ash` instead of
@@ -189,8 +202,8 @@ after the serial-log check passes, re-verifies the post-run image on the
 host side.
 
 `build/haku64_fs.img` is the x86-64 data disk. It is rebuilt on every x64 run
-because the self-test writes `/TMP/NOTE.TXT` into it and no user data is
-expected to survive; its seed files are `HELLO.TXT`, `PATTERN.BIN`,
+because the self-test writes `/disk/NOTE.TXT` into it and no user data is
+expected to survive; its seed files are `HELLO.TXT`, `PATTERN.BIN`, `INITRD`,
 `USER.ELF`, `INIT.ELF` and `X64MOD.HKM`.
 
 `python build.py inspect` (default: `build/haku_fs.img`) lists the root

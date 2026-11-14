@@ -880,11 +880,14 @@ int task64_reap(int parent, int pid, u64 *status);
 int task64_signal(int id, u32 signal);
 int task64_parent(int id);
 
-/* fs64.c: a page cache in front of the FAT12 volume on the ATA disk.
- * Each cached path is at most 32 pages (128 KiB) and eight paths are
- * cached at once. */
+/* fs64.c: a page cache in front of every mounted filesystem. A cached file
+ * is at most FS64_PAGE_MAX pages (128 KiB) and eight paths are cached at
+ * once. The FAT12 volume is mounted at /disk and the RAM initramfs at /. */
 #define K64_FS_FDS      16u
 #define K64_FS_PATH_MAX 64u
+#define FS64_PAGE_MAX   32u
+/* Size of a directory-entry name buffer, including the NUL. */
+#define FS64_NAME_MAX   48u
 /* fs64_fd_file() result for a duplicated console descriptor. */
 #define K64_FS_CONSOLE  (-2)
 int fs64_init(void);
@@ -919,7 +922,7 @@ void fs64_fork_fds(int parent, int child);
 void fs64_share_fds(int parent, int child);
 void fs64_task_cleanup(int task);
 
-/* Metadata and path operations on the mounted FAT12 volume. They share the
+/* Metadata and path operations on the mounted filesystems. They share the
  * page cache, so a write through an open descriptor is visible to a stat or
  * a directory listing once the slot is flushed. All return 0 or a negative
  * errno. `kind` is FS64_KIND_*. */
@@ -938,10 +941,15 @@ void fs64_sync_all(void);
 /* Entry `index` of the directory open on `fd`, with the cursor advanced in
  * the description. Returns 1 with the entry filled, 0 at the end, or a
  * negative errno. `kind` is FS64_KIND_*. */
-int fs64_fd_entry(int task, int fd, u32 index, char name[13], u32 *ino,
-                  int *kind, u32 *next_index);
-int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
-                     int *kind, u32 *next_index);
+int fs64_fd_entry(int task, int fd, u32 index, char name[FS64_NAME_MAX],
+                  u32 *ino, int *kind, u32 *next_index);
+int fs64_dir_entries(const char *path, u32 index, char name[FS64_NAME_MAX],
+                     u32 *ino, int *kind, u32 *next_index);
+
+/* initramfs64.c: read /disk/INITRD and unpack its cpio "newc" archive into
+ * the RAM root. When the archive is absent, the FAT12 volume becomes the
+ * root instead, so an older image still boots. Returns 1 on success. */
+int initramfs64_init(void);
 
 /* module64.c: the x86-64 loader for the container in
  * kernel/module/haku_module.h. It accepts version 2 only, applies the two

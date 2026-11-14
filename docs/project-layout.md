@@ -43,7 +43,11 @@ Haku/
                         preemptive scheduler and the frame-pointer switch;
                         syscall64.c: SYSCALL/SYSRET plus the DPL-3 INT 0x80
                         fallback and the ported call table;
-                        fs64.c: FAT12 page cache in front of the ATA disk;
+                        fs64.c: page cache in front of the FAT12 disk and the
+                        RAM root;
+                        ramfs64.c: RAM root node table; its pages are the
+                        frames the cache aliases;
+                        initramfs64.c: cpio "newc" unpacker for /disk/INITRD;
                         vfs64.c: mount table, path resolution and devfs
                         (null, zero, console);
                         rtc64.c: CMOS wall clock;
@@ -144,7 +148,8 @@ Haku/
   build/               generated files (stage*.bin, *.obj/pe, haku64.img, ...)
   haku64.img           primary bootable floppy image (x86-64)
   haku.img             bootable floppy image (i386, --arch=i386)
-  build/haku64_fs.img  1.44 MB FAT12 ATA disk for the x64 kernel
+  build/haku64_fs.img  1.44 MB FAT12 ATA disk for the x64 kernel, with
+                      build/initrd64.cpio seeded as INITRD
   build/haku_fs.img    1.44 MB FAT12 ATA disk image with HAKU/NEXT/LIB ELFs
                       and the INITRD initramfs archive
   build/ata_spare.img  1.44 MB blank ATA disk on the secondary channel (scan test)

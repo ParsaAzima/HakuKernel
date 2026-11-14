@@ -403,33 +403,53 @@ def build_shell_image(py, user_elf, busybox, command):
 
 
 def build_x64_fs(py, image, exec_elf, module_image, init_elf):
-    """Seed the x86-64 data disk: five files the kernel reads at boot.
+    """Seed the x86-64 disk: a FAT12 volume with the boot archive on it.
 
-    HELLO.TXT carries the 16-byte marker the ELF64 self-test prints,
-    PATTERN.BIN is three pages so a file mapping and a multi-page read both
-    have data on every page, USER.ELF is the program the test execs from
-    the disk (the kernel image does not contain it, so running it proves the
-    exec path), INIT.ELF is the C program built against user/lib64 that the
-    kernel starts as the first ring-3 image, and X64MOD.HKM is the packed
-    module the loader test reads and relocates. The pattern is the same
-    (offset*37+11) & 0xFF formula boot64.c uses to verify it. The image is
-    rebuilt on every x64 run because the kernel also creates /TMP and writes
-    NOTE.TXT into it.
+    The kernel mounts FAT12 at /disk, reads /disk/INITRD, and unpacks it into
+    the RAM filesystem that becomes /. The archive therefore carries what the
+    boot tests open by absolute path: HELLO.TXT with the 16-byte marker,
+    PATTERN.BIN with three pages of a byte pattern, USER.ELF (the program the
+    ring-3 test execs, so the kernel image does not contain it), INIT.ELF (the
+    C program built against user/lib64 that the kernel starts first),
+    X64MOD.HKM (the packed module the loader reads and relocates), and
+    etc/banner.txt for the ring-3 initramfs check. The pattern is the same
+    (offset*37+11) & 0xFF formula boot64.c uses to verify it.
+
+    The FAT12 volume keeps its own copies of HELLO.TXT and PATTERN.BIN so the
+    kernel can prove that /disk and / reach two different backends. The image
+    is rebuilt on every x64 run because the kernel also writes /disk/NOTE.TXT
+    into it.
     """
     hello = b"HAKU64-FILE-OK\r\n"
     pattern = bytes(((i * 37 + 11) & 0xFF) for i in range(3 * 4096))
+    banner = b"Haku x86-64 initramfs\n/etc/banner.txt\n"
     hello_path = os.path.join(BUILD, "haku64_hello.txt")
     pattern_path = os.path.join(BUILD, "haku64_pattern.bin")
+    banner_path = os.path.join(BUILD, "haku64_banner.txt")
+    archive = os.path.join(BUILD, "initrd64.cpio")
     with open(hello_path, "wb") as f:
         f.write(hello)
     with open(pattern_path, "wb") as f:
         f.write(pattern)
+    with open(banner_path, "wb") as f:
+        f.write(banner)
+
+    # cpio "newc" archive. Directories first so the entries below resolve
+    # without an intermediate mkdir; the kernel creates parents anyway.
+    run([py, os.path.join(ROOT, "tools", "mkcpio.py"), archive,
+         "--dir=tmp", "--dir=dev", "--dir=disk",
+         f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
+         f"USER.ELF={exec_elf}", f"INIT.ELF={init_elf}",
+         f"X64MOD.HKM={module_image}", f"etc/banner.txt={banner_path}"])
+    if os.path.getsize(archive) > 32 * 4096:
+        raise SystemExit("x64 initramfs exceeds the 128 KiB cached-file limit")
 
     run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
-         f"USER.ELF={exec_elf}", f"INIT.ELF={init_elf}",
-         f"X64MOD.HKM={module_image}"])
-    log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes)")
+         f"INITRD={archive}", f"USER.ELF={exec_elf}",
+         f"INIT.ELF={init_elf}", f"X64MOD.HKM={module_image}"])
+    log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes, "
+        f"initramfs {os.path.getsize(archive)} bytes)")
 
 
 def build_x64(nasm, py, memory_mb, smp_cpus, mode):
@@ -687,7 +707,8 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
                 "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",
                 "HAKU64-RTC-OK", "HAKU64-SYSCALL64-OK", "HAKU64-FS-OK",
-                "HAKU64-VFS-OK", "HAKU64-DEVFS-OK", "HAKU64-USER-DEV-OK",
+                "HAKU64-VFS-OK", "HAKU64-INITRAMFS-OK", "HAKU64-DEVFS-OK",
+                "HAKU64-USER-DEV-OK", "HAKU64-USER-INITRAMFS-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
                 "HAKU64-COW-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",
@@ -718,15 +739,20 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     if missing or not reached:
         sys.exit("X64 CHECK FAILED: missing markers: " + ", ".join(missing))
 
-    # The run created /TMP/NOTE.TXT and flushed it through the ATA cache, so
+    # The run created /disk/NOTE.TXT and flushed it through the ATA cache, so
     # a layout check of the host-side image proves the write reached the
-    # volume, not just the kernel's page cache.
+    # volume, not just the kernel's page cache. The bytes are compared too:
+    # a valid layout that spells the wrong marker would still be a bug.
     check = subprocess.run([py, os.path.join(ROOT, "tools", "lsfat12.py"),
                             "--check", fs_img], capture_output=True, text=True)
     print(check.stdout, end="")
     if check.returncode != 0:
         print(check.stderr, end="")
         sys.exit("X64 CHECK FAILED: the disk image is not valid after the run")
+    note = subprocess.run([py, os.path.join(ROOT, "tools", "lsfat12.py"),
+                           "--cat", "NOTE.TXT", fs_img], capture_output=True)
+    if note.returncode != 0 or note.stdout != b"HAKU64-DISK-OK\r\n":
+        sys.exit("X64 CHECK FAILED: /disk/NOTE.TXT did not reach the volume")
     log("X64 CHECK PASSED: " + ", ".join(required))
 
 

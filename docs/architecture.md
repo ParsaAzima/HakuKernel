@@ -70,8 +70,8 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
 | keyboard | PC/8042 in set-1 mode: IRQ1 unmasked after a decode-only self-test | `HAKU64-KBD-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
-| files | FAT12 on an ATA disk mounted at `/`, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
-| namespace | a four-entry mount table with longest-prefix resolution; devfs at `/dev` with `null`, `zero` and `console` | `HAKU64-VFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-USER-DEV-OK` |
+| files | FAT12 on an ATA disk at `/disk` plus a RAM initramfs root, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
+| namespace | a four-entry mount table with longest-prefix resolution; FAT12 at `/disk`, `ramfs64` at `/`, devfs at `/dev` with `null`, `zero` and `console`, filled at boot from the `INITRD` cpio archive | `HAKU64-VFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-INITRAMFS-OK`, `HAKU64-USER-DEV-OK`, `HAKU64-USER-INITRAMFS-OK` |
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
@@ -194,7 +194,8 @@ joins a relative name onto `AT_FDCWD` (the task's `cwd`),
 a directory descriptor or an explicit `cwd`, so `chdir` and `openat` see
 one consistent view. The task's `cwd` is canonical and absolute, inherited
 by `fork` and shared by a thread group through its owner. `fs64.c` keeps
-the same page cache and answers metadata from the FAT12 directory entry;
+the same page cache for both file backends and answers metadata from the FAT12
+directory entry or the RAM node;
 `O_DIRECTORY` descriptors use `FS64_DIR` with a parallel path table and the
 descriptor position as the `getdents64` cursor.
 
@@ -213,46 +214,54 @@ owns, each task carries a small table of mapping ranges recording whether
 their frames are owned and whether another space aliases them; a task's
 table is consulted page by page, and `fork` copies it.
 
-Files live on a FAT12 volume attached as the primary-master ATA disk. The
-64-bit image compiles the 32-bit `kernel/drivers/ata.c` and
-`kernel/fs/fat12/fat12.c` unchanged and supplies the seams they expect
-(`kernel/arch/x86_64/compat`): port I/O, the `klog_*` surface over `k64_*`,
-and a single-CPU spin mutex. `fs64.c` is a page cache in front of that
-filesystem: each path gets a slot holding up to 32 frames (128 KiB) and eight
-paths are cached at once, which is what lets `mmap` alias a file's frames and
-keeps every descriptor of one path looking at the same bytes. `open` accepts
-`O_RDONLY`, `O_WRONLY`, `O_RDWR` plus `O_CREAT`, `O_EXCL`, `O_TRUNC` and
-`O_APPEND`; `mkdir` creates one 8.3 directory, and paths may contain `.` and
-`..` because FAT12 resolves them. Dirty pages are written back when the last
-descriptor on a path closes or the owning task exits, so the cache is
-write-back, not write-through: a crash can lose the last pages. The limits
-are explicit: only 8.3 names, no symbolic links, at most 32 cached pages per
-file, and a writable
-`MAP_SHARED` mapping requires a writable descriptor. A shared mapping also
-relies on its descriptor staying open, because only descriptors pin a cache
+Files come from two backends behind one page cache. The FAT12 volume is
+attached as the primary-master ATA disk: the 64-bit image compiles the 32-bit
+`kernel/drivers/ata.c` and `kernel/fs/fat12/fat12.c` unchanged and supplies
+the seams they expect (`kernel/arch/x86_64/compat`): port I/O, the `klog_*`
+surface over `k64_*`, and a single-CPU spin mutex. `fs64.c` is the page cache
+in front of both: each path gets a slot holding up to 32 frames (128 KiB) and
+eight paths are cached at once, which is what lets `mmap` alias a file's
+frames and keeps every descriptor of one path looking at the same bytes. On
+FAT12 the cached frames are copies, written back when the last descriptor on
+a path closes or the owning task exits, so the cache is write-back, not
+write-through: a crash can lose the last pages. On the RAM backend
+(`ramfs64.c`) the cached frames *are* the node's pages, so `read`, `write` and
+`mmap` are coherent by construction and closing only publishes the new length.
+`open` accepts `O_RDONLY`, `O_WRONLY`, `O_RDWR` plus `O_CREAT`, `O_EXCL`,
+`O_TRUNC` and `O_APPEND`; `mkdir` creates one directory, and paths may contain
+`.` and `..` because both backends resolve them. The limits are explicit:
+FAT12 stores 8.3 names, the RAM root stores 48-byte components, both cap a
+cached file at 32 pages, and a writable `MAP_SHARED` mapping requires a
+writable descriptor that stays open, because only descriptors pin a cache
 slot.
 
 The namespace is not the volume. `vfs64.c` holds a four-entry mount table:
-`/` is the FAT12 backend and `/dev` is devfs. Resolution matches the longest
-prefix case-insensitively on a component boundary, so `/DEV/NULL` and
-`/dev/null` name the same file, while `/device.txt` stays on the disk because
-`/dev` does not own it. Every descriptor records the backend it was opened
-through, which is how `read`, `write`, `lseek`, `fstat` and `getdents64` reach
-a device without touching the page cache. `/dev` is a directory and `null`,
-`zero` and `console` are character files with inodes from `0xDE000000`, well
-clear of FAT12's sequence numbers. A write to `null` is discarded and a read
-is end-of-file; `zero` fills the buffer with zeroes; `console` opens as an
-alias of the implicit console descriptors, so its read, write and ioctl
-behaviour is exactly the one fd 0..2 already had. The namespace is read-only:
-create, unlink, rename and rmdir below `/dev` fail with `-EACCES`, and
-truncating a device is `-EINVAL`. `python build.py headless` builds
-`build/haku64_fs.img` with
-`tools/mkfat12.py --empty` on every run,
-seeds `HELLO.TXT`, `PATTERN.BIN`, `USER.ELF` and `X64MOD.HKM`, attaches it to
-QEMU and
-checks the resulting image with `tools/lsfat12.py --check`, so a disk write is
-proven from the host's view of the volume and not only from the kernel's
-cache.
+`/disk` is the FAT12 backend, `/` is the RAM root and `/dev` is devfs.
+Resolution matches the longest prefix case-insensitively on a component
+boundary, so `/DEV/NULL` and `/dev/null` name the same file, while
+`/device.txt` belongs to the RAM root because `/dev` does not own it. Every
+descriptor records the backend it was opened through, which is how `read`,
+`write`, `lseek`, `fstat` and `getdents64` reach a device without touching the
+page cache. `/dev` is a directory and `null`, `zero` and `console` are
+character files with inodes from `0xDE000000`, well clear of FAT12's sequence
+numbers and the RAM root's `0x52410000`. A write to `null` is discarded and a
+read is end-of-file; `zero` fills the buffer with zeroes; `console` opens as
+an alias of the implicit console descriptors, so its read, write and ioctl
+behaviour is exactly the one fd 0..2 already had. The device namespace is
+read-only: create, unlink, rename and rmdir below `/dev` fail with `-EACCES`,
+and truncating a device is `-EINVAL`.
+
+At boot, `initramfs64.c` reads `/disk/INITRD`, parses the cpio "newc" archive
+and creates each entry through the ordinary descriptor path, so the archive
+obeys the same name and space rules as a user program. It understands regular
+files and directories; this port has no symlink syscalls. An image without
+the archive falls back to mounting FAT12 at `/`.
+`python build.py headless` builds `build/haku64_fs.img` with
+`tools/mkfat12.py --empty` on every run, seeds `INITRD` plus the disk's own
+`HELLO.TXT`, `PATTERN.BIN`, `USER.ELF`, `INIT.ELF` and `X64MOD.HKM`, attaches
+it to QEMU and checks the resulting image with `tools/lsfat12.py --check` and
+`--cat NOTE.TXT`, so the disk write is proven from the host's view of the
+volume and not only from the kernel's cache.
 
 `fork` clones the address space page by page: `paging64_clone_space` walks
 the parent's user leaves and aliases the frames a mapping record marks shared.

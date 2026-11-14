@@ -1,47 +1,48 @@
-/* Haku x86-64 file layer: a page cache in front of the on-disk FAT12
- * volume.
+/* Haku x86-64 file layer: a page cache in front of the mounted filesystems.
  *
- * The 64-bit image now boots with an ATA disk attached and mounts the same
- * FAT12 filesystem the 32-bit kernel uses (kernel/fs/fat12/fat12.c). That
- * gives this port what the earlier in-memory placeholder could not: real
- * directories, path walking (including "." and ".."), file creation and
- * writes that survive a reboot.
+ * The 64-bit image boots with an ATA disk holding the same FAT12 filesystem
+ * the 32-bit kernel uses (kernel/fs/fat12/fat12.c) and with a cpio initramfs
+ * on that disk. The FAT12 volume is mounted at /disk; the archive is
+ * unpacked into ramfs64 and becomes the root. A cached path is therefore
+ * either a FAT12 file (backed by a fat12 handle) or a RAM file (backed by a
+ * node whose frames are the cached pages).
  *
  * Files are cached page by page in frames from the frame allocator. The
  * cache is what makes mmap work: MAP_SHARED aliases a cached page, so a
  * store through the mapping is immediately visible to read() and to every
- * other descriptor on the same path, while a dirty page is written back to
- * the disk when the last descriptor closes (or when the task that owns it
- * exits). MAP_PRIVATE copies the page at map time; there is no COW.
+ * other descriptor on the same path. For a FAT12 file a dirty page is
+ * written back when the last descriptor closes (or when its task exits); for
+ * a RAM file the cached page *is* the file page, so the data is already
+ * where it belongs and closing only publishes the new length.
  *
  * Limits, stated rather than hidden: a cached file is at most 32 pages
  * (128 KiB), at most 8 paths are cached at once, and the cache is shared by
- * every descriptor of the same path (opened read-write internally). Only
- * 8.3 names exist because that is what FAT12 stores; there is no unlink,
- * rename or getdents syscall yet. The cache is written back, not write-
- * through: after a crash, the last dirty pages can be lost. A mapping also
- * does not hold a cache reference of its own, so a descriptor must stay
- * open for as long as a shared file mapping aliases its pages: closing the
- * last descriptor flushes the slot and may recycle it, leaving the mapping
- * pointing at frames that no longer belong to the file.
+ * every descriptor of the same path (opened read-write internally). FAT12
+ * still stores 8.3 names; a RAM file may use up to 48 bytes of name. The
+ * FAT12 cache is written back, not write-through: after a crash, the last
+ * dirty pages can be lost. A mapping also does not hold a cache reference of
+ * its own, so a descriptor must stay open for as long as a shared file
+ * mapping aliases its pages.
  */
 #include "haku64.h"
 #include "fat12.h"
+#include "ramfs64.h"
 #include "vfs64.h"
 
 #define FS64_CACHE_MAX 8u
-#define FS64_PAGE_MAX  32u
 #define FS64_FD_MAX    K64_FS_FDS
 
 typedef struct {
     u32 used;
     u32 refs;                      /* open descriptors on this path */
+    u32 backend;                   /* VFS64_MOUNT_FAT or VFS64_MOUNT_RAM */
+    u32 ram;                       /* ramfs64 node when backend is RAM */
     u32 dirty;                     /* bit i: cached page i differs from disk */
     u32 valid;                     /* bit i: frame[i] holds page i */
     char path[K64_FS_PATH_MAX + 1];/* canonical (upper-case) cache key */
     fat12_file_t handle;
     u64 size;                      /* bytes visible to read() */
-    u64 disk_size;                 /* size the FAT12 entry currently has */
+    u64 disk_size;                 /* size the filesystem entry has */
     u64 frame[FS64_PAGE_MAX];      /* 0 means "not loaded" */
 } fs64_cache_t;
 
@@ -52,12 +53,13 @@ static fs64_cache_t cache[FS64_CACHE_MAX];
  * which is what dup() and fork() are supposed to give them. `slot` is a
  * cache index, or FS64_CONSOLE for a duplicated console descriptor, or -1
  * for a mount-table device. `backend` says which namespace the descriptor
- * was opened through, so a device never reaches the FAT12 cache. */
+ * was opened through, so a device never reaches the page cache and a RAM
+ * file is not mistaken for a FAT12 one. */
 typedef struct {
     u32 used;
     u32 refs;
     int slot;
-    u32 backend;                   /* VFS64_MOUNT_FAT or VFS64_MOUNT_DEV */
+    u32 backend;                   /* VFS64_MOUNT_FAT/RAM/DEV */
     int dev;                       /* device number when backend is dev */
     u32 flags;                     /* 0 read, 1 write, 2 read-write */
     u64 pos;
@@ -89,6 +91,7 @@ static char dir_paths[FS64_DESC_MAX][K64_FS_PATH_MAX + 1];
 #define FS64_EACCES   13
 #define FS64_EFAULT   14
 #define FS64_EEXIST   17
+#define FS64_EXDEV    18
 #define FS64_ENOTDIR  20
 #define FS64_EISDIR   21
 #define FS64_EINVAL   22
@@ -110,12 +113,19 @@ static int fat_error(int result) {
 }
 
 static void cache_clear(fs64_cache_t *slot) {
+    int ram = slot->backend == VFS64_MOUNT_RAM;
+
+    /* A RAM slot's frames belong to its node, not to the cache. Releasing an
+     * unlinked node frees them; a linked node keeps them for the next open. */
+    if (ram && slot->ram != RAMFS64_NONE) ramfs64_release(slot->ram);
     for (u32 i = 0; i < FS64_PAGE_MAX; i++) {
-        if (slot->frame[i]) frame64_free(slot->frame[i]);
+        if (slot->frame[i] && !ram) frame64_free(slot->frame[i]);
         slot->frame[i] = 0;
     }
     slot->used = 0;
     slot->refs = 0;
+    slot->backend = VFS64_MOUNT_FAT;
+    slot->ram = RAMFS64_NONE;
     slot->dirty = 0;
     slot->valid = 0;
     slot->size = 0;
@@ -171,7 +181,8 @@ static fs64_cache_t *cache_alloc(void) {
 
         if (slot->refs) continue;
         (void)cache_flush(slot);
-        (void)fat12_file_close(&slot->handle);
+        if (slot->backend == VFS64_MOUNT_FAT)
+            (void)fat12_file_close(&slot->handle);
         cache_clear(slot);
         return slot;
     }
@@ -189,6 +200,16 @@ static int cache_page(fs64_cache_t *slot, u64 index) {
 
     if (!slot || index >= FS64_PAGE_MAX) return 0;
     if (slot->valid & (1u << index)) return 1;
+
+    /* A RAM file page is its own cache page: hand the node's frame to the
+     * slot so read(), write() and mmap all address the same memory. */
+    if (slot->backend == VFS64_MOUNT_RAM) {
+        frame = ramfs64_page(slot->ram, index);
+        if (!frame) return 0;
+        slot->frame[index] = frame;
+        slot->valid |= 1u << index;
+        return 1;
+    }
 
     frame = frame64_alloc();
     if (!frame) return 0;
@@ -216,6 +237,23 @@ static int cache_flush(fs64_cache_t *slot) {
     uint32_t new_pos;
 
     if (!slot || !slot->used) return 1;
+
+    /* The cached page is the file page on a RAM backend, so only the length
+     * still has to be published. Truncating frees pages the slot must then
+     * forget; growing zero-fills the exposed tail. */
+    if (slot->backend == VFS64_MOUNT_RAM) {
+        u64 pages = (slot->size + K64_PAGE_SIZE - 1) / K64_PAGE_SIZE;
+
+        if (ramfs64_truncate(slot->ram, slot->size) < 0) return 0;
+        for (u32 i = (u32)pages; i < FS64_PAGE_MAX; i++) {
+            slot->frame[i] = 0;
+            slot->valid &= ~(1u << i);
+            slot->dirty &= ~(1u << i);
+        }
+        slot->dirty = 0;
+        slot->disk_size = slot->size;
+        return 1;
+    }
 
     /* Tell FAT12 the new length first: growing zero-fills the tail and
      * shrinking releases clusters past the new end. */
@@ -246,12 +284,15 @@ static int cache_flush(fs64_cache_t *slot) {
     return 1;
 }
 
-/* Create or find the cache entry for `path`. `flags` is the FAT12 open
- * mask (READ/WRITE plus CREATE/TRUNC/EXCL). Returns the slot or NULL. */
-static fs64_cache_t *cache_open(const char *path, u8 flags, int *error) {
+/* Create or find the cache entry for `path` (the canonical key) opened below
+ * its mount point as `rel`. `flags` is the FAT12 open mask (READ/WRITE plus
+ * CREATE/TRUNC/EXCL). Returns the slot or NULL. */
+static fs64_cache_t *cache_open(const char *path, const char *rel,
+                                u32 backend, u8 flags, int *error) {
     char key[K64_FS_PATH_MAX + 1];
     fs64_cache_t *slot;
     fat12_stat_t stat;
+    u64 size = 0;
     int result;
 
     if (error) *error = 0;
@@ -267,16 +308,27 @@ static fs64_cache_t *cache_open(const char *path, u8 flags, int *error) {
             return 0;
         }
         if (flags & FAT12_OPEN_TRUNC) {
-            if (fat12_file_truncate(&slot->handle, 0u) != 1) {
-                if (error) *error = -FS64_EIO;
-                return 0;
+            if (slot->backend == VFS64_MOUNT_RAM) {
+                if (ramfs64_truncate(slot->ram, 0u) < 0) {
+                    if (error) *error = -FS64_EIO;
+                    return 0;
+                }
+                /* The node freed its pages; forget the aliases. */
+                for (u32 i = 0; i < FS64_PAGE_MAX; i++) slot->frame[i] = 0;
+                slot->valid = 0;
+            } else {
+                if (fat12_file_truncate(&slot->handle, 0u) != 1) {
+                    if (error) *error = -FS64_EIO;
+                    return 0;
+                }
+                /* Cached pages are stale after a truncate; zero them so a
+                 * later write that extends the file sees zeros, not old
+                 * bytes. */
+                for (u32 i = 0; i < FS64_PAGE_MAX; i++)
+                    if (slot->frame[i])
+                        memset(phys_to_virt64(slot->frame[i]), 0,
+                               K64_PAGE_SIZE);
             }
-            /* Cached pages are stale after a truncate; zero them so a later
-             * write that extends the file sees zeros, not old bytes. */
-            for (u32 i = 0; i < FS64_PAGE_MAX; i++)
-                if (slot->frame[i])
-                    memset(phys_to_virt64(slot->frame[i]), 0,
-                           K64_PAGE_SIZE);
             slot->size = 0;
             slot->disk_size = 0;
             slot->dirty = 0;
@@ -291,27 +343,61 @@ static fs64_cache_t *cache_open(const char *path, u8 flags, int *error) {
     }
 
     memset(slot, 0, sizeof(*slot));
+    slot->backend = backend;
+    slot->ram = RAMFS64_NONE;
 
-    /* Every cached path is opened read-write internally; the descriptor's
-     * own access mode is enforced in fs64_fd_access. */
-    result = fat12_file_open(path, (u8)(FAT12_OPEN_READ | FAT12_OPEN_WRITE |
-                                        flags), &slot->handle);
-    if (result != 1) {
-        if (error) *error = fat_error(result);
-        return 0;
-    }
+    if (backend == VFS64_MOUNT_RAM) {
+        u32 node, ino;
+        int kind;
 
-    if (fat12_file_fstat(&slot->handle, &stat) != 1) {
-        (void)fat12_file_close(&slot->handle);
-        memset(slot, 0, sizeof(*slot));
-        if (error) *error = -FS64_EIO;
-        return 0;
+        result = ramfs64_lookup(rel, &node, &kind, &size, &ino);
+        if (result < 0) {
+            if (result == -FS64_ENOENT && (flags & FAT12_OPEN_CREATE)) {
+                result = ramfs64_create(rel, 0, &node);
+                if (result < 0) {
+                    if (error) *error = result;
+                    return 0;
+                }
+                size = 0;
+            } else {
+                if (error) *error = result;
+                return 0;
+            }
+        } else {
+            if (kind != FS64_KIND_FILE) {
+                if (error) *error = -FS64_EISDIR;
+                return 0;
+            }
+            if ((flags & FAT12_OPEN_CREATE) && (flags & FAT12_OPEN_EXCL)) {
+                if (error) *error = -FS64_EEXIST;
+                return 0;
+            }
+        }
+        slot->ram = node;
+    } else {
+        /* Every cached path is opened read-write internally; the
+         * descriptor's own access mode is enforced in fs64_fd_access. */
+        result = fat12_file_open(rel, (u8)(FAT12_OPEN_READ |
+                                           FAT12_OPEN_WRITE | flags),
+                                &slot->handle);
+        if (result != 1) {
+            if (error) *error = fat_error(result);
+            return 0;
+        }
+
+        if (fat12_file_fstat(&slot->handle, &stat) != 1) {
+            (void)fat12_file_close(&slot->handle);
+            memset(slot, 0, sizeof(*slot));
+            if (error) *error = -FS64_EIO;
+            return 0;
+        }
+        size = stat.size;
     }
 
     slot->used = 1;
     slot->refs = 0;
-    slot->size = stat.size;
-    slot->disk_size = stat.size;
+    slot->size = size;
+    slot->disk_size = size;
     {
         u64 i = 0;
         while (key[i]) { slot->path[i] = key[i]; i++; }
@@ -333,16 +419,25 @@ int fs64_init(void) {
     }
 
     if (fat12_mount() != 1) return 0;
+    if (!ramfs64_init()) return 0;
     if (!vfs64_init()) return 0;
     return 1;
 }
 
-/* Find (and cache) a path without a descriptor, for the boot self-test. */
+/* Find (and cache) a path without a descriptor, for the boot self-test. The
+ * path is resolved through the mount table first, so /HELLO.TXT is the RAM
+ * archive entry and /disk/HELLO.TXT is the FAT12 seed file. A device has no
+ * cache slot and is reported as not found. */
 int fs64_lookup(const char *path) {
+    char rel[VFS64_REL_MAX];
     fs64_cache_t *slot;
+    u32 backend;
     int error;
 
-    slot = cache_open(path, FAT12_OPEN_READ, &error);
+    if (vfs64_resolve(path, &backend, rel) != 0) return -1;
+    if (backend == VFS64_MOUNT_DEV) return -1;
+    slot = cache_open(path, rel[0] ? rel : "/", backend, FAT12_OPEN_READ,
+                      &error);
     if (!slot) return -1;
     for (u32 i = 0; i < FS64_CACHE_MAX; i++)
         if (&cache[i] == slot) return (int)i;
@@ -362,7 +457,8 @@ void fs64_release(int file) {
         slot->refs--;
         if (slot->refs > 0) return;
     }
-    (void)fat12_file_close(&slot->handle);
+    if (slot->backend == VFS64_MOUNT_FAT)
+        (void)fat12_file_close(&slot->handle);
     cache_clear(slot);
 }
 
@@ -439,7 +535,14 @@ u64 fs64_write(int file, u64 offset, const void *src, u64 count) {
         done += chunk;
     }
 
-    if (offset + done > slot->size) slot->size = offset + done;
+    if (offset + done > slot->size) {
+        slot->size = offset + done;
+        /* A RAM page is the file page, so the node must learn the new length
+         * now: otherwise the flush after the write would see growth from a
+         * stale length and zero the bytes that were just written. */
+        if (slot->backend == VFS64_MOUNT_RAM)
+            (void)ramfs64_publish(slot->ram, slot->size);
+    }
     return done;
 }
 
@@ -450,6 +553,12 @@ int fs64_truncate(int file, u64 size) {
     slot = &cache[file];
     if (!slot->used) return -FS64_EINVAL;
     if (size > (u64)FS64_PAGE_MAX * K64_PAGE_SIZE) return -FS64_ENOSPC;
+    if (slot->backend == VFS64_MOUNT_RAM) {
+        /* Apply the new length now: the node owns the pages, and a mapping
+         * of a page past the new end must not keep reporting it. */
+        slot->size = size;
+        return cache_flush(slot) ? 0 : -FS64_EIO;
+    }
     slot->size = size;
     if (size < slot->disk_size) {
         /* The old tail is gone; dirty bits for pages outside the file would
@@ -462,7 +571,7 @@ int fs64_truncate(int file, u64 size) {
 }
 
 /* Every path mutation goes through the mount table first: a device cannot be
- * created, removed or renamed, and saying so now keeps the FAT12 call from
+ * created, removed or renamed, and saying so now keeps a backend from
  * interpreting "/dev/null" as a file name. */
 int fs64_create_dir(const char *path) {
     char rel[VFS64_REL_MAX];
@@ -470,8 +579,10 @@ int fs64_create_dir(const char *path) {
 
     if (!path || !*path) return -FS64_EINVAL;
     if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (backend == VFS64_MOUNT_RAM)
+        return ramfs64_create_dir(rel[0] ? rel : "/");
     if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
-    return fat_error(fat12_dir_create(rel));
+    return fat_error(fat12_dir_create(rel[0] ? rel : "/"));
 }
 
 /* Flush a cached path and forget its name. An open descriptor keeps the
@@ -487,7 +598,8 @@ static void cache_unname(const char *key, int *found) {
         slot->path[0] = 0;
         return;
     }
-    (void)fat12_file_close(&slot->handle);
+    if (slot->backend == VFS64_MOUNT_FAT)
+        (void)fat12_file_close(&slot->handle);
     cache_clear(slot);
 }
 
@@ -498,10 +610,24 @@ int fs64_unlink(const char *path) {
     int result;
 
     if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
-    if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
-    if (!cache_key(rel, key)) return -FS64_EINVAL;
+    if (backend == VFS64_MOUNT_DEV) return -FS64_EACCES;
+    if (!cache_key(path, key)) return -FS64_EINVAL;
+
+    if (backend == VFS64_MOUNT_RAM) {
+        u32 node;
+        int found = 0;
+
+        result = ramfs64_unlink(rel[0] ? rel : "/", &node);
+        if (result < 0) return result;
+        /* An open slot keeps the detached node alive; a slot that is only a
+         * lookup is cleared (and releases the node) by cache_unname. */
+        cache_unname(key, &found);
+        if (!found) ramfs64_release(node);
+        return 0;
+    }
+
     cache_unname(key, 0);
-    result = fat12_file_unlink(rel);
+    result = fat12_file_unlink(rel[0] ? rel : "/");
     return fat_error(result);
 }
 
@@ -511,23 +637,32 @@ int fs64_rename(const char *oldpath, const char *newpath) {
     char oldrel[VFS64_REL_MAX];
     char newrel[VFS64_REL_MAX];
     fs64_cache_t *slot;
-    u32 backend;
+    u32 oldbackend, newbackend;
     int result;
 
-    if (vfs64_resolve(oldpath, &backend, oldrel) != 0) return -FS64_ENOENT;
-    if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
-    if (vfs64_resolve(newpath, &backend, newrel) != 0) return -FS64_ENOENT;
-    if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
-    if (!cache_key(oldrel, oldkey) || !cache_key(newrel, newkey))
+    if (vfs64_resolve(oldpath, &oldbackend, oldrel) != 0)
+        return -FS64_ENOENT;
+    if (vfs64_resolve(newpath, &newbackend, newrel) != 0)
+        return -FS64_ENOENT;
+    if (oldbackend == VFS64_MOUNT_DEV || newbackend == VFS64_MOUNT_DEV)
+        return -FS64_EACCES;
+    if (oldbackend != newbackend) return -FS64_EXDEV;
+    if (!cache_key(oldpath, oldkey) || !cache_key(newpath, newkey))
         return -FS64_EINVAL;
     slot = cache_find(oldkey);
     if (slot && slot->refs == 0) {
         (void)cache_flush(slot);
-        (void)fat12_file_close(&slot->handle);
+        if (slot->backend == VFS64_MOUNT_FAT)
+            (void)fat12_file_close(&slot->handle);
         cache_clear(slot);
         slot = 0;
     }
-    result = fat_error(fat12_file_rename(oldrel, newrel));
+    if (oldbackend == VFS64_MOUNT_RAM)
+        result = ramfs64_rename(oldrel[0] ? oldrel : "/",
+                                newrel[0] ? newrel : "/");
+    else
+        result = fat_error(fat12_file_rename(oldrel[0] ? oldrel : "/",
+                                             newrel[0] ? newrel : "/"));
     if (result == 0 && slot) {
         /* The open description follows the new name. */
         u64 i = 0;
@@ -543,8 +678,10 @@ int fs64_rmdir(const char *path) {
 
     if (!path || !*path) return -FS64_EINVAL;
     if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (backend == VFS64_MOUNT_RAM)
+        return ramfs64_rmdir(rel[0] ? rel : "/");
     if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
-    return fat_error(fat12_dir_remove(rel));
+    return fat_error(fat12_dir_remove(rel[0] ? rel : "/"));
 }
 
 int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind) {
@@ -559,8 +696,13 @@ int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind) {
         if (result < 0) return result;
         return vfs64_dev_stat(device, size, ino, kind);
     }
+    if (backend == VFS64_MOUNT_RAM) {
+        u32 node;
 
-    result = fat12_file_stat(rel, &st);
+        return ramfs64_lookup(rel[0] ? rel : "/", &node, kind, size, ino);
+    }
+
+    result = fat12_file_stat(rel[0] ? rel : "/", &st);
     if (result != 1) return fat_error(result);
     if (size) *size = st.size;
     if (ino) *ino = st.ino;
@@ -645,7 +787,16 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
             if (result < 0) return result;
             return vfs64_dev_stat(device, size, ino, kind);
         }
-        result = fat12_file_stat(rel, &st);
+        if (backend == VFS64_MOUNT_RAM) {
+            u32 node;
+
+            result = ramfs64_lookup(rel[0] ? rel : "/", &node, kind, size,
+                                    ino);
+            if (result < 0) return result;
+            if (size) *size = 0;
+            return 0;
+        }
+        result = fat12_file_stat(rel[0] ? rel : "/", &st);
         if (result != 1) return fat_error(result);
         if (size) *size = 0;
         if (ino) *ino = st.ino;
@@ -658,6 +809,17 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
         fat12_stat_t st;
 
         if (!slot->used) return -FS64_EBADF;
+        if (slot->backend == VFS64_MOUNT_RAM) {
+            u32 node_ino;
+            int node_kind;
+
+            if (ramfs64_stat_node(slot->ram, 0, &node_ino, &node_kind) < 0)
+                return -FS64_EIO;
+            if (size) *size = slot->size;
+            if (ino) *ino = node_ino;
+            if (kind) *kind = FS64_KIND_FILE;
+            return 0;
+        }
         if (fat12_file_fstat(&slot->handle, &st) != 1) return -FS64_EIO;
         if (size) *size = slot->size;
         if (ino) *ino = st.ino;
@@ -666,8 +828,8 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
     return 0;
 }
 
-int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
-                     int *kind, u32 *next_index) {
+int fs64_dir_entries(const char *path, u32 index, char name[FS64_NAME_MAX],
+                     u32 *ino, int *kind, u32 *next_index) {
     fat12_dir_t dir;
     fat12_stat_t st;
     char rel[VFS64_REL_MAX];
@@ -683,8 +845,11 @@ int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
         if (lookup_kind != FS64_KIND_DIR) return -FS64_ENOTDIR;
         return vfs64_dev_entry(index, name, ino, kind, next_index);
     }
+    if (backend == VFS64_MOUNT_RAM)
+        return ramfs64_entry(rel[0] ? rel : "/", index, name, ino, kind,
+                             next_index);
 
-    result = fat12_dir_open(rel, &dir);
+    result = fat12_dir_open(rel[0] ? rel : "/", &dir);
     if (result != 1) return fat_error(result);
     result = fat12_dir_read(&dir, index, &st, name, next_index);
     if (result == 0) return 0;
@@ -694,8 +859,8 @@ int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
     return 1;
 }
 
-int fs64_fd_entry(int task, int fd, u32 index, char name[13], u32 *ino,
-                  int *kind, u32 *next_index) {
+int fs64_fd_entry(int task, int fd, u32 index, char name[FS64_NAME_MAX],
+                  u32 *ino, int *kind, u32 *next_index) {
     fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
     if (!desc || desc->slot != FS64_DIR) return -FS64_ENOTDIR;
@@ -873,17 +1038,33 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     }
 
     if (flags & K64_O_DIRECTORY) {
-        fat12_dir_t dir;
-        int opened;
-
         if (flags & (K64_O_CREAT | K64_O_TRUNC)) {
             if (error) *error = -FS64_EINVAL;
             return -1;
         }
-        opened = fat12_dir_open(rel, &dir);
-        if (opened != 1) {
-            if (error) *error = fat_error(opened);
-            return -1;
+        if (kind == VFS64_MOUNT_RAM) {
+            u32 node, entry_ino;
+            u64 entry_size;
+            int entry_kind, result;
+
+            result = ramfs64_lookup(rel[0] ? rel : "/", &node, &entry_kind,
+                                    &entry_size, &entry_ino);
+            if (result < 0) {
+                if (error) *error = result;
+                return -1;
+            }
+            if (entry_kind != FS64_KIND_DIR) {
+                if (error) *error = -FS64_ENOTDIR;
+                return -1;
+            }
+        } else {
+            fat12_dir_t dir;
+            int opened = fat12_dir_open(rel[0] ? rel : "/", &dir);
+
+            if (opened != 1) {
+                if (error) *error = fat_error(opened);
+                return -1;
+            }
         }
         desc = fd_reserve(task, &fd);
         if (!desc) {
@@ -891,6 +1072,7 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
             return -1;
         }
         desc->slot = FS64_DIR;
+        desc->backend = kind;
         desc->flags = K64_O_RDONLY;
         desc->pos = 0;
         dir_path_set(desc, path);
@@ -903,7 +1085,7 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     if (flags & K64_O_TRUNC) fat_flags |= FAT12_OPEN_TRUNC;
     if (flags & K64_O_APPEND) fat_flags |= FAT12_OPEN_APPEND;
 
-    slot = cache_open(rel, fat_flags, &resolved);
+    slot = cache_open(path, rel[0] ? rel : "/", kind, fat_flags, &resolved);
     if (!slot) {
         if (error) *error = resolved ? resolved : -FS64_EIO;
         return -1;
@@ -915,6 +1097,7 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
         return -1;
     }
     desc->slot = (int)(slot - cache);
+    desc->backend = kind;
     desc->flags = access;
     desc->pos = (flags & K64_O_APPEND) ? slot->size : 0;
 
@@ -1059,13 +1242,15 @@ void fs64_fd_close(int task, int fd) {
     slot = &cache[slot_index];
     if (!slot->used) return;
 
-    /* Persist on every close so a later open sees the bytes on disk even
-     * after the cache slot has been recycled. */
+    /* Publish the new length and, on FAT12, write the dirty pages back so a
+     * later open sees them even after the slot is recycled. A RAM slot's
+     * pages are already the file's pages. */
     (void)cache_flush(slot);
     if (slot->refs > 0) {
         slot->refs--;
         if (slot->refs == 0) {
-            (void)fat12_file_close(&slot->handle);
+            if (slot->backend == VFS64_MOUNT_FAT)
+                (void)fat12_file_close(&slot->handle);
             cache_clear(slot);
         }
     }

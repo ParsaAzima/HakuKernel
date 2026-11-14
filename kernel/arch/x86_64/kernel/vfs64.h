@@ -1,9 +1,10 @@
-/* Haku x86-64 mount table, and the first non-disk backend.
+/* Haku x86-64 mount table and the namespace root.
  *
  * The 64-bit port used to have exactly one filesystem: an absolute path went
  * straight to the FAT12 volume. This module gives paths a namespace instead:
- * a small mount table with longest-prefix lookup, and `/dev` with `null`,
- * `zero` and `console`.
+ * a small mount table with longest-prefix lookup, the FAT12 volume at
+ * `/disk`, the RAM initramfs at `/`, and `/dev` with `null`, `zero` and
+ * `console`.
  *
  * The descriptor table stays in fs64.c, because a descriptor is what a
  * syscall holds. What lives here is the question a syscall must answer
@@ -30,6 +31,7 @@
 
 #define VFS64_MOUNT_FAT 0u
 #define VFS64_MOUNT_DEV 1u
+#define VFS64_MOUNT_RAM 2u
 
 /* Device numbers, in the order `/dev` lists them. The root directory has no
  * device number; vfs64_dev_lookup() reports VFS64_DEV_ROOT for it. */
@@ -43,8 +45,12 @@
  * directory listing cannot confuse the two. */
 #define VFS64_DEV_INO_BASE 0xDE000000u
 
-/* Mount the FAT12 volume at "/" and devfs at "/dev". Returns 1 on success. */
+/* Mount the FAT12 volume at /disk, the RAM root at / and devfs at /dev.
+ * Returns 1 on success. */
 int vfs64_init(void);
+/* Replace the RAM root with the FAT12 volume, for an image that has no
+ * /disk/INITRD. Returns 1 when the root mount exists. */
+int vfs64_mount_root_fat(void);
 u32 vfs64_mount_count(void);
 const char *vfs64_mount_prefix(u32 index);
 u32 vfs64_mount_kind(u32 index);
@@ -64,7 +70,7 @@ int vfs64_dev_stat(int device, u64 *size, u32 *ino, int *kind);
 int vfs64_dev_lookup(const char *rel, int *device, int *kind);
 /* One `/dev` directory entry; 1 with the name filled in, 0 past the end.
  * `kind` is FS64_KIND_CHAR for every device. */
-int vfs64_dev_entry(u32 index, char name[13], u32 *ino, int *kind,
+int vfs64_dev_entry(u32 index, char name[FS64_NAME_MAX], u32 *ino, int *kind,
                     u32 *next);
 const char *vfs64_dev_name(int device);
 

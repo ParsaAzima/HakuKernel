@@ -486,7 +486,10 @@ static u64 sys64_getcwd(int id, u64 user_buf, u64 size) {
  * cursor is the entry ordinal kept in the description, so two threads that
  * share CLONE_FILES read different entries without extra state. */
 static u64 sys64_getdents64(int id, u64 fd, u64 user_buffer, u64 count) {
-    u8 record[40];
+    /* A linux_dirent64 is 19 fixed bytes plus the name, padded to 8; the
+     * longest name FS64_NAME_MAX holds is 47 characters, so 72 bytes is the
+     * largest record this table can produce. */
+    u8 record[FS64_NAME_MAX + 24];
     u8 stage[256];
     u64 space = current_space();
     u64 index, copied = 0, staged = 0;
@@ -499,7 +502,7 @@ static u64 sys64_getdents64(int id, u64 fd, u64 user_buffer, u64 count) {
     index = fs64_fd_pos(id, (int)fd);
 
     for (;;) {
-        char name[13];
+        char name[FS64_NAME_MAX];
         u32 ino, next, namelen, reclen;
         int kind, got;
 

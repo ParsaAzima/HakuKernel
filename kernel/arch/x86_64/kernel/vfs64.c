@@ -63,9 +63,22 @@ static int mount_add(const char *prefix, u32 kind) {
 
 int vfs64_init(void) {
     mount_count = 0;
-    if (!mount_add("/", VFS64_MOUNT_FAT)) return 0;
+    /* /disk first, then the RAM root, then /dev. The scan takes the longest
+     * prefix, so the order only fixes the indices the boot test reads. */
+    if (!mount_add("/disk", VFS64_MOUNT_FAT)) return 0;
+    if (!mount_add("/", VFS64_MOUNT_RAM)) return 0;
     if (!mount_add("/dev", VFS64_MOUNT_DEV)) return 0;
     return 1;
+}
+
+int vfs64_mount_root_fat(void) {
+    for (u32 i = 0; i < mount_count; i++) {
+        if (mounts[i].prefix[0] == '/' && mounts[i].prefix[1] == 0) {
+            mounts[i].kind = VFS64_MOUNT_FAT;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 u32 vfs64_mount_count(void) {
@@ -214,14 +227,14 @@ int vfs64_dev_stat(int device, u64 *size, u32 *ino, int *kind) {
     return 0;
 }
 
-int vfs64_dev_entry(u32 index, char name[13], u32 *ino, int *kind,
+int vfs64_dev_entry(u32 index, char name[FS64_NAME_MAX], u32 *ino, int *kind,
                     u32 *next) {
     const char *device_name;
     u32 length = 0;
 
     if (index >= VFS64_DEV_COUNT) return 0;
     device_name = vfs64_dev_name((int)index);
-    while (device_name[length] && length < 12u) {
+    while (device_name[length] && length < FS64_NAME_MAX - 1u) {
         name[length] = device_name[length];
         length++;
     }

@@ -77,17 +77,32 @@ them: an eight-slot cache of 32 pages per path, walking one directory entry per
 lookup, with `fs64_lookup`, `fs64_read`, `fs64_write` and `fs64_*/stat`
 helpers. `kernel/arch/x86_64/kernel/vfs64.c` holds the namespace: a four-entry
 mount table with longest-prefix, case-insensitive resolution (the FAT12 volume
-at `/`, devfs at `/dev`), and descriptors that record which backend they came
-from. `/dev` offers `null`, `zero` and `console` as character files; a write to
-`/dev/null` is discarded, a read from `/dev/zero` is zeroes, and `/dev/console`
-is an alias of the implicit console descriptors, so its read, write and ioctl
-behaviour is unchanged. The namespace is read-only: create, unlink, rename and
-rmdir below `/dev` fail with `-EACCES`, and truncating a device is `-EINVAL`.
-There is no ramfs, procfs or initramfs backend yet; the FAT12 volume is still
-the only file store. The x64 seed disk
-(`build/haku64_fs.img`) carries `HELLO.TXT`, `PATTERN.BIN`, `USER.ELF` and
-`X64MOD.HKM`, the self-test writes `/TMP/NOTE.TXT` through the cache, and the
-headless run re-verifies the host image afterwards.
+at `/disk`, the RAM root at `/`, devfs at `/dev`), and descriptors that record
+which backend they came from. `/dev` offers `null`, `zero` and `console` as
+character files; a write to `/dev/null` is discarded, a read from `/dev/zero`
+is zeroes, and `/dev/console` is an alias of the implicit console descriptors,
+so its read, write and ioctl behaviour is unchanged. The device namespace is
+read-only: create, unlink, rename and rmdir below `/dev` fail with `-EACCES`,
+and truncating a device is `-EINVAL`.
+
+`kernel/arch/x86_64/kernel/ramfs64.c` is the writable root. It keeps a fixed
+128-node table, 48-byte names, and 32 pages (128 KiB) per file; a file page is
+a frame from the frame allocator that the `fs64.c` page cache aliases directly,
+so `read`, `write`, `mmap` and `stat` all address the same memory with no
+second copy. `kernel/arch/x86_64/kernel/initramfs64.c` reads `INITRD` from
+`/disk`, parses the cpio "newc" archive, and creates every entry through the
+ordinary descriptor path (`fs64_open_fd`/`fs64_write`/`fs64_fd_close`,
+`fs64_create_dir`), so the archive obeys the same name and space limits as a
+user program. It understands regular files and directories; this port has no
+symlink syscalls. An image without `INITRD` boots the old way with FAT12 as
+`/`.
+
+The x64 seed disk (`build/haku64_fs.img`) carries `INITRD` plus its own
+`HELLO.TXT`, `PATTERN.BIN`, `USER.ELF`, `INIT.ELF` and `X64MOD.HKM`. The
+archive holds the same files under `/` (plus `etc/banner.txt` and the `tmp`,
+`dev` and `disk` directories), so the boot test can read one marker from each
+backend, the kernel writes `/disk/NOTE.TXT`, and the headless run re-verifies
+the host image and reads that note back with `tools/lsfat12.py --cat`.
 
 ### Why FAT12 with 8.3 names, and not something bigger
 
