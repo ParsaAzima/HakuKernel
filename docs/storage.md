@@ -75,8 +75,16 @@ The x86-64 kernel compiles the same `ata.c` and `fat12.c` against a small
 compatibility header and puts `kernel/arch/x86_64/kernel/fs64.c` in front of
 them: an eight-slot cache of 32 pages per path, walking one directory entry per
 lookup, with `fs64_lookup`, `fs64_read`, `fs64_write` and `fs64_*/stat`
-helpers. There is no VFS mount table and no second backend yet; one FAT12
-volume is mounted at the root. The x64 seed disk
+helpers. `kernel/arch/x86_64/kernel/vfs64.c` holds the namespace: a four-entry
+mount table with longest-prefix, case-insensitive resolution (the FAT12 volume
+at `/`, devfs at `/dev`), and descriptors that record which backend they came
+from. `/dev` offers `null`, `zero` and `console` as character files; a write to
+`/dev/null` is discarded, a read from `/dev/zero` is zeroes, and `/dev/console`
+is an alias of the implicit console descriptors, so its read, write and ioctl
+behaviour is unchanged. The namespace is read-only: create, unlink, rename and
+rmdir below `/dev` fail with `-EACCES`, and truncating a device is `-EINVAL`.
+There is no ramfs, procfs or initramfs backend yet; the FAT12 volume is still
+the only file store. The x64 seed disk
 (`build/haku64_fs.img`) carries `HELLO.TXT`, `PATTERN.BIN`, `USER.ELF` and
 `X64MOD.HKM`, the self-test writes `/TMP/NOTE.TXT` through the cache, and the
 headless run re-verifies the host image afterwards.

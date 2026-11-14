@@ -70,7 +70,8 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
 | keyboard | PC/8042 in set-1 mode: IRQ1 unmasked after a decode-only self-test | `HAKU64-KBD-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
-| files | FAT12 on an ATA disk, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
+| files | FAT12 on an ATA disk mounted at `/`, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
+| namespace | a four-entry mount table with longest-prefix resolution; devfs at `/dev` with `null`, `zero` and `console` | `HAKU64-VFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-USER-DEV-OK` |
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
@@ -225,11 +226,26 @@ keeps every descriptor of one path looking at the same bytes. `open` accepts
 `..` because FAT12 resolves them. Dirty pages are written back when the last
 descriptor on a path closes or the owning task exits, so the cache is
 write-back, not write-through: a crash can lose the last pages. The limits
-are explicit: only 8.3 names, no `unlink`, `rename` or `getdents`, no
-symbolic links, at most 32 cached pages per file, and a writable
+are explicit: only 8.3 names, no symbolic links, at most 32 cached pages per
+file, and a writable
 `MAP_SHARED` mapping requires a writable descriptor. A shared mapping also
 relies on its descriptor staying open, because only descriptors pin a cache
-slot. `python build.py headless` builds
+slot.
+
+The namespace is not the volume. `vfs64.c` holds a four-entry mount table:
+`/` is the FAT12 backend and `/dev` is devfs. Resolution matches the longest
+prefix case-insensitively on a component boundary, so `/DEV/NULL` and
+`/dev/null` name the same file, while `/device.txt` stays on the disk because
+`/dev` does not own it. Every descriptor records the backend it was opened
+through, which is how `read`, `write`, `lseek`, `fstat` and `getdents64` reach
+a device without touching the page cache. `/dev` is a directory and `null`,
+`zero` and `console` are character files with inodes from `0xDE000000`, well
+clear of FAT12's sequence numbers. A write to `null` is discarded and a read
+is end-of-file; `zero` fills the buffer with zeroes; `console` opens as an
+alias of the implicit console descriptors, so its read, write and ioctl
+behaviour is exactly the one fd 0..2 already had. The namespace is read-only:
+create, unlink, rename and rmdir below `/dev` fail with `-EACCES`, and
+truncating a device is `-EINVAL`. `python build.py headless` builds
 `build/haku64_fs.img` with
 `tools/mkfat12.py --empty` on every run,
 seeds `HELLO.TXT`, `PATTERN.BIN`, `USER.ELF` and `X64MOD.HKM`, attaches it to
@@ -340,13 +356,15 @@ ready returns 0 rather than blocking. Pipes, symlinks and real signal
 handlers are still missing; the syscall port that is there covers what the
 tests and a static libc probe need.
 
-The 64-bit path now has an ELF64 loader, a FAT12 data disk, the syscall table,
+The 64-bit path now has an ELF64 loader, a FAT12 data disk mounted at `/`, a
+`/dev` with `null`, `zero` and `console`, the syscall table,
 a module loader and a user C library (`user/lib64`) with `/INIT.ELF` as the
-first real ring-3 program, but no VFS/devfs, no console device and no bootable
+first real ring-3 program, but no ramfs/procfs boot root, no module
+capabilities and no bootable
 root filesystem image. A shell therefore still requires the 32-bit side, which
 is where the full userland lives. [The roadmap](../ROADMAP.md) (milestones 1
 to 4) lists the remaining stages: a TLS base and the musl probe for milestone
-1, then a VFS/devfs with module capabilities, pipes and signals, and the
+1, then the rest of the VFS with module capabilities, pipes and signals, and the
 interactive shell. The 64-bit sources are excluded from the 32-bit link line,
 so both targets build from one tree.
 
@@ -728,10 +746,11 @@ container rules with the version 2 check and the two 64-bit relocation forms.
 It exports the same eleven symbols so one library serves both kernels, but
 only the six utilities do work: logging, ticks and the heap exist on the 64-bit
 side, while the three capability calls and the two struct fillers answer
-`-ENOSYS` because there is no 64-bit VFS or devfs to own the result. A 64-bit
-module can therefore compute and report; publishing a device or a filesystem
-waits for the 64-bit VFS. The lifecycle is the same four-slot table, with the
-transitions under an atomic lock, and `init_module`/`delete_module` copy the
+`-ENOSYS`. The mount table and devfs now exist, but no registration path is
+wired to them yet, so a 64-bit
+module can compute and report; publishing a device or a filesystem waits for the
+capability half of milestone 2. The lifecycle is the same four-slot table, with
+the transitions under an atomic lock, and `init_module`/`delete_module` copy the
 user buffer page by page through `copy_from_user64` before the loader sees it.
 
 #### Writing a module in C
@@ -805,7 +824,8 @@ keeps the default library out.
 A module is more than code: it can expose kernel functionality. There are two
 capability kinds, and the module slot owns them. This layer belongs to the
 32-bit kernel; the x86-64 build exports the same calls so one header serves
-both, but answers `-ENOSYS` because it has no VFS or devfs yet. The two kinds
+both, but answers `-ENOSYS`: the mount table and devfs are present, yet
+registration is not wired to them. The two kinds
 are:
 
 - a character device, registered in devfs and reached as `/dev/<name>`;
@@ -881,7 +901,8 @@ cannot sandbox code written maliciously, because the module runs in ring 0 with
 the kernel's privileges. Both kernels allocate images from a heap that is
 already executable — the 64-bit heap lives in the boot identity map and the
 32-bit heap in its direct map — so executability is not what gates the feature;
-the remaining gap is the 64-bit VFS/devfs that capability registration needs.
+the remaining gap is the registration path from a module into the 64-bit mount
+table and devfs.
 
 ### Physical frame allocator
 

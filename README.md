@@ -70,10 +70,13 @@ control and pipelines working.
   dropping whatever a module does not reach. Modules are trusted ring-0 code.
   Both kernels load versioned containers; the x86-64 loader provides logging,
   ticks and the kernel heap, while the device/filesystem registration calls
-  answer `-ENOSYS` until a 64-bit VFS exists.
+  answer `-ENOSYS` until module registration reaches the 64-bit mount table and
+  devfs.
 - **Storage** — ATA PIO on both legacy channels with reset/retry recovery, a
   writable FAT12 driver, a VFS with per-process descriptors, `ramfs` root,
-  `initramfs` (cpio newc), `/dev`, and a generated `/proc`.
+  `initramfs` (cpio newc), `/dev`, and a generated `/proc`. The x86-64 kernel
+  mounts FAT12 at `/` through a small mount table and adds a `/dev` with
+  `null`, `zero` and `console`.
 - **Console** — one framebuffer renderer shared by both ports, drawing the
   Terminus 8x16 font as plain full-screen text over a VBE mode with a VGA text
   fallback, PS/2 keyboard, serial mirror, CSI sequence handling with DSR
@@ -100,7 +103,8 @@ control and pipelines working.
   containers, and a 64-bit userland built on `user/lib64`: a freestanding C
   library (string/memory, `printf`, `malloc`, files, `fork`, `mmap`, `errno`)
   whose self-test the kernel loads from the FAT12 volume as `/INIT.ELF`.
-  No VFS/devfs, console device, shell, pipes or signal handlers yet.
+  The root is FAT12 and `/dev` provides `null`, `zero` and `console`; no
+  ramfs/procfs boot root, shell, pipes or signal handlers yet.
 
 ## Quick start
 
@@ -177,12 +181,13 @@ other CPUs with an IPI. Tasks are pinned to the CPU that created them, there
 is no load balancing or migration, and the user-space concurrency tests still
 run on the bootstrap processor, so a ring-3 task running on an AP is not yet
 covered. On i386 the application processors stay parked and every task runs on
-the bootstrap processor. The x86-64 kernel also lacks signal handlers, pipes, a
-VFS, devfs, a console device, a line discipline and the kernel-log latch, so
+the bootstrap processor. The x86-64 kernel also lacks signal handlers, pipes,
+a line discipline, the kernel-log latch and any namespace beyond a FAT12 root
+with `/dev` (`null`, `zero`, `console`), so
 its userland is a C library (`user/lib64`) plus the `/INIT.ELF` self-test
 rather than a shell; its console and PS/2 keyboard are there so a program can
 read a line's worth of keys, and module capability registration answers
-`ENOSYS` there. FAT12
+`ENOSYS` there because no path wires it to the mount table. FAT12
 has 8.3 names, no timestamps, and no
 permission bits. Haku's filesystem cache holds eight paths of at most 128 KiB
 each. Everything beyond the implemented subset returns `ENOSYS`

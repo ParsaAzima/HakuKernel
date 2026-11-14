@@ -9,7 +9,8 @@ The x86-64 kernel serves the ported subset under the x86-64 Linux numbers with
 `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` arguments and `rax` for the number and the
 result, entered by `SYSCALL` with an `INT 0x80` fallback. This page documents
 the 32-bit table in full because it is the complete one; the 64-bit image still
-lacks pipes, a VFS and signal handlers.
+lacks pipes, most VFS backends (it has a FAT12 root and `/dev`) and signal
+handlers.
 
 ## Syscall ABI
 
@@ -439,8 +440,9 @@ Deliberately absent: job-control stop/continue states (the group and session
 calls are real, but stop signals still end a process), hard links, file-backed
 mappings, `socket`, a user-facing `mount` (users cannot reparent the boot
 namespace; loadable modules mount their own prefix during init), networking,
-pipes on x86-64, a 64-bit VFS/devfs, and the capability half of the x64 module
-API (registration answers `-ENOSYS`).
+pipes on x86-64, most of the 64-bit namespace (FAT12 at `/` and devfs at
+`/dev` exist; ramfs, procfs and initramfs do not), and the capability half of
+the x64 module API (registration answers `-ENOSYS`).
 `clone`-created threads are present: a thread shares the caller's address
 space, descriptors and signal dispositions, reports the process id from
 `getpid` and its own id from `gettid`, and the thread form is exercised as

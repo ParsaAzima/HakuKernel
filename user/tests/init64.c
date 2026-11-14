@@ -160,6 +160,74 @@ static void test_files(void) {
     check(text_equals(utsname.sysname, "Haku"), "uname sysname");
 }
 
+/* /dev is a namespace the user can name. These calls go through the syscall
+ * layer, so a device that only works inside the kernel file layer fails
+ * here: read, write, lseek, stat, getdents and the refusal to unlink one. */
+static void test_devices(void) {
+    static const char discarded[] = "discarded";
+    char buffer[8];
+    char dirbuf[256];
+    haku64_stat_t status;
+    long long count;
+    int fd, dir;
+
+    fd = open("/dev/null", HAKU64_O_RDWR);
+    check(fd >= 0, "open /dev/null");
+    if (fd >= 0) {
+        check(write(fd, discarded, sizeof(discarded) - 1) ==
+                  (ssize_t)(sizeof(discarded) - 1), "write /dev/null");
+        check(read(fd, buffer, sizeof(buffer)) == 0, "read /dev/null");
+        check(lseek(fd, 0, HAKU64_SEEK_END) == 0, "lseek /dev/null");
+        check(close(fd) == 0, "close /dev/null");
+    }
+
+    fd = open("/dev/zero", HAKU64_O_RDONLY);
+    check(fd >= 0, "open /dev/zero");
+    if (fd >= 0) {
+        memset(buffer, 0xAA, sizeof(buffer));
+        check(read(fd, buffer, sizeof(buffer)) == (ssize_t)sizeof(buffer),
+              "read /dev/zero");
+        check(buffer[0] == 0 && buffer[sizeof(buffer) - 1] == 0,
+              "/dev/zero returns zeroes");
+        check(write(fd, discarded, sizeof(discarded) - 1) == -1 &&
+                  errno == HAKU64_EBADF, "write to a read-only device");
+        check(close(fd) == 0, "close /dev/zero");
+    }
+
+    fd = open("/dev/console", HAKU64_O_RDWR);
+    check(fd >= 0, "open /dev/console");
+    if (fd >= 0) check(close(fd) == 0, "close /dev/console");
+
+    check(stat("/dev", &status) == 0, "stat /dev");
+    check(HAKU64_S_ISDIR(status.st_mode), "/dev is a directory");
+    check(stat("/dev/null", &status) == 0, "stat /dev/null");
+    check((status.st_mode & HAKU64_S_IFMT) == HAKU64_S_IFCHR,
+          "/dev/null is a character file");
+
+    dir = open("/dev", HAKU64_O_RDONLY | HAKU64_O_DIRECTORY);
+    check(dir >= 0, "open /dev");
+    if (dir >= 0) {
+        count = haku64_errno_check(haku64_syscall3(
+            HAKU64_SYS_GETDENTS64, dir, (long long)dirbuf,
+            (long long)sizeof(dirbuf)));
+        check(count > 0, "getdents64 on /dev");
+        if (count > 0) {
+            haku64_dirent64_t *entry = (haku64_dirent64_t *)dirbuf;
+
+            check(text_equals(entry->d_name, "null"), "first entry is null");
+            check(entry->d_type == HAKU64_DT_CHR, "entry type is char");
+        }
+        check(close(dir) == 0, "close /dev");
+    }
+
+    check(unlink("/dev/null") == -1 && errno == HAKU64_EACCES,
+          "unlink /dev/null is refused");
+    check(open("/dev/missing", HAKU64_O_RDONLY) == -1 &&
+              errno == HAKU64_ENOENT, "unknown device is refused");
+
+    printf("HAKU64-USER-DEV-OK: /dev/null, /dev/zero, /dev/console\n");
+}
+
 static void test_processes(void) {
     int status = 0;
     int child;
@@ -260,6 +328,7 @@ int main(int argc, char **argv, char **envp) {
     test_memory();
     check(getcwd(NULL, 0) == NULL, "getcwd rejects a small buffer");
     test_files();
+    test_devices();
     test_processes();
     test_mappings_and_time();
     test_console();

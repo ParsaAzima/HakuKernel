@@ -44,6 +44,8 @@ Haku/
                         syscall64.c: SYSCALL/SYSRET plus the DPL-3 INT 0x80
                         fallback and the ported call table;
                         fs64.c: FAT12 page cache in front of the ATA disk;
+                        vfs64.c: mount table, path resolution and devfs
+                        (null, zero, console);
                         rtc64.c: CMOS wall clock;
                         smp64.c: ACPI MADT, local APIC and AP bring-up;
                         module64.c: .hkm version 2 loader, exports and slots;
@@ -121,7 +123,8 @@ Haku/
                         module.h: the C interface a kernel module is written
                         against (services, device callbacks, fs ops table) on
                         both architectures; capability calls answer -ENOSYS
-                        on x86-64 until a 64-bit VFS exists
+                        on x86-64 until module registration into the mount
+                        table and devfs is wired up
                         plus haku.h
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks

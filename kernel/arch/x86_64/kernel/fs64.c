@@ -27,6 +27,7 @@
  */
 #include "haku64.h"
 #include "fat12.h"
+#include "vfs64.h"
 
 #define FS64_CACHE_MAX 8u
 #define FS64_PAGE_MAX  32u
@@ -49,11 +50,15 @@ static fs64_cache_t cache[FS64_CACHE_MAX];
 /* A file description: what a descriptor points at. Descriptors of one
  * description share the cache slot, the access mode and the file offset,
  * which is what dup() and fork() are supposed to give them. `slot` is a
- * cache index, or FS64_CONSOLE for a duplicated console descriptor. */
+ * cache index, or FS64_CONSOLE for a duplicated console descriptor, or -1
+ * for a mount-table device. `backend` says which namespace the descriptor
+ * was opened through, so a device never reaches the FAT12 cache. */
 typedef struct {
     u32 used;
     u32 refs;
     int slot;
+    u32 backend;                   /* VFS64_MOUNT_FAT or VFS64_MOUNT_DEV */
+    int dev;                       /* device number when backend is dev */
     u32 flags;                     /* 0 read, 1 write, 2 read-write */
     u64 pos;
 } fs64_desc_t;
@@ -81,6 +86,7 @@ static char dir_paths[FS64_DESC_MAX][K64_FS_PATH_MAX + 1];
 #define FS64_ENOENT   2
 #define FS64_EIO      5
 #define FS64_EBADF    9
+#define FS64_EACCES   13
 #define FS64_EFAULT   14
 #define FS64_EEXIST   17
 #define FS64_ENOTDIR  20
@@ -327,6 +333,7 @@ int fs64_init(void) {
     }
 
     if (fat12_mount() != 1) return 0;
+    if (!vfs64_init()) return 0;
     return 1;
 }
 
@@ -454,9 +461,17 @@ int fs64_truncate(int file, u64 size) {
     return 0;
 }
 
+/* Every path mutation goes through the mount table first: a device cannot be
+ * created, removed or renamed, and saying so now keeps the FAT12 call from
+ * interpreting "/dev/null" as a file name. */
 int fs64_create_dir(const char *path) {
+    char rel[VFS64_REL_MAX];
+    u32 backend;
+
     if (!path || !*path) return -FS64_EINVAL;
-    return fat_error(fat12_dir_create(path));
+    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
+    return fat_error(fat12_dir_create(rel));
 }
 
 /* Flush a cached path and forget its name. An open descriptor keeps the
@@ -478,21 +493,32 @@ static void cache_unname(const char *key, int *found) {
 
 int fs64_unlink(const char *path) {
     char key[K64_FS_PATH_MAX + 1];
+    char rel[VFS64_REL_MAX];
+    u32 backend;
     int result;
 
-    if (!cache_key(path, key)) return -FS64_EINVAL;
+    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
+    if (!cache_key(rel, key)) return -FS64_EINVAL;
     cache_unname(key, 0);
-    result = fat12_file_unlink(path);
+    result = fat12_file_unlink(rel);
     return fat_error(result);
 }
 
 int fs64_rename(const char *oldpath, const char *newpath) {
     char oldkey[K64_FS_PATH_MAX + 1];
     char newkey[K64_FS_PATH_MAX + 1];
+    char oldrel[VFS64_REL_MAX];
+    char newrel[VFS64_REL_MAX];
     fs64_cache_t *slot;
+    u32 backend;
     int result;
 
-    if (!cache_key(oldpath, oldkey) || !cache_key(newpath, newkey))
+    if (vfs64_resolve(oldpath, &backend, oldrel) != 0) return -FS64_ENOENT;
+    if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
+    if (vfs64_resolve(newpath, &backend, newrel) != 0) return -FS64_ENOENT;
+    if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
+    if (!cache_key(oldrel, oldkey) || !cache_key(newrel, newkey))
         return -FS64_EINVAL;
     slot = cache_find(oldkey);
     if (slot && slot->refs == 0) {
@@ -501,7 +527,7 @@ int fs64_rename(const char *oldpath, const char *newpath) {
         cache_clear(slot);
         slot = 0;
     }
-    result = fat_error(fat12_file_rename(oldpath, newpath));
+    result = fat_error(fat12_file_rename(oldrel, newrel));
     if (result == 0 && slot) {
         /* The open description follows the new name. */
         u64 i = 0;
@@ -512,14 +538,29 @@ int fs64_rename(const char *oldpath, const char *newpath) {
 }
 
 int fs64_rmdir(const char *path) {
+    char rel[VFS64_REL_MAX];
+    u32 backend;
+
     if (!path || !*path) return -FS64_EINVAL;
-    return fat_error(fat12_dir_remove(path));
+    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
+    return fat_error(fat12_dir_remove(rel));
 }
 
 int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind) {
     fat12_stat_t st;
-    int result = fat12_file_stat(path, &st);
+    char rel[VFS64_REL_MAX];
+    u32 backend;
+    int result, device, lookup_kind;
 
+    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (backend == VFS64_MOUNT_DEV) {
+        result = vfs64_dev_lookup(rel, &device, &lookup_kind);
+        if (result < 0) return result;
+        return vfs64_dev_stat(device, size, ino, kind);
+    }
+
+    result = fat12_file_stat(rel, &st);
     if (result != 1) return fat_error(result);
     if (size) *size = st.size;
     if (ino) *ino = st.ino;
@@ -589,11 +630,22 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
         if (kind) *kind = FS64_KIND_CHAR;
         return 0;
     }
+    if (desc->backend == VFS64_MOUNT_DEV)
+        return vfs64_dev_stat(desc->dev, size, ino, kind);
     if (desc->slot == FS64_DIR) {
         const char *path = dir_paths[desc_index(desc)];
+        char rel[VFS64_REL_MAX];
         fat12_stat_t st;
-        int result = fat12_file_stat(path, &st);
+        u32 backend;
+        int result, device, lookup_kind;
 
+        if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+        if (backend == VFS64_MOUNT_DEV) {
+            result = vfs64_dev_lookup(rel, &device, &lookup_kind);
+            if (result < 0) return result;
+            return vfs64_dev_stat(device, size, ino, kind);
+        }
+        result = fat12_file_stat(rel, &st);
         if (result != 1) return fat_error(result);
         if (size) *size = 0;
         if (ino) *ino = st.ino;
@@ -615,27 +667,40 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
 }
 
 int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
-                     int *is_dir, u32 *next_index) {
+                     int *kind, u32 *next_index) {
     fat12_dir_t dir;
     fat12_stat_t st;
-    int result = fat12_dir_open(path, &dir);
+    char rel[VFS64_REL_MAX];
+    u32 backend;
+    int result;
 
+    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (backend == VFS64_MOUNT_DEV) {
+        int device, lookup_kind;
+
+        result = vfs64_dev_lookup(rel, &device, &lookup_kind);
+        if (result < 0) return result;
+        if (lookup_kind != FS64_KIND_DIR) return -FS64_ENOTDIR;
+        return vfs64_dev_entry(index, name, ino, kind, next_index);
+    }
+
+    result = fat12_dir_open(rel, &dir);
     if (result != 1) return fat_error(result);
     result = fat12_dir_read(&dir, index, &st, name, next_index);
     if (result == 0) return 0;
     if (result != 1) return fat_error(result);
     if (ino) *ino = st.ino;
-    if (is_dir) *is_dir = st.is_dir;
+    if (kind) *kind = st.is_dir ? FS64_KIND_DIR : FS64_KIND_FILE;
     return 1;
 }
 
 int fs64_fd_entry(int task, int fd, u32 index, char name[13], u32 *ino,
-                  int *is_dir, u32 *next_index) {
+                  int *kind, u32 *next_index) {
     fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
     if (!desc || desc->slot != FS64_DIR) return -FS64_ENOTDIR;
     return fs64_dir_entries(dir_paths[desc_index(desc)], index, name, ino,
-                            is_dir, next_index);
+                            kind, next_index);
 }
 
 static int valid_fd(int task, int fd) {
@@ -671,6 +736,8 @@ static fs64_desc_t *desc_alloc(void) {
         descs[i].used = 1;
         descs[i].refs = 1;
         descs[i].slot = -1;
+        descs[i].backend = VFS64_MOUNT_FAT;
+        descs[i].dev = -1;
         return &descs[i];
     }
     return 0;
@@ -692,12 +759,45 @@ int fs64_fd_console(int task, int fd) {
     return desc->slot == FS64_CONSOLE;
 }
 
+/* Reserve the lowest free descriptor at or above 3 and a fresh description.
+ * The caller fills the description and publishes it last, so a scheduled
+ * task never sees a half-built entry. Returns 0 when the table is full. */
+static fs64_desc_t *fd_reserve(int task, int *fd_out) {
+    fs64_desc_t *desc;
+    int fd;
+
+    for (fd = 3; fd < (int)FS64_FD_MAX; fd++)
+        if (fd_desc[task][fd] < 0) break;
+    if (fd >= (int)FS64_FD_MAX) return 0;
+    desc = desc_alloc();
+    if (!desc) return 0;
+    *fd_out = fd;
+    return desc;
+}
+
+/* Remember the path a directory descriptor was opened with: the *at calls
+ * and every entry listing resolve it again. */
+static void dir_path_set(fs64_desc_t *desc, const char *path) {
+    u32 i = 0;
+
+    while (path[i] && i < K64_FS_PATH_MAX) {
+        dir_paths[desc_index(desc)][i] = path[i];
+        i++;
+    }
+    dir_paths[desc_index(desc)][i] = 0;
+}
+
 /* open(path, flags) for one task. Only O_RDONLY/O_WRONLY/O_RDWR plus
  * O_CREAT/O_EXCL/O_TRUNC/O_APPEND are accepted. New descriptors start at 3
- * because 0..2 are the console. */
+ * because 0..2 are the console. The path is resolved through the mount
+ * table first: /dev/null and friends never reach the FAT12 cache, and an
+ * opened /dev/console is an alias of the implicit console descriptors, so
+ * read(), write() and ioctl() behave exactly as they do for fd 0..2. */
 int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     fs64_cache_t *slot;
     fs64_desc_t *desc;
+    char rel[VFS64_REL_MAX];
+    u32 kind;
     int fd, resolved;
     u8 fat_flags = FAT12_OPEN_READ | FAT12_OPEN_WRITE;
     u32 access = (u32)(flags & 3u);
@@ -716,6 +816,61 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
         if (error) *error = -FS64_EINVAL;
         return -1;
     }
+    if (vfs64_resolve(path, &kind, rel) != 0) {
+        if (error) *error = -FS64_ENOENT;
+        return -1;
+    }
+
+    if (kind == VFS64_MOUNT_DEV) {
+        int device, lookup_kind, result;
+
+        result = vfs64_dev_lookup(rel, &device, &lookup_kind);
+        if (result < 0) {
+            if (error) *error = result;
+            return -1;
+        }
+
+        if (flags & K64_O_DIRECTORY) {
+            /* Only the mount point is a directory; a device is a file. */
+            if (lookup_kind != FS64_KIND_DIR) {
+                if (error) *error = -FS64_ENOTDIR;
+                return -1;
+            }
+            if (flags & (K64_O_CREAT | K64_O_TRUNC)) {
+                if (error) *error = -FS64_EINVAL;
+                return -1;
+            }
+            desc = fd_reserve(task, &fd);
+            if (!desc) {
+                if (error) *error = -FS64_ENOSPC;
+                return -1;
+            }
+            desc->slot = FS64_DIR;
+            desc->flags = K64_O_RDONLY;
+            desc->pos = 0;
+            dir_path_set(desc, path);
+            fd_desc[task][fd] = desc_index(desc);
+            return fd;
+        }
+
+        result = vfs64_dev_open(rel, flags, &device);
+        if (result < 0) {
+            if (error) *error = result;
+            return -1;
+        }
+        desc = fd_reserve(task, &fd);
+        if (!desc) {
+            if (error) *error = -FS64_ENOSPC;
+            return -1;
+        }
+        desc->backend = VFS64_MOUNT_DEV;
+        desc->dev = device;
+        if (device == VFS64_DEV_CONSOLE) desc->slot = FS64_CONSOLE;
+        desc->flags = access;
+        desc->pos = 0;
+        fd_desc[task][fd] = desc_index(desc);
+        return fd;
+    }
 
     if (flags & K64_O_DIRECTORY) {
         fat12_dir_t dir;
@@ -725,18 +880,12 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
             if (error) *error = -FS64_EINVAL;
             return -1;
         }
-        opened = fat12_dir_open(path, &dir);
+        opened = fat12_dir_open(rel, &dir);
         if (opened != 1) {
             if (error) *error = fat_error(opened);
             return -1;
         }
-        for (fd = 3; fd < (int)FS64_FD_MAX; fd++)
-            if (fd_desc[task][fd] < 0) break;
-        if (fd >= (int)FS64_FD_MAX) {
-            if (error) *error = -FS64_ENOSPC;
-            return -1;
-        }
-        desc = desc_alloc();
+        desc = fd_reserve(task, &fd);
         if (!desc) {
             if (error) *error = -FS64_ENOSPC;
             return -1;
@@ -744,14 +893,7 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
         desc->slot = FS64_DIR;
         desc->flags = K64_O_RDONLY;
         desc->pos = 0;
-        {
-            u32 i = 0;
-            while (path[i] && i < K64_FS_PATH_MAX) {
-                dir_paths[desc_index(desc)][i] = path[i];
-                i++;
-            }
-            dir_paths[desc_index(desc)][i] = 0;
-        }
+        dir_path_set(desc, path);
         fd_desc[task][fd] = desc_index(desc);
         return fd;
     }
@@ -761,20 +903,13 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     if (flags & K64_O_TRUNC) fat_flags |= FAT12_OPEN_TRUNC;
     if (flags & K64_O_APPEND) fat_flags |= FAT12_OPEN_APPEND;
 
-    slot = cache_open(path, fat_flags, &resolved);
+    slot = cache_open(rel, fat_flags, &resolved);
     if (!slot) {
         if (error) *error = resolved ? resolved : -FS64_EIO;
         return -1;
     }
 
-    for (fd = 3; fd < (int)FS64_FD_MAX; fd++)
-        if (fd_desc[task][fd] < 0) break;
-    if (fd >= (int)FS64_FD_MAX) {
-        if (error) *error = -FS64_ENOSPC;
-        return -1;
-    }
-
-    desc = desc_alloc();
+    desc = fd_reserve(task, &fd);
     if (!desc) {
         if (error) *error = -FS64_ENOSPC;
         return -1;
@@ -786,6 +921,36 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     fd_desc[task][fd] = desc_index(desc);
     slot->refs++;
     return fd;
+}
+
+/* 1 when the descriptor names a mount-table device rather than a file or the
+ * console. The syscall layer uses this to route read/write before it looks
+ * for a FAT12 cache slot. */
+int fs64_fd_device(int task, int fd) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    return desc && desc->backend == VFS64_MOUNT_DEV &&
+           desc->slot != FS64_CONSOLE;
+}
+
+/* Device read/write. The access mode comes from the description, so an
+ * O_RDONLY /dev/zero refuses a write the way a file would. */
+int fs64_fd_dev_read(int task, int fd, void *dst, u64 count) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    if (!desc || desc->backend != VFS64_MOUNT_DEV || desc->slot == FS64_CONSOLE)
+        return -FS64_EBADF;
+    if (desc->flags == K64_O_WRONLY) return -FS64_EBADF;
+    return vfs64_dev_read(desc->dev, dst, count);
+}
+
+int fs64_fd_dev_write(int task, int fd, const void *src, u64 count) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    if (!desc || desc->backend != VFS64_MOUNT_DEV || desc->slot == FS64_CONSOLE)
+        return -FS64_EBADF;
+    if (desc->flags == K64_O_RDONLY) return -FS64_EBADF;
+    return vfs64_dev_write(desc->dev, src, count);
 }
 
 /* The cache slot behind `fd`, or a negative value: -1 for a free or console
@@ -807,17 +972,26 @@ int fs64_fd_seek(int task, int fd, u64 pos) {
     fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
     /* Directory descriptors keep their entry cursor here too, so seekdir
-     * and getdents64 share one position. */
-    if (!desc || (desc->slot < 0 && desc->slot != FS64_DIR)) return 0;
+     * and getdents64 share one position. A device has a position as well
+     * (the console alias does not: it is a terminal). */
+    if (!desc) return 0;
+    if (desc->slot < 0 && desc->slot != FS64_DIR &&
+        desc->backend != VFS64_MOUNT_DEV)
+        return 0;
     desc->pos = pos;
     return 1;
 }
 
-/* 0 = read-only, 1 = write-only, 2 = read-write, -1 = not a file. */
+/* 0 = read-only, 1 = write-only, 2 = read-write, -1 = not a file. Devices and
+ * duplicated console descriptors answer with the mode they were opened with;
+ * only a free descriptor is -1. */
 int fs64_fd_access(int task, int fd) {
     fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
-    if (!desc || desc->slot < 0) return -1;
+    if (!desc) return -1;
+    if (desc->slot < 0 && desc->slot != FS64_CONSOLE &&
+        desc->backend != VFS64_MOUNT_DEV)
+        return -1;
     return (int)desc->flags;
 }
 

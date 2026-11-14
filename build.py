@@ -687,6 +687,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-SYSCALL-OK", "HAKU64-ELF-OK", "HAKU64-ELF-RUN-OK",
                 "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",
                 "HAKU64-RTC-OK", "HAKU64-SYSCALL64-OK", "HAKU64-FS-OK",
+                "HAKU64-VFS-OK", "HAKU64-DEVFS-OK", "HAKU64-USER-DEV-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
                 "HAKU64-COW-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",

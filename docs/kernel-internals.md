@@ -184,8 +184,9 @@ low 32 bits of every computed address because the image, the kernel text and
 the exports all live below 4 GiB (an amd64 pointer is packed with a zero upper
 half). Its export table has the same eleven names so `include/haku/module.h`
 and `libhakumod` are shared; the six utilities work, while the capability
-calls and the two struct fillers answer `-ENOSYS` until a 64-bit VFS and devfs
-exist. User space reaches both loaders through `init_module` (175) and
+calls and the two struct fillers answer `-ENOSYS` until module registration
+reaches the 64-bit mount table and devfs. User space reaches both loaders
+through `init_module` (175) and
 `delete_module` (176); `syscall64.c` bounds the image length by the container's
 worst case, copies it page by page, and copies the name into a 25-byte stack
 buffer.
@@ -225,7 +226,8 @@ switch nor sets `CR4.OSFXSR`. On x86-64 SSE2 is part of the ABI and the
 scheduler `FXSAVE`s each task, so compiler-emitted SSE2 is safe, but there is
 still no math library. `module.c` also checks at build time that the public
 `haku_module_fs_ops_t` and the kernel's `vfs_fs_ops_t` have the same size; that
-assert is part of the 32-bit build only, since the 64-bit kernel has no VFS.
+assert is still part of the 32-bit build only, because the 64-bit filesystem
+layer does not use `vfs_fs_ops_t` yet.
 
 Error mapping: bad container or relocation `-EINVAL`, unknown import
 `-ENOENT`, duplicate name `-EEXIST`, full table `-ENOSPC`, heap exhaustion

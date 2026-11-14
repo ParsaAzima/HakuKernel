@@ -26,6 +26,7 @@
 #include "haku64.h"
 #include "haku/abi.h"
 #include "haku_module.h"
+#include "vfs64.h"
 
 typedef struct {
     u32 base_low;
@@ -803,6 +804,105 @@ static int test_fs(void) {
     return 1;
 }
 
+/* The mount table and the first non-disk backend. fs64_init() mounted FAT12
+ * at "/" and devfs at "/dev", so a path now names a backend before it names
+ * a file. The test runs before the scheduler exists, so it speaks to the
+ * descriptor table for task 0, exactly as the FAT12 tests above do. */
+static int test_vfs64(void) {
+    static const char junk[] = "this is discarded";
+    char buffer[8];
+    char rel[VFS64_REL_MAX];
+    char name[13];
+    u64 size;
+    u32 ino, mount, next = 0;
+    int fd, error = 0, kind, entry_kind, result;
+
+    /* Two mounts, each winning exactly its own subtree: /dev must not claim
+     * /device.txt, and a relative path names no mount at all. */
+    if (vfs64_mount_count() != 2) return 0;
+    if (memcmp(vfs64_mount_prefix(0), "/", 2) != 0 ||
+        vfs64_mount_kind(0) != VFS64_MOUNT_FAT)
+        return 0;
+    if (memcmp(vfs64_mount_prefix(1), "/dev", 5) != 0 ||
+        vfs64_mount_kind(1) != VFS64_MOUNT_DEV)
+        return 0;
+    if (vfs64_resolve("/dev/null", &mount, rel) != 0 ||
+        mount != VFS64_MOUNT_DEV || memcmp(rel, "/null", 6) != 0)
+        return 0;
+    if (vfs64_resolve("/DEVICE.TXT", &mount, rel) != 0 ||
+        mount != VFS64_MOUNT_FAT || memcmp(rel, "/DEVICE.TXT", 12) != 0)
+        return 0;
+    if (vfs64_resolve("dev/null", &mount, rel) == 0) return 0;
+
+    /* /dev/null accepts writes and reads back end-of-file. */
+    fd = fs64_open_fd(0, "/dev/null", K64_O_RDWR, &error);
+    if (fd < 0) return 0;
+    if (fs64_fd_dev_write(0, fd, junk, sizeof(junk) - 1) !=
+        (int)(sizeof(junk) - 1)) {
+        fs64_fd_close(0, fd);
+        return 0;
+    }
+    if (fs64_fd_dev_read(0, fd, buffer, sizeof(buffer)) != 0) {
+        fs64_fd_close(0, fd);
+        return 0;
+    }
+    fs64_fd_close(0, fd);
+
+    /* /dev/zero fills even a buffer that was not zero. */
+    memset(buffer, 0xAA, sizeof(buffer));
+    fd = fs64_open_fd(0, "/dev/zero", K64_O_RDONLY, &error);
+    if (fd < 0) return 0;
+    if (fs64_fd_dev_read(0, fd, buffer, sizeof(buffer)) !=
+        (int)sizeof(buffer)) {
+        fs64_fd_close(0, fd);
+        return 0;
+    }
+    fs64_fd_close(0, fd);
+    for (u32 i = 0; i < sizeof(buffer); i++)
+        if (buffer[i] != 0) return 0;
+
+    /* /dev/console is the implicit console, reached by name. */
+    fd = fs64_open_fd(0, "/dev/console", K64_O_RDWR, &error);
+    if (fd < 0) return 0;
+    if (!fs64_fd_console(0, fd)) {
+        fs64_fd_close(0, fd);
+        return 0;
+    }
+    fs64_fd_close(0, fd);
+
+    /* /dev is a directory; the devices are character files with inodes
+     * above the FAT12 range. */
+    if (fs64_stat_path("/dev", &size, &ino, &kind) != 0 ||
+        kind != FS64_KIND_DIR || ino != VFS64_DEV_INO_BASE)
+        return 0;
+    if (fs64_stat_path("/dev/null", &size, &ino, &kind) != 0 ||
+        kind != FS64_KIND_CHAR || ino != VFS64_DEV_INO_BASE + 1u)
+        return 0;
+
+    /* Listing comes back in mount order and then ends. */
+    result = fs64_dir_entries("/dev", 0, name, &ino, &entry_kind, &next);
+    if (result != 1 || entry_kind != FS64_KIND_CHAR ||
+        memcmp(name, "null", 5) != 0) return 0;
+    result = fs64_dir_entries("/dev", next, name, &ino, &entry_kind, &next);
+    if (result != 1 || entry_kind != FS64_KIND_CHAR ||
+        memcmp(name, "zero", 5) != 0) return 0;
+    result = fs64_dir_entries("/dev", next, name, &ino, &entry_kind, &next);
+    if (result != 1 || entry_kind != FS64_KIND_CHAR ||
+        memcmp(name, "console", 8) != 0) return 0;
+    if (fs64_dir_entries("/dev", next, name, &ino, &entry_kind, &next) != 0)
+        return 0;
+
+    /* The namespace is read-only: a device is not a place to create,
+     * remove, rename or truncate things. */
+    if (fs64_unlink("/dev/null") != -HAKU_EACCES) return 0;
+    if (fs64_create_dir("/dev/tmp") != -HAKU_EACCES) return 0;
+    if (fs64_rename("/dev/null", "/NULL") != -HAKU_EACCES) return 0;
+    if (fs64_rmdir("/dev") != -HAKU_EACCES) return 0;
+    if (fs64_stat_path("/dev/missing", &size, &ino, &kind) != -HAKU_ENOENT)
+        return 0;
+    return 1;
+}
+
 /* The ring-3 program created /TMP and wrote NOTE.TXT, then closed it. A new
  * lookup therefore has to read the bytes back from the volume, not from a
  * descriptor that is still open: this is the disk-write proof. */
@@ -1112,6 +1212,14 @@ void kernel64_main(void) {
     k64_puts(" pattern=");
     k64_dec(fs64_size(fs64_lookup("/PATTERN.BIN")));
     k64_puts("\r\n");
+
+    if (!test_vfs64()) k64_fail("VFS namespace self-test");
+    k64_puts("HAKU64-VFS-OK: mounts=");
+    k64_dec(vfs64_mount_count());
+    k64_puts(" devfs devices=");
+    k64_dec(VFS64_DEV_COUNT);
+    k64_puts("\r\n");
+    k64_puts("HAKU64-DEVFS-OK: null zero console\r\n");
 
     gdt64_init();
     k64_puts("HAKU64-GDT-OK: tss=");

@@ -501,9 +501,9 @@ static u64 sys64_getdents64(int id, u64 fd, u64 user_buffer, u64 count) {
     for (;;) {
         char name[13];
         u32 ino, next, namelen, reclen;
-        int is_dir, got;
+        int kind, got;
 
-        got = fs64_fd_entry(id, (int)fd, (u32)index, name, &ino, &is_dir,
+        got = fs64_fd_entry(id, (int)fd, (u32)index, name, &ino, &kind,
                             &next);
         if (got < 0) {
             if (staged) break;
@@ -533,7 +533,9 @@ static u64 sys64_getdents64(int id, u64 fd, u64 user_buffer, u64 count) {
         memcpy(record, &ino, 4);          /* ino is u32 */
         *(s64 *)(record + 8) = (s64)next;
         *(u16 *)(record + 16) = (u16)reclen;
-        record[18] = (u8)(is_dir ? SYS64_DT_DIR : SYS64_DT_REG);
+        record[18] = (u8)(kind == FS64_KIND_DIR ? SYS64_DT_DIR
+                        : kind == FS64_KIND_CHAR ? SYS64_DT_CHR
+                                                 : SYS64_DT_REG);
         memcpy(record + 19, name, namelen + 1u);
         memcpy(stage + staged, record, reclen);
         staged += reclen;
@@ -588,6 +590,12 @@ static u64 sys64_truncate(int id, u64 user_path, u64 length) {
     if (result < 0) return (u64)result;
     fd = fs64_open_fd(id, path, K64_O_WRONLY, &error);
     if (fd < 0) return (u64)error;
+    if (fs64_fd_device(id, fd)) {
+        /* A device has no length to change; EINVAL is what Linux reports for
+         * a character device. */
+        fs64_fd_close(id, fd);
+        return (u64)0 - SYS64_EINVAL;
+    }
     file = fs64_fd_file(id, fd);
     if (file < 0) {
         fs64_fd_close(id, fd);
@@ -601,7 +609,9 @@ static u64 sys64_truncate(int id, u64 user_path, u64 length) {
 static u64 sys64_ftruncate(int id, u64 fd, u64 length) {
     int file = fs64_fd_file(id, (int)fd);
 
-    if (file < 0) return (u64)0 - SYS64_EBADF;
+    if (file < 0 && !fs64_fd_device(id, (int)fd))
+        return (u64)0 - SYS64_EBADF;
+    if (fs64_fd_device(id, (int)fd)) return (u64)0 - SYS64_EINVAL;
     if (fs64_fd_access(id, (int)fd) == 0) return (u64)0 - SYS64_EINVAL;
     return fs64_truncate(file, length) < 0 ? (u64)0 - SYS64_ENOSPC : 0;
 }
@@ -682,7 +692,10 @@ static u64 sys64_fcntl(int id, u64 fd, u64 command, u64 argument) {
     case K64_F_GETFL:
         result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
         if (result < 0) return (u64)result;
-        if (kind == FS64_KIND_CHAR) return K64_O_RDWR;
+        if (kind == FS64_KIND_CHAR) {
+            result = fs64_fd_access(id, (int)fd);
+            return result < 0 ? K64_O_RDWR : (u64)(u32)result;
+        }
         if (kind == FS64_KIND_DIR) return K64_O_RDONLY | K64_O_DIRECTORY;
         result = fs64_fd_access(id, (int)fd);
         return result < 0 ? 0 : (u64)(u32)result;
@@ -814,6 +827,27 @@ static u64 sys64_write(u64 fd, u64 buffer, u64 count) {
     if (!fs64_fd_console(id, (int)fd)) {
         u8 chunk[64];
         u64 pos, done = 0;
+
+        if (fs64_fd_device(id, (int)fd)) {
+            space = current_space();
+            if (count == 0) return 0;
+            if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+            while (done < count) {
+                u64 n = count - done;
+                int put;
+
+                if (n > sizeof(chunk)) n = sizeof(chunk);
+                if (!copy_from_user64(space, chunk, buffer + done, n)) {
+                    if (done) break;
+                    return (u64)0 - SYS64_EFAULT;
+                }
+                put = fs64_fd_dev_write(id, (int)fd, chunk, n);
+                if (put < 0) return done ? done : (u64)put;
+                if (put == 0) break;
+                done += (u64)put;
+            }
+            return done;
+        }
 
         file = fs64_fd_file(id, (int)fd);
         if (file < 0) return (u64)0 - SYS64_EBADF;
@@ -1159,6 +1193,25 @@ static u64 sys64_read(u64 fd, u64 buffer, u64 count) {
     u8 chunk[64];
 
     file = fs64_fd_file(id, (int)fd);
+    if (fs64_fd_device(id, (int)fd)) {
+        space = current_space();
+        if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+        while (done < count) {
+            u64 n = count - done;
+            int got;
+
+            if (n > sizeof(chunk)) n = sizeof(chunk);
+            got = fs64_fd_dev_read(id, (int)fd, chunk, n);
+            if (got < 0) return done ? done : (u64)got;
+            if (got == 0) break;
+            if (!copy_to_user64(space, buffer + done, chunk, (u64)got)) {
+                if (done) break;
+                return (u64)0 - SYS64_EFAULT;
+            }
+            done += (u64)got;
+        }
+        return done;
+    }
     if (file < 0) return (u64)0 - SYS64_EBADF;
     if (fs64_fd_access(id, (int)fd) == 1) return (u64)0 - SYS64_EBADF;
     if (count == 0) return 0;
@@ -1192,7 +1245,8 @@ static u64 sys64_read(u64 fd, u64 buffer, u64 count) {
 static u64 sys64_close(u64 fd) {
     int id = sched64_current();
 
-    if (fs64_fd_file(id, (int)fd) < 0 && !fs64_fd_console(id, (int)fd))
+    if (fs64_fd_file(id, (int)fd) < 0 && !fs64_fd_console(id, (int)fd) &&
+        !fs64_fd_device(id, (int)fd) && !fs64_fd_is_dir(id, (int)fd))
         return (u64)0 - SYS64_EBADF;
     fs64_fd_close(id, (int)fd);
     return 0;
@@ -1449,6 +1503,23 @@ static u64 sys64_lseek(u64 fd, u64 offset, u64 whence) {
     int id = sched64_current();
     int file = fs64_fd_file(id, (int)fd);
     s64 delta = (s64)offset, pos;
+
+    if (fs64_fd_device(id, (int)fd)) {
+        /* A device has a position but no end: SEEK_END is zero, and the
+         * device itself ignores the offset it is read or written at. */
+        switch (whence) {
+        case K64_SEEK_SET: pos = 0; break;
+        case K64_SEEK_CUR: pos = (s64)fs64_fd_pos(id, (int)fd); break;
+        case K64_SEEK_END: pos = 0; break;
+        default: return (u64)0 - SYS64_EINVAL;
+        }
+        if (delta > 0 && pos > (s64)0x7FF0000000000000ull - delta)
+            return (u64)0 - SYS64_EINVAL;
+        pos += delta;
+        if (pos < 0) return (u64)0 - SYS64_EINVAL;
+        (void)fs64_fd_seek(id, (int)fd, (u64)pos);
+        return (u64)pos;
+    }
 
     if (file < 0) return (u64)0 - SYS64_EBADF;
     switch (whence) {

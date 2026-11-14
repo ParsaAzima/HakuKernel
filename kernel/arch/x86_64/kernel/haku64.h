@@ -899,6 +899,12 @@ u64 fs64_write(int file, u64 offset, const void *src, u64 count);
 int fs64_truncate(int file, u64 size);
 int fs64_open_fd(int task, const char *path, u64 flags, int *error);
 int fs64_fd_file(int task, int fd);
+/* Mount-table device descriptors: a device is neither a file (no cache
+ * slot) nor the console. The read/write helpers return a byte count or a
+ * negative -errno, and they enforce the descriptor's access mode. */
+int fs64_fd_device(int task, int fd);
+int fs64_fd_dev_read(int task, int fd, void *dst, u64 count);
+int fs64_fd_dev_write(int task, int fd, const void *src, u64 count);
 u64 fs64_fd_pos(int task, int fd);
 int fs64_fd_seek(int task, int fd, u64 pos);
 int fs64_fd_access(int task, int fd);
@@ -931,11 +937,11 @@ int fs64_fd_sync(int task, int fd);
 void fs64_sync_all(void);
 /* Entry `index` of the directory open on `fd`, with the cursor advanced in
  * the description. Returns 1 with the entry filled, 0 at the end, or a
- * negative errno. */
+ * negative errno. `kind` is FS64_KIND_*. */
 int fs64_fd_entry(int task, int fd, u32 index, char name[13], u32 *ino,
-                  int *is_dir, u32 *next_index);
+                  int *kind, u32 *next_index);
 int fs64_dir_entries(const char *path, u32 index, char name[13], u32 *ino,
-                     int *is_dir, u32 *next_index);
+                     int *kind, u32 *next_index);
 
 /* module64.c: the x86-64 loader for the container in
  * kernel/module/haku_module.h. It accepts version 2 only, applies the two

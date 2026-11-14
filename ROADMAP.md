@@ -111,11 +111,14 @@ filesystems.
 
 **Work.**
 
-- [ ] `vfs64.c`: a mount table, path resolution, and an fd table that dispatches
+- [x] `vfs64.c`: a mount table, path resolution, and an fd table that dispatches
       to the backend a mount names. `fs64.c` becomes the FAT12 backend rather
       than the whole filesystem.
-- [ ] `ramfs64` as the boot root, `devfs64` with `null`, `zero` and `console`,
-      and a minimal `procfs64` (`meminfo`, `uptime`, `self/cmdline`).
+- [x] devfs with `null`, `zero` and `console` mounted at `/dev`; the namespace
+      refuses create, unlink, rename and rmdir below a mount that is not the
+      disk.
+- [ ] `ramfs64` as the boot root, a minimal `procfs64` (`meminfo`, `uptime`,
+      `self/cmdline`), and a module-registered `/dev/hello` device.
 - [ ] An x86-64 initramfs: reuse `tools/mkcpio.py`, unpack in the kernel, and
       mount the archive as `/` with the disk at `/disk` — the same namespace
       shape the 32-bit image already uses.
@@ -129,8 +132,9 @@ filesystems.
 - [ ] Keep the build-time size assertion between `haku_module_fs_ops_t` and
       `vfs_fs_ops_t`, now for the 64-bit layouts too.
 
-**Acceptance.** `HAKU64-VFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-INITRAMFS-OK`,
-`HAKU64-MODULE-CAP-OK`; `/dev/hello` reads, `/rom` mounts and lists, and
+**Acceptance.** `HAKU64-VFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-USER-DEV-OK`,
+`HAKU64-INITRAMFS-OK`, `HAKU64-MODULE-CAP-OK`; `/dev/hello` reads, `/rom`
+mounts and lists, and
 `delete_module` reports `-EBUSY` until the last descriptor closes.
 
 ## 3. Pipes, signals and job control

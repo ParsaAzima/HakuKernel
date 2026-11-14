@@ -33,7 +33,8 @@ python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
 x86-64 is the primary target. `shell` and `probe` force the 32-bit image
-because the 64-bit side has no VFS, console device or shell yet; passing
+because the 64-bit side has a FAT12 root with a `/dev` but no shell yet;
+passing
 `--arch=x64` with either is an error rather than a silent switch.
 
 The kernel does not assume a memory size: it reads the E820 map, sizes the
