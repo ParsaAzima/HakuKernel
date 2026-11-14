@@ -173,6 +173,24 @@ int paging64_map_lapic(void) {
     return paging64_map_device_page(K64_LAPIC_VIRT, K64_LAPIC_PHYS);
 }
 
+/* Map a VBE linear framebuffer into K64_FB_VIRT. The pages are uncached
+ * (PCD+PWT) for the same reason the APIC is: the display engine does not
+ * snoop the CPU caches, so a write-back line could sit dirty for a long time
+ * and then be reordered with the writes around it. 4 KiB pages keep the
+ * mapping independent of the aperture's alignment; the window is 4 MiB, so
+ * at most two page tables are involved. */
+int paging64_map_framebuffer(u64 phys, u64 bytes) {
+    u64 mapped;
+
+    if (!bytes || bytes > K64_FB_WINDOW_BYTES) return 0;
+    if (phys & (K64_PAGE_SIZE - 1ull)) return 0;
+    bytes = (bytes + K64_PAGE_SIZE - 1ull) & K64_PAGE_MASK;
+    for (mapped = 0; mapped < bytes; mapped += K64_PAGE_SIZE)
+        if (!paging64_map_device_page(K64_FB_VIRT + mapped, phys + mapped))
+            return 0;
+    return 1;
+}
+
 /* ------------------------------------------------------------ address spaces */
 
 /* One zeroed table from the frame allocator, reached through the physmap.
@@ -226,6 +244,10 @@ u64 paging64_create_space(void) {
      * arrives while a process runs acknowledges through the unit, and the
      * IPI path must work without switching CR3 first. */
     root[K64_LAPIC_SLOT] = boot[K64_LAPIC_SLOT];
+    /* The framebuffer window is shared for the same reason, and one more:
+     * write() to the console paints the screen from a system call, which runs
+     * on the caller's CR3. */
+    root[K64_FB_SLOT] = boot[K64_FB_SLOT];
     return space;
 }
 

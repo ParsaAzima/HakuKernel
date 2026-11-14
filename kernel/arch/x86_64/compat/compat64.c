@@ -78,3 +78,13 @@ void mutex_lock(mutex_t *mutex) {
 void mutex_unlock(mutex_t *mutex) {
     if (mutex) mutex->locked = 0;
 }
+
+/* Interrupt-safe spinlock over the scheduler's implementation: the only
+ * difference from spin64_lock is the name the shared console sources use. */
+irqflags_t spin_lock_irqsave(spinlock_t *lock) {
+    return spin64_lock(lock);
+}
+
+void spin_unlock_irqrestore(spinlock_t *lock, irqflags_t flags) {
+    spin64_unlock(lock, flags);
+}

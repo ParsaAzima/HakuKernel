@@ -1,19 +1,12 @@
-/* Haku x86-64 console and string primitives.
+/* Haku x86-64 string, number and failure primitives.
  *
- * Everything the kernel prints goes to COM1 (stage 1 already programmed the
- * divisor and line format), which is what the headless check reads. There
- * is no framebuffer console on this path yet, and no formatting library:
- * k64_puts/k64_hex/k64_dec are enough for boot diagnostics.
+ * The console tee itself lives in console64.c: every printed byte goes to
+ * COM1 (stage 1 already programmed the divisor and line format) and, once a
+ * display backend is up, to the screen. What stays here is the formatting the
+ * boot diagnostics need (hex, decimal, a fatal stop) and the freestanding
+ * memory primitives: there is no formatting library on this port.
  */
 #include "haku64.h"
-
-void k64_putc(char c) {
-    serial_putc64(c);
-}
-
-void k64_puts(const char *text) {
-    serial_write64(text);
-}
 
 /* Lower-case hex without leading zeros, so addresses stay readable. */
 void k64_hex(u64 value) {
@@ -80,4 +73,26 @@ int memcmp(const void *a, const void *b, usize count) {
         if (left[i] != right[i]) return (int)left[i] - (int)right[i];
     }
     return 0;
+}
+
+/* Overlap-safe, which is what the console scroll needs: the framebuffer
+ * movers shift a region up by one text row inside the same buffer. */
+void *memmove(void *dst, const void *src, usize count) {
+    u8 *out = (u8 *)dst;
+    const u8 *in = (const u8 *)src;
+
+    if (out == in || count == 0) return dst;
+    if (out < in) {
+        for (usize i = 0; i < count; i++) out[i] = in[i];
+    } else {
+        for (usize i = count; i > 0; i--) out[i - 1] = in[i - 1];
+    }
+    return dst;
+}
+
+usize strlen(const char *text) {
+    usize length = 0;
+
+    while (text && text[length]) length++;
+    return length;
 }

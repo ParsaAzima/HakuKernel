@@ -1090,6 +1090,10 @@ void kernel64_main(void) {
     k64_puts("\r\n");
 
     if (!heap64_init()) k64_fail("heap window rejected");
+    /* The screen only becomes usable now: mapping the VBE aperture needs the
+     * page tables, and reserving it needs the frame allocator. Every byte
+     * printed from here on is teed to COM1 and to the display. */
+    console64_init();
     k64_puts("HAKU64-HEAP-OK: window=");
     k64_dec(K64_HEAP_SIZE >> 20);
     k64_puts("MiB free=");
@@ -1124,8 +1128,13 @@ void kernel64_main(void) {
     if (!test_idt_table()) k64_fail("IDT layout self-test");
     pic64_remap(K64_IRQ_BASE, K64_IRQ_BASE + 8);
     pic64_mask_all();
-    pic64_clear_mask(0);        /* only the timer is unmasked so far */
+    pic64_clear_mask(0);        /* timer first: it is the boot timebase */
     timer64_init(100);
+    /* PS/2 keyboard: drains the controller, unmasks IRQ1 and proves the
+     * set-1 decoder on synthesised scancodes. Interrupts are still off, so
+     * the self-test's queue cannot race a real key. */
+    kbd64_init();
+    if (!kbd64_self_test()) k64_fail("PS/2 keyboard decode self-test");
     k64_puts("HAKU64-IDT-OK: gates=256 ist=df/nmi irq0=");
     k64_dec(K64_IRQ_BASE);
     k64_puts(" hz=");

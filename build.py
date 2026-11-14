@@ -491,6 +491,13 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     sources += [os.path.join(ROOT, "kernel", "drivers", "ata.c"),
                 os.path.join(ROOT, "kernel", "drivers", "acpi.c"),
                 os.path.join(ROOT, "kernel", "drivers", "apic.c"),
+                # The console is the same source on both ports: the display
+                # backend table, the VGA text fallback, the shared VBE
+                # renderer and the Terminus table it draws.
+                os.path.join(ROOT, "kernel", "drivers", "display.c"),
+                os.path.join(ROOT, "kernel", "drivers", "vga_text.c"),
+                os.path.join(ROOT, "kernel", "drivers", "fbcon.c"),
+                os.path.join(ROOT, "kernel", "drivers", "font_terminus.c"),
                 os.path.join(ROOT, "kernel", "fs", "fat12", "fat12.c")]
     if not sources:
         sys.exit("no kernel/arch/x86_64/**/*.c files found")
@@ -640,10 +647,24 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
 
     if os.path.exists(serial):
         os.remove(serial)
+    # The human monitor types the key the ring-3 console read blocks on and
+    # captures the screen: the framebuffer console only proves itself in the
+    # pixels, and the read test only completes when a real scancode arrives
+    # through IRQ1. Port 5555 belongs to the 32-bit headless run.
+    mon_port = 5556
+    ppm = os.path.join(BUILD, "screen64.ppm")
+    boot_timeout = float(os.environ.get("HAKU_X64_TIMEOUT", "60"))
     proc = subprocess.Popen(base + ["-display", "none",
-                                    "-serial", f"file:{serial}"])
-    reached = wait_for_serial(serial, "HAKU64-SELFTEST-OK",
-                              float(os.environ.get("HAKU_X64_TIMEOUT", "60")))
+                                    "-serial", f"file:{serial}",
+                                    "-monitor",
+                                    f"tcp:127.0.0.1:{mon_port},"
+                                    "server=on,wait=off"])
+    if not wait_for_serial(serial, "HAKU64-KEY-READY", boot_timeout):
+        log("warning: the ring-3 program never asked for a keystroke")
+    else:
+        monitor_cmd(mon_port, ["sendkey x"])
+    reached = wait_for_serial(serial, "HAKU64-SELFTEST-OK", boot_timeout)
+    monitor_cmd(mon_port, [f"screendump {ppm}"])
     proc.kill()
     proc.wait()
     with open(serial, errors="replace") as f:
@@ -652,6 +673,8 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     log(content)
     required = ["HAKU64-BOOT-OK", "HAKU64-E820-OK", "HAKU64-PAGING-OK",
                 "HAKU64-PERCPU-OK", "HAKU64-FRAME-OK", "HAKU64-HEAP-OK",
+                "HAKU64-TERMINAL-OK: console=",
+                "HAKU64-KBD-OK", "HAKU64-KEY-OK",
                 "HAKU64-GDT-OK",
                 "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
                 f"HAKU64-SMP-OK: cpus={smp_cpus}",
@@ -681,6 +704,20 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
         for line in content.splitlines():
             if "HAKU64-FAIL" in line:
                 sys.exit(f"X64 CHECK FAILED: {line.strip()}")
+    if "HAKU64-FB-OK" in content:
+        # The renderer's signature block must be in the captured pixels: a
+        # console that reported the mode but painted nothing is a failure the
+        # serial log cannot see. The status-bar tint proves the reserved rows
+        # were painted rather than left as a black band.
+        if not os.path.exists(ppm):
+            missing.append("framebuffer active but no screendump captured")
+        elif not ppm_has_color(ppm, (0x20, 0xA0, 0xFF)):
+            missing.append("framebuffer signature color missing from the"
+                           " screendump")
+        elif not ppm_has_color(ppm, (0x14, 0x16, 0x28)):
+            missing.append("status bar missing from the screendump")
+    elif "HAKU64-FB-SKIP" not in content:
+        missing.append("no framebuffer status line in the serial log")
     if missing or not reached:
         sys.exit("X64 CHECK FAILED: missing markers: " + ", ".join(missing))
 
@@ -1361,14 +1398,16 @@ def main():
         if "KERNEL PANIC" in content:
             missing.append("kernel panicked during the headless run")
         # The framebuffer console proves itself on the screen: when the
-        # graphics mode is live the signature block the driver draws must
-        # show up in the captured framebuffer.
+        # graphics mode is live the signature block the driver draws and the
+        # status bar under the log must show up in the captured framebuffer.
         if "FB-OK" in content:
             if not os.path.exists(ppm):
                 missing.append("framebuffer active but no screendump captured")
             elif not ppm_has_color(ppm, (0x20, 0xA0, 0xFF)):
                 missing.append("framebuffer signature color missing from the"
                                " screendump")
+            elif not ppm_has_color(ppm, (0x14, 0x16, 0x28)):
+                missing.append("status bar missing from the screendump")
         elif "FB-SKIP" not in content:
             missing.append("no framebuffer status line in the serial log")
         unexpected = [m for m in ("USER-SYSCALL-FAIL",

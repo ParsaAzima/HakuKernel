@@ -284,6 +284,17 @@ static regs64_t *handle_irq(regs64_t *r) {
     u32 irq = (u32)(r->vector - K64_IRQ_BASE);
     if (irq == 0) {
         timer64_tick();
+        /* The status bar's uptime is the only thing on screen that changes
+         * without a system call, so the tick that starts a new second
+         * repaints it. 100 Hz gives a modulo test per tick and one bar
+         * repaint per second. */
+        if (timer64_ticks() % (u64)(timer64_hz() ? timer64_hz() : 1u) == 0)
+            console64_status();
+    } else if (irq == 1) {
+        /* PS/2 keyboard: read the controller, queue the decoded byte and
+         * wake a console reader. IRQ1 is only unmasked once kbd64_init()
+         * has drained the firmware's leftovers. */
+        kbd64_irq();
     } else if (irq < K64_IRQ_COUNT) {
         if (irq_counts[irq]++ == 0) {
             k64_puts("HAKU64-IRQ-UNEXPECTED: irq=");

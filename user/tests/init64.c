@@ -219,6 +219,34 @@ static void test_mappings_and_time(void) {
           "monotonic clock moves forward");
 }
 
+/* The console read blocks: when the keyboard queue is empty the kernel parks
+ * the task with -EAGAIN and IRQ1 wakes it, so this loop retries until a byte
+ * arrives. build.py types 'x' only after it reads the marker below, which is
+ * what makes the handshake deterministic instead of a race with boot time. */
+static void test_console(void) {
+    char ch = 0;
+    int tries;
+
+    printf("HAKU64-KEY-READY: waiting for one keystroke\n");
+    for (tries = 0; tries < 200000; tries++) {
+        ssize_t n = read(0, &ch, 1);
+
+        if (n == 1) {
+            if (ch == 'x')
+                printf("HAKU64-KEY-OK: console read got '%c'\n", ch);
+            else {
+                printf("HAKU64-KEY-FAIL: console read got 0x%02x\n",
+                       (unsigned char)ch);
+                failures++;
+            }
+            return;
+        }
+        if (n != -1) break;        /* 0 or a positive short count: not ours */
+    }
+    printf("HAKU64-KEY-FAIL: console read never returned a byte\n");
+    failures++;
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)envp;
 
@@ -234,6 +262,7 @@ int main(int argc, char **argv, char **envp) {
     test_files();
     test_processes();
     test_mappings_and_time();
+    test_console();
 
     if (failures) {
         printf("HAKU64-LIBC-FAIL: %d check(s)\n", failures);

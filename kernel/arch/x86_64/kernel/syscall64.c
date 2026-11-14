@@ -1103,6 +1103,53 @@ static u64 sys64_mkdirat(int id, int dirfd, u64 path) {
     return (u64)fs64_create_dir(name);
 }
 
+/* console64: is a byte waiting? Called by sched64_park_until() with the task
+ * lock held, which is how a keystroke that lands between the empty check and
+ * the park is still seen. */
+static int console_data_ready(void) {
+    return kbd64_pending() != 0;
+}
+
+/* read(0, buf, n) on the console. There is no line discipline: the queue
+ * hands out decoded characters as they are typed, and the bytes are echoed so
+ * typing is visible on the framebuffer console. An empty queue parks the task
+ * with -EAGAIN; IRQ1 wakes it and the caller retries, which is the same
+ * contract the 32-bit console uses for its blocking read. */
+static regs64_t *sys64_console_read(regs64_t *frame) {
+    u8 chunk[64];
+    u64 count = frame->rdx, done = 0;
+
+    if (count == 0) {
+        frame->rax = 0;
+        return frame;
+    }
+    if (count > sizeof(chunk)) count = sizeof(chunk);
+
+    while (done < count) {
+        int ch = kbd64_read();
+        if (ch < 0) break;
+        chunk[done++] = (u8)ch;
+    }
+
+    if (!done) {
+        int parked = 0;
+        return sched64_park_until(frame, K64_CONSOLE_WAIT_ADDR,
+                                  (u64)0 - SYS64_EAGAIN,
+                                  console_data_ready, &parked);
+    }
+
+    if (!copy_to_user64(current_space(), frame->rsi, chunk, done)) {
+        frame->rax = (u64)0 - SYS64_EFAULT;
+        return frame;
+    }
+    for (u64 i = 0; i < done; i++) {
+        if (chunk[i] == '\n') k64_putc('\r');
+        k64_putc((char)chunk[i]);
+    }
+    frame->rax = done;
+    return frame;
+}
+
 /* read(fd, buffer, count): file descriptors only. The data is staged in a
  * small kernel buffer and copied out page by page, so a bad pointer after
  * some bytes is a short read rather than a fault. */
@@ -2247,6 +2294,8 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     switch (frame->rax) {
     case K64_SYS_READ:
+        if (fs64_fd_console(sched64_current(), (int)frame->rdi))
+            return sys64_console_read(frame);
         result = sys64_read(frame->rdi, frame->rsi, frame->rdx);
         break;
 

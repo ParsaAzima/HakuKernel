@@ -305,3 +305,17 @@ u64 frame64_highest_free(void) {
     spin64_unlock(&frame_lock, flags);
     return result;
 }
+
+/* Take a physical range out of the pool. The framebuffer aperture is the one
+ * caller: firmware may place it inside RAM, and the allocator would otherwise
+ * hand those frames to a task whose writes would paint over the console. The
+ * bits are cleared here rather than during init because the aperture is only
+ * known once the VBE handover has been read. */
+void frame64_reserve_range(u64 start, u64 end) {
+    u64 flags;
+
+    if (!frame_count || end <= start) return;
+    flags = spin64_lock(&frame_lock);
+    mark_reserved(start, end);
+    spin64_unlock(&frame_lock, flags);
+}

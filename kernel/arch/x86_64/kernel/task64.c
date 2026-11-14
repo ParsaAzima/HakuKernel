@@ -1054,12 +1054,14 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
  * syscall (RAX=0) and switch away. The frame is saved *before* the state
  * changes, because the task is not RUNNING any more when switch_to looks at
  * it, yet a wake must resume it through that exact frame. */
-regs64_t *sched64_futex_wait(regs64_t *frame, u64 address) {
+static regs64_t *park_task(regs64_t *frame, u64 address, u64 result,
+                           int (*ready)(void), int *parked) {
     k64_percpu_t *cpu = this_cpu();
     int id;
     u64 flags;
 
-    if (!enabled || !cpu) {
+    if (parked) *parked = 0;
+    if (!enabled || !cpu || !cpu->current) {
         frame->rax = (u64)0 - 22;          /* EINVAL */
         return frame;
     }
@@ -1070,15 +1072,38 @@ regs64_t *sched64_futex_wait(regs64_t *frame, u64 address) {
     }
 
     fxsave64(fxsave_areas[id]);
-    frame->rax = 0;
+    frame->rax = result;
     flags = spin64_lock(&sched_lock);
     tasks[id].frame = frame;
     tasks[id].futex_addr = address;
     tasks[id].state = K64_TASK_WAIT;
+    /* `ready` runs with the task lock held, which is what closes the
+     * lost-wakeup window: whatever it tests is published under the same lock
+     * the waker takes, so a wake either happens before this check (and is
+     * seen) or after the WAIT state exists (and finds the task). */
+    if (ready && ready()) {
+        tasks[id].futex_addr = 0;
+        tasks[id].state = K64_TASK_RUNNING;
+        spin64_unlock(&sched_lock, flags);
+        return frame;
+    }
     spin64_unlock(&sched_lock, flags);
+    if (parked) *parked = 1;
 
-    return switch_away("HAKU64-TASK-HALT: every task is blocked on a"
-                       " futex\r\n");
+    return switch_away("HAKU64-TASK-HALT: every task is parked\r\n");
+}
+
+regs64_t *sched64_park(regs64_t *frame, u64 address, u64 result) {
+    return park_task(frame, address, result, 0, 0);
+}
+
+regs64_t *sched64_park_until(regs64_t *frame, u64 address, u64 result,
+                             int (*ready)(void), int *parked) {
+    return park_task(frame, address, result, ready, parked);
+}
+
+regs64_t *sched64_futex_wait(regs64_t *frame, u64 address) {
+    return park_task(frame, address, 0, 0, 0);
 }
 
 /* Wake up to `count` tasks parked on `address`. The match is on the virtual
@@ -1097,7 +1122,6 @@ int sched64_futex_wake(int id, u64 address, int count) {
         if (tasks[i].state != K64_TASK_WAIT) continue;
         if (tasks[i].futex_addr != address) continue;
         tasks[i].futex_addr = 0;
-        tasks[i].brk = 0;
         tasks[i].state = K64_TASK_READY;
         if (tasks[i].cpu < K64_SMP_MAX_CPUS)
             cpus_mask |= 1u << tasks[i].cpu;

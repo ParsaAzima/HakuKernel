@@ -87,7 +87,7 @@ typedef signed long long s64;
 #define K64_RESERVED_END     (K64_HEAP_START + K64_HEAP_SIZE)
 
 /* ------------------------------------------------------------ device windows
- * Two kernel virtual windows outside the physmap, each with its own PML4
+ * Three kernel virtual windows outside the physmap, each with its own PML4
  * slot so a 4 KiB mapping never touches the 2 MiB pages the physmap uses:
  *
  *   K64_LAPIC_VIRT (slot 448)  the local APIC MMIO page, uncached. The
@@ -96,13 +96,19 @@ typedef signed long long s64;
  *                             must reach the unit whatever CR3 is loaded.
  *   K64_ACPI_WINDOW (slot 384) two pages used to read ACPI tables at boot.
  *                             Never copied into a user space.
+ *   K64_FB_VIRT (slot 496)    the VBE linear framebuffer, copied into every
+ *                             PML4 for the same reason as the APIC: the
+ *                             console keeps drawing while a task runs.
  *
- * Both sit in the upper canonical half, next to the physmap (slot 256). */
+ * All three sit in the upper canonical half, next to the physmap (slot 256). */
 #define K64_LAPIC_PHYS   0xFEE00000ull
 #define K64_LAPIC_VIRT   0xFFFFE00000000000ull
 #define K64_LAPIC_SLOT   448u
 #define K64_ACPI_WINDOW  0xFFFFC00000000000ull
 #define K64_ACPI_WINDOW_PAGES 2u
+#define K64_FB_VIRT      0xFFFFF80000000000ull
+#define K64_FB_SLOT      496u
+#define K64_FB_WINDOW_BYTES (4ull * 1024ull * 1024ull)
 
 /* E820 handover from stage2 (24-byte entries, count at 0x6FFC). */
 #define K64_E820_COUNT (*(volatile u32 *)0x6FFC)
@@ -565,6 +571,46 @@ void k64_hex(u64 value);
 void k64_dec(u64 value);
 void k64_fail(const char *what);
 
+/* console64.c: the console tee. Every byte the kernel prints goes to COM1
+ * (what the headless check reads) and, once console64_init() has picked a
+ * backend, to the screen. Before that the display is still the boot
+ * firmware's, so only the serial side is live. */
+void console64_init(void);
+/* 1 when the screen is being painted (a backend was selected). */
+int console64_ready(void);
+/* Answers the screen size the console writer can use: the framebuffer's text
+ * grid, or the VGA text grid. Both are always valid after console64_init. */
+u32 console64_columns(void);
+u32 console64_rows(void);
+const char *console64_name(void);
+/* Repaint the status bar (machine name and geometry on the left, uptime on
+ * the right). Called at console init and once a second from IRQ0; safe to
+ * call before the console is up, where it does nothing. */
+void console64_status(void);
+
+/* fb64.c: map the VBE aperture stage 2 selected and start the shared
+ * renderer. Returns 1 when the framebuffer console is live, 0 when the
+ * handover is missing or unusable (VGA text stays the backend). */
+int fb64_init(void);
+
+/* kbd64.c: PS/2 keyboard. Set-1 scancodes from IRQ1 are decoded to ASCII and
+ * queued; console read() pops from that queue and parks on
+ * K64_CONSOLE_WAIT_ADDR when it is empty, so IRQ1 is the wakeup. */
+#define K64_KBD_QUEUE 128u
+/* A kernel pseudo-address, far above any user mapping: the scheduler only
+ * compares it for equality when it matches waiters. */
+#define K64_CONSOLE_WAIT_ADDR 0xFFFFFFFFFFFFF000ull
+void kbd64_init(void);
+/* Decode-only self-test with synthesised scancodes, so it does not depend on
+ * the headless run typing anything. Prints HAKU64-KBD-OK. */
+int kbd64_self_test(void);
+/* Pop one decoded byte; -1 when the queue is empty. */
+int kbd64_read(void);
+/* Number of queued bytes (safe from interrupt context). */
+u32 kbd64_pending(void);
+/* IRQ1: read the controller and queue what it produced. */
+void kbd64_irq(void);
+
 /* bootmem64.c: bump allocator for the structures that must exist before
  * the frame allocator and heap do (page tables, frame bitmaps). */
 void bootmem64_init(void);
@@ -584,6 +630,10 @@ int paging64_map_device_page(u64 virt, u64 phys);
 /* Idempotently map K64_LAPIC_VIRT -> K64_LAPIC_PHYS. Returns 0 when no
  * boot memory was left for the intermediate tables. */
 int paging64_map_lapic(void);
+/* Map a VBE linear framebuffer aperture into K64_FB_VIRT, uncached. The
+ * range must be page aligned and fit the 4 MiB window (stage 2 caps a mode at
+ * 1024x768x32, which is 3 MiB). Returns 1 on success. */
+int paging64_map_framebuffer(u64 phys, u64 bytes);
 
 /* Per-process address spaces. A space is the physical address of a PML4
  * that shares the kernel's identity map and physmap and owns PML4 slot 1.
@@ -689,6 +739,10 @@ u64 frame64_free_count(void);
 u64 frame64_usable_count(void);
 u64 frame64_limit(void);
 u64 frame64_highest_free(void);
+/* Keep a physical range out of the pool. The framebuffer aperture can sit
+ * inside RAM on some firmware, and handing it to a task would paint over the
+ * screen; called once, after frame64_init and before the first user space. */
+void frame64_reserve_range(u64 start, u64 end);
 
 /* heap64.c */
 int heap64_init(void);
@@ -810,6 +864,17 @@ int sched64_tgid(int id);
  * address runnable again and answers how many it woke. */
 regs64_t *sched64_futex_wait(regs64_t *frame, u64 address);
 int sched64_futex_wake(int id, u64 address, int count);
+/* Park the caller on `address` with `result` in RAX and switch away; the
+ * wake side is sched64_futex_wake. Used for the console read when the
+ * keyboard queue is empty, so a blocking read costs no CPU. Returns the frame
+ * to resume the next task with. */
+regs64_t *sched64_park(regs64_t *frame, u64 address, u64 result);
+/* As sched64_park, but `ready` decides whether parking is still necessary. It
+ * runs with the task lock held, so a producer that publishes under the same
+ * lock cannot be missed. `parked`, when given, is 1 after a real switch
+ * away; a task that did not park sees `result` in RAX and retries. */
+regs64_t *sched64_park_until(regs64_t *frame, u64 address, u64 result,
+                             int (*ready)(void), int *parked);
 /* end the caller on a signal (no handlers exist, so this is exit-by-signal) */
 regs64_t *sched64_terminate(regs64_t *frame, u32 signal);
 /* reap a DONE child of `parent`; returns the child id or a negative errno */
