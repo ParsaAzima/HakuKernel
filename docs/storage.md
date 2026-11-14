@@ -77,13 +77,26 @@ them: an eight-slot cache of 32 pages per path, walking one directory entry per
 lookup, with `fs64_lookup`, `fs64_read`, `fs64_write` and `fs64_*/stat`
 helpers. `kernel/arch/x86_64/kernel/vfs64.c` holds the namespace: a four-entry
 mount table with longest-prefix, case-insensitive resolution (the FAT12 volume
-at `/disk`, the RAM root at `/`, devfs at `/dev`), and descriptors that record
-which backend they came from. `/dev` offers `null`, `zero` and `console` as
-character files; a write to `/dev/null` is discarded, a read from `/dev/zero`
-is zeroes, and `/dev/console` is an alias of the implicit console descriptors,
-so its read, write and ioctl behaviour is unchanged. The device namespace is
-read-only: create, unlink, rename and rmdir below `/dev` fail with `-EACCES`,
-and truncating a device is `-EINVAL`.
+at `/disk`, the RAM root at `/`, procfs at `/proc`, devfs at `/dev`), and
+descriptors that record which backend they came from. `/dev` offers `null`,
+`zero` and `console` as character files; a write to `/dev/null` is discarded, a
+read from `/dev/zero` is zeroes, and `/dev/console` is an alias of the implicit
+console descriptors, so its read, write and ioctl behaviour is unchanged. The
+table has four slots beyond the built-ins for devices a module registers with
+`haku_module_register_device`; each slot counts its open descriptors, so
+unloading that module reports `-EBUSY` until the last one closes. The device
+namespace is read-only: create, unlink, rename and rmdir below `/dev` fail with
+`-EACCES`, and truncating a device is `-EINVAL`.
+
+`kernel/arch/x86_64/kernel/procfs64.c` mounts at `/proc` and generates
+`meminfo`, `uptime` and `self/cmdline` when the path is first opened, holding
+the result in the one page the `fs64.c` cache keeps for that path; every open
+of the same path observes that snapshot until the slot is evicted, and `stat`
+reports the length without generating anything. `meminfo` reports total and
+free frames, the heap window and the RAM filesystem's node and byte counts,
+`uptime` is seconds and hundredths, and `self/cmdline` names `/INIT.ELF`. Procfs
+is read-only: opening for writing or truncating reports `-EACCES`, as does
+unlink, create, rename or rmdir below `/proc`.
 
 `kernel/arch/x86_64/kernel/ramfs64.c` is the writable root. It keeps a fixed
 128-node table, 48-byte names, and 32 pages (128 KiB) per file; a file page is
@@ -102,7 +115,15 @@ The x64 seed disk (`build/haku64_fs.img`) carries `INITRD` plus its own
 archive holds the same files under `/` (plus `etc/banner.txt` and the `tmp`,
 `dev` and `disk` directories), so the boot test can read one marker from each
 backend, the kernel writes `/disk/NOTE.TXT`, and the headless run re-verifies
-the host image and reads that note back with `tools/lsfat12.py --cat`.
+the host image and reads that note back with `tools/lsfat12.py --cat`. The
+module test loads `X64MOD.HKM`, which registers `/dev/hello`: the test reads
+its marker, checks that `delete_module` is `-EBUSY` while the descriptor is
+open, then closes it and proves unload removes the node.
+
+The ring-3 test reads `/proc/meminfo`, `/proc/uptime` and `/proc/self/cmdline`
+through the same descriptors it uses for files, and reports
+`HAKU64-USER-PROCFS-OK`; the kernel-side test reports `HAKU64-PROCFS-OK` and
+`HAKU64-MODULE-DEV-OK`.
 
 ### Why FAT12 with 8.3 names, and not something bigger
 

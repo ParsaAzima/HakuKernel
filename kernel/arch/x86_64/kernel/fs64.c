@@ -26,6 +26,7 @@
  */
 #include "haku64.h"
 #include "fat12.h"
+#include "procfs64.h"
 #include "ramfs64.h"
 #include "vfs64.h"
 
@@ -35,8 +36,9 @@
 typedef struct {
     u32 used;
     u32 refs;                      /* open descriptors on this path */
-    u32 backend;                   /* VFS64_MOUNT_FAT or VFS64_MOUNT_RAM */
+    u32 backend;                   /* VFS64_MOUNT_FAT/RAM/PROC */
     u32 ram;                       /* ramfs64 node when backend is RAM */
+    u32 proc;                      /* procfs64 entry when backend is PROC */
     u32 dirty;                     /* bit i: cached page i differs from disk */
     u32 valid;                     /* bit i: frame[i] holds page i */
     char path[K64_FS_PATH_MAX + 1];/* canonical (upper-case) cache key */
@@ -126,6 +128,7 @@ static void cache_clear(fs64_cache_t *slot) {
     slot->refs = 0;
     slot->backend = VFS64_MOUNT_FAT;
     slot->ram = RAMFS64_NONE;
+    slot->proc = PROCFS64_NONE;
     slot->dirty = 0;
     slot->valid = 0;
     slot->size = 0;
@@ -238,6 +241,10 @@ static int cache_flush(fs64_cache_t *slot) {
 
     if (!slot || !slot->used) return 1;
 
+    /* A procfs page is generated once at open; there is nothing to write
+     * back and no length to publish. */
+    if (slot->backend == VFS64_MOUNT_PROC) return 1;
+
     /* The cached page is the file page on a RAM backend, so only the length
      * still has to be published. Truncating frees pages the slot must then
      * forget; growing zero-fills the exposed tail. */
@@ -303,6 +310,9 @@ static fs64_cache_t *cache_open(const char *path, const char *rel,
 
     slot = cache_find(key);
     if (slot) {
+        /* Generated content stays valid for the cached path; a procfs open
+         * never truncates or re-creates. */
+        if (slot->backend == VFS64_MOUNT_PROC) return slot;
         if ((flags & FAT12_OPEN_CREATE) && (flags & FAT12_OPEN_EXCL)) {
             if (error) *error = -FS64_EEXIST;
             return 0;
@@ -345,6 +355,7 @@ static fs64_cache_t *cache_open(const char *path, const char *rel,
     memset(slot, 0, sizeof(*slot));
     slot->backend = backend;
     slot->ram = RAMFS64_NONE;
+    slot->proc = PROCFS64_NONE;
 
     if (backend == VFS64_MOUNT_RAM) {
         u32 node, ino;
@@ -374,6 +385,33 @@ static fs64_cache_t *cache_open(const char *path, const char *rel,
             }
         }
         slot->ram = node;
+    } else if (backend == VFS64_MOUNT_PROC) {
+        char content[PROCFS64_CONTENT_MAX];
+        int entry, entry_kind;
+        u64 frame;
+        u8 *page;
+
+        result = procfs64_lookup(rel, &entry, &entry_kind);
+        if (result < 0) {
+            if (error) *error = result;
+            return 0;
+        }
+        if (entry_kind != FS64_KIND_FILE) {
+            if (error) *error = -FS64_EISDIR;
+            return 0;
+        }
+        size = procfs64_fill(entry, content, sizeof(content));
+        frame = frame64_alloc();
+        if (!frame) {
+            if (error) *error = -FS64_ENOSPC;
+            return 0;
+        }
+        page = (u8 *)phys_to_virt64(frame);
+        memset(page, 0, K64_PAGE_SIZE);
+        memcpy(page, content, (usize)size);
+        slot->frame[0] = frame;
+        slot->valid = 1u;
+        slot->proc = (u32)entry;
     } else {
         /* Every cached path is opened read-write internally; the
          * descriptor's own access mode is enforced in fs64_fd_access. */
@@ -519,6 +557,7 @@ u64 fs64_write(int file, u64 offset, const void *src, u64 count) {
     if (file < 0 || (u32)file >= FS64_CACHE_MAX) return 0;
     slot = &cache[file];
     if (!slot->used || offset >= max) return 0;
+    if (slot->backend == VFS64_MOUNT_PROC) return 0;
     if (count > max - offset) count = max - offset;
 
     while (done < count) {
@@ -552,6 +591,7 @@ int fs64_truncate(int file, u64 size) {
     if (file < 0 || (u32)file >= FS64_CACHE_MAX) return -FS64_EINVAL;
     slot = &cache[file];
     if (!slot->used) return -FS64_EINVAL;
+    if (slot->backend == VFS64_MOUNT_PROC) return -FS64_EACCES;
     if (size > (u64)FS64_PAGE_MAX * K64_PAGE_SIZE) return -FS64_ENOSPC;
     if (slot->backend == VFS64_MOUNT_RAM) {
         /* Apply the new length now: the node owns the pages, and a mapping
@@ -610,7 +650,8 @@ int fs64_unlink(const char *path) {
     int result;
 
     if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
-    if (backend == VFS64_MOUNT_DEV) return -FS64_EACCES;
+    if (backend == VFS64_MOUNT_DEV || backend == VFS64_MOUNT_PROC)
+        return -FS64_EACCES;
     if (!cache_key(path, key)) return -FS64_EINVAL;
 
     if (backend == VFS64_MOUNT_RAM) {
@@ -644,7 +685,8 @@ int fs64_rename(const char *oldpath, const char *newpath) {
         return -FS64_ENOENT;
     if (vfs64_resolve(newpath, &newbackend, newrel) != 0)
         return -FS64_ENOENT;
-    if (oldbackend == VFS64_MOUNT_DEV || newbackend == VFS64_MOUNT_DEV)
+    if (oldbackend == VFS64_MOUNT_DEV || newbackend == VFS64_MOUNT_DEV ||
+        oldbackend == VFS64_MOUNT_PROC || newbackend == VFS64_MOUNT_PROC)
         return -FS64_EACCES;
     if (oldbackend != newbackend) return -FS64_EXDEV;
     if (!cache_key(oldpath, oldkey) || !cache_key(newpath, newkey))
@@ -695,6 +737,13 @@ int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind) {
         result = vfs64_dev_lookup(rel, &device, &lookup_kind);
         if (result < 0) return result;
         return vfs64_dev_stat(device, size, ino, kind);
+    }
+    if (backend == VFS64_MOUNT_PROC) {
+        int entry;
+
+        result = procfs64_lookup(rel, &entry, &lookup_kind);
+        if (result < 0) return result;
+        return procfs64_stat(entry, size, ino, kind);
     }
     if (backend == VFS64_MOUNT_RAM) {
         u32 node;
@@ -787,6 +836,16 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
             if (result < 0) return result;
             return vfs64_dev_stat(device, size, ino, kind);
         }
+        if (backend == VFS64_MOUNT_PROC) {
+            int entry;
+
+            result = procfs64_lookup(rel, &entry, &lookup_kind);
+            if (result < 0) return result;
+            result = procfs64_stat(entry, size, ino, kind);
+            if (result < 0) return result;
+            if (size) *size = 0;
+            return 0;
+        }
         if (backend == VFS64_MOUNT_RAM) {
             u32 node;
 
@@ -809,6 +868,13 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
         fat12_stat_t st;
 
         if (!slot->used) return -FS64_EBADF;
+        if (slot->backend == VFS64_MOUNT_PROC) {
+            int result = procfs64_stat((int)slot->proc, size, ino, kind);
+
+            if (result < 0) return result;
+            if (size) *size = slot->size;
+            return 0;
+        }
         if (slot->backend == VFS64_MOUNT_RAM) {
             u32 node_ino;
             int node_kind;
@@ -844,6 +910,14 @@ int fs64_dir_entries(const char *path, u32 index, char name[FS64_NAME_MAX],
         if (result < 0) return result;
         if (lookup_kind != FS64_KIND_DIR) return -FS64_ENOTDIR;
         return vfs64_dev_entry(index, name, ino, kind, next_index);
+    }
+    if (backend == VFS64_MOUNT_PROC) {
+        int entry, lookup_kind;
+
+        result = procfs64_lookup(rel, &entry, &lookup_kind);
+        if (result < 0) return result;
+        if (lookup_kind != FS64_KIND_DIR) return -FS64_ENOTDIR;
+        return procfs64_entry(entry, index, name, ino, kind, next_index);
     }
     if (backend == VFS64_MOUNT_RAM)
         return ramfs64_entry(rel[0] ? rel : "/", index, name, ino, kind,
@@ -1025,6 +1099,7 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
         }
         desc = fd_reserve(task, &fd);
         if (!desc) {
+            vfs64_dev_closed(device);
             if (error) *error = -FS64_ENOSPC;
             return -1;
         }
@@ -1034,6 +1109,61 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
         desc->flags = access;
         desc->pos = 0;
         fd_desc[task][fd] = desc_index(desc);
+        return fd;
+    }
+
+    if (kind == VFS64_MOUNT_PROC) {
+        int entry, entry_kind, result;
+
+        if (flags & (K64_O_WRONLY | K64_O_RDWR | K64_O_CREAT |
+                     K64_O_TRUNC)) {
+            if (error) *error = -FS64_EACCES;
+            return -1;
+        }
+        result = procfs64_lookup(rel, &entry, &entry_kind);
+        if (result < 0) {
+            if (error) *error = result;
+            return -1;
+        }
+        if (flags & K64_O_DIRECTORY) {
+            if (entry_kind != FS64_KIND_DIR) {
+                if (error) *error = -FS64_ENOTDIR;
+                return -1;
+            }
+            desc = fd_reserve(task, &fd);
+            if (!desc) {
+                if (error) *error = -FS64_ENOSPC;
+                return -1;
+            }
+            desc->slot = FS64_DIR;
+            desc->backend = VFS64_MOUNT_PROC;
+            desc->flags = K64_O_RDONLY;
+            desc->pos = 0;
+            dir_path_set(desc, path);
+            fd_desc[task][fd] = desc_index(desc);
+            return fd;
+        }
+        if (entry_kind != FS64_KIND_FILE) {
+            if (error) *error = -FS64_EISDIR;
+            return -1;
+        }
+        slot = cache_open(path, rel[0] ? rel : "/", VFS64_MOUNT_PROC,
+                          FAT12_OPEN_READ, &resolved);
+        if (!slot) {
+            if (error) *error = resolved ? resolved : -FS64_EIO;
+            return -1;
+        }
+        desc = fd_reserve(task, &fd);
+        if (!desc) {
+            if (error) *error = -FS64_ENOSPC;
+            return -1;
+        }
+        desc->slot = (int)(slot - cache);
+        desc->backend = VFS64_MOUNT_PROC;
+        desc->flags = K64_O_RDONLY;
+        desc->pos = 0;
+        fd_desc[task][fd] = desc_index(desc);
+        slot->refs++;
         return fd;
     }
 
@@ -1234,6 +1364,8 @@ void fs64_fd_close(int task, int fd) {
     slot_index = desc->slot;
     desc->refs--;
     if (desc->refs == 0) {
+        if (desc->backend == VFS64_MOUNT_DEV && slot_index != FS64_CONSOLE)
+            vfs64_dev_closed(desc->dev);
         desc->used = 0;
         desc->slot = -1;
     }

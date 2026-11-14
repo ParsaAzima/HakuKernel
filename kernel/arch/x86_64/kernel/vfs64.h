@@ -32,21 +32,30 @@
 #define VFS64_MOUNT_FAT 0u
 #define VFS64_MOUNT_DEV 1u
 #define VFS64_MOUNT_RAM 2u
+#define VFS64_MOUNT_PROC 3u
 
 /* Device numbers, in the order `/dev` lists them. The root directory has no
- * device number; vfs64_dev_lookup() reports VFS64_DEV_ROOT for it. */
+ * device number; vfs64_dev_lookup() reports VFS64_DEV_ROOT for it. Module
+ * devices follow the built-ins in registration order. */
 #define VFS64_DEV_NULL    0
 #define VFS64_DEV_ZERO    1
 #define VFS64_DEV_CONSOLE 2
 #define VFS64_DEV_COUNT   3
 #define VFS64_DEV_ROOT    (-1)
 
+/* A module may publish at most this many character devices. */
+#define VFS64_DEV_MODULE_MAX 4u
+
 /* Device inodes start well clear of the FAT12 sequence numbers so a
  * directory listing cannot confuse the two. */
 #define VFS64_DEV_INO_BASE 0xDE000000u
 
-/* Mount the FAT12 volume at /disk, the RAM root at / and devfs at /dev.
- * Returns 1 on success. */
+typedef int (*vfs64_dev_read_fn)(void *buffer, u32 count, u32 *out_count);
+typedef int (*vfs64_dev_write_fn)(const void *buffer, u32 count,
+                                  u32 *out_count);
+
+/* Mount the FAT12 volume at /disk, the RAM root at /, procfs at /proc and
+ * devfs at /dev. Returns 1 on success. */
 int vfs64_init(void);
 /* Replace the RAM root with the FAT12 volume, for an image that has no
  * /disk/INITRD. Returns 1 when the root mount exists. */
@@ -73,5 +82,21 @@ int vfs64_dev_lookup(const char *rel, int *device, int *kind);
 int vfs64_dev_entry(u32 index, char name[FS64_NAME_MAX], u32 *ino, int *kind,
                     u32 *next);
 const char *vfs64_dev_name(int device);
+/* Built-in devices plus the module devices currently registered. */
+u32 vfs64_dev_count(void);
+
+/* Publish a module character device under `/dev`. `owner` is the module slot
+ * the device belongs to; the kernel refuses to unload that module while a
+ * descriptor still has it open. Returns the device number or -errno. */
+int vfs64_dev_register(const char *name, vfs64_dev_read_fn read,
+                       vfs64_dev_write_fn write, int owner);
+/* 1 when a device owned by `owner` is open, 0 otherwise. */
+int vfs64_dev_owner_busy(int owner);
+/* Detach every device owned by `owner`; the caller has already established
+ * that none is open. */
+void vfs64_dev_remove_owner(int owner);
+/* Track a descriptor on a module device, so unload can report -EBUSY. */
+void vfs64_dev_opened(int device);
+void vfs64_dev_closed(int device);
 
 #endif

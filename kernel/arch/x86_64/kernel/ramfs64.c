@@ -410,3 +410,16 @@ int ramfs64_entry(const char *path, u32 index, char name[FS64_NAME_MAX],
     }
     return 0;
 }
+
+void ramfs64_usage(u32 *nodes_out, u64 *bytes_out) {
+    u32 count = 0;
+    u64 bytes = 0;
+
+    for (u32 i = 0; i < RAMFS64_MAX_NODES; i++) {
+        if (!nodes[i].used) continue;
+        count++;
+        if (nodes[i].kind == FS64_KIND_FILE) bytes += nodes[i].size;
+    }
+    if (nodes_out) *nodes_out = count;
+    if (bytes_out) *bytes_out = bytes;
+}

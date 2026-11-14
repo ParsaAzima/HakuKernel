@@ -1212,6 +1212,10 @@ static u64 sys64_read(u64 fd, u64 buffer, u64 count) {
                 return (u64)0 - SYS64_EFAULT;
             }
             done += (u64)got;
+            /* A device that transferred less than it was asked for has no
+             * more to give right now: stop instead of looping on the same
+             * text. /dev/zero always transfers the full request. */
+            if ((u64)got < n) break;
         }
         return done;
     }

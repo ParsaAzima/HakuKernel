@@ -168,7 +168,9 @@ and proves relocation and logging, `hello.c` registers a character device and
 checks the C runtime it linked, and `romfs.c` registers and mounts a read-only
 filesystem. The x64 build packs one module, `build/X64MOD.HKM` from
 `x64demo.c`, and seeds it on `build/haku64_fs.img`; the boot self-test reads it
-back from the FAT12 volume, so the disk path is part of the check.
+back from the FAT12 volume, so the disk path is part of the check. Its init
+registers `/dev/hello`, which the same test reads before proving
+`delete_module` reports `-EBUSY` while the descriptor is open.
 
 The loader does no symbol table lookup at run time. The host has already
 reduced `haku_module_init`/`haku_module_exit` to offsets inside the image and
@@ -183,10 +185,12 @@ side: it accepts version 2 only, applies `R_64_ABS`/`R_64_PC32`, and stores the
 low 32 bits of every computed address because the image, the kernel text and
 the exports all live below 4 GiB (an amd64 pointer is packed with a zero upper
 half). Its export table has the same eleven names so `include/haku/module.h`
-and `libhakumod` are shared; the six utilities work, while the capability
-calls and the two struct fillers answer `-ENOSYS` until module registration
-reaches the 64-bit mount table and devfs. User space reaches both loaders
-through `init_module` (175) and
+and `libhakumod` are shared. The six utilities work;
+`haku_module_register_device` adds a character device to the 64-bit devfs table
+with the loading slot as its owner, so unload is `-EBUSY` while a descriptor
+is open and detaches the node before freeing the image. Filesystem registration,
+mount and the two struct fillers still answer `-ENOSYS`. User space reaches
+both loaders through `init_module` (175) and
 `delete_module` (176); `syscall64.c` bounds the image length by the container's
 worst case, copies it page by page, and copies the name into a 25-byte stack
 buffer.
@@ -200,6 +204,9 @@ it asks for that same name. The token is what makes the capability calls safe:
 `haku_module_register_device`, `haku_module_register_fs`, and
 `haku_module_mount` bind the resource to the slot that is currently running its
 init hook, and report `-EPERM` from anywhere else — including the exit hook.
+The x86-64 loader records the loading slot in `module64_active` for the same
+purpose; device registration uses it as the owner, and registration outside an
+init hook answers `-ENOSYS`.
 
 Teardown is detached-before-free. `delete_module` marks the slot `UNLOADING`,
 unmounts the module's prefix (`-EBUSY` while any open description points at

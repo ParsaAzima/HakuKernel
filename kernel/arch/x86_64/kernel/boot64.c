@@ -26,6 +26,7 @@
 #include "haku64.h"
 #include "haku/abi.h"
 #include "haku_module.h"
+#include "procfs64.h"
 #include "vfs64.h"
 
 typedef struct {
@@ -817,11 +818,11 @@ static int test_fs(void) {
     return 1;
 }
 
-/* The mount table: /disk is the FAT12 volume, / is the RAM initramfs and
- * /dev is devfs. fs64_init() built the table, and initramfs64_init() filled
- * the RAM root, so a path now names a backend before it names a file. The
- * test runs before the scheduler exists, so it speaks to the descriptor
- * table for task 0, exactly as the tests above do. */
+/* The mount table: /disk is the FAT12 volume, / is the RAM initramfs, /proc
+ * is procfs and /dev is devfs. fs64_init() built the table, and
+ * initramfs64_init() filled the RAM root, so a path now names a backend
+ * before it names a file. The test runs before the scheduler exists, so it
+ * speaks to the descriptor table for task 0, exactly as the tests above do. */
 static int test_vfs64(void) {
     static const char junk[] = "this is discarded";
     char buffer[8];
@@ -831,20 +832,26 @@ static int test_vfs64(void) {
     u32 ino, mount, next = 0;
     int fd, error = 0, kind, entry_kind, result, slot, note;
 
-    /* Three mounts, each winning exactly its own subtree: /dev must not claim
+    /* Four mounts, each winning exactly its own subtree: /dev must not claim
      * /device.txt, and a relative path names no mount at all. */
-    if (vfs64_mount_count() != 3) return 0;
+    if (vfs64_mount_count() != 4) return 0;
     if (memcmp(vfs64_mount_prefix(0), "/disk", 6) != 0 ||
         vfs64_mount_kind(0) != VFS64_MOUNT_FAT)
         return 0;
     if (memcmp(vfs64_mount_prefix(1), "/", 2) != 0 ||
         vfs64_mount_kind(1) != VFS64_MOUNT_RAM)
         return 0;
-    if (memcmp(vfs64_mount_prefix(2), "/dev", 5) != 0 ||
-        vfs64_mount_kind(2) != VFS64_MOUNT_DEV)
+    if (memcmp(vfs64_mount_prefix(2), "/proc", 6) != 0 ||
+        vfs64_mount_kind(2) != VFS64_MOUNT_PROC)
+        return 0;
+    if (memcmp(vfs64_mount_prefix(3), "/dev", 5) != 0 ||
+        vfs64_mount_kind(3) != VFS64_MOUNT_DEV)
         return 0;
     if (vfs64_resolve("/dev/null", &mount, rel) != 0 ||
         mount != VFS64_MOUNT_DEV || memcmp(rel, "/null", 6) != 0)
+        return 0;
+    if (vfs64_resolve("/proc/meminfo", &mount, rel) != 0 ||
+        mount != VFS64_MOUNT_PROC || memcmp(rel, "/meminfo", 9) != 0)
         return 0;
     if (vfs64_resolve("/disk/HELLO.TXT", &mount, rel) != 0 ||
         mount != VFS64_MOUNT_FAT || memcmp(rel, "/HELLO.TXT", 11) != 0)
@@ -948,6 +955,142 @@ static int test_vfs64(void) {
     return 1;
 }
 
+/* Read a generated procfs file into `buffer` through a cache lookup. */
+static int proc_read(const char *path, char *buffer, u32 capacity,
+                     u32 *length) {
+    u64 size;
+    int file = fs64_lookup(path);
+
+    if (file < 0) return 0;
+    size = fs64_size(file);
+    if (size == 0 || size > capacity ||
+        fs64_read(file, 0, buffer, size) != size) {
+        fs64_release(file);
+        return 0;
+    }
+    fs64_release(file);
+    if (length) *length = (u32)size;
+    return 1;
+}
+
+/* /proc is generated at open time from kernel counters, and is read-only.
+ * The test opens each documented entry, checks the shape of the content and
+ * proves every mutation is refused rather than silently creating a file. */
+static int test_procfs(void) {
+    static const char cmdline[] = "/INIT.ELF\n";
+    char buffer[PROCFS64_CONTENT_MAX];
+    char name[FS64_NAME_MAX];
+    u64 size;
+    u32 ino, next = 0, length;
+    int kind, entry_kind, result, fd, slot, error = 0;
+
+    /* The mount point is a directory with an inode of its own, and each
+     * file's inode identifies its entry number. */
+    if (fs64_stat_path("/proc", &size, &ino, &kind) != 0 ||
+        kind != FS64_KIND_DIR || ino != PROCFS64_INO_BASE + 1u)
+        return 0;
+    if (fs64_stat_path("/proc/meminfo", &size, &ino, &kind) != 0 ||
+        kind != FS64_KIND_FILE || size == 0 ||
+        ino != PROCFS64_INO_BASE + PROCFS64_MEMINFO + 1u)
+        return 0;
+    if (fs64_stat_path("/proc/self", &size, &ino, &kind) != 0 ||
+        kind != FS64_KIND_DIR)
+        return 0;
+    if (fs64_stat_path("/proc/missing", &size, &ino, &kind) != -HAKU_ENOENT)
+        return 0;
+
+    /* meminfo names the counters the kernel keeps. */
+    if (!proc_read("/proc/meminfo", buffer, sizeof(buffer), &length))
+        return 0;
+    if (memcmp(buffer, "MemTotal: ", 10) != 0) return 0;
+    {
+        u32 lines = 0;
+
+        for (u32 i = 0; i < length; i++)
+            if (buffer[i] == '\n') lines++;
+        if (lines != 5) return 0;
+    }
+
+    /* uptime is "seconds.hundredths seconds.hundredths\n" with digits,
+     * dots and spaces only. */
+    if (!proc_read("/proc/uptime", buffer, sizeof(buffer), &length))
+        return 0;
+    {
+        u32 dots = 0, newlines = 0;
+
+        for (u32 i = 0; i < length; i++) {
+            if (buffer[i] == '.') {
+                dots++;
+                continue;
+            }
+            if (buffer[i] == '\n') {
+                newlines++;
+                continue;
+            }
+            if (buffer[i] != ' ' && (buffer[i] < '0' || buffer[i] > '9'))
+                return 0;
+        }
+        if (dots != 2 || newlines != 1) return 0;
+    }
+
+    if (!proc_read("/proc/self/cmdline", buffer, sizeof(buffer), &length))
+        return 0;
+    if (length != sizeof(cmdline) - 1u ||
+        memcmp(buffer, cmdline, length) != 0)
+        return 0;
+
+    /* Listing /proc comes back in table order and then ends. */
+    result = fs64_dir_entries("/proc", 0, name, &ino, &entry_kind, &next);
+    if (result != 1 || entry_kind != FS64_KIND_FILE ||
+        memcmp(name, "meminfo", 8) != 0) return 0;
+    result = fs64_dir_entries("/proc", next, name, &ino, &entry_kind, &next);
+    if (result != 1 || entry_kind != FS64_KIND_FILE ||
+        memcmp(name, "uptime", 7) != 0) return 0;
+    result = fs64_dir_entries("/proc", next, name, &ino, &entry_kind, &next);
+    if (result != 1 || entry_kind != FS64_KIND_DIR ||
+        memcmp(name, "self", 5) != 0) return 0;
+    if (fs64_dir_entries("/proc", next, name, &ino, &entry_kind, &next) != 0)
+        return 0;
+    result = fs64_dir_entries("/proc/self", 0, name, &ino, &entry_kind, &next);
+    if (result != 1 || entry_kind != FS64_KIND_FILE ||
+        memcmp(name, "cmdline", 8) != 0) return 0;
+    if (fs64_dir_entries("/proc/self", next, name, &ino, &entry_kind,
+                         &next) != 0)
+        return 0;
+
+    /* A descriptor reads the generated page, and a directory descriptor
+     * remembers that /proc is its path. */
+    fd = fs64_open_fd(0, "/proc/meminfo", K64_O_RDONLY, &error);
+    if (fd < 0) return 0;
+    slot = fs64_fd_file(0, fd);
+    if (slot < 0 || fs64_read(slot, 0, buffer, 10) != 10 ||
+        memcmp(buffer, "MemTotal: ", 10) != 0) {
+        fs64_fd_close(0, fd);
+        return 0;
+    }
+    fs64_fd_close(0, fd);
+
+    fd = fs64_open_fd(0, "/proc", K64_O_DIRECTORY, &error);
+    if (fd < 0 || !fs64_fd_is_dir(0, fd)) {
+        if (fd >= 0) fs64_fd_close(0, fd);
+        return 0;
+    }
+    fs64_fd_close(0, fd);
+    if (fs64_open_fd(0, "/proc", K64_O_RDONLY, &error) >= 0) return 0;
+    if (error != -HAKU_EISDIR) return 0;
+
+    /* Generated files are read-only: no open for writing, no truncate, no
+     * create, remove or rename. */
+    if (fs64_open_fd(0, "/proc/meminfo", K64_O_WRONLY, &error) >= 0)
+        return 0;
+    if (error != -HAKU_EACCES) return 0;
+    if (fs64_unlink("/proc/meminfo") != -HAKU_EACCES) return 0;
+    if (fs64_create_dir("/proc/tmp") != -HAKU_EACCES) return 0;
+    if (fs64_rename("/proc/meminfo", "/proc/tmp") != -HAKU_EACCES) return 0;
+    if (fs64_rmdir("/proc/self") != -HAKU_EACCES) return 0;
+    return 1;
+}
+
 /* The kernel writes /disk/NOTE.TXT through a descriptor and closes it: a new
  * lookup then has to read the bytes back from the volume, not from the cache
  * slot that is still open. The host check reads the same file with
@@ -1000,9 +1143,12 @@ static u64 path_size64(const char *path) {
  * bad-magic and truncated-size loads prove the loader rejects what it should
  * instead of trusting the file. */
 static int test_module(void) {
+    static const char device_text[] = "HAKU64-MODULE-DEV-OK\r\n";
+    static const char junk[] = "discarded";
     u8 *image;
-    u64 size;
-    int file;
+    u64 size, dev_size;
+    u32 ino;
+    int file, kind;
     int ok = 1;
 
     file = fs64_lookup("/X64MOD.HKM");
@@ -1019,11 +1165,45 @@ static int test_module(void) {
 
     if (module64_load(image, (u32)size) != 0 || module64_count() != 1)
         ok = 0;
-    else if (module64_load(image, (u32)size) != -HAKU_EEXIST)
+
+    /* The module published /dev/hello through the capability call. It is a
+     * real character device: reads return the module's marker, writes are
+     * discarded, and an open descriptor pins the module image. */
+    if (ok) {
+        int fd, error = 0;
+
+        if (fs64_stat_path("/dev/hello", &dev_size, &ino, &kind) != 0 ||
+            kind != FS64_KIND_CHAR ||
+            ino != VFS64_DEV_INO_BASE + VFS64_DEV_COUNT + 1u ||
+            vfs64_dev_count() != VFS64_DEV_COUNT + 1u)
+            ok = 0;
+        fd = ok ? fs64_open_fd(0, "/dev/hello", K64_O_RDWR, &error) : -1;
+        if (ok && fd < 0) ok = 0;
+        if (ok) {
+            char hello[sizeof(device_text)];
+
+            if (fs64_fd_dev_read(0, fd, hello, sizeof(hello)) !=
+                    (int)(sizeof(device_text) - 1u) ||
+                memcmp(hello, device_text, sizeof(device_text) - 1u) != 0 ||
+                fs64_fd_dev_write(0, fd, junk, sizeof(junk) - 1u) !=
+                    (int)(sizeof(junk) - 1u))
+                ok = 0;
+        }
+        /* A descriptor still on the device is what makes unload -EBUSY. */
+        if (ok && module64_unload("HAKU-X64") != -HAKU_EBUSY) ok = 0;
+        if (ok && module64_count() != 1) ok = 0;
+        if (fd >= 0) fs64_fd_close(0, fd);
+        /* CLOSE releases the open count; the node itself is still there. */
+        if (ok && fs64_stat_path("/dev/hello", &dev_size, &ino, &kind) != 0)
+            ok = 0;
+    }
+
+    if (ok && module64_load(image, (u32)size) != -HAKU_EEXIST)
         ok = 0;
-    else if (module64_load(image, HAKU_MODULE_HEADER_SIZE - 1u) != -HAKU_EINVAL)
+    else if (ok && module64_load(image, HAKU_MODULE_HEADER_SIZE - 1u) !=
+                      -HAKU_EINVAL)
         ok = 0;
-    else {
+    else if (ok) {
         image[0] ^= 0xFFu;
         if (module64_load(image, (u32)size) != -HAKU_EINVAL)
             ok = 0;
@@ -1031,6 +1211,11 @@ static int test_module(void) {
     }
     if (ok && module64_unload("HAKU-X64") != 0) ok = 0;
     if (ok && module64_count() != 0) ok = 0;
+    /* Unload detached the device with the image, so nothing dangles. */
+    if (ok && vfs64_dev_count() != VFS64_DEV_COUNT) ok = 0;
+    if (ok && fs64_stat_path("/dev/hello", &dev_size, &ino, &kind) !=
+                  -HAKU_ENOENT)
+        ok = 0;
     if (ok && module64_unload("HAKU-X64") != -HAKU_ENOENT) ok = 0;
 
     kfree64(image);
@@ -1038,6 +1223,8 @@ static int test_module(void) {
 
     k64_puts("HAKU64-MODULE-REJECT-OK: duplicate, truncated and bad magic"
              " refused\r\n");
+    k64_puts("HAKU64-MODULE-DEV-OK: /dev/hello read, write dumped,"
+             " unload -EBUSY while open\r\n");
     return 1;
 }
 
@@ -1295,10 +1482,13 @@ void kernel64_main(void) {
     k64_dec(vfs64_mount_count());
     k64_puts(" root=");
     k64_puts(vfs64_mount_kind(1) == VFS64_MOUNT_RAM ? "ram" : "fat");
-    k64_puts(" devfs devices=");
+    k64_puts(" procfs=1 devfs devices=");
     k64_dec(VFS64_DEV_COUNT);
     k64_puts("\r\n");
     k64_puts("HAKU64-DEVFS-OK: null zero console\r\n");
+
+    if (!test_procfs()) k64_fail("procfs self-test");
+    k64_puts("HAKU64-PROCFS-OK: meminfo uptime self/cmdline read-only\r\n");
 
     gdt64_init();
     k64_puts("HAKU64-GDT-OK: tss=");

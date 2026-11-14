@@ -48,8 +48,10 @@ Haku/
                         ramfs64.c: RAM root node table; its pages are the
                         frames the cache aliases;
                         initramfs64.c: cpio "newc" unpacker for /disk/INITRD;
-                        vfs64.c: mount table, path resolution and devfs
-                        (null, zero, console);
+                        procfs64.c: generated /proc/meminfo, uptime,
+                        self/cmdline;
+                        vfs64.c: mount table, path resolution, devfs
+                        (null, zero, console) and module device slots;
                         rtc64.c: CMOS wall clock;
                         smp64.c: ACPI MADT, local APIC and AP bring-up;
                         module64.c: .hkm version 2 loader, exports and slots;

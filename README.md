@@ -103,8 +103,10 @@ control and pipelines working.
   containers, and a 64-bit userland built on `user/lib64`: a freestanding C
   library (string/memory, `printf`, `malloc`, files, `fork`, `mmap`, `errno`)
   whose self-test the kernel loads from the FAT12 volume as `/INIT.ELF`.
-  The root is FAT12 and `/dev` provides `null`, `zero` and `console`; no
-  ramfs/procfs boot root, shell, pipes or signal handlers yet.
+  The disk is `/disk`, a cpio initramfs is the RAM root, `/proc` generates
+  `meminfo`/`uptime`/`self/cmdline`, and `/dev` provides `null`, `zero`,
+  `console` and devices a module registers; there is no shell, no module
+  filesystem yet, and no pipes or signal handlers.
 
 ## Quick start
 

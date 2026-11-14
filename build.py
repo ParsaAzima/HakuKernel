@@ -708,13 +708,16 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-ELF-REJECT-OK", "HAKU64-ABI-OK", "HAKU64-NX-OK",
                 "HAKU64-RTC-OK", "HAKU64-SYSCALL64-OK", "HAKU64-FS-OK",
                 "HAKU64-VFS-OK", "HAKU64-INITRAMFS-OK", "HAKU64-DEVFS-OK",
+                "HAKU64-PROCFS-OK",
                 "HAKU64-USER-DEV-OK", "HAKU64-USER-INITRAMFS-OK",
+                "HAKU64-USER-PROCFS-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
                 "HAKU64-COW-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",
                 "HAKU64-THREAD-OK", "HAKU64-PORT-OK",
                 "HAKU64-MODULE-OK", "HAKU64-MODULE-LIB-OK",
                 "HAKU64-MODULE-LOAD-OK", "HAKU64-MODULE-REJECT-OK",
+                "HAKU64-MODULE-DEV-OK",
                 "HAKU64-MODULE-UNLOAD-OK", "HAKU64-LIBC-OK",
                 "HAKU64-SELFTEST-OK"]
     if smp_cpus == 1:

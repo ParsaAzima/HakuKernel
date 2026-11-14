@@ -74,4 +74,7 @@ void ramfs64_release(u32 node);
 int ramfs64_entry(const char *path, u32 index, char name[FS64_NAME_MAX],
                   u32 *ino, int *kind, u32 *next);
 
+/* Count the allocated nodes and the bytes their files hold, for /proc. */
+void ramfs64_usage(u32 *nodes, u64 *bytes);
+
 #endif

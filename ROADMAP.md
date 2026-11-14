@@ -28,9 +28,9 @@ next milestone that needs new kernel work is 2.
 | Ring 3 | `SYSCALL`/`SYSRET` + `INT 0x80`, page-by-page user copies, NX | `INT 0x80`, page-by-page user copies |
 | Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads, `futex` | same, plus signals, job control and wait queues |
 | Syscalls | ported subset on the x86-64 numbers; no pipes, no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
-| Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, devfs, file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
+| Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
 | Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
-| Modules | version 2 loader: log, ticks, heap; capability calls return `-ENOSYS` | version 1 loader with device and filesystem registration |
+| Modules | version 2 loader: log, ticks, heap, device registration; filesystem registration/mount return `-ENOSYS` | version 1 loader with device and filesystem registration |
 | Userland | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device | freestanding user C library, `busybox ash`, probes |
 
 Verified on every push by CI and locally:
@@ -119,27 +119,32 @@ filesystems.
       disk.
 - [x] `ramfs64` as the boot root. A fixed node table whose pages are the very
       frames the page cache aliases, so `read`, `write` and `mmap` stay
-      coherent without a copy. `procfs64` (`meminfo`, `uptime`,
-      `self/cmdline`) and a module-registered `/dev/hello` device are still
-      open.
+      coherent without a copy.
+- [x] `procfs64` at `/proc`: `meminfo`, `uptime` and `self/cmdline` are
+      generated at open time into the cache page, and every mutation answers
+      `-EACCES`. The ring-3 test reads all three.
+- [x] `X64MOD.HKM` registers `/dev/hello` through
+      `haku_module_register_device`; the boot test reads its marker, proves
+      `delete_module` reports `-EBUSY` while a descriptor is open, and checks
+      the node is detached on unload.
 - [x] An x86-64 initramfs: `tools/mkcpio.py` builds `INITRD`, `initramfs64.c`
       unpacks it into the RAM root through the descriptor path, and the disk
       stays at `/disk` — the same namespace shape the 32-bit image uses. An
       image without the archive falls back to FAT12 as `/`.
-- [ ] Enable the module capability exports: `haku_module_register_device`,
-      `haku_module_register_fs`, `haku_module_mount`, `haku_module_fill_stat`
-      and `haku_module_fill_dirent`. Keep the existing `-EBUSY` rule: unload
-      fails while a descriptor opened through the module is still live.
+- [ ] Wire the remaining module capability exports:
+      `haku_module_register_fs`, `haku_module_mount` and the two struct
+      fillers. Keep the existing `-EBUSY` rule for devices.
 - [ ] Port `hello.c` and `romfs.c` to the 64-bit build and run them from the
       disk, so the capability path is exercised by real C modules rather than
       stubs.
 - [ ] Keep the build-time size assertion between `haku_module_fs_ops_t` and
       `vfs_fs_ops_t`, now for the 64-bit layouts too.
 
-**Acceptance.** `HAKU64-VFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-USER-DEV-OK`,
-`HAKU64-INITRAMFS-OK`, `HAKU64-USER-INITRAMFS-OK`, `HAKU64-MODULE-CAP-OK`;
-`/dev/hello` reads, `/rom` mounts and lists, and
-`delete_module` reports `-EBUSY` until the last descriptor closes.
+**Acceptance.** `HAKU64-VFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-PROCFS-OK`,
+`HAKU64-USER-DEV-OK`, `HAKU64-USER-PROCFS-OK`, `HAKU64-INITRAMFS-OK`,
+`HAKU64-USER-INITRAMFS-OK`, `HAKU64-MODULE-DEV-OK`; `/dev/hello` reads and
+`delete_module` reports `-EBUSY` until the last descriptor closes. The `/rom`
+mount and its `HAKU64-MODULE-CAP-OK` marker wait for the filesystem half.
 
 ## 3. Pipes, signals and job control
 

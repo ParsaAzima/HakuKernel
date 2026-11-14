@@ -8,10 +8,10 @@
  * is below 4 GiB, so the container keeps its 32-bit relocation records and
  * an amd64 pointer is packed as its low half with a zero upper half.
  *
- * This loader exports logging, the tick counter, the heap and the two struct
- * fillers. The 64-bit kernel has no VFS or devfs yet, so the capability calls
- * exist (a module may reference them) but answer -ENOSYS; an x64 module can
- * compute and report, not publish a namespace.
+ * This loader exports logging, the tick counter, the heap, the device
+ * registration call and the two struct fillers. A module can therefore
+ * publish a character device in `/dev`; filesystem registration and mounting
+ * still answer -ENOSYS because this port has no module-backed filesystem.
  *
  * Modules are trusted ring-0 code. The loader validates the container so a
  * malformed file cannot escape the image, and a four-slot table makes the
@@ -20,6 +20,7 @@
 #include "haku64.h"
 #include "haku_module.h"
 #include "haku/abi.h"
+#include "vfs64.h"
 /* The module ABI's string runtime is libhakumod's, with 32-bit lengths. The
  * kernel links its own 64-bit mem* (compat/cpu.h, reached through
  * haku_module.h), so it must not also declare the module-side prototypes:
@@ -82,16 +83,23 @@ void haku_module_free(void *pointer) {
     kfree64(pointer);
 }
 
-/* The capability layer belongs to the 32-bit VFS and devfs. Keeping the
- * symbols makes one header and one library serve both kernels; refusing at
- * runtime is more honest than pretending a device exists. */
+/* The slot whose init is currently running. A capability call is made from
+ * that init, so this is the owner recorded for anything it publishes: the
+ * device table then knows which module to refuse to unload while a descriptor
+ * is still open. Only one init hook runs at a time; a second load reports
+ * -EBUSY while the token is held, so the owner is never ambiguous. */
+static volatile u32 module64_active = MODULE64_NO_SLOT;
+
+/* Device registration is wired to the VFS; filesystem registration and
+ * mount remain -ENOSYS until a module backend exists on this port. */
 haku_i32 haku_module_register_device(const char *name,
                                      haku_module_device_read_t read,
                                      haku_module_device_write_t write) {
-    (void)name;
-    (void)read;
-    (void)write;
-    return -HAKU_ENOSYS;
+    u32 owner = module64_active;
+
+    if (owner >= HAKU_MODULE_TABLE_SIZE) return -HAKU_ENOSYS;
+    return vfs64_dev_register(name, (vfs64_dev_read_fn)read,
+                              (vfs64_dev_write_fn)write, (int)owner);
 }
 
 haku_i32 haku_module_register_fs(const haku_module_fs_ops_t *ops) {
@@ -331,6 +339,8 @@ int module64_load(const u8 *file, u32 size) {
     }
     if (result == 0 && slot == MODULE64_NO_SLOT)
         result = -HAKU_ENOSPC;
+    if (result == 0 && module64_active != MODULE64_NO_SLOT)
+        result = -HAKU_EBUSY;
     if (result == 0) {
         memcpy(module64_slots[slot].name, file + 48, HAKU_MODULE_NAME_MAX);
         module64_slots[slot].base = base;
@@ -341,6 +351,7 @@ int module64_load(const u8 *file, u32 size) {
                 ? (module64_exit_fn)0
                 : (module64_exit_fn)((u64)base + exit_offset);
         module64_slots[slot].state = MODULE64_LOADING;
+        module64_active = slot;
         entry = module64_slots[slot].init;
     }
     module64_release();
@@ -351,7 +362,11 @@ int module64_load(const u8 *file, u32 size) {
 
     init_result = entry();
     module64_acquire();
+    module64_active = MODULE64_NO_SLOT;
     if (init_result != 0) {
+        /* init may have registered a device before failing; detach it with
+         * the rest of the slot so a later load does not collide with it. */
+        vfs64_dev_remove_owner((int)slot);
         module64_clear_slot(slot);
         module64_release();
         kfree64(base);
@@ -389,10 +404,19 @@ int module64_unload(const char *name) {
             result = -HAKU_EBUSY;
             break;
         }
+        /* An open descriptor on a device this module published keeps the
+         * module's text alive: the read and write callbacks live there. */
+        if (vfs64_dev_owner_busy((int)i)) {
+            result = -HAKU_EBUSY;
+            break;
+        }
         slot = i;
         exit_fn = module64_slots[i].exit;
         base = module64_slots[i].base;
         module64_slots[i].state = MODULE64_UNLOADING;
+        /* Detach the device before the image is freed: a later open finds no
+         * node, and one that raced the check cannot reach module code. */
+        vfs64_dev_remove_owner((int)i);
         result = 0;
         break;
     }

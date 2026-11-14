@@ -130,14 +130,16 @@ ported table: `stat`/`fstat`/`statx`, `chdir`/`getcwd` with a relative open,
 `openat`/`mkdirat`, `getdents64` on an empty and a seeded directory,
 `ftruncate`/`truncate`/`renameat`/`unlinkat`, `uname`/`times`/`getrlimit`/
 `clock_getres`, `prctl` names, two different `getrandom` words,
-`brk`+`mprotect`, `poll`/`select`, `sched_yield` and `dup3`/`fcntl`). It also
-`HAKU64-DISK-OK`, `HAKU64-VFS-OK` and `HAKU64-INITRAMFS-OK` (the kernel reads
-`/disk/INITRD`, unpacks the cpio archive into the RAM root, and reports the
-entry, file and byte counts while `/disk` stays the FAT12 volume), and
-`HAKU64-DEVFS-OK` (devfs at `/dev` with `null`, `zero` and `console`). It also
-loads `X64MOD.HKM` from the RAM root: the module logs, reads ticks, uses
-the heap and exits (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`,
-`HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`), while a duplicate load, a
+`brk`+`mprotect`, `poll`/`select`, `sched_yield` and `dup3`/`fcntl`). The boot
+log also carries `HAKU64-DISK-OK`, `HAKU64-VFS-OK` (four mounts),
+`HAKU64-INITRAMFS-OK` (the kernel reads `/disk/INITRD`, unpacks the cpio
+archive into the RAM root, and reports the entry, file and byte counts while
+`/disk` stays the FAT12 volume), `HAKU64-DEVFS-OK` (devfs at `/dev` with the
+three built-ins) and `HAKU64-PROCFS-OK` (generated `meminfo`, `uptime` and
+`self/cmdline`, none of them writable). It also loads `X64MOD.HKM` from the RAM
+root: the module logs, reads ticks, uses the heap and registers `/dev/hello`
+(`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`, `HAKU64-MODULE-LOAD-OK`,
+`HAKU64-MODULE-DEV-OK`, `HAKU64-MODULE-UNLOAD-OK`), while a duplicate load, a
 truncated file and a bad magic must be refused before
 `HAKU64-MODULE-REJECT-OK`. Finally `HAKU64-LIBC-OK`: the kernel loads
 `/INIT.ELF` from the RAM root, and that program — written in ordinary C against
@@ -145,7 +147,9 @@ truncated file and a bad magic must be refused before
 copy-on-write child, maps memory and reads the clock before exiting 0.
 `HAKU64-USER-INITRAMFS-OK` shows that same ring-3 program opening
 `/etc/banner.txt`, a file that exists only in the archive and not on the seed
-disk, so the userland path really reaches the RAM root.
+disk, so the userland path really reaches the RAM root, and
+`HAKU64-USER-PROCFS-OK` shows it reading the generated files through ordinary
+descriptors.
 The display stack is checked too: `HAKU64-FB-OK` names the VBE mode the shared
 renderer took over (`grid=128x48 font=terminus-8x16`), `HAKU64-TERMINAL-OK`
 names the backend, and `HAKU64-KBD-OK` proves the PS/2 set-1 decoder. The run
