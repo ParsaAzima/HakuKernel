@@ -1664,9 +1664,12 @@ static u64 sys64_gettid(void) {
 /* clone(flags, child_stack, parent_tid, child_tid, tls): CLONE_VM is what
  * makes this a thread, because the child then runs in the caller's address
  * space with its own stack. Without CLONE_VM the call degrades to a fork, so
- * a caller that asks for a process still gets one. The unsupported flags are
- * refused instead of ignored: a task must not believe it got TLS or a
- * clear-on-exit child TID when the kernel does not implement them. */
+ * a caller that asks for a process still gets one. CLONE_SETTLS installs the
+ * fifth argument as the child's FS base, which is the SysV thread pointer;
+ * GS is not touched, because a per-thread Windows TEB belongs to user code
+ * and is installed with arch_prctl(ARCH_SET_GS). The unsupported flags are
+ * refused instead of ignored: a task must not believe it got a clear-on-exit
+ * child TID when the kernel does not implement it. */
 static regs64_t *sys64_clone(regs64_t *frame) {
     u64 flags = frame->rdi;
     u64 parent_tid = frame->rdx;
@@ -1682,7 +1685,7 @@ static regs64_t *sys64_clone(regs64_t *frame) {
         return frame;
     }
 
-    frame = sched64_clone(frame, flags, frame->rsi);
+    frame = sched64_clone(frame, flags, frame->rsi, frame->r8);
     if ((s64)frame->rax > 0 && (flags & K64_CLONE_PARENT_SETTID)) {
         u32 pid = (u32)frame->rax;
 
@@ -2884,9 +2887,12 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
         break;
 
     case K64_SYS_EXIT:
-    case K64_SYS_EXIT_GROUP:
         /* exit_status is recorded by sched64_exit from RDI. */
         return sched64_exit(frame);
+
+    case K64_SYS_EXIT_GROUP:
+        /* exit_group takes the whole thread group down with the caller. */
+        return sched64_exit_group(frame);
 
     default:
         result = (u64)0 - SYS64_ENOSYS;

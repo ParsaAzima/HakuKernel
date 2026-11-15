@@ -377,6 +377,13 @@ what lets `user/lib64` place a TEB there and makes a compiler-generated
 `__declspec(thread)` variable work. The startup stack that makes that possible
 is documented in [the x86-64 C library](libc64.md#thread-local-storage).
 
+`clone` (56) on the x86-64 side honours `CLONE_SETTLS` (0x00080000): the fifth
+argument (`r8`) becomes the child's FS base after a check that it lies inside
+the user half. GS is deliberately not set from it; a program that wants a
+Windows-style TEB installs it with `arch_prctl(ARCH_SET_GS)` in the child.
+`exit` (60) ends only the calling task, while `exit_group` (231) ends every
+task of the caller's thread group.
+
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
 rejects unmapped/kernel pointers, wraparound, invalid descriptors and
@@ -458,7 +465,8 @@ filesystem registration and mounting do not), and the filesystem half of the
 x64 module API (it answers `-ENOSYS`; device registration is wired).
 `clone`-created threads are present: a thread shares the caller's address
 space, descriptors and signal dispositions, reports the process id from
-`getpid` and its own id from `gettid`, and the thread form is exercised as
+`getpid` and its own id from `gettid`, can carry its own FS base through
+`CLONE_SETTLS` and thus its own TLS block, and the thread form is exercised as
 `USER-THREAD-OK`.
 Where a call exists but cannot be honoured — permission bits, record locks,
 terminal modes — it succeeds

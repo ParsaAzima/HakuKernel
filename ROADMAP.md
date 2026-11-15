@@ -16,8 +16,8 @@ work.
 
 Milestone 1 is mostly landed: the x86-64 side has its own C library
 (`user/lib64`) and `/INIT.ELF` runs from the FAT12 volume as a real ring-3
-program. What is left in it is a TLS base and a third-party musl probe; the
-next milestone that needs new kernel work is 2.
+program. What is left in it is the third-party musl probe; the next milestone
+that needs new kernel work is 2.
 
 ## Where the project stands
 
@@ -101,6 +101,12 @@ the work on its behalf.
       `AT_PHDR`, copies the template, builds a TEB/TlsSlots block and installs
       it as the user GS base before `main()`. `HAKU64-USER-TLS-OK` covers the
       initializer, zero fill, read/write, both base calls and fork isolation.
+- [x] Threads with TLS: `clone` honours `CLONE_SETTLS` (fifth argument becomes
+      the child's FS base), and `user/lib64/thread64.c` builds a thread from a
+      64 KiB stack plus a freshly copied TLS template and TEB.
+      `haku64_thread_entry` installs GS in the child, `_exit` ends one thread,
+      `exit_group` ends the group, and `HAKU64-USER-THREAD-OK` checks the
+      per-thread block, the shared pid and `waitpid(tid)`.
 - [ ] The x86-64 third-party probe: the i386 suite builds a static musl
       binary and runs it; the 64-bit side should prove the same thing with an
       `x86_64-linux-musl` build, so the ABI is tested by code the project did

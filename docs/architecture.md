@@ -343,10 +343,14 @@ each has its own thread-local block.
 `clone` requires `CLONE_VM` and a 16-byte aligned child stack inside the user
 half; without `CLONE_VM` it falls back to `sched64_fork`, so a caller that
 asks for a process still gets one. `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`,
-`CLONE_THREAD`, `CLONE_SYSVSEM` and `CLONE_PARENT_SETTID` are accepted and
-everything else — TLS, child-tid stores, `CLONE_CLEARTID` — is `-EINVAL`
-rather than ignored, so a caller never believes it got a feature the kernel
-does not implement. The child resumes right after the `SYSCALL` with `RAX=0`
+`CLONE_THREAD`, `CLONE_SYSVSEM`, `CLONE_PARENT_SETTID` and `CLONE_SETTLS` are
+accepted and everything else — child-tid stores, `CLONE_CHILD_CLEARTID` — is
+`-EINVAL` rather than ignored, so a caller never believes it got a feature the
+kernel does not implement. `CLONE_SETTLS` makes the fifth argument the child's
+FS base (the SysV thread pointer) after checking it is inside the user half;
+GS is left alone, because a Windows-style TEB is a library choice and
+`user/lib64` installs it with `arch_prctl(ARCH_SET_GS)` in the child's entry
+trampoline. The child resumes right after the `SYSCALL` with `RAX=0`
 and the requested stack, keeps the creator as its parent (so `wait4(tid)`
 reaps it), and with `CLONE_THREAD` keeps the creator's `tgid`: `getpid`
 returns the thread group's id while `gettid` returns the task's own, and
@@ -366,10 +370,13 @@ returned; the round-robin scan skips `WAIT`. `WAKE` makes at most `count`
 waiters on the same address runnable again and answers how many it woke. There
 is no timeout and no priority inheritance, and a wait that leaves nothing
 runnable prints `HAKU64-TASK-HALT: every task is blocked on a futex` and halts
-instead of spinning. Two thread limitations are deliberate: `exit` and
-`exit_group` end only the calling task (there is no group exit that stops the
-other threads), and `kill` addresses one task id, so a signal aimed at a
-process id reaches the thread in that slot rather than the whole group.
+instead of spinning. `exit` (60) ends only the calling task, which is what a
+thread wants; `exit_group` (231) marks every other task with the same `tgid`
+`DONE` under the scheduler lock — nudging a peer on another CPU to reschedule
+— and then exits the caller through the ordinary path, so reaping stays the
+single cleanup point. The one deliberate thread limitation left is `kill`: it
+addresses one task id, so a signal aimed at a process id reaches the thread in
+that slot rather than the whole group.
 
 `clock_gettime` reports `CLOCK_MONOTONIC` as time since boot and
 `CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the ticks

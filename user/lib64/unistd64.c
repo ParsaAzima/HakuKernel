@@ -136,7 +136,7 @@ void _exit(int status) {
 
 void exit(int status) {
     /* exit_group ends every thread in the process, which is what a libc
-     * exit() means even though this library cannot create threads yet. */
+     * exit() means now that haku64_thread_create() can start one. */
     haku64_syscall1(HAKU64_SYS_EXIT_GROUP, status);
     for (;;) {
     }

@@ -355,6 +355,17 @@ int arch_prctl(int code, unsigned long long address);
 /* crt64.asm calls this before main(); exported so a custom entry point can
  * do the same. Returns 0 on success (or when the image has no TLS). */
 int haku64_tls_init(const unsigned long long *auxv);
+/* One more TEB and TLS block for a new thread, and their release.
+ * haku64_tls_new returns the TEB address (a GS base) or NULL with errno
+ * set. Freeing is only safe once no task can reach them, so only a caller
+ * that knows the thread is gone should call haku64_tls_free. */
+void *haku64_tls_new(void);
+void haku64_tls_free(void *teb);
+/* Run fn(arg) on a new thread in this process: same address space, files and
+ * cwd, its own stack and its own copy of every __declspec(thread) variable.
+ * Returns the new tid, or -1 with errno. There is no join; waitpid(tid) reaps
+ * it, and the stack/TLS block are released with the address space at exit. */
+int haku64_thread_create(int (*fn)(void *), void *arg);
 int fork(void);
 int waitpid(int pid, int *status, int options);
 int execve(const char *path, char *const argv[], char *const envp[]);

@@ -114,8 +114,8 @@ Haku/
                       string.c, unistd.c, crt0.asm, syscall.asm: user C library
                       (32-bit ABI)
     lib64/            errno64.c, memory64.c, mman64.c, stdio64.c, string64.c,
-                      tls64.c, unistd64.c, crt64.asm, syscall64.asm,
-                      haku_stdarg.h:
+                      thread64.c, tls64.c, unistd64.c, crt64.asm,
+                      syscall64.asm, thread64.asm, haku_stdarg.h:
                       x86-64 user C library (Microsoft x64 ABI)
     tests/            libtest.c: C library self-test installed as LIB.ELF
                       init64.c: x86-64 C library self-test installed as

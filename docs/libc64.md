@@ -4,7 +4,8 @@
 
 `user/lib64/` is the C library an x86-64 ring-3 program links against. It
 covers the subset of the POSIX surface that the kernel actually implements and
-nothing else: no dynamic linking, no threads, no locale, no floating point.
+nothing else: no dynamic linking, no locale, no floating point, and threads
+only as a thin layer over `clone`.
 
 The first program built with it is `user/tests/init64.c`. The kernel loads it as
 `/INIT.ELF` from the FAT12 volume and starts it at ring 3, so the boot test
@@ -33,7 +34,8 @@ compiles the two independently, and neither build touches the other's files.
 | `crt64.asm` | `_start`: reads the initial stack image, finds the auxiliary vector, calls `haku64_tls_init`, calls `main(argc, argv, envp)`, exits with its return value. |
 | `syscall64.asm` | `haku64_syscall0`..`haku64_syscall6`: the raw kernel entry, returning `-errno` unchanged. |
 | `haku_stdarg.h` | A freestanding `<stdarg.h>`: MSVC's `__va_start` intrinsic, or the clang builtins. |
-| `tls64.c` | `_tls_index` and `_tls_used`, the TLS template markers, `haku64_tls_init`: finds `PT_TLS` through `AT_PHDR`, maps the block and a TEB, and installs the user GS base. |
+| `tls64.c` | `_tls_index` and `_tls_used`, the TLS template markers, `haku64_tls_init`: finds `PT_TLS` through `AT_PHDR`, maps the block and a TEB, and installs the user GS base; `haku64_tls_new`/`haku64_tls_free` do the same per thread. |
+| `thread64.c`, `thread64.asm` | `haku64_thread_create`: a 64 KiB stack, a per-thread TEB and TLS block, and a `clone` with `CLONE_SETTLS`; the asm stub starts the child at `haku64_thread_entry`, which installs GS and runs the body. |
 | `errno64.c` | `errno` and `haku64_errno_check`, which turns a kernel `-errno` into `-1` plus `errno`. |
 | `string64.c` | `mem*` and `str*`: `memcpy`, `memmove`, `memset`, `memcmp`, `memchr`, `strlen`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strcmp`, `strncmp`, `strchr`, `strrchr`, `strstr`. |
 | `stdio64.c` | `printf`, `snprintf`, `puts`, `putchar` over one 1 KiB formatting buffer. |
@@ -144,6 +146,34 @@ own copy-on-write view of the same block and a new image starts with none.
 The library installs the TEB as the GS base because that is the base MSVC's
 thread-local access reads; FS is available for code that wants it.
 
+## Threads
+
+`haku64_thread_create(fn, arg)` starts a second task in the same process.
+It maps a 64 KiB stack, builds a TEB plus a fresh copy of the TLS template
+with `haku64_tls_new`, and calls `clone` with every flag that makes a full
+thread:
+
+```
+CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_SYSVSEM |
+CLONE_THREAD | CLONE_SETTLS
+```
+
+`CLONE_SETTLS` sets only the child's FS base, to the address of its thread
+control block (the TEB page). The kernel leaves GS alone because the TEB is a
+library concept; `thread64.asm` reloads the start record from a register the
+child inherited, and `haku64_thread_entry` calls `arch_prctl(ARCH_SET_GS)`
+before it runs `fn`. From then on every `__declspec(thread)` access in that
+thread reaches its own block, and a write there is invisible to the parent.
+
+The start record lives at the top of the new stack, 32 bytes above the
+initial RSP; those 32 bytes are exactly the shadow space the entry call
+needs. Nothing is allocated on the heap, and the parent never frees anything
+the child might still be reading. `_exit` ends only the calling thread, while
+`exit`/`exit_group` take the whole group down. There is no join: the caller
+can `waitpid(tid)` for the status. The stack and TLS block are not reclaimed
+until the process exits, because without a join there is no point at which
+the parent knows the thread stopped using them.
+
 ## Build pipeline
 
 `python build.py` (x64) compiles `user/lib64/*.c` and `*.asm` and
@@ -174,6 +204,7 @@ regression says what broke instead of only changing an exit status:
 | `HAKU64-LIBC-START: argc=1` | the program reached `main` with the expected arguments |
 | `HAKU64-LIBC-FAIL: <what> (line <n>)` | that check failed; the run fails |
 | `HAKU64-USER-TLS-OK` | TLS initializer, zero fill, read/write, FS/GS bases and fork isolation all passed |
+| `HAKU64-USER-THREAD-OK` | a cloned thread got its own stack, TLS block, FS and GS bases, and the parent's block stayed put |
 | `HAKU64-LIBC-OK` | every check passed; required by the x64 marker list |
 | `HAKU64-LIBC-RUN-OK` | the kernel reaped it with exit status 0 |
 
@@ -187,6 +218,10 @@ zero-filled variable, a write and read back, `arch_prctl` `GET_GS`/`GET_FS`,
 writes its own TLS block while the parent keeps the old value. The child
 process verifies that it has its own pid and that `getppid()` names the parent,
 which is what catches a forked task inheriting the parent's thread-group id.
+`haku64_thread_create` is checked the same way: the thread starts on its own
+stack with the template values, sees the parent's pid and its own tid, writes
+its own TLS block, and exits with a status `waitpid` collects while the
+parent's variables are unchanged.
 
 ## Deliberate limits
 
@@ -197,14 +232,15 @@ which is what catches a forked task inheriting the parent's thread-group id.
 - **No floating point in `printf`.** `%f`, `%e` and `%g` are not implemented;
   the kernel has no FPU context switch for user tasks beyond FXSAVE/FXRSTOR of
   the SSE state.
-- **No threads, no signals, no pipes.** `fork`, `execve`, `wait4`, `clone` with
-  `CLONE_VM` and `futex` exist in the kernel, but the library does not build a
-  threading layer on them, and neither `pipe` nor `sigaction` has a syscall on
-  the 64-bit side yet.
-- **One TLS block per task.** `__declspec(thread)` and `arch_prctl` work, but
-  `clone` has no `CLONE_SETTLS`, so the library cannot start a second thread
-  with its own block. A forked child inherits the base and gets a copy-on-write
-  view of the block; the parent's values stay put until it writes again.
+- **No signals, no pipes.** `sigaction` and `pipe` have no syscall on the
+  64-bit side yet, so a thread cannot be cancelled or woken by either.
+- **Thread resources are not reclaimed.** `haku64_thread_create` gives every
+  thread a 64 KiB stack and a TLS block and never frees them: there is no
+  join, so the parent has no safe point at which to unmap memory the child
+  may still touch. Both mappings go away with the address space at process
+  exit. A long-running program that starts many short threads therefore grows
+  its mappings. `printf`'s formatting buffer and `errno` are single copies
+  shared by all threads, so concurrent output can interleave.
 - **`mmap` is anonymous-first.** An anonymous mapping needs `fd == (u64)-1`
   and takes its offset in bytes; there is no file-backed mapping from the
   library yet.

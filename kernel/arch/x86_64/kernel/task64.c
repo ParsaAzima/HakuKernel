@@ -515,6 +515,51 @@ regs64_t *sched64_exit(regs64_t *frame) {
     return switch_away("HAKU64-TASK-HALT: no runnable task after exit\r\n");
 }
 
+/* exit_group(): every task of the caller's thread group ends, not just the
+ * caller. This is what a libc exit() must do now that haku64_thread_create()
+ * can start a sibling: a thread that calls exit() has to take the rest of
+ * the process with it. Peers are marked DONE under the scheduler lock and
+ * never run again (the scan only picks READY/RUNNING tasks), and a peer on
+ * another CPU is told to reschedule so it does not run until its next timer
+ * tick. Nothing is freed here — the space is still shared and reaping stays
+ * the single cleanup point — so a peer that is reaped later sees its normal
+ * state. The caller then exits through the ordinary path with the same
+ * status.
+ */
+regs64_t *sched64_exit_group(regs64_t *frame) {
+    k64_percpu_t *cpu = this_cpu();
+    int me;
+    u32 tgid;
+    u32 cpus_mask = 0;
+    u64 flags;
+
+    if (!enabled || !cpu || (int)cpu->current < 0) return frame;
+    me = (int)cpu->current;
+    tgid = tasks[me].tgid;
+
+    flags = spin64_lock(&sched_lock);
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (i == me || tasks[i].state == K64_TASK_UNUSED) continue;
+        if (tasks[i].tgid != tgid) continue;
+        /* An existing zombie keeps the status its own exit reported. */
+        if (tasks[i].state == K64_TASK_DONE) continue;
+        tasks[i].state = K64_TASK_DONE;
+        tasks[i].term_signal = 0;
+        tasks[i].exit_status = frame->rdi;
+        tasks[i].futex_addr = 0;
+        if (tasks[i].cpu != cpu->index && tasks[i].cpu < K64_SMP_MAX_CPUS)
+            cpus_mask |= 1u << tasks[i].cpu;
+    }
+    spin64_unlock(&sched_lock, flags);
+
+    /* A peer on another CPU only notices the state change when its own
+     * scheduler next runs, so ask each affected CPU to reschedule now. */
+    for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
+        if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
+
+    return sched64_exit(frame);
+}
+
 /* A ring-3 exception ends the task: there is no signal model on the 64-bit
  * port, so the closest honest behaviour is a terminated process. The fault
  * reason is kept for the boot test (and a future parent). */
@@ -992,8 +1037,11 @@ regs64_t *sched64_fork(regs64_t *frame) {
  * pointer — so a store in either task is visible to the other, which is what
  * makes this a thread instead of a process. The child resumes at the same
  * RIP as the caller (right after the syscall) with RAX=0 and the caller's
- * requested stack. It is reapable by the task that created it. */
-regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
+ * requested stack. CLONE_SETTLS gives it its own FS base, which is what a
+ * second thread needs to reach its own thread-local block. It is reapable by
+ * the task that created it. */
+regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
+                        u64 tls) {
     int parent = cur_task();
     int child, owner;
     u8 *stack;
@@ -1006,6 +1054,8 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
         !tasks[parent].space || !child_stack ||
         child_stack < K64_USER_BASE || child_stack >= K64_USER_END ||
         (child_stack & 15ull) ||
+        ((flags & K64_CLONE_SETTLS) &&
+         (tls < K64_USER_BASE || tls >= K64_USER_END)) ||
         (flags & ~(u64)K64_CLONE_SUPPORTED)) {
         frame->rax = (u64)0 - 22;          /* EINVAL */
         return frame;
@@ -1059,7 +1109,10 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack) {
     tasks[child].fault_vector = 0;
     tasks[child].fault_address = 0;
     tasks[child].futex_addr = 0;
-    tasks[child].fs_base = tasks[parent].fs_base;
+    if (flags & K64_CLONE_SETTLS)
+        tasks[child].fs_base = tls;
+    else
+        tasks[child].fs_base = tasks[parent].fs_base;
     tasks[child].gs_base = tasks[parent].gs_base;
     tasks[child].brk = 0;
     {

@@ -326,12 +326,14 @@ typedef signed long long s64;
 #define K64_POLLNVAL 0x0020u
 
 /* clone() flags, with the Linux numbering. Only these are honoured; the
- * rest are refused so a caller never believes it got a guarantee (thread
- * TLS, for example, is not implemented). CLONE_VM and CLONE_THREAD are the
- * two that make a thread: one address space, one process id. CLONE_FS and
- * CLONE_SYSVSEM are accepted as no-ops because there is no per-task cwd,
- * umask or semaphore undo list to share yet, so "shared" is the only
- * truthful answer. */
+ * rest are refused so a caller never believes it got a guarantee. CLONE_VM
+ * and CLONE_THREAD are the two that make a thread: one address space, one
+ * process id. CLONE_FS and CLONE_SYSVSEM are accepted as no-ops because
+ * there is no per-task cwd, umask or semaphore undo list to share yet, so
+ * "shared" is the only truthful answer. CLONE_SETTLS puts the fifth argument
+ * in the child's FS base (the SysV thread pointer); it does not touch GS,
+ * because the Windows-x64 TLS convention needs a per-thread TEB chosen by
+ * user code, which installs it with arch_prctl(ARCH_SET_GS). */
 #define K64_CLONE_VM              0x00000100u
 #define K64_CLONE_FS              0x00000200u
 #define K64_CLONE_FILES           0x00000400u
@@ -344,7 +346,8 @@ typedef signed long long s64;
 #define K64_CLONE_CHILD_SETTID    0x01000000u
 #define K64_CLONE_SUPPORTED \
     (K64_CLONE_VM | K64_CLONE_FS | K64_CLONE_FILES | K64_CLONE_SIGHAND | \
-     K64_CLONE_THREAD | K64_CLONE_SYSVSEM | K64_CLONE_PARENT_SETTID)
+     K64_CLONE_THREAD | K64_CLONE_SYSVSEM | K64_CLONE_PARENT_SETTID | \
+     K64_CLONE_SETTLS)
 
 /* futex(): op is the low seven bits. FUTEX_PRIVATE_FLAG is accepted and
  * treated like the plain op, because a waiter is matched on the address it
@@ -820,6 +823,8 @@ void sched64_start_ap(u32 cpu);
 int task64_create_user(u64 entry, u64 user_stack_top, u64 space);
 regs64_t *sched64_tick(regs64_t *frame);
 regs64_t *sched64_exit(regs64_t *frame);
+/* end every task of the caller's thread group, then the caller */
+regs64_t *sched64_exit_group(regs64_t *frame);
 /* A ring-3 exception is not resumable: mark the task done, record why, and
  * switch to the next runnable task. */
 regs64_t *sched64_fault(regs64_t *frame, u32 vector, u64 address);
@@ -876,9 +881,11 @@ regs64_t *sched64_fork(regs64_t *frame);
  * `child_stack` (16-byte aligned, inside the user half), shares the space's
  * frames and mapping records, and returns 0 in the child. CLONE_THREAD keeps
  * the caller's process id (getpid) while gettid differs; CLONE_FILES shares
- * the descriptor table, otherwise the child gets a copy. The child is
- * reapable by the task that created it. */
-regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack);
+ * the descriptor table, otherwise the child gets a copy. CLONE_SETTLS makes
+ * `tls` the child's FS base and leaves it inherited without the flag. The
+ * child is reapable by the task that created it. */
+regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
+                        u64 tls);
 /* Process id of the thread group `id` belongs to, as a task index. */
 int sched64_tgid(int id);
 /* futex blocking: park the caller on `address` (already checked against the

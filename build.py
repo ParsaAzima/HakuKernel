@@ -596,7 +596,8 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     for source in sorted(glob.glob(os.path.join(lib64_dir, "*.asm"))):
         obj = os.path.join(BUILD, "u64asm_" +
                            os.path.splitext(os.path.basename(source))[0] + ".obj")
-        run([nasm, "-f", "win64", source, "-o", obj])
+        run([nasm, "-I" + os.path.join(ROOT, "include"), "-f", "win64",
+             source, "-o", obj])
         lib64_objects.append(obj)
     for source in lib64_sources + [init64_source]:
         obj = os.path.join(BUILD, "u64lib_" +
@@ -712,6 +713,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-USER-DEV-OK", "HAKU64-USER-INITRAMFS-OK",
                 "HAKU64-USER-PROCFS-OK",
                 "HAKU64-USER-TLS-OK",
+                "HAKU64-USER-THREAD-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
                 "HAKU64-COW-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",

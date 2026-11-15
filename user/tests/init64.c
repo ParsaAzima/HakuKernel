@@ -287,6 +287,71 @@ static void test_tls(void) {
         printf("HAKU64-USER-TLS-OK: arch_prctl FS/GS and __declspec(thread)\n");
 }
 
+/* A thread is a second task in this address space with its own stack and
+ * its own TLS block: clone(CLONE_SETTLS) sets its FS base, and
+ * haku64_thread_entry() installs a per-thread GS base before the body runs.
+ * The child writes the shared variables below; the parent reads them after
+ * waitpid, so there is no polling and no handshake. The template values 7/0
+ * prove the child starts from the image, not from the parent's copy. */
+static int thread_result;
+static int thread_pid;
+static int thread_tid;
+static int thread_arg;
+
+static int thread_body(void *arg) {
+    unsigned long long gs = 0;
+    unsigned long long fs = 0;
+    int ok;
+
+    thread_arg = (int)(unsigned long long)arg;
+    ok = tls_counter == 7 && tls_zero == 0;      /* fresh template copy */
+    tls_counter = 99;
+    tls_zero = 42;
+    ok = ok && tls_counter == 99 && tls_zero == 42;
+    ok = ok && arch_prctl(HAKU64_ARCH_GET_GS,
+                          (unsigned long long)&gs) == 0 && gs != 0;
+    /* CLONE_SETTLS put the thread's control block in FS, and the trampoline
+     * installed the same block as the GS base. */
+    ok = ok && arch_prctl(HAKU64_ARCH_GET_FS,
+                          (unsigned long long)&fs) == 0 && fs == gs;
+    thread_pid = getpid();
+    thread_tid = gettid();
+    thread_result = ok;
+    return 5;
+}
+
+static void test_threads(void) {
+    int status = 0;
+    int before = failures;
+    int pid = getpid();
+    int self = gettid();
+    int tid;
+
+    tls_counter = 21;
+    tls_zero = 5;
+    thread_result = 0;
+    thread_pid = 0;
+    thread_tid = 0;
+    thread_arg = 0;
+
+    tid = haku64_thread_create(thread_body, (void *)0x5A5A);
+    check(tid > 0, "haku64_thread_create");
+    if (tid > 0) {
+        check(tid != self, "the thread has its own tid");
+        check(waitpid(tid, &status, 0) == tid, "waitpid for the thread");
+        check(((status >> 8) & 0xFF) == 5, "thread exit status");
+        check(thread_result == 1, "thread TLS, FS and GS");
+        check(thread_pid == pid, "thread shares the process id");
+        check(thread_tid == tid, "thread tid matches clone");
+        check(thread_arg == 0x5A5A, "thread argument");
+        check(tls_counter == 21 && tls_zero == 5,
+              "parent TLS block is unchanged");
+    }
+
+    if (failures == before)
+        printf("HAKU64-USER-THREAD-OK: clone SETTLS and per-thread TLS\n");
+}
+
 static void test_processes(void) {
     int status = 0;
     int child;
@@ -484,6 +549,7 @@ int main(int argc, char **argv, char **envp) {
     test_devices();
     test_procfs();
     test_tls();
+    test_threads();
     test_processes();
     test_mappings_and_time();
     test_console();
