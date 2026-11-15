@@ -333,7 +333,12 @@ typedef signed long long s64;
  * "shared" is the only truthful answer. CLONE_SETTLS puts the fifth argument
  * in the child's FS base (the SysV thread pointer); it does not touch GS,
  * because the Windows-x64 TLS convention needs a per-thread TEB chosen by
- * user code, which installs it with arch_prctl(ARCH_SET_GS). */
+ * user code, which installs it with arch_prctl(ARCH_SET_GS). The three TID
+ * flags use the fourth argument: PARENT_SETTID writes the child's tid into
+ * the caller's space before clone() returns, CHILD_SETTID writes it into the
+ * child's space before the child runs, and CHILD_CLEARTID zeroes that word
+ * and wakes one futex waiter when the child ends, which is what makes a
+ * join possible. */
 #define K64_CLONE_VM              0x00000100u
 #define K64_CLONE_FS              0x00000200u
 #define K64_CLONE_FILES           0x00000400u
@@ -347,7 +352,7 @@ typedef signed long long s64;
 #define K64_CLONE_SUPPORTED \
     (K64_CLONE_VM | K64_CLONE_FS | K64_CLONE_FILES | K64_CLONE_SIGHAND | \
      K64_CLONE_THREAD | K64_CLONE_SYSVSEM | K64_CLONE_PARENT_SETTID | \
-     K64_CLONE_SETTLS)
+     K64_CLONE_CHILD_SETTID | K64_CLONE_CHILD_CLEARTID | K64_CLONE_SETTLS)
 
 /* futex(): op is the low seven bits. FUTEX_PRIVATE_FLAG is accepted and
  * treated like the plain op, because a waiter is matched on the address it
@@ -398,6 +403,7 @@ typedef signed long long s64;
 #define K64_SIGSEGV 11u
 #define K64_SIGTERM 15u
 #define K64_SIGCHLD 17u
+#define K64_NSIG    31u
 
 /* lseek() whence values, with the Linux numbering. */
 #define K64_SEEK_SET 0u
@@ -825,6 +831,9 @@ regs64_t *sched64_tick(regs64_t *frame);
 regs64_t *sched64_exit(regs64_t *frame);
 /* end every task of the caller's thread group, then the caller */
 regs64_t *sched64_exit_group(regs64_t *frame);
+/* kill() of the caller's own thread group: a fatal signal ends every peer,
+ * then the caller, and never resumes its frame. */
+regs64_t *sched64_signal_group(regs64_t *frame, u32 signal);
 /* A ring-3 exception is not resumable: mark the task done, record why, and
  * switch to the next runnable task. */
 regs64_t *sched64_fault(regs64_t *frame, u32 vector, u64 address);
@@ -875,24 +884,28 @@ regs64_t *sched64_yield(regs64_t *frame);
 /* fork/wait: a child gets a copy of its parent's user pages (shared ranges
  * are aliased, everything else is copied) and of its descriptor table. The
  * parent blocks in wait4 until the child is DONE, then the child's space,
- * frames and kernel stack are released. */
-regs64_t *sched64_fork(regs64_t *frame);
+ * frames and kernel stack are released. `flags` carries the clone() TID
+ * flags when a clone() without CLONE_VM degrades to a fork; the child's tid
+ * word is written in its own (copied) space, so `child_tid` must name a
+ * mapping the parent has too. */
+regs64_t *sched64_fork(regs64_t *frame, u64 flags, u64 child_tid);
 /* clone(): with CLONE_VM the child runs in the caller's address space on
  * `child_stack` (16-byte aligned, inside the user half), shares the space's
  * frames and mapping records, and returns 0 in the child. CLONE_THREAD keeps
  * the caller's process id (getpid) while gettid differs; CLONE_FILES shares
  * the descriptor table, otherwise the child gets a copy. CLONE_SETTLS makes
- * `tls` the child's FS base and leaves it inherited without the flag. The
- * child is reapable by the task that created it. */
+ * `tls` the child's FS base and leaves it inherited without the flag.
+ * CLONE_CHILD_SETTID writes the child's tid to `child_tid` before the child
+ * runs, and CLONE_CHILD_CLEARTID zeroes it and wakes one futex waiter when
+ * the child ends, which is how haku64_thread_join() waits. The child is
+ * reapable by the task that created it. */
 regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
-                        u64 tls);
+                        u64 tls, u64 child_tid);
 /* Process id of the thread group `id` belongs to, as a task index. */
 int sched64_tgid(int id);
-/* futex blocking: park the caller on `address` (already checked against the
- * expected value) and switch away; returns the frame to resume the next
- * task with. `sched64_futex_wake` makes up to `count` waiters on the same
- * address runnable again and answers how many it woke. */
-regs64_t *sched64_futex_wait(regs64_t *frame, u64 address);
+/* futex wake: make up to `count` tasks parked on `address` runnable again and
+ * answer how many were woken. A WAIT is sched64_park_until() with the value
+ * recheck as its `ready` hook, which is what closes the lost-wakeup window. */
 int sched64_futex_wake(int id, u64 address, int count);
 /* Park the caller on `address` with `result` in RAX and switch away; the
  * wake side is sched64_futex_wake. Used for the console read when the
@@ -905,13 +918,16 @@ regs64_t *sched64_park(regs64_t *frame, u64 address, u64 result);
  * away; a task that did not park sees `result` in RAX and retries. */
 regs64_t *sched64_park_until(regs64_t *frame, u64 address, u64 result,
                              int (*ready)(void), int *parked);
-/* end the caller on a signal (no handlers exist, so this is exit-by-signal) */
-regs64_t *sched64_terminate(regs64_t *frame, u32 signal);
 /* reap a DONE child of `parent`; returns the child id or a negative errno */
 int task64_exec(int id, u64 space);
 int task64_reap(int parent, int pid, u64 *status);
 /* terminate a task as if by a signal; returns 0 or a negative errno */
 int task64_signal(int id, u32 signal);
+/* kill(2): end the whole thread group `id` leads. A process with threads
+ * dies as one, because the default action of a fatal signal has to reach
+ * every thread. Returns 0, -ESRCH when nothing in the group is alive, or the
+ * signal-0 existence answer. */
+int task64_signal_group(int id, u32 signal);
 int task64_parent(int id);
 
 /* fs64.c: a page cache in front of every mounted filesystem. A cached file

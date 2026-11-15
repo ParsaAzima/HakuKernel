@@ -297,10 +297,15 @@ console descriptor that was never duplicated is a no-op; there is no
 `(status & 0xFF) << 8` or the terminating signal, and reaps it; a task's
 space, frames and kernel stack are released only at that point, which is also
 what lets the boot test inspect a task after it stopped. Signals have no
-handlers: `kill` and a ring-3 fault perform the default action, terminate,
-and `wait4` reports the signal number. `SIGCHLD` is not delivered, there are
-no signal masks, and a task cannot signal itself through `kill` — that path
-goes through `exit` so the dispatcher never resumes the frame.
+handlers: a fatal signal performs the default action, terminate, and `wait4`
+reports the signal number. `SIGCHLD` is not delivered and there are no signal
+masks. `kill` names a process, and a process is its thread group, so the
+default action reaches every thread; a signal aimed at the caller's own group
+ends it through `sched64_signal_group` instead of returning. `tgkill` is the
+only call that can name a single thread, and it refuses a tgid/tid pair that
+does not belong together. A ring-3 fault is fatal for the same reason: it
+ends the whole group, because a sibling must not keep running in a space its
+peer just faulted in.
 
 `execve` reads the whole file into a heap buffer (32 pages is the cache limit),
 runs `elf64_load`, and `task64_exec` releases the caller's old space — aliased
@@ -319,9 +324,15 @@ builder (`sys64_build_init_stack`) instead of hand-writing a smaller stack, so
 the first ring-3 program sees the same vector `execve` would give it.
 Descriptors survive execve because there is no `O_CLOEXEC`. A failed call
 returns `-ENOENT`, `-ENOEXEC`, `-EIO`, `-E2BIG`, `-EFAULT` or `-ENOMEM` and
-leaves the caller running unchanged. A task whose space is shared with another thread
-cannot exec at all: `task64_exec` refuses, because there is no way to stop the
-other threads, and the call reports `-EINVAL`.
+leaves the caller running unchanged. Execve from a thread is allowed and
+follows Linux: every other task of the group is marked `DONE` first, the
+caller takes the mapping records, bump pointer, break and `cwd` over from the
+space owner, becomes the group id, and is reparented to the old leader's
+parent so the reaper is still the process that created the group. Only a
+live task outside the group sharing the space makes this impossible; that
+case is refused before anything changes and the caller keeps running. The old
+image's tid word and futex address are cleared too, so a later exit cannot
+write into a word the new program happens to have at the same address.
 
 Threads are tasks that share one address space. `task64.c` gives each slot a
 `space_owner`, so exactly one slot owns the PML4, the mapping records and the
@@ -343,8 +354,8 @@ each has its own thread-local block.
 `clone` requires `CLONE_VM` and a 16-byte aligned child stack inside the user
 half; without `CLONE_VM` it falls back to `sched64_fork`, so a caller that
 asks for a process still gets one. `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`,
-`CLONE_THREAD`, `CLONE_SYSVSEM`, `CLONE_PARENT_SETTID` and `CLONE_SETTLS` are
-accepted and everything else — child-tid stores, `CLONE_CHILD_CLEARTID` — is
+`CLONE_THREAD`, `CLONE_SYSVSEM`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`,
+`CLONE_CHILD_CLEARTID` and `CLONE_SETTLS` are accepted and everything else is
 `-EINVAL` rather than ignored, so a caller never believes it got a feature the
 kernel does not implement. `CLONE_SETTLS` makes the fifth argument the child's
 FS base (the SysV thread pointer) after checking it is inside the user half;
@@ -360,23 +371,37 @@ user count, every descriptor call resolves through it, and only the last user
 closes the descriptions. Without `CLONE_FILES` the child gets a private copy
 of the table, with the same descriptions and therefore the same offsets.
 
+The two child-tid flags use the fourth argument and are what make a join
+possible. `CLONE_CHILD_SETTID` writes the child's tid into that word in the
+child's own space before the child can run; a `fork`-style clone gets a copy
+of the parent's pages, which is why the write happens after the space exists
+and not in the caller's. `CLONE_CHILD_CLEARTID` remembers the address, and
+the exit path zeroes it and wakes one futex waiter after the status is
+published. Both are honoured with or without `CLONE_VM`, matching the i386
+port.
+
 `futex` implements `FUTEX_WAIT` and `FUTEX_WAKE`, with `FUTEX_PRIVATE_FLAG`
 accepted because there is one address space per check, and the op is the low
 seven bits. `WAIT` reads the word through the page-table validator and
 compares it with the expected value: a mismatch is `-EAGAIN`, not a sleep
 that misses the wake. A match moves the task to `K64_TASK_WAIT` with its
 syscall frame saved and `RAX=0`, so a wake resumes it as if the call had
-returned; the round-robin scan skips `WAIT`. `WAKE` makes at most `count`
-waiters on the same address runnable again and answers how many it woke. There
-is no timeout and no priority inheritance, and a wait that leaves nothing
-runnable prints `HAKU64-TASK-HALT: every task is blocked on a futex` and halts
-instead of spinning. `exit` (60) ends only the calling task, which is what a
-thread wants; `exit_group` (231) marks every other task with the same `tgid`
-`DONE` under the scheduler lock — nudging a peer on another CPU to reschedule
-— and then exits the caller through the ordinary path, so reaping stays the
-single cleanup point. The one deliberate thread limitation left is `kill`: it
-addresses one task id, so a signal aimed at a process id reaches the thread in
-that slot rather than the whole group.
+returned; the round-robin scan skips `WAIT`. The lost-wakeup window between
+that read and the park is closed by rechecking the word under the scheduler
+lock (`sched64_park_until` with a `futex_word_changed` hook): the waker
+writes the word before it takes the same lock, so either the recheck sees the
+new value and the task never sleeps, or the wake finds it parked. A task
+already marked `DONE` by a peer does not park at all; it switches away
+instead, so `exit_group`, an exec from a thread or a group signal cannot
+resurrect it. `WAKE` makes at most `count` waiters on the same address
+runnable again and answers how many it woke. There is no timeout and no
+priority inheritance, and a wait that leaves nothing runnable prints
+`HAKU64-TASK-HALT: every task is parked` and halts instead of spinning.
+`exit` (60) ends only the calling task, which is what a thread wants;
+`exit_group` (231) marks every other task with the same `tgid` `DONE` under
+the scheduler lock — nudging a peer on another CPU to reschedule — and then
+exits the caller through the ordinary path, so reaping stays the single
+cleanup point.
 
 `clock_gettime` reports `CLOCK_MONOTONIC` as time since boot and
 `CLOCK_REALTIME` as the CMOS RTC epoch sampled once at boot plus the ticks

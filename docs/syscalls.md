@@ -381,8 +381,31 @@ is documented in [the x86-64 C library](libc64.md#thread-local-storage).
 argument (`r8`) becomes the child's FS base after a check that it lies inside
 the user half. GS is deliberately not set from it; a program that wants a
 Windows-style TEB installs it with `arch_prctl(ARCH_SET_GS)` in the child.
+`CLONE_CHILD_SETTID` (0x01000000) and `CLONE_CHILD_CLEARTID` (0x00200000) are
+accepted too, with or without `CLONE_VM`: the pinned word is checked once in
+the caller, the new tid is written into the *child's* space before it can run,
+and on exit the kernel zeroes the word and wakes one futex waiter on it. That
+pair is the whole of join: `haku64_thread_join` sleeps in `futex` on the word
+and reaps the tid with `wait4`. A flag outside the accepted set is `-EINVAL`
+rather than ignored.
 `exit` (60) ends only the calling task, while `exit_group` (231) ends every
-task of the caller's thread group.
+task of the caller's thread group. `kill` (62) is process-directed — the id
+names a thread group, so the default action reaches every thread, including
+when the caller signals its own group — while `tgkill` (234) can single out one
+task and refuses a tid that does not belong to the given tgid. `execve` from a
+thread ends the other members of its group and keeps the address space for the
+new image; it is refused only when a live task outside the group shares that
+space.
+
+`futex` (202) implements `FUTEX_WAIT` and `FUTEX_WAKE`, and accepts
+`FUTEX_PRIVATE_FLAG` because the op is the low seven bits. `WAIT` compares the
+word with the expected value and answers `-EAGAIN` on a mismatch instead of
+sleeping through the wake; a match parks the task, and the word is rechecked
+under the scheduler lock so the window between the read and the park cannot
+lose a wakeup. `WAKE` makes at most `count` waiters on that address runnable
+and reports how many it woke. There is no timeout, no priority inheritance,
+and the address is matched without regard to the address space, so a shared
+page works and a spurious wake is harmless.
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
@@ -393,7 +416,7 @@ against the interrupt/wakeup race. Ring-3 page faults are contained and
 reported rather than halting the kernel: the fault handler prints a crash
 report (vector, error code, `CR2`, control registers, general registers, and
 the validated user stack), encodes the error code in the exit status byte
-(`0x80 | err`), and terminates only the faulting process. These syscalls are an
+(`0x80 | err`), and terminates the faulting thread group. These syscalls are an
 initial POSIX-inspired kernel interface, not full POSIX conformance. Run
 `python build.py headless` to test read/write/open/close/lseek/getpid/exit,
 gettimeofday/nanosleep, brk/mmap/munmap, per-process `getusage` memory and
@@ -429,7 +452,8 @@ else can pass.
 Haku implements a POSIX-*inspired* subset aimed at a statically linked musl
 userland; conformance is not a goal. What exists, by area:
 
-- **Process:** `exit`/`exit_group`, `fork`, `vfork`, `clone` (fork form),
+- **Process:** `exit`/`exit_group`, `fork`, `vfork`, `clone` (fork and thread
+  forms),
   `wait4`/`waitpid`, `execve`, `getpid`/`getppid`/`getuid`/`geteuid`/
   `getgid`/`getegid`/`gettid`, `getpgrp`/`getpgid`/`setpgid`/`setsid`/
   `getsid`, `kill`/`tkill`/`tgkill`, `rt_sigaction`/
@@ -467,7 +491,11 @@ x64 module API (it answers `-ENOSYS`; device registration is wired).
 space, descriptors and signal dispositions, reports the process id from
 `getpid` and its own id from `gettid`, can carry its own FS base through
 `CLONE_SETTLS` and thus its own TLS block, and the thread form is exercised as
-`USER-THREAD-OK`.
+`USER-THREAD-OK`. With `CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID` the tid is
+published in the child before it runs and cleared with one futex wake at exit,
+which is what `user/lib64` builds its join on (`USER-THREAD-JOIN-OK`); a thread
+can `execve`, ending the rest of its group (`USER-THREAD-EXEC-OK`), and a
+signal or fault aimed at the process reaches every thread.
 Where a call exists but cannot be honoured — permission bits, record locks,
 terminal modes — it succeeds
 without changing state and the limitation is documented above instead of

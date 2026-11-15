@@ -72,6 +72,7 @@ typedef long long time_t;
 #define HAKU64_SYS_DUP2          33
 #define HAKU64_SYS_NANOSLEEP     35
 #define HAKU64_SYS_GETPID        39
+#define HAKU64_SYS_CLONE         56
 #define HAKU64_SYS_FORK          57
 #define HAKU64_SYS_EXECVE        59
 #define HAKU64_SYS_EXIT          60
@@ -92,6 +93,7 @@ typedef long long time_t;
 #define HAKU64_SYS_GETPPID       110
 #define HAKU64_SYS_ARCH_PRCTL    158
 #define HAKU64_SYS_GETTID        186
+#define HAKU64_SYS_FUTEX         202
 #define HAKU64_SYS_GETDENTS64    217
 #define HAKU64_SYS_CLOCK_GETTIME 228
 #define HAKU64_SYS_CLOCK_GETRES  229
@@ -104,6 +106,17 @@ typedef long long time_t;
 #define HAKU64_SYS_DUP3          292
 #define HAKU64_SYS_GETRANDOM     318
 #define HAKU64_SYS_STATX         332
+
+/* clone(2) flags and futex(2) operations the thread API uses. Only the bits
+ * below are meaningful here: the kernel refuses the rest rather than
+ * pretending to honour them. CHILD_SETTID publishes the new tid in the
+ * child's space and CHILD_CLEARTID zeroes that word (and wakes a futex
+ * waiter) when the child ends; together they are what a join sleeps on. */
+#define HAKU64_CLONE_CHILD_CLEARTID 0x00200000
+#define HAKU64_CLONE_CHILD_SETTID   0x01000000
+#define HAKU64_FUTEX_WAIT           0
+#define HAKU64_FUTEX_WAKE           1
+#define HAKU64_FUTEX_PRIVATE_FLAG   128
 
 /* arch_prctl(2) subcommands and the auxv keys crt64.asm and the TLS setup
  * read. The numbers are the Linux x86-64 ones. */
@@ -366,6 +379,24 @@ void haku64_tls_free(void *teb);
  * Returns the new tid, or -1 with errno. There is no join; waitpid(tid) reaps
  * it, and the stack/TLS block are released with the address space at exit. */
 int haku64_thread_create(int (*fn)(void *), void *arg);
+/* A joinable thread. The handle lives in the thread's own stack mapping, so
+ * joining costs no allocation and the handle points into memory that
+ * haku64_thread_join() releases: never touch it after a successful join. */
+typedef struct haku64_thread {
+    int tid;                        /* also what waitpid() wants */
+    int done;                       /* CLONE_CHILD_CLEARTID word, 0 once ended */
+    void *teb;                      /* the thread's TLS control block */
+    unsigned char *stack;           /* base of its stack mapping */
+    unsigned long long stack_size;
+} haku64_thread_t;
+/* Spawn a thread that can be joined, or NULL with errno set. The child gets
+ * CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID, so the tid lands in the handle
+ * before it runs and is zeroed (with one futex wake) when it ends. */
+haku64_thread_t *haku64_thread_spawn(int (*fn)(void *), void *arg);
+/* Wait until the thread has ended, reap it, and release its stack and TLS
+ * block. Returns its exit status, or -1 with errno; the handle is dangling
+ * afterwards. */
+int haku64_thread_join(haku64_thread_t *thread);
 int fork(void);
 int waitpid(int pid, int *status, int options);
 int execve(const char *path, char *const argv[], char *const envp[]);

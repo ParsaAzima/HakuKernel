@@ -42,6 +42,7 @@ typedef struct {
     u64 mmap_next;   /* per-task bump pointer for anonymous mappings */
     u64 brk;         /* program break; 0 until the first brk() call */
     u64 futex_addr;  /* user address a K64_TASK_WAIT task is parked on */
+    u64 clear_tid;   /* CLONE_CHILD_CLEARTID word, zeroed at exit */
     u64 fs_base;     /* user FS base, arch_prctl(ARCH_SET_FS) */
     u64 gs_base;     /* user GS base, arch_prctl(ARCH_SET_GS) */
     char cwd[K64_FS_PATH_MAX + 1]; /* working directory, canonical and absolute */
@@ -492,11 +493,74 @@ static regs64_t *switch_away(const char *halt_message) {
     return result;
 }
 
+/* ------------------------------------------------------------- task exit
+ *
+ * Three things have to happen atomically when a task stops: its state becomes
+ * DONE, its exit status (or fatal signal) is recorded, and its
+ * CLONE_CHILD_CLEARTID word — the one a joiner futex-waits on — is published
+ * for clearing. The state change and the signal word are one transaction
+ * under sched_lock; the user write itself is not, because breaking a
+ * copy-on-write page allocates and the page allocator must not be called
+ * with the scheduler lock held.
+ */
+typedef struct {
+    int id;         /* slot whose word to clear; only used for validation */
+    u64 space;      /* address space that holds the word */
+    u64 address;    /* user address of the word, 0 when there is none */
+} tid_word64_t;
+
+/* Mark `id` finished with `signal` (0 for an exit) and `status`. Called with
+ * sched_lock held. Returns the word to clear after the lock is dropped. */
+static u64 finish_locked(int id, u32 signal, u64 status) {
+    u64 address = tasks[id].clear_tid;
+
+    tasks[id].clear_tid = 0;
+    tasks[id].futex_addr = 0;
+    tasks[id].term_signal = signal;
+    if (!signal) tasks[id].exit_status = status;
+    tasks[id].state = K64_TASK_DONE;
+    return address;
+}
+
+/* Write one byte of a user word through the page tables: never dereferences
+ * a user address, so a stale pointer cannot fault the kernel. */
+static int store_user_byte(u64 space, u64 address, u8 value) {
+    u64 phys;
+    int writable, user;
+
+    if (!space || address < K64_USER_BASE || address >= K64_USER_END)
+        return 0;
+    if (!paging64_write_prepare(space, address)) return 0;
+    if (!paging64_query_space(space, address, &phys, &writable, &user))
+        return 0;
+    if (!user || !writable) return 0;
+    *(volatile u8 *)phys_to_virt64(phys) = value;
+    return 1;
+}
+
+/* Zero the clear-tid word and wake one waiter. The joiner reads the zero,
+ * sees the task DONE in wait4, reaps it and releases the thread's stack and
+ * TLS block, which is exactly the join contract. The word may lie on an
+ * unaligned address, so it is written byte by byte (four page walks in the
+ * worst case; this is a once-per-thread-exit path). */
+static void clear_tid_word(const tid_word64_t *word) {
+    u32 value = 0;
+
+    if (!word->address) return;
+    for (int i = 0; i < 4; i++) {
+        if (!store_user_byte(word->space, word->address + (u64)i,
+                             (u8)(value >> (8 * i))))
+            break;
+    }
+    (void)sched64_futex_wake(word->id, word->address, 1);
+}
+
 /* Called from the system call handler for SYS_EXIT. The exit frame is not
  * saved because the task never resumes; a process that wants to continue
  * after a syscall just returns through the normal path. */
 regs64_t *sched64_exit(regs64_t *frame) {
     k64_percpu_t *cpu = this_cpu();
+    tid_word64_t word;
     int me;
     u64 flags;
 
@@ -504,14 +568,14 @@ regs64_t *sched64_exit(regs64_t *frame) {
     me = (int)cpu->current;
 
     flags = spin64_lock(&sched_lock);
-    tasks[me].state = K64_TASK_DONE;
-    tasks[me].term_signal = 0;
-    /* exit()/exit_group() pass the status in RDI; the frame is not saved
-     * because the task never resumes, but the value is what a parent would
-     * read back. */
-    tasks[me].exit_status = frame->rdi;
+    word.id = me;
+    word.space = tasks[as_owner(me)].space;
+    /* exit() passes the status in RDI; the frame is not saved because the
+     * task never resumes, but the value is what a parent would read back. */
+    word.address = finish_locked(me, 0, frame->rdi);
     spin64_unlock(&sched_lock, flags);
 
+    clear_tid_word(&word);
     return switch_away("HAKU64-TASK-HALT: no runnable task after exit\r\n");
 }
 
@@ -524,13 +588,14 @@ regs64_t *sched64_exit(regs64_t *frame) {
  * tick. Nothing is freed here — the space is still shared and reaping stays
  * the single cleanup point — so a peer that is reaped later sees its normal
  * state. The caller then exits through the ordinary path with the same
- * status.
- */
-regs64_t *sched64_exit_group(regs64_t *frame) {
+ * status. */
+static regs64_t *end_group(regs64_t *frame, u32 signal, u64 status,
+                           const char *halt_message) {
     k64_percpu_t *cpu = this_cpu();
-    int me;
-    u32 tgid;
-    u32 cpus_mask = 0;
+    tid_word64_t words[K64_TASK_MAX];
+    tid_word64_t own;
+    u32 tgid, cpus_mask = 0;
+    int count = 0, me;
     u64 flags;
 
     if (!enabled || !cpu || (int)cpu->current < 0) return frame;
@@ -543,26 +608,51 @@ regs64_t *sched64_exit_group(regs64_t *frame) {
         if (tasks[i].tgid != tgid) continue;
         /* An existing zombie keeps the status its own exit reported. */
         if (tasks[i].state == K64_TASK_DONE) continue;
-        tasks[i].state = K64_TASK_DONE;
-        tasks[i].term_signal = 0;
-        tasks[i].exit_status = frame->rdi;
-        tasks[i].futex_addr = 0;
+        words[count].id = i;
+        words[count].space = tasks[as_owner(i)].space;
+        words[count].address = finish_locked(i, signal, status);
+        count++;
         if (tasks[i].cpu != cpu->index && tasks[i].cpu < K64_SMP_MAX_CPUS)
             cpus_mask |= 1u << tasks[i].cpu;
     }
+    own.id = me;
+    own.space = tasks[as_owner(me)].space;
+    own.address = finish_locked(me, signal, frame->rdi);
     spin64_unlock(&sched_lock, flags);
+
+    /* The peers' words are cleared first: each belongs to a thread that is
+     * already DONE, so a joiner may reap it while the caller finishes. The
+     * caller still holds a reference to the shared space until its own reap,
+     * so those writes cannot race with the space being released. */
+    for (int i = 0; i < count; i++) clear_tid_word(&words[i]);
+    clear_tid_word(&own);
 
     /* A peer on another CPU only notices the state change when its own
      * scheduler next runs, so ask each affected CPU to reschedule now. */
     for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
         if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
 
-    return sched64_exit(frame);
+    return switch_away(halt_message);
 }
 
-/* A ring-3 exception ends the task: there is no signal model on the 64-bit
- * port, so the closest honest behaviour is a terminated process. The fault
- * reason is kept for the boot test (and a future parent). */
+regs64_t *sched64_exit_group(regs64_t *frame) {
+    return end_group(frame, 0, frame->rdi,
+                     "HAKU64-TASK-HALT: no runnable task after exit_group\r\n");
+}
+
+/* kill() of the caller's own thread group: the fatal signal takes every
+ * thread of the process, exactly as exit_group does, and the caller reports
+ * the signal instead of a status. */
+regs64_t *sched64_signal_group(regs64_t *frame, u32 signal) {
+    return end_group(frame, signal, 0,
+                     "HAKU64-TASK-HALT: no runnable task after a signal\r\n");
+}
+
+/* A ring-3 exception ends the whole process: the fault info is recorded on
+ * the faulting task and then the group goes down together, because the
+ * default action of SIGSEGV takes every thread (a sibling cannot keep running
+ * in an address space its peer just faulted in). The reason is kept for the
+ * boot test and a future parent. */
 regs64_t *sched64_fault(regs64_t *frame, u32 vector, u64 address) {
     k64_percpu_t *cpu = this_cpu();
     int me;
@@ -572,33 +662,13 @@ regs64_t *sched64_fault(regs64_t *frame, u32 vector, u64 address) {
     me = (int)cpu->current;
 
     flags = spin64_lock(&sched_lock);
-    tasks[me].state = K64_TASK_DONE;
-    tasks[me].term_signal = K64_SIGSEGV;
     tasks[me].fault_vector = vector;
     tasks[me].fault_address = address;
     spin64_unlock(&sched_lock, flags);
 
-    return switch_away("HAKU64-TASK-HALT: no runnable task after a user"
-                       " fault\r\n");
-}
-
-/* End the current task because a signal has no handler on this port. The
- * exit status is not used; wait4 reports the signal instead. */
-regs64_t *sched64_terminate(regs64_t *frame, u32 signal) {
-    k64_percpu_t *cpu = this_cpu();
-    int me;
-    u64 flags;
-
-    if (!enabled || !cpu || (int)cpu->current < 0) return frame;
-    me = (int)cpu->current;
-
-    flags = spin64_lock(&sched_lock);
-    tasks[me].state = K64_TASK_DONE;
-    tasks[me].term_signal = signal;
-    spin64_unlock(&sched_lock, flags);
-
-    return switch_away("HAKU64-TASK-HALT: no runnable task after a"
-                       " signal\r\n");
+    return end_group(frame, K64_SIGSEGV, 0,
+                     "HAKU64-TASK-HALT: no runnable task after a user"
+                     " fault\r\n");
 }
 
 /* Mark a task finished from outside (the boot self-test does this to the
@@ -606,14 +676,18 @@ regs64_t *sched64_terminate(regs64_t *frame, u32 signal) {
  * never killed this way, because it would then have no frame to return
  * from. */
 void task64_kill(int id) {
+    tid_word64_t word;
     u32 owner;
     u64 flags;
 
     if (!valid_id(id) || id == cur_task()) return;
     flags = spin64_lock(&sched_lock);
-    tasks[id].state = K64_TASK_DONE;
+    word.id = id;
+    word.space = tasks[as_owner(id)].space;
+    word.address = finish_locked(id, 0, 0);
     owner = tasks[id].cpu;
     spin64_unlock(&sched_lock, flags);
+    clear_tid_word(&word);
     /* If another CPU is running it, the state change alone will not make it
      * switch: nudge it. */
     smp64_resched_cpu(owner);
@@ -922,7 +996,26 @@ static void finalize_task(int id) {
     tasks[id].state = K64_TASK_UNUSED;
 }
 
-regs64_t *sched64_fork(regs64_t *frame) {
+/* CLONE_CHILD_SETTID/CLONE_CHILD_CLEARTID: the tid word lives in the child's
+ * address space and is written there before the child can run, because a
+ * forked caller only sees a copy of the parent's pages. The caller has
+ * already validated the address against the parent's mappings, which the
+ * child either shares (CLONE_VM) or owns as a copy. */
+static void publish_child_tid(int child, u64 flags, u64 child_tid) {
+    u32 tid = (u32)(child + 1);
+
+    if (!child_tid) return;
+    if (flags & K64_CLONE_CHILD_SETTID) {
+        for (int i = 0; i < 4; i++)
+            (void)store_user_byte(tasks[as_owner(child)].space,
+                                  child_tid + (u64)i,
+                                  (u8)(tid >> (8 * i)));
+    }
+    if (flags & K64_CLONE_CHILD_CLEARTID)
+        tasks[child].clear_tid = child_tid;
+}
+
+regs64_t *sched64_fork(regs64_t *frame, u64 flags, u64 child_tid) {
     int parent = cur_task();
     int child;
     u64 space;
@@ -997,6 +1090,10 @@ regs64_t *sched64_fork(regs64_t *frame) {
     tasks[child].fault_address = 0;
     tasks[child].mmap_next = tasks[parent].mmap_next;
     tasks[child].futex_addr = 0;
+    /* The tid word is the child's own, set by publish_child_tid() below when
+     * the clone() asked for it; inheriting the parent's would clear a word in
+     * a space the child only copied. */
+    tasks[child].clear_tid = 0;
     tasks[child].fs_base = tasks[parent].fs_base;
     tasks[child].gs_base = tasks[parent].gs_base;
     tasks[child].brk = 0;
@@ -1026,6 +1123,7 @@ regs64_t *sched64_fork(regs64_t *frame) {
     }
 
     fs64_fork_fds(parent, child);
+    publish_child_tid(child, flags, child_tid);
     tasks[child].state = K64_TASK_READY;
 
     frame->rax = (u64)(child + 1);          /* pid is index + 1, like getpid */
@@ -1041,14 +1139,14 @@ regs64_t *sched64_fork(regs64_t *frame) {
  * second thread needs to reach its own thread-local block. It is reapable by
  * the task that created it. */
 regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
-                        u64 tls) {
+                        u64 tls, u64 child_tid) {
     int parent = cur_task();
     int child, owner;
     u8 *stack;
     u64 top;
     regs64_t *child_frame;
 
-    if (!(flags & K64_CLONE_VM)) return sched64_fork(frame);
+    if (!(flags & K64_CLONE_VM)) return sched64_fork(frame, flags, child_tid);
 
     if (!enabled || parent <= 0 || tasks[parent].state != K64_TASK_RUNNING ||
         !tasks[parent].space || !child_stack ||
@@ -1109,6 +1207,7 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
     tasks[child].fault_vector = 0;
     tasks[child].fault_address = 0;
     tasks[child].futex_addr = 0;
+    tasks[child].clear_tid = 0;
     if (flags & K64_CLONE_SETTLS)
         tasks[child].fs_base = tls;
     else
@@ -1135,6 +1234,7 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
     else
         fs64_fork_fds(parent, child);
 
+    publish_child_tid(child, flags, child_tid);
     tasks[child].state = K64_TASK_READY;
     frame->rax = (u64)(child + 1);
     return frame;
@@ -1165,6 +1265,15 @@ static regs64_t *park_task(regs64_t *frame, u64 address, u64 result,
     fxsave64(fxsave_areas[id]);
     frame->rax = result;
     flags = spin64_lock(&sched_lock);
+    /* A peer can end this task between the value check and here (exit_group,
+     * execve from a thread, a group signal on another CPU). Parking would
+     * resurrect a task that is already DONE, so it switches away instead and
+     * never resumes this frame. */
+    if (tasks[id].state == K64_TASK_DONE) {
+        spin64_unlock(&sched_lock, flags);
+        if (parked) *parked = 1;
+        return switch_away("HAKU64-TASK-HALT: an ended task tried to park\r\n");
+    }
     tasks[id].frame = frame;
     tasks[id].futex_addr = address;
     tasks[id].state = K64_TASK_WAIT;
@@ -1191,10 +1300,6 @@ regs64_t *sched64_park(regs64_t *frame, u64 address, u64 result) {
 regs64_t *sched64_park_until(regs64_t *frame, u64 address, u64 result,
                              int (*ready)(void), int *parked) {
     return park_task(frame, address, result, ready, parked);
-}
-
-regs64_t *sched64_futex_wait(regs64_t *frame, u64 address) {
-    return park_task(frame, address, 0, 0, 0);
 }
 
 /* Wake up to `count` tasks parked on `address`. The match is on the virtual
@@ -1227,16 +1332,101 @@ int sched64_futex_wake(int id, u64 address, int count) {
     return woken;
 }
 
+/* execve from a thread: Linux ends the other threads of the group, and the
+ * caller keeps the address space. The mapping ledger, the bump pointer and
+ * the break live in the owner's slot, so they move to the caller first; the
+ * image swap can then free the old space as if the caller had always owned
+ * it. A live task outside the group sharing the space makes this impossible
+ * (the caller would not be its last user), so the call is refused before
+ * anything is ended and the peer state changes are the only ones made. */
+static int exec_take_space(int id) {
+    k64_percpu_t *cpu = this_cpu();
+    int owner = as_owner(id);
+    int old_parent = tasks[id].parent;
+    u32 tgid = tasks[id].tgid;
+    u32 cpus_mask = 0, refs = 1;
+    tid_word64_t words[K64_TASK_MAX];
+    int count = 0, cpu_index = cpu ? (int)cpu->index : 0;
+    u64 flags;
+
+    if (!enabled || !cpu) return 0;
+
+    /* Pre-flight: a live user with a different group id belongs to another
+     * process, so the caller cannot take the space over. */
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (i == id || tasks[i].state == K64_TASK_UNUSED) continue;
+        if (space_owner[i] != owner) continue;
+        if (tasks[i].state == K64_TASK_DONE) continue;
+        if (tasks[i].tgid != tgid) return 0;
+    }
+
+    flags = spin64_lock(&sched_lock);
+    /* The group leader is usually the caller's parent, and it is one of the
+     * threads that ends here: the caller inherits the leader's parent, which
+     * is what keeps a reaped exec'd thread from losing its status. */
+    if (old_parent != id && valid_id(old_parent) &&
+        tasks[old_parent].tgid == tgid) {
+        int grand = tasks[old_parent].parent;
+        tasks[id].parent = (grand == 0 || !valid_id(grand)) ? -1 : grand;
+    }
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (i == id || tasks[i].state == K64_TASK_UNUSED) continue;
+        if (tasks[i].tgid != tgid) continue;
+        if (tasks[i].state == K64_TASK_DONE) continue;
+        words[count].id = i;
+        words[count].space = tasks[as_owner(i)].space;
+        words[count].address = finish_locked(i, 0, 0);
+        count++;
+        if (tasks[i].cpu != cpu_index && tasks[i].cpu < K64_SMP_MAX_CPUS)
+            cpus_mask |= 1u << tasks[i].cpu;
+    }
+    /* The caller is now the owner. The reference count still includes every
+     * thread that was just ended but not yet reaped, because each of them
+     * drops its reference in finalize_task. */
+    for (int i = 1; i < (int)K64_TASK_MAX; i++)
+        if (i != id && tasks[i].state != K64_TASK_UNUSED &&
+            space_owner[i] == owner)
+            refs++;
+    if (owner != id) {
+        memcpy(mappings[id], mappings[owner], sizeof(mappings[id]));
+        memset(mappings[owner], 0, sizeof(mappings[owner]));
+        tasks[id].space = tasks[owner].space;
+        tasks[id].mmap_next = tasks[owner].mmap_next;
+        tasks[id].brk = tasks[owner].brk;
+        {
+            u64 k = 0;
+            while (tasks[owner].cwd[k] && k < K64_FS_PATH_MAX) {
+                tasks[id].cwd[k] = tasks[owner].cwd[k];
+                k++;
+            }
+            tasks[id].cwd[k] = 0;
+        }
+        space_refs[owner] = 0;
+        space_owner[owner] = owner;
+    }
+    space_owner[id] = id;
+    space_refs[id] = refs;
+    tasks[id].tgid = (u32)id;
+    spin64_unlock(&sched_lock, flags);
+
+    for (int i = 0; i < count; i++) clear_tid_word(&words[i]);
+    for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
+        if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
+    return 1;
+}
+
 /* execve's hand-off: the caller has just loaded a fresh image, so the old
  * space is unreachable from ring 3 and is released here (aliased shared
  * pages survive, exactly as they do at exit). The mapping table belongs to
  * the old image and is cleared; the new image starts with an empty anonymous
  * window. The caller is responsible for RIP/RSP and for switching CR3.
- * Replacing a shared space is refused: there is no way to stop the other
- * threads, so execve from a thread fails instead of leaving them behind. */
+ * Called from a thread, the rest of the group first ends (Linux semantics);
+ * a task that shares its space with a separate process is refused. */
 int task64_exec(int id, u64 space) {
     if (!valid_id(id) || id == 0 || !space) return 0;
-    if (as_owner(id) != id || space_refs[id] > 1) return 0;
+    if (as_owner(id) != id || space_refs[id] > 1) {
+        if (!exec_take_space(id)) return 0;
+    }
     if (tasks[id].space && tasks[id].space != space) {
         paging64_free_space_frames(tasks[id].space, exit_keep,
                                    (void *)(u64)id);
@@ -1247,6 +1437,11 @@ int task64_exec(int id, u64 space) {
     tasks[id].mmap_next = K64_USER_MMAP_BASE;
     tasks[id].fault_vector = 0;
     tasks[id].fault_address = 0;
+    /* The old image's tid word and futex address are gone with its pages: a
+     * later exit must not clear a word the new program happens to have at
+     * the same address. */
+    tasks[id].clear_tid = 0;
+    tasks[id].futex_addr = 0;
     /* The old image's thread pointer dies with it. Clearing the fields and
      * the live MSRs means the new program sees FS/GS base 0 until it calls
      * arch_prctl, exactly like a freshly exec'd Linux process. */
@@ -1297,6 +1492,7 @@ int task64_signal(int id, u32 signal) {
 
     if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return -3;
     if (id == cur_task()) return -22;      /* EINVAL: use exit() */
+    if (signal > K64_NSIG) return -22;
     if (signal == 0) return 0;
 
     flags = spin64_lock(&sched_lock);
@@ -1310,6 +1506,46 @@ int task64_signal(int id, u32 signal) {
     spin64_unlock(&sched_lock, flags);
     smp64_resched_cpu(owner);
     return 0;
+}
+
+/* kill(2) names a process, and a process is its thread group: the default
+ * action of a fatal signal takes every thread, not just the one whose tid
+ * happened to be named. `id` is the slot the caller named; the group it
+ * belongs to is what ends. The caller never ends here — the dispatcher routes
+ * a signal aimed at the caller's own group through sched64_signal_group(),
+ * because that call must not resume its frame. */
+int task64_signal_group(int id, u32 signal) {
+    k64_percpu_t *cpu = this_cpu();
+    tid_word64_t words[K64_TASK_MAX];
+    u32 tgid, cpus_mask = 0;
+    int count = 0, found = 0, me = cur_task();
+    u64 flags;
+
+    if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return -3;
+    if (signal > K64_NSIG) return -22;
+    tgid = tasks[id].tgid;
+
+    flags = spin64_lock(&sched_lock);
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (tasks[i].state == K64_TASK_UNUSED) continue;
+        if (tasks[i].tgid != tgid) continue;
+        found = 1;
+        if (signal == 0 || i == me) continue;
+        if (tasks[i].state == K64_TASK_DONE) continue;
+        words[count].id = i;
+        words[count].space = tasks[as_owner(i)].space;
+        words[count].address = finish_locked(i, signal, 0);
+        count++;
+        if (cpu && tasks[i].cpu != cpu->index &&
+            tasks[i].cpu < K64_SMP_MAX_CPUS)
+            cpus_mask |= 1u << tasks[i].cpu;
+    }
+    spin64_unlock(&sched_lock, flags);
+
+    for (int i = 0; i < count; i++) clear_tid_word(&words[i]);
+    for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
+        if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
+    return found ? 0 : -3;
 }
 
 int task64_parent(int id) {

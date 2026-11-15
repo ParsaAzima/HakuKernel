@@ -352,6 +352,104 @@ static void test_threads(void) {
         printf("HAKU64-USER-THREAD-OK: clone SETTLS and per-thread TLS\n");
 }
 
+/* A joinable thread is the same clone() plus the two child tid flags: the
+ * kernel puts the new tid in the handle before the child can run
+ * (CLONE_CHILD_SETTID) and zeroes it with one futex wake when the child ends
+ * (CLONE_CHILD_CLEARTID), which is what haku64_thread_join() sleeps on. The
+ * body pauses first so the parent is reliably parked on that word instead of
+ * finding it already clear, and the status it returns is what the join
+ * reports. */
+static int join_state;
+
+static int join_body(void *arg) {
+    haku64_timespec_t pause;
+
+    join_state = (int)(unsigned long long)arg;
+    pause.tv_sec = 0;
+    pause.tv_nsec = 50 * 1000 * 1000;      /* 50 ms: the parent joins first */
+    (void)nanosleep(&pause, NULL);
+    join_state += 1;
+    return 5;
+}
+
+static void test_thread_join(void) {
+    int before = failures;
+    haku64_thread_t *thread;
+
+    join_state = 0;
+    thread = haku64_thread_spawn(join_body, (void *)0x1234);
+    check(thread != NULL, "haku64_thread_spawn");
+    if (!thread) return;
+
+    check(thread->tid > 0, "spawn returns a tid");
+    check(thread->done == thread->tid, "CLONE_CHILD_SETTID published the tid");
+    check(haku64_thread_join(thread) == 5, "haku64_thread_join status");
+    check(join_state == 0x1235, "the joined thread ran to completion");
+
+    if (failures == before)
+        printf("HAKU64-USER-THREAD-JOIN-OK: clear-tid futex and join\n");
+}
+
+/* execve from a thread: the rest of the group ends and the caller keeps the
+ * address space, so the new image never sees its old threads. The forked
+ * leader spawns the thread and then parks on a word nothing writes; the
+ * thread execs after a wide margin, which ends the parked leader. The new
+ * image is this same file with argv[1] = "thread-exec": main prints a marker
+ * and returns 42, which the parent reaps below together with the leader. */
+static int exec_wait_word;
+
+static int exec_thread_body(void *arg) {
+    haku64_timespec_t pause;
+    char *argv[3];
+
+    (void)arg;
+    pause.tv_sec = 0;
+    pause.tv_nsec = 200 * 1000 * 1000;
+    (void)nanosleep(&pause, NULL);
+    argv[0] = "/INIT.ELF";
+    argv[1] = "thread-exec";
+    argv[2] = NULL;
+    execve("/INIT.ELF", argv, NULL);
+    return 0;                       /* only reached when execve failed */
+}
+
+static void test_thread_exec(void) {
+    int before = failures;
+    int statuses[2] = { -1, -1 };
+    int images = 0;
+    int child;
+
+    exec_wait_word = 0;
+    child = fork();
+    check(child >= 0, "fork before exec-from-thread");
+    if (child < 0) return;
+    if (child == 0) {
+        if (!haku64_thread_spawn(exec_thread_body, NULL)) _exit(9);
+        /* Nothing writes this word, so the park is the last thing this task
+         * ever does; the thread's execve ends it. */
+        (void)haku64_syscall3(HAKU64_SYS_FUTEX,
+                              (long long)(void *)&exec_wait_word,
+                              HAKU64_FUTEX_WAIT | HAKU64_FUTEX_PRIVATE_FLAG, 0);
+        _exit(8);                   /* a spurious wake is a failure */
+    }
+
+    /* Both the ended leader and the reparented thread are children of this
+     * process, so waitpid(-1) collects the two of them in either order. */
+    for (int i = 0; i < 2; i++) {
+        int status = 0;
+
+        check(waitpid(-1, &status, 0) > 0, "wait for an exec'd child");
+        statuses[i] = (status >> 8) & 0xFF;
+        if (statuses[i] == 42) images++;
+    }
+    check(images == 1, "the thread's new image ran");
+    check((statuses[0] == 0) + (statuses[1] == 0) == 1,
+          "the exec ended the group leader");
+
+    if (failures == before)
+        printf("HAKU64-USER-THREAD-EXEC-OK: execve from a thread\n");
+}
+
 static void test_processes(void) {
     int status = 0;
     int child;
@@ -535,6 +633,14 @@ static void test_procfs(void) {
 int main(int argc, char **argv, char **envp) {
     (void)envp;
 
+    /* test_thread_exec() re-executes this file with this argument: the first
+     * thing the new image does is prove it is running and report a status
+     * only that path can produce. It must run before the argc == 1 checks. */
+    if (argc == 2 && argv && argv[1] && text_equals(argv[1], "thread-exec")) {
+        printf("HAKU64-USER-THREAD-EXEC-IMAGE-OK: the new image is running\n");
+        return 42;
+    }
+
     printf("HAKU64-LIBC-START: argc=%d\n", argc);
     check(argc == 1, "argc from the kernel");
     check(argc >= 1 && argv && argv[0] && text_equals(argv[0], "/INIT.ELF"),
@@ -550,6 +656,8 @@ int main(int argc, char **argv, char **envp) {
     test_procfs();
     test_tls();
     test_threads();
+    test_thread_join();
+    test_thread_exec();
     test_processes();
     test_mappings_and_time();
     test_console();

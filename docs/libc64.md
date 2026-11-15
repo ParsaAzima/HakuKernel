@@ -35,7 +35,7 @@ compiles the two independently, and neither build touches the other's files.
 | `syscall64.asm` | `haku64_syscall0`..`haku64_syscall6`: the raw kernel entry, returning `-errno` unchanged. |
 | `haku_stdarg.h` | A freestanding `<stdarg.h>`: MSVC's `__va_start` intrinsic, or the clang builtins. |
 | `tls64.c` | `_tls_index` and `_tls_used`, the TLS template markers, `haku64_tls_init`: finds `PT_TLS` through `AT_PHDR`, maps the block and a TEB, and installs the user GS base; `haku64_tls_new`/`haku64_tls_free` do the same per thread. |
-| `thread64.c`, `thread64.asm` | `haku64_thread_create`: a 64 KiB stack, a per-thread TEB and TLS block, and a `clone` with `CLONE_SETTLS`; the asm stub starts the child at `haku64_thread_entry`, which installs GS and runs the body. |
+| `thread64.c`, `thread64.asm` | `haku64_thread_spawn`/`haku64_thread_join` and the fire-and-forget `haku64_thread_create`: a 64 KiB stack, a handle, a per-thread TEB and TLS block, and a `clone` with `CLONE_SETTLS` and the two child tid flags; the asm stub starts the child at `haku64_thread_entry`, which installs GS and runs the body. |
 | `errno64.c` | `errno` and `haku64_errno_check`, which turns a kernel `-errno` into `-1` plus `errno`. |
 | `string64.c` | `mem*` and `str*`: `memcpy`, `memmove`, `memset`, `memcmp`, `memchr`, `strlen`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strcmp`, `strncmp`, `strchr`, `strrchr`, `strstr`. |
 | `stdio64.c` | `printf`, `snprintf`, `puts`, `putchar` over one 1 KiB formatting buffer. |
@@ -148,14 +148,16 @@ thread-local access reads; FS is available for code that wants it.
 
 ## Threads
 
-`haku64_thread_create(fn, arg)` starts a second task in the same process.
-It maps a 64 KiB stack, builds a TEB plus a fresh copy of the TLS template
-with `haku64_tls_new`, and calls `clone` with every flag that makes a full
+`haku64_thread_create(fn, arg)` starts a second task in the same process and
+returns its tid. `haku64_thread_spawn(fn, arg)` does the same but returns a
+handle that can be joined, and `haku64_thread_join(thread)` waits for it.
+Both map a 64 KiB stack, build a TEB plus a fresh copy of the TLS template
+with `haku64_tls_new`, and call `clone` with every flag that makes a full
 thread:
 
 ```
 CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_SYSVSEM |
-CLONE_THREAD | CLONE_SETTLS
+CLONE_THREAD | CLONE_SETTLS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID
 ```
 
 `CLONE_SETTLS` sets only the child's FS base, to the address of its thread
@@ -165,14 +167,32 @@ child inherited, and `haku64_thread_entry` calls `arch_prctl(ARCH_SET_GS)`
 before it runs `fn`. From then on every `__declspec(thread)` access in that
 thread reaches its own block, and a write there is invisible to the parent.
 
-The start record lives at the top of the new stack, 32 bytes above the
-initial RSP; those 32 bytes are exactly the shadow space the entry call
-needs. Nothing is allocated on the heap, and the parent never frees anything
-the child might still be reading. `_exit` ends only the calling thread, while
-`exit`/`exit_group` take the whole group down. There is no join: the caller
-can `waitpid(tid)` for the status. The stack and TLS block are not reclaimed
-until the process exits, because without a join there is no point at which
-the parent knows the thread stopped using them.
+The mapping is laid out from the top down: the handle, then the start record,
+then the initial RSP. The 32 bytes between the record and the RSP are exactly
+the shadow space the entry call needs, and nothing above the initial RSP is
+touched by the child's stack, so the handle stays readable for the whole
+lifetime of the thread. Nothing is allocated on the heap and the parent never
+frees anything the child might still be reading.
+
+`CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID` are what make a join possible: the
+kernel writes the child's tid into the handle's `done` word before the child
+can run, and zeroes it — waking one futex waiter — when the child ends.
+`haku64_thread_join` therefore sleeps on `futex(WAIT)` until the word clears,
+reaps the tid with `waitpid`, frees the TEB with `haku64_tls_free`, and
+unmaps the stack. Its return value is the thread's exit status. The handle
+lives inside that stack mapping, so it is dangling after a successful join
+and must not be used again.
+
+A thread that calls `execve` replaces the whole process: the kernel ends the
+rest of the thread group, moves the address space to the caller, resets the
+thread pointer and the tid word, and enters the new image on its own stack
+with a cleared register set. That is a Linux-compatible exec, so the new
+program never sees the old threads.
+
+`_exit` ends only the calling thread, while `exit`/`exit_group` take the
+whole group down. `haku64_thread_create` has no join: the caller can
+`waitpid(tid)` for the status, but the stack and TLS block are not reclaimed
+until the process exits.
 
 ## Build pipeline
 
@@ -205,6 +225,9 @@ regression says what broke instead of only changing an exit status:
 | `HAKU64-LIBC-FAIL: <what> (line <n>)` | that check failed; the run fails |
 | `HAKU64-USER-TLS-OK` | TLS initializer, zero fill, read/write, FS/GS bases and fork isolation all passed |
 | `HAKU64-USER-THREAD-OK` | a cloned thread got its own stack, TLS block, FS and GS bases, and the parent's block stayed put |
+| `HAKU64-USER-THREAD-JOIN-OK` | `CLONE_CHILD_SETTID` published the tid, the joiner slept on the clear-tid word and woke with the thread's status |
+| `HAKU64-USER-THREAD-EXEC-IMAGE-OK` | the image a thread `execve`d is running (printed by the new image) |
+| `HAKU64-USER-THREAD-EXEC-OK` | the exec ended the group leader, which was reaped, and the thread's image exited with 42 |
 | `HAKU64-LIBC-OK` | every check passed; required by the x64 marker list |
 | `HAKU64-LIBC-RUN-OK` | the kernel reaped it with exit status 0 |
 
@@ -221,7 +244,13 @@ which is what catches a forked task inheriting the parent's thread-group id.
 `haku64_thread_create` is checked the same way: the thread starts on its own
 stack with the template values, sees the parent's pid and its own tid, writes
 its own TLS block, and exits with a status `waitpid` collects while the
-parent's variables are unchanged.
+parent's variables are unchanged. The join test reads the tid back from the
+handle and joins a thread that is still pausing, so the parent really sleeps
+on the clear-tid word. The exec test forks, has the child's leader park on a
+word nothing writes, and lets a thread of that child `execve` this same file
+with `argv[1] = "thread-exec"`; the new image prints its marker and returns
+42, and the parent reaps the ended leader (status 0) and the reparented
+thread (status 42).
 
 ## Deliberate limits
 
@@ -234,13 +263,14 @@ parent's variables are unchanged.
   the SSE state.
 - **No signals, no pipes.** `sigaction` and `pipe` have no syscall on the
   64-bit side yet, so a thread cannot be cancelled or woken by either.
-- **Thread resources are not reclaimed.** `haku64_thread_create` gives every
-  thread a 64 KiB stack and a TLS block and never frees them: there is no
-  join, so the parent has no safe point at which to unmap memory the child
-  may still touch. Both mappings go away with the address space at process
-  exit. A long-running program that starts many short threads therefore grows
-  its mappings. `printf`'s formatting buffer and `errno` are single copies
-  shared by all threads, so concurrent output can interleave.
+- **`haku64_thread_create` leaks its thread's mappings.** The joinable
+  `haku64_thread_spawn`/`haku64_thread_join` pair releases the 64 KiB stack
+  and the TLS block, but the older fire-and-forget call has no safe point at
+  which to unmap memory the child may still touch, so its mappings go away
+  only with the address space at process exit. A long-running program that
+  starts many short threads that way grows its mappings. `printf`'s
+  formatting buffer and `errno` are single copies shared by all threads, so
+  concurrent output can interleave.
 - **`mmap` is anonymous-first.** An anonymous mapping needs `fd == (u64)-1`
   and takes its offset in bytes; there is no file-backed mapping from the
   library yet.

@@ -36,6 +36,7 @@ static u64 sys64_random_next(void);
 
 #define SYS64_EPERM  1ull
 #define SYS64_ENOENT 2ull
+#define SYS64_ESRCH  3ull
 #define SYS64_EIO    5ull
 #define SYS64_E2BIG  7ull
 #define SYS64_ENOEXEC 8ull
@@ -1673,6 +1674,7 @@ static u64 sys64_gettid(void) {
 static regs64_t *sys64_clone(regs64_t *frame) {
     u64 flags = frame->rdi;
     u64 parent_tid = frame->rdx;
+    u64 child_tid = frame->r10;
     u64 space = current_space();
 
     if (flags & ~(u64)K64_CLONE_SUPPORTED) {
@@ -1684,8 +1686,16 @@ static regs64_t *sys64_clone(regs64_t *frame) {
         frame->rax = (u64)0 - SYS64_EFAULT;
         return frame;
     }
+    /* The child writes its own tid word through the same mappings the caller
+     * has (a clone() without CLONE_VM gets a copy), so the check here is the
+     * one the child would need. */
+    if ((flags & (K64_CLONE_CHILD_SETTID | K64_CLONE_CHILD_CLEARTID)) &&
+        !user_page64(space, child_tid, 0, 1)) {
+        frame->rax = (u64)0 - SYS64_EFAULT;
+        return frame;
+    }
 
-    frame = sched64_clone(frame, flags, frame->rsi, frame->r8);
+    frame = sched64_clone(frame, flags, frame->rsi, frame->r8, child_tid);
     if ((s64)frame->rax > 0 && (flags & K64_CLONE_PARENT_SETTID)) {
         u32 pid = (u32)frame->rax;
 
@@ -1696,13 +1706,36 @@ static regs64_t *sys64_clone(regs64_t *frame) {
     return frame;
 }
 
+/* futex WAIT closes the lost-wakeup window between its value check and the
+ * park: sched64_park_until() calls futex_word_changed() with the task lock
+ * held, and every waker writes the new word before it takes that same lock.
+ * So either this read sees the new value (the task never sleeps) or the wake
+ * finds the parked task. The state is per CPU because a CPU runs one task at
+ * a time and the hook runs inside that task's syscall. */
+typedef struct {
+    u64 address;
+    u32 value;
+} futex_check64_t;
+
+static futex_check64_t futex_checks[K64_SMP_MAX_CPUS];
+
+static int futex_word_changed(void) {
+    k64_percpu_t *cpu = k64_cpu();
+    futex_check64_t *check = &futex_checks[cpu ? cpu->index : 0];
+    u32 word = 0;
+
+    if (!copy_from_user64(current_space(), &word, check->address, 4))
+        return 1;                       /* unmapped now: do not sleep */
+    return word != check->value;
+}
+
 /* futex(uaddr, op, val, timeout, uaddr2, val3): only WAIT and WAKE exist,
  * and WAIT has no timeout, so `timeout` is never read. FUTEX_PRIVATE_FLAG is
  * accepted because the address check is always against one address space.
- * WAIT compares the word once; a different value means the wake happened
- * first and is reported as -EAGAIN rather than sleeping through it. A real
- * wait returns the next task's frame from the scheduler, so the caller's
- * frame is never resumed twice. */
+ * WAIT compares the word once and again under the scheduler lock; a different
+ * value means the wake happened first and is reported as -EAGAIN rather than
+ * sleeping through it. A real wait returns the next task's frame from the
+ * scheduler, so the caller's frame is never resumed twice. */
 static regs64_t *sys64_futex(regs64_t *frame) {
     u64 uaddr = frame->rdi;
     u64 op = frame->rsi;
@@ -1719,7 +1752,10 @@ static regs64_t *sys64_futex(regs64_t *frame) {
                                              (int)frame->rdx);
         return frame;
 
-    case K64_FUTEX_WAIT:
+    case K64_FUTEX_WAIT: {
+        k64_percpu_t *cpu;
+        futex_check64_t *check;
+
         if (!copy_from_user64(current_space(), &word, uaddr, 4)) {
             frame->rax = (u64)0 - SYS64_EFAULT;
             return frame;
@@ -1728,7 +1764,12 @@ static regs64_t *sys64_futex(regs64_t *frame) {
             frame->rax = (u64)0 - SYS64_EAGAIN;
             return frame;
         }
-        return sched64_futex_wait(frame, uaddr);
+        cpu = k64_cpu();
+        check = &futex_checks[cpu ? cpu->index : 0];
+        check->address = uaddr;
+        check->value = (u32)frame->rdx;
+        return sched64_park_until(frame, uaddr, 0, futex_word_changed, 0);
+    }
 
     default:
         frame->rax = (u64)0 - SYS64_EINVAL;
@@ -1771,14 +1812,17 @@ static u64 sys64_wait4(u64 pid, u64 status, u64 options) {
     return (u64)result;
 }
 
-/* kill(pid, signal): pid 1 and up is a task index + 1. Only the default
- * action (terminate) exists; the caller's own pid is handled in the
- * dispatcher because it must not resume its frame. */
+/* kill(pid, signal): pid 1 and up names a process, and a process is its
+ * thread group, so the default action reaches every thread. Linux's pid 0
+ * (own process group) and negative pids (process groups) are not implemented
+ * because there is no pgrp table here, and are refused. The caller's own group
+ * is
+ * handled in the dispatcher because it must not resume its frame. */
 static u64 sys64_kill(u64 pid, u64 signal) {
     s64 want = (s64)pid;
 
-    if (want <= 0) return (u64)0 - SYS64_EINVAL;
-    return (u64)task64_signal((int)want - 1, (u32)signal);
+    if (want <= 0 || want > (s64)K64_TASK_MAX) return (u64)0 - SYS64_EINVAL;
+    return (u64)task64_signal_group((int)want - 1, (u32)signal);
 }
 
 /* clock_gettime(clock_id, timespec). CLOCK_MONOTONIC counts timer ticks
@@ -2432,13 +2476,18 @@ static u64 sys64_set_tid_address(u64 tidptr) {
     return sys64_gettid();
 }
 
-/* tgkill(tgid, tid, sig): route to the task the tid names. */
+/* tgkill(tgid, tid, sig): route to the one task the tid names, but only when
+ * it really belongs to `tgid`, like Linux. Without that check a numeric tid
+ * from another process would signal a stranger. */
 static u64 sys64_tgkill(u64 tgid, u64 tid, u64 signal) {
-    int id = sched64_current();
+    int target;
 
-    (void)tgid;
     if (tid == 0 || tid > K64_TASK_MAX) return (u64)0 - SYS64_EINVAL;
-    return (u64)task64_signal((int)tid - 1, (u32)signal);
+    target = (int)tid - 1;
+    if (task64_state(target) == (int)K64_TASK_UNUSED)
+        return (u64)0 - SYS64_ESRCH;
+    if ((u64)(sched64_tgid(target) + 1) != tgid) return (u64)0 - SYS64_ESRCH;
+    return (u64)task64_signal(target, (u32)signal);
 }
 
 /* init_module(image, length): copy the container into kernel memory and let
@@ -2839,7 +2888,7 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
         break;
 
     case K64_SYS_FORK:
-        return sched64_fork(frame);
+        return sched64_fork(frame, 0, 0);
 
     case K64_SYS_CLONE:
         return sys64_clone(frame);
@@ -2854,13 +2903,18 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
         result = sys64_wait4(frame->rdi, frame->rsi, frame->rdx);
         break;
 
-    case K64_SYS_KILL:
-        /* kill() of the caller ends it instead of returning: the frame the
-         * handler was given must never be resumed. */
-        if (frame->rdi == sys64_getpid() && frame->rsi != 0)
-            return sched64_terminate(frame, (u32)frame->rsi);
+    case K64_SYS_KILL: {
+        int target = (int)frame->rdi - 1;
+
+        /* kill() aimed at the caller's own thread group (its pid or any
+         * sibling tid) ends the process and must never resume this frame. */
+        if ((s64)frame->rdi > 0 && frame->rsi != 0 && frame->rsi <= K64_NSIG &&
+            task64_state(target) != (int)K64_TASK_UNUSED &&
+            sched64_tgid(target) == sched64_tgid(sched64_current()))
+            return sched64_signal_group(frame, (u32)frame->rsi);
         result = sys64_kill(frame->rdi, frame->rsi);
         break;
+    }
 
     case K64_SYS_GETPID:
         result = sys64_getpid();

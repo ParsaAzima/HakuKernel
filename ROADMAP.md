@@ -107,6 +107,17 @@ the work on its behalf.
       `haku64_thread_entry` installs GS in the child, `_exit` ends one thread,
       `exit_group` ends the group, and `HAKU64-USER-THREAD-OK` checks the
       per-thread block, the shared pid and `waitpid(tid)`.
+- [x] Reclaimable threads: `clone` also honours `CLONE_CHILD_SETTID` and
+      `CLONE_CHILD_CLEARTID` (with or without `CLONE_VM`), publishing the tid in
+      the child's space before it runs and zeroing the word with one futex wake
+      at exit. `haku64_thread_spawn`/`haku64_thread_join` keep the handle inside
+      the thread's own stack, sleep on that word, then reap and unmap, so a
+      joined thread costs no allocation and leaks nothing
+      (`HAKU64-USER-THREAD-JOIN-OK`). `kill` is process-directed, so a signal
+      reaches the whole group, while `tgkill` stays per task and validates the
+      group id. A thread can `execve`: the rest of the group ends and the caller
+      keeps the address space (`HAKU64-USER-THREAD-EXEC-OK`), and a ring-3
+      fault ends the group rather than leaving a sibling in a broken space.
 - [ ] The x86-64 third-party probe: the i386 suite builds a static musl
       binary and runs it; the 64-bit side should prove the same thing with an
       `x86_64-linux-musl` build, so the ABI is tested by code the project did
