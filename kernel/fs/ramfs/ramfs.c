@@ -3,7 +3,7 @@
  * This is the userland root: a Unix-like tree with long names, permission
  * bits, timestamps, symbolic links, and nested directories that grow with
  * the number of entries. Nothing survives a reboot, which is exactly the
- * contract an initramfs needs — the archive is unpacked into it at boot
+ * contract an initramfs needs ??? the archive is unpacked into it at boot
  * and the system runs entirely from RAM.
  *
  * Storage model: nodes live in a fixed table (RAMFS_MAX_NODES) and file
@@ -57,6 +57,17 @@ typedef struct ramfs_node {
 typedef struct {
     ramfs_node_t *node;
     uint32_t offset;
+    /* Directory cursor: the VFS asks for index 0, 1, 2, ... in order and the
+     * child list is singly linked, so relisting from the head for each entry
+     * is quadratic in the number of children (a 300-entry /bin costs about
+     * 45k link steps per listing). Remember the last reported child and
+     * resume after it; the cached node is validated against `used` and its
+     * parent on every use, so a removed child just falls back to a full
+     * walk. */
+    ramfs_node_t *dir_cursor;
+    uint32_t dir_cursor_ino;   /* ino of that child, so a reused slot is not
+                                * mistaken for it */
+    uint32_t dir_cursor_index;
 } ramfs_handle_t;
 
 static ramfs_node_t nodes[RAMFS_MAX_NODES];
@@ -398,6 +409,9 @@ static int32_t ramfs_open(const char *path, uint32_t flags,
     if (!handle) return -VFS_ENOMEM;
     handle->node = node;
     handle->offset = 0;
+    handle->dir_cursor = 0;
+    handle->dir_cursor_ino = 0;
+    handle->dir_cursor_index = 0;
     node->handles++;
     *handle_out = handle;
     return 1;
@@ -598,13 +612,18 @@ static int32_t ramfs_opendir(const char *path, void **handle_out) {
     if (!handle) return -VFS_ENOMEM;
     handle->node = node;
     handle->offset = 0;
+    handle->dir_cursor = 0;
+    handle->dir_cursor_ino = 0;
+    handle->dir_cursor_index = 0;
     node->handles++;
     *handle_out = handle;
     return 1;
 }
 
 /* The index is a child ordinal: slot 0 is the first entry, and the walk
- * skips the number of children already reported. */
+ * skips the number of children already reported. The common case is the
+ * next ordinal in sequence, which resumes right after the last reported
+ * child instead of walking the list from the head again. */
 static int32_t ramfs_readdir(void *handle_ptr, uint32_t index,
                              vfs_dirent_t *out, uint32_t *next_index) {
     ramfs_handle_t *handle = (ramfs_handle_t *)handle_ptr;
@@ -612,6 +631,15 @@ static int32_t ramfs_readdir(void *handle_ptr, uint32_t index,
     uint32_t seen = 0;
     if (!handle || !handle->node) return -VFS_EINVAL;
     child = handle->node->child;
+    if (index != 0 && index == handle->dir_cursor_index &&
+        handle->dir_cursor && handle->dir_cursor->used &&
+        handle->dir_cursor->ino == handle->dir_cursor_ino &&
+        handle->dir_cursor->parent == handle->node) {
+        /* The cached child is still in this directory, so the entry that
+         * follows it is the requested ordinal. */
+        child = handle->dir_cursor->next;
+        seen = index;
+    }
     while (child && seen < index) {
         child = child->next;
         seen++;
@@ -629,6 +657,9 @@ static int32_t ramfs_readdir(void *handle_ptr, uint32_t index,
         memcpy(out->name, child->name, length);
         out->name[length] = 0;
     }
+    handle->dir_cursor = child;
+    handle->dir_cursor_ino = child->ino;
+    handle->dir_cursor_index = index + 1u;
     *next_index = index + 1u;
     return 1;
 }
