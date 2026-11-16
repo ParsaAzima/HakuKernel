@@ -7,17 +7,22 @@ mirror-image build strategy.
 
 ## No floating point, no SSE
 
-The kernel never sets `CR4.OSFXSR`, so an SSE instruction faults with `#UD`
-at ring 0 and ring 3, and a task switch does not save any XMM state. Both
-i386 toolchains are therefore asked for integer-only code: `/arch:IA32` for
-`cl.exe`, `-mno-sse -mno-sse2 -mno-mmx` for `clang-cl`. Without that,
-clang-cl inherits MSVC's `/arch:SSE2` default and may use SSE2 for
-constant-size memory operations such as the `memset` calls at the start of
-`paging_init` — which is exactly how a clang-cl CI build once panicked with
-an invalid opcode right after the `INT3` self-test. The same flags apply to
-the user C library, whose objects run at ring 3 under the same CPU state.
-Crash reports print the two words at the faulting `EIP`, so a `#UD` can be
-told apart from a `ud2` that the compiler emitted for an unreachable path.
+The 32-bit kernel never sets `CR4.OSFXSR`, so an SSE instruction faults with
+`#UD` at ring 0 and ring 3, and a task switch does not save any XMM state. The
+i386 build is therefore asked for integer-only code with
+`-mno-sse -mno-sse2 -mno-mmx`. Without that, clang-cl inherits the
+`/arch:SSE2` default and may use SSE2 for constant-size memory operations such
+as the `memset` calls at the start of `paging_init` — which is exactly how a
+clang-cl CI build once panicked with an invalid opcode right after the `INT3`
+self-test. The same flags apply to the user C library, whose objects run at
+ring 3 under the same CPU state.
+
+The x86-64 port takes the other route: `entry64.asm` and `ap_trampoline64.asm`
+set `CR4.OSFXSR|OSXMMEXCPT`, clear `CR0.EM`/`CR0.TS` and set `CR0.MP` before
+the first C instruction, so SSE2 (which the x86-64 ABI assumes) is legal
+everywhere and no extra per-task state is needed. Crash reports print the two
+words at the faulting `EIP`, so a `#UD` can be told apart from a `ud2` that
+the compiler emitted for an unreachable path.
 
 ## Locking
 

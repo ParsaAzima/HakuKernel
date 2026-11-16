@@ -1,7 +1,8 @@
 # HakuKernel Roadmap
 
 HakuKernel is a small, freestanding x86 operating system: a NASM bootloader, a
-C kernel built with MSVC or clang-cl, ring-3 programs, a Linux-inspired syscall
+C kernel built with LLVM's clang-cl and linked by lld-link, ring-3 programs, a
+Linux-inspired syscall
 ABI and loadable ring-0 modules. This roadmap covers the work after v0.2.0.
 x86-64 is the primary architecture, so the first goal is to make the 64-bit
 side carry a real userland; the later goals add capabilities neither side had
@@ -26,7 +27,7 @@ that needs new kernel work is 2.
 | Boot and memory | long-mode entry, four-level paging, 2 MiB physmap, frame allocator, 8 MiB heap | 32-bit protected mode, two-level paging, direct map |
 | Interrupts | 64-bit IDT/TSS with IST, 8259 + PIT, RTC; SMP bring-up with per-CPU scheduling, LAPIC timers and TLB shootdown | same, including per-CPU scheduling on the APs (`--smp=1..4`) |
 | Ring 3 | `SYSCALL`/`SYSRET` + `INT 0x80`, page-by-page user copies, NX | `INT 0x80`, page-by-page user copies |
-| Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads, `futex` | same, plus signals, job control and wait queues |
+| Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads and the pthread subset, `futex`, process groups and sessions | same, plus signal handlers, job control and wait queues |
 | Syscalls | ported subset on the x86-64 numbers; no pipes, no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
 | Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
 | Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
@@ -118,6 +119,34 @@ the work on its behalf.
       group id. A thread can `execve`: the rest of the group ends and the caller
       keeps the address space (`HAKU64-USER-THREAD-EXEC-OK`), and a ring-3
       fault ends the group rather than leaving a sibling in a broken space.
+- [x] Detached threads that clean up after themselves: `clone` accepts
+      `CLONE_DETACH` (a Haku flag, valid only with `CLONE_THREAD`), and the CPU
+      that ran the task reclaims its slot at the next tick or switch instead of
+      keeping a waitable zombie. `haku64_thread_create` is now such a thread —
+      it frees its own TLS block and unmaps its own stack on return instead of
+      leaking both until process exit — and the kernel's detached reap is
+      checked by `HAKU64-USER-DETACH-OK` on x86-64 and `USER-DETACH-OK` on
+      i386.
+- [x] The pthread subset of `include/haku/pthread.h` on both ports:
+      create/join/detach/exit, a robust mutex (`lock`, `trylock`, `unlock`,
+      `destroy`, `consistent`, `EOWNERDEAD`, poisoning) and a condition
+      variable. Every thread is a detached kernel task with a control-block
+      page and a 128 KiB stack, and a join or detach claims it with a
+      `FINISHED → REAPED` compare-and-swap *after* the kernel zeroes its tid
+      inside the exit syscall, so the pages cannot be pulled out from under a
+      thread still issuing that call. Robust-list heads live in a static table
+      indexed by task id, because a thread frees its control block first; the
+      kernel walks the list on exit, bounded by 64 nodes, and marks each owned
+      futex `OWNER_DIED` with one wake. `HAKU64-USER-PTHREAD-OK`/
+      `USER-PTHREAD-OK` and `HAKU64-USER-ROBUST-OK`/`USER-ROBUST-OK` cover it.
+- [x] Thread-safe `printf` and `errno`. The formatter builds every line in a
+      buffer on the caller's stack instead of one shared static buffer
+      (`HAKU64-USER-ERRNO-THREAD-OK`/`USER-ERRNO-THREAD-OK` also prove that one
+      thread's `errno` write never reaches its creator: i386 keeps it at
+      `%fs:4`, x86-64 reads GS:32 from the TEB).
+- [x] `kill` follows the POSIX pid rules on both ports: pid 0 is the caller's
+      process group, -1 every other task, and any other negative pid the
+      members of that group.
 - [ ] The x86-64 third-party probe: the i386 suite builds a static musl
       binary and runs it; the 64-bit side should prove the same thing with an
       `x86_64-linux-musl` build, so the ABI is tested by code the project did
@@ -190,8 +219,11 @@ continue, and a foreground process group tied to the console.
       `setpgid`/`getpgrp`/`setsid` with the same rules the 32-bit side has.
 - [ ] A console TTY: `TIOCGPGRP`/`TIOCSPGRP`, `TCGETS`/`TCSETS`, `SIGHUP` when
       the session leader exits, and `SIGTTOU`/`SIGTTIN` for background reads.
-- [ ] Exit semantics: a thread group exits only when its last thread does, and
-      the robust futex list is walked on exit.
+- [x] Exit semantics: a thread group exits only when its last thread does (a
+      leader that exits hands the address space, heap and mappings to a
+      survivor), and `set_robust_list`/`get_robust_list` let the kernel walk a
+      thread's robust futex list on exit, bounded by 64 nodes, marking each
+      owned word `OWNER_DIED` and waking a waiter.
 
 **Acceptance.** `HAKU64-PIPE-OK`, `HAKU64-SIGNAL-OK`, `HAKU64-JOBCTL-OK`; a
 ring-3 test runs a two-stage pipeline, catches and returns from a handler,

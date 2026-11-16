@@ -4,26 +4,30 @@
 
 The build and boot failures that come up most often, and what causes them.
 
-- **`not a 32-bit image`** — you used the x64 `cl.exe`; build.py picks
-  `…\bin\Hostx64\x86\cl.exe` automatically, don't override it.
+- **`not a 32-bit image`** — a 64-bit object reached the 32-bit link. Both
+  targets now run the same `clang-cl`, and `build.py` chooses the triple
+  (`--target=i686-pc-windows-msvc` or `--target=x86_64-pc-windows-msvc`), so
+  don't pass `--target` by hand.
 - **unresolved external (e.g. `_memset`)** — a CRT helper leaked in; add it
   to `kernel.c` (or simplify the code that triggered it).
 - **NASM win32 drops all `global` symbols without `section .text`** — code
   assembles fine but the .obj has no definitions (found by dumping symbols).
   Every NASM-for-link file needs an explicit section directive.
-- **MSVC prepends `_`, NASM doesn't** — write bare names in C (`isr0`,
-  `idt_load`) to meet NASM's `_isr0`, `_idt_load`. Spelling `_isr0` in C
-  asks the linker for `__isr0`.
+- **the i686 COFF ABI prepends `_`, NASM doesn't** — write bare names in C
+  (`isr0`, `idt_load`) to meet NASM's `_isr0`, `_idt_load`. Spelling `_isr0` in
+  C asks the linker for `__isr0`. The `-f win32` NASM output and the
+  `--target=i686-pc-windows-msvc` objects agree on this, so a mismatch is a
+  real naming bug rather than a toolchain difference.
 - **QEMU triple-faults / reboots** — run `python build.py headless` and read
   `build/serial.log`; no `HAKU-BOOT-OK` means the kernel never started
   (check disk load / GDT / entry address). A `KERNEL PANIC:` line is followed
   by the crash report and `build/qemu.log` has the exception trace.
 - **`KERNEL PANIC: Invalid opcode` right after `INT3-RESUMED`** — an object was
-  built for a CPU with vector registers while `CR4.OSFXSR` is off. The build
-  passes `/arch:IA32` (`cl.exe`) or `-mno-sse -mno-sse2 -mno-mmx`
-  (`clang-cl`) for this reason; the crash report's `code eip=` line shows the
-  faulting bytes (`0F 0B` is a compiler-generated `ud2`, an SSE prefix such as
-  `66 0F` is vector code).
+  built for a CPU with vector registers while `CR4.OSFXSR` is off. The 32-bit
+  build passes `-mno-sse -mno-sse2 -mno-mmx` for exactly this reason; the x64
+  entry code enables SSE2 before any C runs instead. The crash report's
+  `code eip=` line shows the faulting bytes (`0F 0B` is a compiler-generated
+  `ud2`, an SSE prefix such as `66 0F` is vector code).
 - **`ELF-LOAD-FAIL: image is not a 32-bit x86 executable`** — the binary was
   built for the host, not for Haku. `musl-gcc` on an x86-64 machine targets
   x86-64 unless a cross toolchain is used, so CI builds the musl probe with an

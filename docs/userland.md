@@ -43,19 +43,82 @@ syscall ABI, `types.h`, `errno.h`, `string.h`, `stdlib.h`, `unistd.h`,
   `include/haku/mman.h`.
 - Strings and memory: `mem*`, `str*`, `atoi`, `malloc`/`calloc`/`realloc`/
   `free` (a first-fit free list over `brk`), and `printf`/`puts`/`putchar`
-  with a `%c/%s/%d/%u/%x/%X/%p` subset (no floats, 512-byte output buffer).
+  with a `%c/%s/%d/%u/%x/%X/%p` subset (no floats; the formatter builds the
+  line in a per-call buffer on the stack, which is what makes concurrent
+  calls safe).
 - `user/lib/crt0.asm` supplies `_start`: it calls `main(void)` and exits with
   the returned status.
 
 `build.py` compiles the library and `user/tests/libtest.c` with the same
-`cl.exe` (or `clang-cl`) used for the kernel, links a fixed-base PE32 at
-`0x40000000` with no CRT, and `tools/pe2elf.py` repacks its RX/R/RW sections
-into ELF32 `PT_LOAD` segments. The image is installed as `LIB.ELF`;
-`NEXT.ELF` spawns it, requires a clean exit status, and the run prints
-`USER-LIB-OK`. There is no C runtime, dynamic linker, standard header set,
-floating-point formatting, or thread-safe allocator, and data-image filenames
-remain 8.3. The user ELFs are regenerated on every build, but an existing
-`build/haku_fs.img` only receives `LIB.ELF` after `--fresh` or `headless`.
+`clang-cl` used for the kernel (the `--target=i686-pc-windows-msvc` triple),
+links a fixed-base PE32 at `0x40000000` with no CRT, and `tools/pe2elf.py`
+repacks its RX/R/RW sections into ELF32 `PT_LOAD` segments. The image is
+installed as `LIB.ELF`; `NEXT.ELF` spawns it, requires a clean exit status,
+and the run prints `USER-LIB-OK`. There is no C runtime, dynamic linker,
+standard header set, floating-point formatting, or thread-safe `malloc`.
+`printf` and `errno` *are* thread-safe: the formatter works in a per-call
+stack buffer, and `errno` lives in each thread's control block. data-image
+filenames remain 8.3. The user ELFs are regenerated on every build, but an
+existing `build/haku_fs.img` only receives `LIB.ELF` after `--fresh` or
+`headless`.
+
+### Threads: the pthread subset
+
+`include/haku/pthread.h` is one contract for both ports; `user/lib/pthread.c`
+and `user/lib64/pthread64.c` implement it on top of the same kernel calls.
+What exists is deliberately small:
+
+| Group | Calls |
+|---|---|
+| thread | `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_self`, `pthread_equal`, `pthread_exit` |
+| mutex | `pthread_mutex_init`/`_destroy`/`_lock`/`_trylock`/`_unlock`/`_consistent`, `PTHREAD_MUTEX_INITIALIZER` |
+| cond | `pthread_cond_init`/`_destroy`/`_wait`/`_signal`/`_broadcast`, `PTHREAD_COND_INITIALIZER` |
+
+Attributes, recursive and error-checking mutexes, read/write locks,
+thread-specific data, cancellation, timed waits, and `pthread_atfork` are
+**absent** and the headers do not declare them.
+
+A thread is a kernel task created with
+`clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SETTLS|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|CLONE_DETACH)`.
+`CLONE_DETACH` tells the kernel the task has no joiner, so its slot goes back
+on the timer tick instead of staying a waitable zombie; join and detach are
+pure library state. Each thread owns a control-block page (which also holds
+its `haku_tcb_t` on i386 and is the TEB page on x86-64) plus a 128 KiB stack
+mapping, and `munmap`s both when it is done.
+
+Two details make the hand-off safe:
+
+- A joiner first claims the thread with a `FINISHED → REAPED` compare-and-swap,
+  then *waits for `tid` to reach zero*. The kernel zeroes that word inside the
+  exit syscall (`CLONE_CHILD_CLEARTID`), and only then is the exiting thread
+  off its user stack, so the joiner can never pull the pages out from under
+  the syscall stub. A detached thread frees itself on the same basis.
+- `errno` is per thread: i386 keeps it in `haku_tcb_t.error` at `%fs:4`
+  (located through the block's self pointer), x86-64 keeps it in the TEB at
+  GS:32. `haku_errno_slot()` is two instructions, so every failure path can
+  use it.
+
+Mutexes are robust. The futex word holds the owner's task id plus the
+kernel's `OWNER_DIED`/`WAITERS` bits, and the robust-list node embedded in
+every mutex sits at `HAKU_PTHREAD_NODE_OFFSET` (16) so the one offset the
+kernel reads applies to all of them. When a thread exits while holding a
+mutex the kernel's exit walk marks the word owner-died and wakes a waiter;
+the next `pthread_mutex_lock` returns `EOWNERDEAD`, `pthread_mutex_consistent`
+declares the protected state repaired, and an unlock *without* that call
+poisons the mutex so every later lock returns `ENOTRECOVERABLE`. Each thread
+keeps its list head in a static table indexed by task id rather than in its
+control block, because a thread frees the block before the exit syscall that
+walks the list.
+
+A condition variable is a counter plus a futex wake. A waiter reads the
+counter, releases the mutex, and parks on the value it read; a signal bumps
+the counter *after* the waiter's predicate was changed under the mutex, so a
+signal that arrives in the window turns the park into `EAGAIN` instead of
+getting lost.
+
+`fork()` keeps only the calling thread: the child refreshes its handle's task
+id, marks it as this process's main thread, and forgets every inherited
+robust-list head.
 
 ## Running a real userland: busybox and musl
 

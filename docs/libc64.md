@@ -36,9 +36,11 @@ compiles the two independently, and neither build touches the other's files.
 | `haku_stdarg.h` | A freestanding `<stdarg.h>`: MSVC's `__va_start` intrinsic, or the clang builtins. |
 | `tls64.c` | `_tls_index` and `_tls_used`, the TLS template markers, `haku64_tls_init`: finds `PT_TLS` through `AT_PHDR`, maps the block and a TEB, and installs the user GS base; `haku64_tls_new`/`haku64_tls_free` do the same per thread. |
 | `thread64.c`, `thread64.asm` | `haku64_thread_spawn`/`haku64_thread_join` and the fire-and-forget `haku64_thread_create`: a 64 KiB stack, a handle, a per-thread TEB and TLS block, and a `clone` with `CLONE_SETTLS` and the two child tid flags; the asm stub starts the child at `haku64_thread_entry`, which installs GS and runs the body. |
-| `errno64.c` | `errno` and `haku64_errno_check`, which turns a kernel `-errno` into `-1` plus `errno`. |
+| `pthread64.c` | The x64 half of the shared pthread subset (`include/haku/pthread.h`): create/join/detach/exit, robust mutexes and condition variables. A pthread owns a TEB page plus a 128 KiB stack and is cloned with `CLONE_DETACH`. |
+| `robust64.c` | The per-task-id robust-list heads (a static table of `HAKU_PTHREAD_MAX_THREADS` entries) and `haku64_robust_ensure`/`haku64_robust_forget`/`haku64_robust_forget_all`. |
+| `errno64.c` | `errno`, `haku64_errno_slot` (reads GS:32) and `haku64_errno_check`, which turns a kernel `-errno` into `-1` plus `errno`. |
 | `string64.c` | `mem*` and `str*`: `memcpy`, `memmove`, `memset`, `memcmp`, `memchr`, `strlen`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strcmp`, `strncmp`, `strchr`, `strrchr`, `strstr`. |
-| `stdio64.c` | `printf`, `snprintf`, `puts`, `putchar` over one 1 KiB formatting buffer. |
+| `stdio64.c` | `printf`, `snprintf`, `puts`, `putchar`; the formatter builds each line in a 1 KiB buffer on the caller's stack. |
 | `memory64.c` | `malloc`, `calloc`, `realloc`, `free` (first fit over a `brk` heap with block splitting) and `atoi`. |
 | `unistd64.c` | `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `dup3`, `unlink`, `rename`, `mkdir`, `rmdir`, `chdir`, `getcwd`, `access`, `getpid`, `gettid`, `getppid`, `arch_prctl`, `fork`, `waitpid`, `execve`, `exit`, `_exit`, `brk`, `sbrk`, `stat`, `lstat`, `fstat`, `nanosleep`, `sleep`, `clock_gettime`, `uname`. |
 | `mman64.c` | `mmap`, `munmap`, `mprotect`. |
@@ -49,7 +51,8 @@ Everything returns `-1` and sets `errno` on failure, using the kernel's
 ## The Microsoft x64 ABI
 
 The userland follows the Microsoft x64 calling convention, because the
-kernel's build already requires `cl.exe`/`clang-cl` and both of those emit it:
+kernel's build already uses LLVM's `clang-cl` with the
+`x86_64-pc-windows-msvc` triple, which emits it:
 integer arguments in `RCX`/`RDX`/`R8`/`R9`, floating point in `XMM0`-`XMM3`,
 32 bytes of shadow space at the callee's stack top, and a 16-byte aligned `RSP`
 at every `CALL`.
@@ -149,16 +152,22 @@ thread-local access reads; FS is available for code that wants it.
 ## Threads
 
 `haku64_thread_create(fn, arg)` starts a second task in the same process and
-returns its tid. `haku64_thread_spawn(fn, arg)` does the same but returns a
-handle that can be joined, and `haku64_thread_join(thread)` waits for it.
-Both map a 64 KiB stack, build a TEB plus a fresh copy of the TLS template
-with `haku64_tls_new`, and call `clone` with every flag that makes a full
-thread:
+returns its tid. It is detached: there is no handle, and when `fn` returns the
+thread frees its TLS block, unmaps its own 64 KiB stack and exits, so the
+kernel reclaims the task slot at the next switch. The tid is only useful for
+`kill()` and `/proc`-style inspection. `haku64_thread_spawn(fn, arg)` returns
+a handle that can be joined, and `haku64_thread_join(thread)` waits for it.
+
+Both build a TEB plus a fresh copy of the TLS template with
+`haku64_tls_new`, and call `clone` with every flag that makes a full thread:
 
 ```
 CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_SYSVSEM |
 CLONE_THREAD | CLONE_SETTLS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID
 ```
+
+`haku64_thread_create` adds `CLONE_DETACH`, the kernel's "no joiner" flag: the
+slot is released by the scheduler instead of staying a waitable zombie.
 
 `CLONE_SETTLS` sets only the child's FS base, to the address of its thread
 control block (the TEB page). The kernel leaves GS alone because the TEB is a
@@ -190,9 +199,51 @@ with a cleared register set. That is a Linux-compatible exec, so the new
 program never sees the old threads.
 
 `_exit` ends only the calling thread, while `exit`/`exit_group` take the
-whole group down. `haku64_thread_create` has no join: the caller can
-`waitpid(tid)` for the status, but the stack and TLS block are not reclaimed
-until the process exits.
+whole group down.
+
+## pthreads and robust mutexes
+
+`pthread64.c` implements the API declared in `include/haku/pthread.h` — the
+same header the i386 library uses — on top of those kernel calls. A pthread
+is cloned with `CLONE_DETACH`, so the kernel reclaims its slot instead of
+leaving a waitable zombie; join and detach are library state only. Its TEB
+page also holds the `haku_pthread` handle at `HAKU64_TEB_HANDLE_OFFSET`
+(0x200) and the TEB records that address at `+0x50`
+(`HAKU64_TEB_THREAD_OFFSET`), so `pthread_self()` is a GS load plus an add.
+The stack is a separate 128 KiB mapping; join or the thread's own exit
+releases the handle, TEB and TLS block with `haku64_tls_free` and the stack
+with one `munmap`.
+
+Three ordering rules are easy to get wrong and are worth naming:
+
+- A thread publishes `FINISHED` *before* it issues its exit syscall, so a
+  fast joiner cannot free on that transition alone: it must also wait for the
+  kernel to zero `tid` (`CLONE_CHILD_CLEARTID`), and only then is the exiting
+  thread off its user stack.
+- `pthread_join` and `pthread_detach` both claim a finished thread with a
+  `FINISHED → REAPED` compare-and-swap, so exactly one of them frees the
+  pages.
+- The clone stub loads the 32-bit `detached` stack argument with a 32-bit
+  load (`mov r14d, [rsp+88]`); a qword load picks up the caller's unwritten
+  upper half and makes a zero argument look nonzero.
+
+A mutex is robust. The futex word holds the owner's task id plus the kernel's
+`OWNER_DIED`/`WAITERS` bits, the node sits at `HAKU_PTHREAD_NODE_OFFSET` (16)
+in every mutex so one `futex_offset` applies, and each thread's list head
+lives in a static table indexed by task id — not in the TEB, which is already
+unmapped by the time the exit syscall walks the list. A thread that dies
+holding a mutex leaves the word owner-died; the next lock returns
+`EOWNERDEAD`, `pthread_mutex_consistent` repairs it, and unlocking without
+that call poisons it so later locks return `ENOTRECOVERABLE`.
+
+`errno` is per thread through the TEB: `haku64_errno_slot()` reads GS:32
+with `__readgsqword(0x30)`. `__declspec(thread)` was rejected for it because
+the compiler then emits its own TEB layout and index for the variable, which
+the library does not control.
+
+`fork()` keeps only the calling thread. `haku64_after_fork` forgets every
+inherited robust-list head and marks the surviving handle as this process's
+main thread, so a forked child never joins or detaches the parent's thread.
 
 ## Build pipeline
 
@@ -226,6 +277,10 @@ regression says what broke instead of only changing an exit status:
 | `HAKU64-USER-TLS-OK` | TLS initializer, zero fill, read/write, FS/GS bases and fork isolation all passed |
 | `HAKU64-USER-THREAD-OK` | a cloned thread got its own stack, TLS block, FS and GS bases, and the parent's block stayed put |
 | `HAKU64-USER-THREAD-JOIN-OK` | `CLONE_CHILD_SETTID` published the tid, the joiner slept on the clear-tid word and woke with the thread's status |
+| `HAKU64-USER-PTHREAD-OK` | three `pthread_create` workers serialized 150 increments under a mutex and woke the main thread through a condition variable, then joined with their return values |
+| `HAKU64-USER-DETACH-OK` | a detached pthread freed its own pages and `kill(tid, 0)` then reported `ESRCH` |
+| `HAKU64-USER-ROBUST-OK` | a thread died holding a robust mutex: `EOWNERDEAD`, then `pthread_mutex_consistent` to repair it, and a second one left `ENOTRECOVERABLE` |
+| `HAKU64-USER-ERRNO-THREAD-OK` | a thread's `errno` write did not reach its creator's |
 | `HAKU64-USER-THREAD-EXEC-IMAGE-OK` | the image a thread `execve`d is running (printed by the new image) |
 | `HAKU64-USER-THREAD-EXEC-OK` | the exec ended the group leader, which was reaped, and the thread's image exited with 42 |
 | `HAKU64-LIBC-OK` | every check passed; required by the x64 marker list |
@@ -243,14 +298,16 @@ process verifies that it has its own pid and that `getppid()` names the parent,
 which is what catches a forked task inheriting the parent's thread-group id.
 `haku64_thread_create` is checked the same way: the thread starts on its own
 stack with the template values, sees the parent's pid and its own tid, writes
-its own TLS block, and exits with a status `waitpid` collects while the
-parent's variables are unchanged. The join test reads the tid back from the
+its own TLS block, and exits as a detached task (the test polls
+`kill(tid, 0)` for the reaped slot). The join test reads the tid back from the
 handle and joins a thread that is still pausing, so the parent really sleeps
 on the clear-tid word. The exec test forks, has the child's leader park on a
 word nothing writes, and lets a thread of that child `execve` this same file
 with `argv[1] = "thread-exec"`; the new image prints its marker and returns
 42, and the parent reaps the ended leader (status 0) and the reparented
-thread (status 42).
+thread (status 42). Finally the pthread tests above run the same library
+surface a real program would: create/join, a mutex and condition variable, a
+detached worker, the two robust-mutex outcomes, and per-thread `errno`.
 
 ## Deliberate limits
 
@@ -263,18 +320,15 @@ thread (status 42).
   the SSE state.
 - **No signals, no pipes.** `sigaction` and `pipe` have no syscall on the
   64-bit side yet, so a thread cannot be cancelled or woken by either.
-- **`haku64_thread_create` leaks its thread's mappings.** The joinable
-  `haku64_thread_spawn`/`haku64_thread_join` pair releases the 64 KiB stack
-  and the TLS block, but the older fire-and-forget call has no safe point at
-  which to unmap memory the child may still touch, so its mappings go away
-  only with the address space at process exit. A long-running program that
-  starts many short threads that way grows its mappings. `printf`'s
-  formatting buffer and `errno` are single copies shared by all threads, so
-  concurrent output can interleave.
+- **`haku64_thread_create` is detached, not joinable.** Its thread frees its
+  own stack and TLS block on return, so there is no status to collect; use
+  `haku64_thread_spawn`/`haku64_thread_join` or `pthread_create` when the
+  result matters.
 - **`mmap` is anonymous-first.** An anonymous mapping needs `fd == (u64)-1`
   and takes its offset in bytes; there is no file-backed mapping from the
   library yet.
-- **One 1 KiB formatting buffer.** `printf` output longer than that is
-  truncated rather than allocated, and the buffer is not thread safe.
+- **`printf` truncates at 1 KiB.** Each call formats into a buffer on its own
+  stack, so concurrent calls cannot corrupt each other or `errno`, but output
+  longer than the buffer is truncated rather than allocated.
 - **8.3 filenames.** The volume is FAT12, so a path in the self-test is a short
   uppercase name.

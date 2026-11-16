@@ -3,8 +3,9 @@
 [Back to the project README](../README.md)
 
 Haku is a freestanding operating system. The primary target is x86-64: a NASM
-bootloader, a C kernel built with MSVC or clang-cl, ring-3 user tasks and a
-module loader. The original 32-bit x86 kernel (`--arch=i386`) still carries the
+bootloader, a C kernel built with LLVM's clang-cl and linked by lld-link,
+ring-3 user tasks and a module loader. The original 32-bit x86 kernel
+(`--arch=i386`) still carries the
 static musl/busybox userland, the user C library and the shell. These pages
 describe how both are built and how they work in detail.
 
@@ -20,7 +21,7 @@ describe how both are built and how they work in detail.
 | [x86-64 C library](libc64.md) | `user/lib64`: the Microsoft x64 ABI decision, the `_start` stack image, the implemented call set, the `/INIT.ELF` self-test, and its deliberate limits. |
 | [Terminal, display, and input](terminal.md) | Console backends, keyboard input, the kernel log display latch, and panic/crash reporting. |
 | [Storage and filesystems](storage.md) | ATA PIO, FAT12, the VFS layer, the boot namespace, and why the filesystem is deliberately small. |
-| [Kernel internals](kernel-internals.md) | Locking primitives, the sector cache, ELF32/ELF64 program loading, Haku module packing and loading on both architectures, and the `link.exe` + `tools/pe2bin.py` build strategy. |
+| [Kernel internals](kernel-internals.md) | Locking primitives, the sector cache, ELF32/ELF64 program loading, Haku module packing and loading on both architectures, and the `lld-link` + `tools/pe2bin.py` build strategy. |
 | [Project layout](project-layout.md) | Where sources, build outputs, and generated artifacts live. |
 | [Troubleshooting](troubleshooting.md) | The build and boot failures that come up most often, and what causes them. |
 

@@ -23,8 +23,9 @@ accounting described below is not yet wired into it). `WUNTRACED` and
 but a job-control shell passes `WUNTRACED` to every `waitpid`. Each task
 records a process group and a session, inherited across `fork`; `setpgid`
 moves the caller or one of its children into a live group, `setsid` makes the
-caller a leader of both, and `kill` with a negative pid signals a whole
-group. That is what lets `ash` run a foreground pipeline: it puts both
+caller a leader of both, and `kill` follows the POSIX pid rules — pid 0 is
+the caller's group, -1 every other task, and a negative pid names a group.
+That is what lets `ash` run a foreground pipeline: it puts both
 children in a fresh group and hands that group to the terminal.
 `exit_group` ends the calling process like `exit`. `clone` accepts the
 thread-creating form: with `CLONE_VM` the child shares the caller's address
@@ -36,7 +37,14 @@ in one owner slot that every thread reads (`space_state`), so `brk`,
 `mmap`, `mprotect`, and `munmap` in one thread are visible to the others.
 `exit` ends only the calling thread; `exit_group`, a fatal signal, and
 `execve` end the other threads, and when the owner leaves, the group id and
-the address space move to a surviving thread. A forked child gets a private
+the address space move to a surviving thread. `CLONE_DETACH` (a Haku flag,
+only valid with `CLONE_THREAD`) marks a thread with no joiner: the CPU that
+ran it finalizes its slot at the next tick instead of keeping a waitable
+zombie, which is what every pthread uses. On exit the kernel also walks the
+thread's `set_robust_list`/`get_robust_list` head, bounded by 64 nodes, and
+for each futex word the dying thread still owns sets `FUTEX_OWNER_DIED` and
+wakes one waiter, so a robust mutex reports `EOWNERDEAD` instead of sleeping
+on a dead owner. A forked child gets a private
 copy
 of the address space (code, data, stacks, heap, and mappings), a copy of the
 caller's saved register frame with `eax` zeroed, and its own descriptor table;

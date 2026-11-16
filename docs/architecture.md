@@ -98,9 +98,12 @@ of a bad kernel stack, and without a switch it could not be reported. And the
 TSS exists purely to describe `RSP0` and those stacks, since long mode has no
 hardware task switching.
 
-Because MSVC x64 has no inline assembly, `CLI`/`STI`/`LIDT`/`LGDT`/`LTR`,
-port I/O, `CR2`/`CR3`, `PAUSE`, `FXSAVE`/`FXRSTOR` and the CR4/CR0 bits that
-enable SSE all live in `isr64.asm` as small callable functions. The same file
+The x86-64 port keeps every privileged instruction out of C: `CLI`/`STI`/
+`LIDT`/`LGDT`/`LTR`, port I/O, `CR2`/`CR3`, `PAUSE`, `FXSAVE`/`FXRSTOR` and
+the CR4/CR0 bits that enable SSE all live in `isr64.asm` as small callable
+functions. That predates the LLVM switch — clang-cl in MSVC mode accepts some
+inline assembly, but one NASM file is easier to audit than a dialect split —
+and it keeps the C side ABI-clean under both compilers. The same file
 holds three exception probes (`int3_probe64`, `probe_load64`, `probe_div64`).
 Recovering from a fault means skipping the faulting instruction, so instead of
 decoding it each probe exports a label for the instruction *after* the one
@@ -355,7 +358,8 @@ each has its own thread-local block.
 half; without `CLONE_VM` it falls back to `sched64_fork`, so a caller that
 asks for a process still gets one. `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`,
 `CLONE_THREAD`, `CLONE_SYSVSEM`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`,
-`CLONE_CHILD_CLEARTID` and `CLONE_SETTLS` are accepted and everything else is
+`CLONE_CHILD_CLEARTID`, `CLONE_SETTLS` and the Haku-only `CLONE_DETACH` are
+accepted and everything else is
 `-EINVAL` rather than ignored, so a caller never believes it got a feature the
 kernel does not implement. `CLONE_SETTLS` makes the fifth argument the child's
 FS base (the SysV thread pointer) after checking it is inside the user half;
@@ -371,6 +375,13 @@ user count, every descriptor call resolves through it, and only the last user
 closes the descriptions. Without `CLONE_FILES` the child gets a private copy
 of the table, with the same descriptions and therefore the same offsets.
 
+`CLONE_DETACH` (0x40000000) is valid only together with `CLONE_THREAD`. The
+task then has no joiner: when it exits, the CPU that ran it finalizes the slot
+in `reap_pending_detached` — called at the top of the tick, of `sched64_yield`
+and of `switch_away`, before the scheduler lock — so no waitable zombie is
+left behind. A detached task is skipped by `wait4` and by the parent's
+reaping scan, and `kill(tid, 0)` reports `ESRCH` once the slot is `UNUSED`.
+
 The two child-tid flags use the fourth argument and are what make a join
 possible. `CLONE_CHILD_SETTID` writes the child's tid into that word in the
 child's own space before the child can run; a `fork`-style clone gets a copy
@@ -378,7 +389,17 @@ of the parent's pages, which is why the write happens after the space exists
 and not in the caller's. `CLONE_CHILD_CLEARTID` remembers the address, and
 the exit path zeroes it and wakes one futex waiter after the status is
 published. Both are honoured with or without `CLONE_VM`, matching the i386
-port.
+port. A detached thread still sets and clears the word if the caller asked
+for it, so a library that wants the wake and not the waitable task can have
+both.
+
+Robust futexes use `set_robust_list` (273) and `get_robust_list` (274): the
+head must be 8-byte aligned inside the user half and the length is the
+24-byte `struct robust_list_head`. The exit path walks the list before the
+address space goes away, bounded by 64 nodes, and for every futex word whose
+owner is the dying task writes `(word & FUTEX_WAITERS) | FUTEX_OWNER_DIED`
+and wakes one waiter. A cycle or a wild pointer costs at most the budget —
+each node is read with the same validated user-copy helper as a syscall.
 
 `futex` implements `FUTEX_WAIT` and `FUTEX_WAKE`, with `FUTEX_PRIVATE_FLAG`
 accepted because there is one address space per check, and the op is the low
@@ -838,16 +859,18 @@ A C module links `libhakumod`, which is `kernel/module/lib/module_lib.c` plus
 `__aulldiv`, `__aullrem`, `__alldiv`, `__allrem`); the assembly half supplies
 the `__chkstk`/`___chkstk_ms` stack probes and the `__allshl`/`__aullshr`/
 `__allshr` shift helpers, whose calling convention (count in `cl`, value in
-`edx:eax`) C cannot express. The 64-bit helpers are spelled `_allmul` and so
-on in C on purpose: the compiler's own reference to a helper is undecorated,
-so a C definition of `__allmul` would produce `___allmul` and never resolve.
-None of the library is linked eagerly — the packer's reachability pass drops
-every section the module does not call.
+`edx:eax`) C cannot express. On i386 the 64-bit helpers are `__stdcall` and
+carry an `__asm__` label so the symbol stays at the compiler's undecorated
+name: the implicit call leaves its four argument words for the callee to pop,
+and a cdecl definition would return with the stack sixteen bytes off. An asm
+label on the *declaration* is what keeps `__aulldiv` from becoming
+`_aulldiv@16`. None of the library is linked eagerly — the packer's
+reachability pass drops every section the module does not call.
 
 There is no libc and no floating-point library. On i386 the kernel does not
 save x87 or SSE state across a task switch and never sets `CR4.OSFXSR`, so a
-32-bit module must not touch either; the build passes `/arch:IA32` (or
-`-mno-sse -mno-sse2 -mno-mmx`) to keep the compiler from doing it silently. On
+32-bit module must not touch either; the build passes
+`-mno-sse -mno-sse2 -mno-mmx` to keep the compiler from doing it silently. On
 x86-64, SSE2 is part of the ABI, so `sched64_init` enables the FPU and every
 switch `FXSAVE`s/`FXRSTOR`s the task; compiler-emitted SSE2 is therefore safe,
 but a module still has no math library and must not assume x87. Module code
@@ -856,17 +879,18 @@ i386 and 16 KiB on x86-64, so frames stay small and a module never blocks,
 sleeps, or spins waiting for another task. A module that needs a large buffer
 takes it from `haku_module_alloc`, not from the stack.
 
-`build.py` compiles the 32-bit modules with
+`build.py` compiles the 32-bit modules with clang-cl's i686 triple:
 
 ```
-cl /nologo /c /GS- /Zl /Os /Gy /W3 /arch:IA32 /Iinclude
+clang-cl --target=i686-pc-windows-msvc /nologo /c /GS- /Zl /Os /Gy /W3
+         -mno-sse -mno-sse2 -mno-mmx /Iinclude
 ```
 
-and the x86-64 demo with the x64 compiler and its own runtime:
+and the x86-64 demo with the x64 triple and its own runtime:
 
 ```
-cl /nologo /c /GS- /Zl /Os /Gy /W3 /Iinclude /Ikernel\module \
-   /Ikernel\arch\x86_64\compat
+clang-cl --target=x86_64-pc-windows-msvc /nologo /c /GS- /Zl /Os /Gy /W3
+         /Iinclude /Ikernel\module /Ikernel\arch\x86_64\compat
 nasm -f win64 kernel\module\lib\runtime64.asm -o build\x64_modruntime.obj
 ```
 

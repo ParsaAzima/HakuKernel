@@ -9,10 +9,15 @@ manual test runs.
 
 | Tool | Version here | Notes |
 |---|---|---|
-| Visual Studio 2022 | 17.x, **Desktop development with C++** | we call the x86 and x64 `cl.exe`/`link.exe` directly — no project/solution needed |
+| LLVM (clang-cl + lld-link) | 19+ | from `C:\Program Files\LLVM\bin`; no Visual Studio install is needed — `build.py` retargets the same `clang-cl` with `--target=i686-pc-windows-msvc` or `--target=x86_64-pc-windows-msvc` and links with `lld-link` |
 | NASM | 3.02 | `winget install -e --id NASM.NASM` |
 | QEMU | 11.x | both `qemu-system-i386.exe` and `qemu-system-x86_64.exe` |
 | Python 3 | 3.14 | drives the whole build (`build.py` + helpers) |
+
+The switches the build passes (`/c`, `/Fo`, `/ENTRY`, `/ALIGN`,
+`/NODEFAULTLIB`, …) are the MSVC-compatible ones clang-cl accepts; only the
+tool discovery and the `--target` triple are new. `build.py` looks in
+`C:\Program Files\LLVM\bin` first and falls back to `PATH`.
 
 ## Build & run
 
@@ -59,6 +64,11 @@ copy-on-write `fork` and `vfork` (`USER-COW-OK`, `USER-VFORK-OK`,
 `VFORK-EXEC-RAN`), signal delivery and dispositions (`USER-SIGNAL-OK`),
 `clone`-created threads that share the address space and descriptors and
 report a distinct tid under the same pid (`USER-THREAD-OK`),
+the pthread subset — create/join, a mutex, a condition variable, a detached
+thread that frees its own pages, robust mutexes whose owner dies
+(`EOWNERDEAD`, `pthread_mutex_consistent`, poisoning) and per-thread errno
+(`USER-PTHREAD-OK`, `USER-DETACH-OK`, `USER-ROBUST-OK`,
+`USER-ERRNO-THREAD-OK`),
 the user C library (`USER-LIB-OK`), a packed ring-0 module that is loaded,
 refused twice under the same name, and unloaded again
 (`USER-MODULE-OK`, `MODULE-LOAD-OK name=HAKU-DEMO`,
@@ -149,7 +159,12 @@ copy-on-write child, maps memory and reads the clock before exiting 0.
 `/etc/banner.txt`, a file that exists only in the archive and not on the seed
 disk, so the userland path really reaches the RAM root, and
 `HAKU64-USER-PROCFS-OK` shows it reading the generated files through ordinary
-descriptors.
+descriptors. The same program also runs the pthread subset —
+`HAKU64-USER-PTHREAD-OK` (create/join, mutex, condition variable),
+`HAKU64-USER-DETACH-OK` (a detached thread frees its own pages and its slot
+disappears), `HAKU64-USER-ROBUST-OK` (`EOWNERDEAD`, `pthread_mutex_consistent`
+and poisoning) and `HAKU64-USER-ERRNO-THREAD-OK` (per-thread `errno`) — on top
+of the raw `clone`/clear-tid tests.
 The display stack is checked too: `HAKU64-FB-OK` names the VBE mode the shared
 renderer took over (`grid=128x48 font=terminus-8x16`), `HAKU64-TERMINAL-OK`
 names the backend, and `HAKU64-KBD-OK` proves the PS/2 set-1 decoder. The run

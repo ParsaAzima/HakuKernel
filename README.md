@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Compiler-MSVC%20%2F%20Clang--CL-5C2D91?style=for-the-badge&logo=visualstudio&logoColor=white" alt="MSVC and Clang-CL" />
-  <img src="https://img.shields.io/badge/Linker-MS%20LINK%20%2F%20LLD-68217A?style=for-the-badge" alt="Linker" />
+  <img src="https://img.shields.io/badge/Compiler-Clang--CL-5C2D91?style=for-the-badge&logo=llvm&logoColor=white" alt="Clang-CL" />
+  <img src="https://img.shields.io/badge/Linker-LLD-68217A?style=for-the-badge" alt="LLD" />
   <img src="https://img.shields.io/badge/Build-Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
   <img src="https://img.shields.io/badge/Emulator-QEMU-FF6600?style=for-the-badge&logo=qemu&logoColor=white" alt="QEMU" />
 </p>
@@ -29,8 +29,8 @@ ELF64 programs at ring 3 behind the Linux x86-64 syscall ABI. The same source
 tree still builds the original 32-bit kernel (`python build.py --arch=i386`),
 which is where the static musl/busybox userland, the user C library and the
 shell live. There is no C runtime inside the kernel and no hosted library
-under it: MSVC (or clang-cl) and NASM produce freestanding objects that
-`link.exe`/`lld-link` combine into a flat boot image, and QEMU boots it.
+under it: LLVM's `clang-cl` and NASM produce freestanding objects that
+`lld-link` combines into a flat boot image, and QEMU boots it.
 
 The practical target is a small, honest POSIX-*inspired* subset that a real
 static Linux binary can use. The strongest evidence for that is the CI job
@@ -49,6 +49,9 @@ control and pipelines working.
   8 KiB kernel stacks, `spawn`/`fork`/`vfork`/`execve`/`wait4`, real process
   groups and sessions, `kill(-pgid)`, foreground group on the console, signals,
   and `clone`-created threads that share one address space and descriptor table.
+  Both ports also carry a pthread subset (create/join/detach, robust mutexes,
+  condition variables) with per-thread `errno`; a detached thread's slot and
+  pages are reclaimed as soon as it exits.
 - **SMP** — ACPI MADT discovery, a local-APIC driver and INIT-SIPI trampolines
   that bring the application processors online on both kernels, with atomic
   spinlocks and a private GDT/TSS per processor. On x86-64 every CPU also
@@ -92,7 +95,8 @@ control and pipelines working.
   `dup`/`dup2` over a shared file
   description, `nanosleep`, `execve` of an ELF64 file from the disk with
   `argc`/`argv`/`envp` on the new stack, threads: `clone` with
-  `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`, `gettid`, and `futex` wait/wake,
+  `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`, `gettid`, `futex` wait/wake, a
+  detached `CLONE_DETACH` form, the pthread subset and robust mutexes,
   the ported i386 syscall table on the x86-64 ABI (`stat`/`statx`,
   `getdents64`, `rename`/`unlink`/`truncate`, `chdir`/`getcwd`/`openat`,
   `pread`/`pwrite`, `mprotect`/`brk`/`madvise`, `poll`/`select`, `fcntl`/
@@ -101,8 +105,9 @@ control and pipelines working.
   Terminus font as plain text, a PS/2 keyboard whose queue a blocking
   console `read()` drains, a module loader for version 2
   containers, and a 64-bit userland built on `user/lib64`: a freestanding C
-  library (string/memory, `printf`, `malloc`, files, `fork`, `mmap`, `errno`)
-  whose self-test the kernel loads from the FAT12 volume as `/INIT.ELF`.
+  library (string/memory, `printf`, `malloc`, files, `fork`, `mmap`, `errno`,
+  pthreads) whose self-test the kernel loads from the FAT12 volume as
+  `/INIT.ELF`.
   The disk is `/disk`, a cpio initramfs is the RAM root, `/proc` generates
   `meminfo`/`uptime`/`self/cmdline`, and `/dev` provides `null`, `zero`,
   `console` and devices a module registers; there is no shell, no module
@@ -110,9 +115,10 @@ control and pipelines working.
 
 ## Quick start
 
-Requirements: Visual Studio 2022 with **Desktop development with C++** (both
-the x86 and x64 `cl.exe`), NASM, QEMU (i386 and x86-64), and Python 3. CI uses
-clang-cl/lld-link on Ubuntu with the same `build.py`.
+Requirements: LLVM (`clang-cl` and `lld-link`; no Visual Studio install is
+needed), NASM, QEMU (i386 and x86-64), and Python 3. `build.py` picks the
+i686 or x86-64 triple for the same compiler, and CI uses that same path on
+Ubuntu.
 
 ```cmd
 python build.py                 :: build haku64.img only (x86-64)

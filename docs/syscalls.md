@@ -26,7 +26,8 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `nanosleep` (162), `mremap` (163), `vfork` (190), `mmap2` (192),
 `stat64` (195), `lstat64` (196),
 `fstat64` (197), `madvise` (219), `exit_group` (252), `set_thread_area` (243),
-`get_thread_area` (244), `set_tid_address` (258), `fstatat64` (300),
+`get_thread_area` (244), `set_tid_address` (258), `set_robust_list` (311),
+`get_robust_list` (312), `fstatat64` (300),
 `uname` (122),
 `getrusage` (77), `times` (43), `getppid` (64), `getuid` (24), `geteuid` (49),
 `getgid` (47), `getegid` (50), and `statx` (383), with arguments in
@@ -206,9 +207,11 @@ signal, `SIG_DFL` ends the process for every signal except `SIGCHLD`,
 `SIGURG`, `SIGWINCH`, and `SIGCONT` (which are ignored); a parent then sees
 the signal number in the wait status the way Linux reports it. A signal
 queued for a task blocked in a syscall wakes it with `EINTR` (the console
-read loop re-checks the input ring instead of returning `EINTR`). `kill`
-with pid 0 targets the caller, pid -1 targets every other process, and any
-other negative pid targets the members of that process group (`killpg`).
+read loop re-checks the input ring instead of returning `EINTR`). The pid
+argument follows the POSIX rules: `kill(0, sig)` targets the caller's process
+group, `kill(-1, sig)` every other task, and any other negative pid the members
+of that group (`kill(-pgid, sig)`, which is what a shell uses for a pipeline).
+The same splitting works on both ports, so a shell cannot tell them apart.
 `fork` and
 `vfork` reset the dispositions to the default and keep the blocked set;
 `execve` resets the dispositions and keeps both the blocked set and the
@@ -216,10 +219,13 @@ pending signals. The C library wrappers live in `user/lib/signal.c` behind
 `include/haku/signal.h`, and the ring-3 self-test covers delivery, blocking,
 `SIG_IGN`, `SA_SIGINFO`, `SA_RESTORER`, the pid/tid forms, the default
 fatal disposition, and the `EINTR` wake-up (`USER-SIGNAL-OK`). Process
-groups exist for signal delivery and the terminal, but stop/continue
-signals still end a process, so there is no job control beyond the
-foreground group. There is no `sigqueue`, and one thread runs per process,
-so a thread id is a process id.
+groups and sessions are real enough for a shell: `setpgid`, `setsid`, and the
+`TIOCSPGRP` foreground group all work, but stop/continue signals still end a
+process, so there is no job control beyond the foreground group. There is no
+`sigqueue`. A task id is no longer a process id: `clone` with `CLONE_THREAD`
+gives every thread its own tid under the group's pid, `kill` is
+process-directed (it names the group), and `tkill`/`tgkill` single out one
+thread.
 
 Writes are not atomic: there is no journal, so a failing multi-sector
 write leaves exactly its durable prefix (a short count means those bytes
@@ -386,8 +392,16 @@ accepted too, with or without `CLONE_VM`: the pinned word is checked once in
 the caller, the new tid is written into the *child's* space before it can run,
 and on exit the kernel zeroes the word and wakes one futex waiter on it. That
 pair is the whole of join: `haku64_thread_join` sleeps in `futex` on the word
-and reaps the tid with `wait4`. A flag outside the accepted set is `-EINVAL`
-rather than ignored.
+and reaps the tid with `wait4`. `CLONE_DETACH` (0x40000000, a Haku extension)
+is accepted only together with `CLONE_THREAD`: the new task has no joiner, so
+the CPU that ran it reclaims the slot as soon as it exits instead of leaving a
+waitable zombie. The pthread layer builds on exactly that. `set_robust_list`
+(273) and `get_robust_list` (274) store and report the
+`robust_list_head` a thread wants walked at exit (311/312 on i386); the length
+has to be the structure's own size, 24 bytes on x86-64 and 12 on i386. The walk is
+bounded by 64 nodes and, for every futex word the exiting task still owns, sets
+`FUTEX_OWNER_DIED` and wakes one waiter. A flag outside the accepted set is
+`-EINVAL` rather than ignored.
 `exit` (60) ends only the calling task, while `exit_group` (231) ends every
 task of the caller's thread group. `kill` (62) is process-directed — the id
 names a thread group, so the default action reaches every thread, including
@@ -458,6 +472,7 @@ userland; conformance is not a goal. What exists, by area:
   `getgid`/`getegid`/`gettid`, `getpgrp`/`getpgid`/`setpgid`/`setsid`/
   `getsid`, `kill`/`tkill`/`tgkill`, `rt_sigaction`/
   `rt_sigprocmask`/`rt_sigreturn`, `sched_yield`, `prctl` (process name),
+  `set_robust_list`/`get_robust_list`,
   `personality`, `times`, `getrusage` (zeroed), `uname`,
   `getrlimit`/`setrlimit`/`prlimit64` (fixed values), `getrandom`.
 - **Memory:** `brk`, `mmap`/`mmap2` (anonymous only), `munmap`, `mprotect`,
@@ -495,7 +510,12 @@ space, descriptors and signal dispositions, reports the process id from
 published in the child before it runs and cleared with one futex wake at exit,
 which is what `user/lib64` builds its join on (`USER-THREAD-JOIN-OK`); a thread
 can `execve`, ending the rest of its group (`USER-THREAD-EXEC-OK`), and a
-signal or fault aimed at the process reaches every thread.
+signal or fault aimed at the process reaches every thread. `CLONE_DETACH`
+(the Haku extension above) makes a thread unjoinable, and the pthread subset
+uses it for every thread on both ports: create/join with a mutex and a
+condition variable (`USER-PTHREAD-OK`), a detached thread that reclaims its
+own pages (`USER-DETACH-OK`), robust mutexes whose owner dies
+(`USER-ROBUST-OK`), and per-thread `errno` (`USER-ERRNO-THREAD-OK`).
 Where a call exists but cannot be honoured — permission bits, record locks,
 terminal modes — it succeeds
 without changing state and the limitation is documented above instead of
