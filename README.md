@@ -33,10 +33,10 @@ under it: LLVM's `clang-cl` and NASM produce freestanding objects that
 `lld-link` combines into a flat boot image, and QEMU boots it.
 
 The practical target is a small, honest POSIX-*inspired* subset that a real
-static Linux binary can use. The strongest evidence for that is the CI job
-that boots static musl programs, and the `python build.py shell` target, which
-brings up a 1 MiB static **busybox** as PID 1 and lands in `ash` with job
-control and pipelines working.
+static Linux binary can use. CI boots both ports headless and checks their
+marker sets on every push, and the `python build.py shell` target brings up a
+1 MiB static **busybox** as PID 1 and lands in `ash` with job control and
+pipelines working.
 
 ## Status
 
@@ -54,10 +54,10 @@ control and pipelines working.
   pages are reclaimed as soon as it exits.
 - **SMP** — ACPI MADT discovery, a local-APIC driver and INIT-SIPI trampolines
   that bring the application processors online on both kernels, with atomic
-  spinlocks and a private GDT/TSS per processor. On x86-64 every CPU also
-  schedules: a GS-based per-CPU block, a local-APIC timer per CPU, per-CPU idle
-  tasks, reschedule IPIs and TLB shootdown, so tasks run in parallel. On i386
-  the APs park with interrupts off and the bootstrap CPU keeps scheduling.
+  spinlocks and a private GDT/TSS per processor. Every CPU then schedules: a
+  per-CPU block behind `GS`, a timer per CPU, per-CPU idle tasks, reschedule
+  IPIs and TLB shootdown, so tasks run in parallel. On i386 the bootstrap
+  processor keeps IRQ0 as its tick while the APs use the local APIC.
 - **Syscalls** — the i386 numbers for a working file/process/memory/time/signal
   subset, validated user pointers, `-errno` results, and the 64-byte i386
   `struct stat` family that glibc and musl expect.
@@ -183,23 +183,20 @@ build.py             the whole build, test, and QEMU orchestration
 Haku does not claim POSIX compatibility. It implements a subset aimed at
 statically linked Linux binaries, without demand paging, swap, or networking.
 Both images have `clone`/`futex` threads and bring the application processors
-online with their own TSS and the shared IDT. On x86-64 the processors also
-schedule: each CPU has its own current task, idle task and timer, and wakes
-other CPUs with an IPI. Tasks are pinned to the CPU that created them, there
-is no load balancing or migration, and the user-space concurrency tests still
-run on the bootstrap processor, so a ring-3 task running on an AP is not yet
-covered. On i386 the application processors stay parked and every task runs on
-the bootstrap processor. The x86-64 kernel also lacks signal handlers, pipes,
-a line discipline, the kernel-log latch and any namespace beyond a FAT12 root
-with `/dev` (`null`, `zero`, `console`), so
-its userland is a C library (`user/lib64`) plus the `/INIT.ELF` self-test
-rather than a shell; its console and PS/2 keyboard are there so a program can
-read a line's worth of keys, and module capability registration answers
-`ENOSYS` there because no path wires it to the mount table. FAT12
-has 8.3 names, no timestamps, and no
-permission bits. Haku's filesystem cache holds eight paths of at most 128 KiB
-each. Everything beyond the implemented subset returns `ENOSYS`
-rather than pretending to work.
+online with their own TSS and the shared IDT. Every CPU schedules: each has
+its own current task, idle task and timer, and wakes other CPUs with an IPI.
+Tasks are pinned to the CPU that created them, there is no load balancing or
+migration, and the user-space concurrency tests still run on the bootstrap
+processor, so a ring-3 task running on an AP is not yet covered. The x86-64
+kernel also lacks signal handlers, pipes, a line discipline, the kernel-log
+latch and any namespace beyond a FAT12 root with `/dev` (`null`, `zero`,
+`console`), so its userland is a C library (`user/lib64`) plus the
+`/INIT.ELF` self-test rather than a shell; its console and PS/2 keyboard
+are there so a program can read a line's worth of keys, and module capability
+registration answers `ENOSYS` there because no path wires it to the mount
+table. FAT12 has 8.3 names, no timestamps, and no permission bits. Haku's
+filesystem cache holds eight paths of at most 128 KiB each. Everything
+beyond the implemented subset returns `ENOSYS` rather than pretending to work.
 
 ## Policies
 

@@ -34,7 +34,8 @@ that needs new kernel work is 2.
 | Modules | version 2 loader: log, ticks, heap, device registration; filesystem registration/mount return `-ENOSYS` | version 1 loader with device and filesystem registration |
 | Userland | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device | freestanding user C library, `busybox ash`, probes |
 
-Verified on every push by CI and locally:
+CI runs the two headless gates at one and four CPUs on every push; the shell
+check is a local gate:
 
 ```cmd
 python build.py headless                  :: x64: prints "X64 CHECK PASSED"
