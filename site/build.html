@@ -161,6 +161,8 @@
         <tr><th scope="row"><code>python build.py headless --arch=i386</code></th><td>The same for the 32-bit port. Prints <code>HEADLESS CHECK PASSED</code>.</td></tr>
         <tr><th scope="row"><code>python build.py shell</code></th><td>Boots the 32-bit image with a static busybox as PID&nbsp;1 and lands in <code>ash</code>, with job control and pipelines.</td></tr>
         <tr><th scope="row"><code>python build.py shell --check</code></th><td>Scripted shell run; prints <code>SHELL CHECK PASSED</code>.</td></tr>
+        <tr><th scope="row"><code>python build.py rootfs</code></th><td>Boots a minimal Linux-style rootfs on the 32-bit image: the FAT12 volume is <code>/</code>, <code>/INIT</code> is PID&nbsp;1, and <code>/etc/rc</code> or a login <code>sh</code> starts from <code>/bin/busybox</code>.</td></tr>
+        <tr><th scope="row"><code>python build.py rootfs --check</code></th><td>Scripted rootfs boot; prints <code>ROOTFS CHECK PASSED</code>.</td></tr>
         <tr><th scope="row"><code>python build.py probe --init=FILE</code></th><td>Boots an external static ELF32 as <code>/init</code> on the 32-bit image. Manual use only; it is not a CI gate.</td></tr>
         <tr><th scope="row"><code>python build.py inspect ...</code></th><td>Lists, checks or extracts a FAT12 image without modifying it.</td></tr>
         <tr><th scope="row"><code>--smp=N</code></th><td>Guest CPUs. 1–8 on x86-64, 1–4 on i386; the default is 2.</td></tr>
@@ -229,6 +231,8 @@ ctest --test-dir build/ctest --output-on-failure</code></pre>
         <tr><th scope="row"><code>build/haku64_fs.img</code></th><td>1.44&nbsp;MB FAT12 ATA disk seeded with the test files, <code>INIT.ELF</code> and <code>X64MOD.HKM</code>. Rebuilt on every run.</td></tr>
         <tr><th scope="row"><code>haku.img</code></th><td>Bootable floppy image for the 32-bit port.</td></tr>
         <tr><th scope="row"><code>build/haku_fs.img</code></th><td>32-bit data disk with the user ELFs and initramfs. Treated as user data.</td></tr>
+        <tr><th scope="row"><code>build/haku_rootfs.img</code></th><td>1.44&nbsp;MB FAT12 rootfs: <code>INIT</code>, <code>BIN/BUSYBOX</code>, <code>ETC/{MOTD,PROFILE,RC}</code>, <code>DEV</code>, <code>PROC</code>, <code>TMP</code>. Rebuilt by <code>rootfs</code>.</td></tr>
+        <tr><th scope="row"><code>build/haku_rootfs.tar</code></th><td>The same tree as a tar for a host, with fixed owners and timestamps.</td></tr>
       </tbody>
     </table>
   </div>
@@ -238,6 +242,15 @@ ctest --test-dir build/ctest --output-on-failure</code></pre>
     <code>python build.py inspect --check</code> verifies its BPB, FAT mirrors
     and cluster chains without writing to it. If it is damaged, report it
     instead of deleting it out of hand.
+  </p>
+  <p>
+    The rootfs keeps the whole userland on the volume: nothing is unpacked into
+    RAM, so the 1&nbsp;MiB busybox lives where it is and a Linux-shaped tree
+    (<code>/etc/rc</code>, <code>/bin/busybox</code>, <code>/dev</code>,
+    <code>/proc</code>) is the real namespace. FAT12 has no symlinks, so
+    applets run through the multiplexer, <code>/bin/busybox ls</code>, rather
+    than through <code>$PATH</code>. Both busybox targets fetch the Alpine
+    static build on first use, so they are local gates, not CI jobs.
   </p>
 </section>
 

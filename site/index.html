@@ -107,7 +107,7 @@
           "name": "Can Haku run Linux binaries?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Only statically linked programs that stay inside the implemented syscall subset. The 32-bit image boots a static musl busybox, and a musl probe can be run manually; the x86-64 side runs its own C library and /INIT.ELF."
+            "text": "Only statically linked programs that stay inside the implemented syscall subset. The 32-bit image boots a static musl busybox, either directly as PID 1 or from a Linux-style rootfs where /etc/rc and /bin/busybox are paths on the disk, and a musl probe can be run manually; the x86-64 side runs its own C library and /INIT.ELF."
           }
         }
       ]
@@ -275,6 +275,8 @@
     <dd>An in-RAM root populated from a cpio <code>newc</code> initramfs embedded in the boot image.</dd>
     <dt>Disk</dt>
     <dd>FAT12 at <code>/disk</code> on both ports, behind one mount table with longest-prefix resolution.</dd>
+    <dt>Rootfs</dt>
+    <dd>Optionally the FAT12 volume itself: <code>python build.py rootfs</code> mounts it at <code>/</code>, keeps <code>/disk</code> on the same bytes, and runs <code>/INIT</code> as PID&nbsp;1.</dd>
     <dt>Generated</dt>
     <dd><code>/proc/meminfo</code>, <code>/proc/uptime</code>, <code>/proc/self/cmdline</code>; <code>/dev/null</code>, <code>zero</code>, <code>console</code>.</dd>
     <dt>Writes</dt>
@@ -346,7 +348,7 @@
         <tr><th scope="row">Scheduling</th><td>per-CPU LAPIC timers, every CPU dispatches</td><td>PIT wall clock, APs dispatch from the shared table</td></tr>
         <tr><th scope="row">Signals</th><td>default actions</td><td>handlers, dispositions and job control</td></tr>
         <tr><th scope="row">Pipes</th><td class="no">no</td><td class="yes">yes</td></tr>
-        <tr><th scope="row">Userland</th><td><code>user/lib64</code> and <code>/INIT.ELF</code> from disk</td><td>user C library and <code>busybox ash</code> as PID&nbsp;1</td></tr>
+        <tr><th scope="row">Userland</th><td><code>user/lib64</code> and <code>/INIT.ELF</code> from disk</td><td>user C library, <code>busybox ash</code> as PID&nbsp;1, and a FAT12 rootfs whose <code>/INIT</code> starts the shell</td></tr>
         <tr><th scope="row">Modules</th><td>v2: log, ticks, heap, device registration</td><td>v1: device and filesystem registration</td></tr>
       </tbody>
     </table>
@@ -367,6 +369,7 @@
     <li>No SMP-tested ring-3 task: the user-space concurrency tests still run on the bootstrap processor.</li>
     <li>The x86-64 side has no pipes, no signal handlers, no shell and no line discipline.</li>
     <li>FAT12 only: 8.3 names, no timestamps, no permission bits, eight cached paths of 128&nbsp;KiB.</li>
+    <li>The rootfs is a 1.44&nbsp;MB FAT12 volume: one busybox binary, no symlinks and no <code>/etc/fstab</code>, so applets run as <code>/bin/busybox APP</code>.</li>
     <li>The x86-64 module loader answers filesystem registration with <code>-ENOSYS</code>.</li>
     <li>Modules are trusted ring-0 code. There is no sandbox and no signature check.</li>
   </ul>
@@ -407,8 +410,10 @@
     <h3>Can Haku run Linux binaries?</h3>
     <p>
       Only statically linked programs that stay inside the implemented syscall
-      subset. The 32-bit image boots a static musl busybox, and a musl probe
-      can be run manually; the x86-64 side runs its own C library and
+      subset. The 32-bit image boots a static musl busybox, either directly as
+      PID&nbsp;1 or from a Linux-style rootfs where <code>/etc/rc</code> and
+      <code>/bin/busybox</code> are paths on the disk, and a musl probe can be
+      run manually; the x86-64 side runs its own C library and
       <code>/INIT.ELF</code>.
     </p>
   </div>
@@ -429,9 +434,10 @@ python build.py
 <span class="c">:: build, boot headless and verify the marker set</span>
 python build.py headless
 
-<span class="c">:: the 32-bit port, with its busybox shell</span>
+<span class="c">:: the 32-bit port: busybox shell, then a Linux-style rootfs</span>
 python build.py headless --arch=i386
-python build.py shell</code></pre>
+python build.py shell
+python build.py rootfs</code></pre>
 
   <div class="strip">
     <div><strong>x64 CHECK PASSED</strong>boot, storage, processes, syscalls, modules</div>
