@@ -555,7 +555,9 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     run([py, os.path.join(ROOT, "tools", "mkelf64.py"),
          user_flat, user_elf, f"--base={user_base:#x}",
          f"--data-offset={user_bss:#x}"])
-    embedded = user_elf.replace("/", "\\")
+    # NASM's incbin accepts forward slashes on Windows and Linux alike, while
+    # a backslash in the macro becomes a literal escaped name on a POSIX host.
+    embedded = user_elf.replace("\\", "/")
     run([nasm, "-f", "win64", f"-DUSER64_IMAGE={embedded}",
          user_image_asm, "-o", user_image_obj])
 
