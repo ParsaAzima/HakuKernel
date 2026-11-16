@@ -80,7 +80,9 @@ int vfork(void);
  * space, descriptors and current working directory. stack_top is the
  * initial stack pointer (it grows down); the thread runs until fn returns
  * and then exits with fn's value. Returns the thread id, whose exit can be
- * collected with waitpid(tid). */
+ * collected with waitpid(tid). The thread keeps the caller's thread block,
+ * so errno is shared; this is the raw clone wrapper, and pthread_create() is
+ * the one that gives a thread a block and a robust list of its own. */
 int thread_create(int (*fn)(void *), void *arg, void *stack_top);
 int waitpid(int pid, int *status, int options);
 int spawn(const char *path);

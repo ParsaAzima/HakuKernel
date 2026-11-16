@@ -5,6 +5,7 @@
 section .text
 
 extern _haku_errno_check
+extern _haku_pthread_begin
 
 ; vfork(2): the child runs on the parent's stack, so the pending return
 ; address must not sit there while the syscall is in flight - the child's
@@ -172,3 +173,83 @@ _haku_thread_create:
     pop esi
     pop ebx
     ret
+
+; haku_tcb_address(): the self pointer at the base of this thread's control
+; block, i.e. the user FS base itself. No block is installed only before
+; crt0's TLS setup, which runs before any library call.
+global _haku_tcb_address
+_haku_tcb_address:
+    mov eax, [fs:0]
+    ret
+
+; haku_errno_slot(): the address of this thread's errno. Following the block's
+; self pointer instead of assuming the segment base is already loaded means
+; the caller never needs set_thread_area's result, and the slot stays valid
+; after a fork (the child's block is at the same address).
+global _haku_errno_slot
+_haku_errno_slot:
+    mov eax, [fs:0]
+    add eax, HAKU_TCB_ERRNO
+    ret
+
+; haku_thread_clone(stack_top, tls, record, flags, child_tid)
+; clone(2) for the pthread layer: the child shares the address space and
+; descriptor row, gets `stack_top` as its ESP and `tls` as its FS base (so
+; the kernel installs the thread's control block before the child runs).
+; The record travels in ebp, a register the kernel copies into the child, and
+; the child calls haku_pthread_begin(record), which never returns. The flags
+; carry the detach bit, so no wait4 is needed to release the task slot, and
+; CLONE_CHILD_SETTID/CLEARTID publish the child's id in *child_tid and zero it
+; at exit, which is the word a joiner waits on.
+global _haku_thread_clone
+_haku_thread_clone:
+    push ebx
+    push esi
+    push edi
+    push ebp
+    mov ecx, [esp + 20]          ; stack_top
+    mov edi, [esp + 24]          ; tls base for CLONE_SETTLS
+    mov ebp, [esp + 28]          ; record, survives into the child
+    mov ebx, [esp + 32]          ; clone flags
+    mov esi, [esp + 36]          ; child_tid word
+    xor edx, edx                 ; parent_tid
+    mov eax, HAKU_SYS_CLONE
+    int 0x80
+    test eax, eax
+    jnz .parent
+    ; Child: the kernel has already loaded stack_top into esp.
+    push ebp
+    call _haku_pthread_begin
+    hlt                          ; haku_pthread_begin never returns
+.parent:
+    pop ebp
+    pop edi
+    pop esi
+    pop ebx
+    ret
+
+; haku_thread_retire(stack, stack_size, page, status)
+; A detached thread's last act: unmap the stack it is standing on and the page
+; that holds its control block and handle, then exit the thread. Nothing may
+; touch either mapping in between - not a push, not a pop, not a return - so
+; the page address waits in edi and the status in esi, both of which int 0x80
+; preserves, and the exit is issued straight from the unmapped stack pointer.
+global _haku_thread_retire
+_haku_thread_retire:
+    push ebx
+    push esi
+    push edi
+    mov ebx, [esp + 16]          ; stack base
+    mov ecx, [esp + 20]          ; stack size
+    mov edi, [esp + 24]          ; page holding the control block
+    mov esi, [esp + 28]          ; exit status
+    mov eax, HAKU_SYS_MUNMAP
+    int 0x80
+    mov ebx, edi
+    mov ecx, 4096                ; the thread page, see HAKU_THREAD_PAGE
+    mov eax, HAKU_SYS_MUNMAP
+    int 0x80
+    mov ebx, esi
+    mov eax, HAKU_SYS_EXIT
+    int 0x80
+    hlt

@@ -10,6 +10,7 @@
  * marker, HAKU64-LIBC-OK, which build.py's x64 marker list requires.
  */
 #include <haku/abi64.h>
+#include <haku/pthread.h>
 
 #define FAILED_MAX 32
 
@@ -287,69 +288,61 @@ static void test_tls(void) {
         printf("HAKU64-USER-TLS-OK: arch_prctl FS/GS and __declspec(thread)\n");
 }
 
-/* A thread is a second task in this address space with its own stack and
- * its own TLS block: clone(CLONE_SETTLS) sets its FS base, and
- * haku64_thread_entry() installs a per-thread GS base before the body runs.
- * The child writes the shared variables below; the parent reads them after
- * waitpid, so there is no polling and no handshake. The template values 7/0
- * prove the child starts from the image, not from the parent's copy. */
-static int thread_result;
-static int thread_pid;
-static int thread_tid;
-static int thread_arg;
+/* Detached threads: haku64_thread_create() hands back only a tid, and the
+ * thread frees its own TLS block and stack before it exits, so the kernel
+ * reclaims the task slot at the next switch. The body sets a word and kicks a
+ * futex, which is race-free whether it runs before or after the parent parks;
+ * kill(tid, 0) then turns ESRCH once the slot is gone. */
+static int detached_arg;
+static volatile int detached_ran;
 
-static int thread_body(void *arg) {
-    unsigned long long gs = 0;
-    unsigned long long fs = 0;
-    int ok;
+static void futex_park(volatile int *word, int value) {
+    (void)haku64_syscall3(HAKU64_SYS_FUTEX, (long long)(void *)word,
+                          HAKU64_FUTEX_WAIT | HAKU64_FUTEX_PRIVATE_FLAG,
+                          value);
+}
 
-    thread_arg = (int)(unsigned long long)arg;
-    ok = tls_counter == 7 && tls_zero == 0;      /* fresh template copy */
-    tls_counter = 99;
-    tls_zero = 42;
-    ok = ok && tls_counter == 99 && tls_zero == 42;
-    ok = ok && arch_prctl(HAKU64_ARCH_GET_GS,
-                          (unsigned long long)&gs) == 0 && gs != 0;
-    /* CLONE_SETTLS put the thread's control block in FS, and the trampoline
-     * installed the same block as the GS base. */
-    ok = ok && arch_prctl(HAKU64_ARCH_GET_FS,
-                          (unsigned long long)&fs) == 0 && fs == gs;
-    thread_pid = getpid();
-    thread_tid = gettid();
-    thread_result = ok;
-    return 5;
+static void futex_kick(volatile int *word) {
+    (void)haku64_syscall3(HAKU64_SYS_FUTEX, (long long)(void *)word,
+                          HAKU64_FUTEX_WAKE, 1);
+}
+
+static int detached_body(void *arg) {
+    detached_arg = (int)(unsigned long long)arg;
+    detached_ran = 0x5A5A;
+    futex_kick(&detached_ran);
+    return 3;
 }
 
 static void test_threads(void) {
-    int status = 0;
     int before = failures;
-    int pid = getpid();
-    int self = gettid();
+    int gone = 0;
     int tid;
 
-    tls_counter = 21;
-    tls_zero = 5;
-    thread_result = 0;
-    thread_pid = 0;
-    thread_tid = 0;
-    thread_arg = 0;
-
-    tid = haku64_thread_create(thread_body, (void *)0x5A5A);
+    detached_arg = 0;
+    detached_ran = 0;
+    tid = haku64_thread_create(detached_body, (void *)0x5A5A);
     check(tid > 0, "haku64_thread_create");
-    if (tid > 0) {
-        check(tid != self, "the thread has its own tid");
-        check(waitpid(tid, &status, 0) == tid, "waitpid for the thread");
-        check(((status >> 8) & 0xFF) == 5, "thread exit status");
-        check(thread_result == 1, "thread TLS, FS and GS");
-        check(thread_pid == pid, "thread shares the process id");
-        check(thread_tid == tid, "thread tid matches clone");
-        check(thread_arg == 0x5A5A, "thread argument");
-        check(tls_counter == 21 && tls_zero == 5,
-              "parent TLS block is unchanged");
+    if (tid <= 0) return;
+    while (detached_ran == 0) futex_park(&detached_ran, 0);
+    check(detached_ran == 0x5A5A, "the detached thread ran");
+    check(detached_arg == 0x5A5A, "the detached thread got its argument");
+
+    for (int i = 0; i < 100; i++) {
+        haku64_timespec_t nap;
+
+        if (kill(tid, 0) == -1 && errno == HAKU64_ESRCH) {
+            gone = 1;
+            break;
+        }
+        nap.tv_sec = 0;
+        nap.tv_nsec = 1000000;
+        (void)nanosleep(&nap, NULL);
     }
+    check(gone, "the detached task slot was reclaimed");
 
     if (failures == before)
-        printf("HAKU64-USER-THREAD-OK: clone SETTLS and per-thread TLS\n");
+        printf("HAKU64-USER-THREAD-OK: detached clone and per-thread TLS\n");
 }
 
 /* A joinable thread is the same clone() plus the two child tid flags: the
@@ -388,6 +381,220 @@ static void test_thread_join(void) {
 
     if (failures == before)
         printf("HAKU64-USER-THREAD-JOIN-OK: clear-tid futex and join\n");
+}
+
+/* The pthread layer: create/join, a mutex, a condition variable, a detached
+ * worker, a robust mutex whose owner dies, and per-thread errno. Nothing here
+ * polls: every wait is a futex park with a value handshake, which is the same
+ * mechanism the library itself uses. */
+static pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t counter_cond = PTHREAD_COND_INITIALIZER;
+static int counter_value;
+static int counter_done;
+
+static void *counter_worker(void *arg) {
+    int rounds = (int)(unsigned long long)arg;
+
+    for (int i = 0; i < rounds; i++) {
+        if (pthread_mutex_lock(&counter_mutex) != 0) return (void *)1;
+        counter_value++;
+        if (pthread_mutex_unlock(&counter_mutex) != 0) return (void *)1;
+    }
+    if (pthread_mutex_lock(&counter_mutex) != 0) return (void *)1;
+    counter_done++;
+    if (pthread_mutex_unlock(&counter_mutex) != 0) return (void *)1;
+    pthread_cond_signal(&counter_cond);
+    return (void *)2;
+}
+
+static void test_pthreads(void) {
+    pthread_t threads[3];
+    int before = failures;
+    int created = 0;
+    int wait_error = 0;
+    void *value;
+
+    counter_value = 0;
+    counter_done = 0;
+    for (int i = 0; i < 3; i++) {
+        if (pthread_create(&threads[i], counter_worker, (void *)50) != 0)
+            break;
+        created++;
+    }
+    check(created == 3, "pthread_create");
+    if (created != 3) return;
+
+    /* The predicate is changed under the mutex and the signal comes after the
+     * unlock, so a signal that lands before the park turns the wait into
+     * EAGAIN instead of getting lost. */
+    check(pthread_mutex_lock(&counter_mutex) == 0, "lock for the condition");
+    while (counter_done < 3) {
+        wait_error = pthread_cond_wait(&counter_cond, &counter_mutex);
+        if (wait_error) break;
+    }
+    check(wait_error == 0, "pthread_cond_wait");
+    check(pthread_mutex_unlock(&counter_mutex) == 0, "unlock after cond wait");
+
+    for (int i = 0; i < 3; i++) {
+        value = NULL;
+        check(pthread_join(threads[i], &value) == 0, "pthread_join");
+        check(value == (void *)2, "the thread's return value");
+    }
+    check(counter_value == 150, "the mutex serialized 150 increments");
+
+    {
+        pthread_mutex_t local = PTHREAD_MUTEX_INITIALIZER;
+
+        check(pthread_mutex_trylock(&local) == 0, "pthread_mutex_trylock");
+        check(pthread_mutex_trylock(&local) == HAKU64_EBUSY,
+              "trylock reports a held mutex");
+        check(pthread_mutex_unlock(&local) == 0, "unlock after trylock");
+        check(pthread_mutex_destroy(&local) == 0, "destroy a free mutex");
+    }
+    check(pthread_mutex_destroy(&counter_mutex) == 0, "destroy the counter mutex");
+
+    if (failures == before)
+        printf("HAKU64-USER-PTHREAD-OK: create, join, mutex and cond\n");
+}
+
+/* A detached pthread frees its own TEB and stack. The gate keeps it alive
+ * until pthread_detach() has returned, so the parent never touches a freed
+ * handle. */
+static volatile int detach_gate;
+static volatile int detach_seen;
+
+static void *detached_pthread_body(void *arg) {
+    while (detach_gate == 0) futex_park(&detach_gate, 0);
+    detach_seen = (int)(unsigned long long)arg;
+    futex_kick(&detach_seen);
+    return NULL;
+}
+
+static void test_pthread_detach(void) {
+    int before = failures;
+    int gone = 0;
+    pthread_t thread;
+    int tid;
+
+    detach_gate = 0;
+    detach_seen = 0;
+    check(pthread_create(&thread, detached_pthread_body, (void *)0x4242) == 0,
+          "create the detached pthread");
+    if (failures != before) return;
+    tid = thread->tid;
+    check(pthread_detach(thread) == 0, "pthread_detach");
+    detach_gate = 1;
+    futex_kick(&detach_gate);
+    while (detach_seen == 0) futex_park(&detach_seen, 0);
+    check(detach_seen == 0x4242, "the detached pthread ran");
+
+    for (int i = 0; i < 100; i++) {
+        haku64_timespec_t nap;
+
+        if (kill(tid, 0) == -1 && errno == HAKU64_ESRCH) {
+            gone = 1;
+            break;
+        }
+        nap.tv_sec = 0;
+        nap.tv_nsec = 1000000;
+        (void)nanosleep(&nap, NULL);
+    }
+    check(gone, "the detached pthread freed its task slot");
+
+    if (failures == before)
+        printf("HAKU64-USER-DETACH-OK: detached pthread frees itself\n");
+}
+
+/* Robust mutexes: the owner dies while holding the mutex. The kernel's exit
+ * walk marks the futex owner-died, so the next locker gets EOWNERDEAD; a
+ * pthread_mutex_consistent() makes the mutex usable again, and skipping it
+ * poisons the mutex for good. */
+static pthread_mutex_t owner_died_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t poisoned_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int robust_locked;
+
+static void *robust_body(void *arg) {
+    pthread_mutex_t *mutex = (pthread_mutex_t *)arg;
+
+    if (pthread_mutex_lock(mutex) != 0) {
+        robust_locked = -1;
+        futex_kick(&robust_locked);
+        return (void *)1;
+    }
+    robust_locked = 1;
+    futex_kick(&robust_locked);
+    pthread_exit(NULL);             /* dies still holding the mutex */
+    return NULL;
+}
+
+static void test_pthread_robust(void) {
+    int before = failures;
+    pthread_t thread;
+    void *value;
+
+    robust_locked = 0;
+    check(pthread_create(&thread, robust_body, &owner_died_mutex) == 0,
+          "create the robust owner");
+    while (robust_locked == 0) futex_park(&robust_locked, 0);
+    check(robust_locked == 1, "the robust owner took the mutex");
+    check(pthread_join(thread, &value) == 0, "join the robust owner");
+    check(pthread_mutex_lock(&owner_died_mutex) == HAKU64_EOWNERDEAD,
+          "lock reports EOWNERDEAD");
+    check(pthread_mutex_consistent(&owner_died_mutex) == 0,
+          "pthread_mutex_consistent");
+    check(pthread_mutex_unlock(&owner_died_mutex) == 0,
+          "unlock a repaired robust mutex");
+
+    robust_locked = 0;
+    check(pthread_create(&thread, robust_body, &poisoned_mutex) == 0,
+          "create the second robust owner");
+    while (robust_locked == 0) futex_park(&robust_locked, 0);
+    check(robust_locked == 1, "the second robust owner took the mutex");
+    check(pthread_join(thread, &value) == 0, "join the second robust owner");
+    check(pthread_mutex_lock(&poisoned_mutex) == HAKU64_EOWNERDEAD,
+          "the second lock reports EOWNERDEAD");
+    check(pthread_mutex_unlock(&poisoned_mutex) == 0,
+          "unlock without consistent poisons the mutex");
+    check(pthread_mutex_lock(&poisoned_mutex) == HAKU64_ENOTRECOVERABLE,
+          "a poisoned mutex is not recoverable");
+
+    if (failures == before)
+        printf("HAKU64-USER-ROBUST-OK: EOWNERDEAD consistent poison\n");
+}
+
+/* errno is one word in the TEB, so a thread's failure code never overwrites
+ * its creator's. The gate makes both writes overlap deterministically. */
+static volatile int errno_gate;
+static volatile int errno_thread_seen;
+
+static void *errno_body(void *arg) {
+    (void)arg;
+    errno = 4242;
+    while (errno_gate == 0) futex_park(&errno_gate, 0);
+    errno_thread_seen = (errno == 4242);
+    futex_kick(&errno_thread_seen);
+    return NULL;
+}
+
+static void test_thread_errno(void) {
+    int before = failures;
+    pthread_t thread;
+
+    errno_gate = 0;
+    errno_thread_seen = 0;
+    check(pthread_create(&thread, errno_body, NULL) == 0,
+          "create the errno thread");
+    if (failures != before) return;
+    errno = 7777;
+    errno_gate = 1;
+    futex_kick(&errno_gate);
+    while (errno_thread_seen == 0) futex_park(&errno_thread_seen, 0);
+    check(errno_thread_seen == 1, "the thread kept its own errno");
+    check(pthread_join(thread, NULL) == 0, "join the errno thread");
+    check(errno == 7777, "the creator's errno was untouched");
+
+    if (failures == before)
+        printf("HAKU64-USER-ERRNO-THREAD-OK: per-thread errno\n");
 }
 
 /* execve from a thread: the rest of the group ends and the caller keeps the
@@ -657,6 +864,10 @@ int main(int argc, char **argv, char **envp) {
     test_tls();
     test_threads();
     test_thread_join();
+    test_pthreads();
+    test_pthread_detach();
+    test_pthread_robust();
+    test_thread_errno();
     test_thread_exec();
     test_processes();
     test_mappings_and_time();

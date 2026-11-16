@@ -2740,21 +2740,114 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
         break;
 
     case K64_SYS_GETPGRP:
-        result = (u64)(sched64_current() + 1);
+        result = sched64_pgrp(sched64_current());
         break;
 
-    case K64_SYS_GETPGID:
-    case K64_SYS_GETSID:
-        result = (frame->rdi == 0 ||
-                  (s64)frame->rdi == sys64_getpid())
-                     ? (u64)sys64_getpid()
-                     : (u64)0 - SYS64_EINVAL;
-        break;
+    case K64_SYS_GETPGID: {
+        s64 want = (s64)frame->rdi;
+        int target;
 
-    case K64_SYS_SETPGID:
+        if (want == 0) {
+            target = sched64_current();
+        } else if (want > 0 && want <= (s64)K64_TASK_MAX) {
+            target = (int)want - 1;
+            if (task64_state(target) == (int)K64_TASK_UNUSED) {
+                result = (u64)0 - SYS64_ESRCH;
+                break;
+            }
+        } else {
+            result = (u64)0 - SYS64_ESRCH;
+            break;
+        }
+        result = sched64_pgrp(target);
+        break;
+    }
+
+    case K64_SYS_GETSID: {
+        s64 want = (s64)frame->rdi;
+        int target;
+
+        if (want == 0) {
+            target = sched64_current();
+        } else if (want > 0 && want <= (s64)K64_TASK_MAX) {
+            target = (int)want - 1;
+            if (task64_state(target) == (int)K64_TASK_UNUSED) {
+                result = (u64)0 - SYS64_ESRCH;
+                break;
+            }
+        } else {
+            result = (u64)0 - SYS64_ESRCH;
+            break;
+        }
+        result = sched64_sid(target);
+        break;
+    }
+
+    case K64_SYS_SETPGID: {
+        s64 want = (s64)frame->rdi;
+        s64 group = (s64)frame->rsi;
+        int target;
+        int status;
+
+        /* Only the caller's own process (pid 0, or its pid/tid) may be
+         * moved: there is no privilege model here, so anything else is
+         * refused rather than silently allowed. */
+        if (want == 0) {
+            target = sched64_current();
+        } else if (want > 0 && want <= (s64)K64_TASK_MAX) {
+            target = (int)want - 1;
+        } else {
+            result = (u64)0 - SYS64_EINVAL;
+            break;
+        }
+        if (sched64_tgid(target) != sched64_tgid(sched64_current())) {
+            result = (u64)0 - SYS64_EPERM;
+            break;
+        }
+        if (group < 0 || group > (s64)K64_TASK_MAX) {
+            result = (u64)0 - SYS64_EINVAL;
+            break;
+        }
+        if (group == 0) group = (s64)sched64_tgid(target) + 1;
+        status = sched64_set_pgrp(target, (u32)group);
+        result = status < 0 ? (u64)status : 0;
+        break;
+    }
+
     case K64_SYS_SETSID:
+        result = (u64)sched64_setsid(sched64_current());
+        break;
+
+    case K64_SYS_SET_ROBUST_LIST:
+        result = (u64)sched64_set_robust_list(sched64_current(), frame->rdi,
+                                             frame->rsi);
+        break;
+
+    case K64_SYS_GET_ROBUST_LIST: {
+        u64 head;
+        u64 length = K64_ROBUST_LIST_SIZE;
+        int target;
+
+        /* Linux lets a debugger read another task's list; without ptrace the
+         * only task whose list is visible is the caller's own. */
+        if (frame->rdi != 0 && (s64)frame->rdi != (s64)sys64_gettid()) {
+            result = (u64)0 - SYS64_EPERM;
+            break;
+        }
+        target = sched64_current();
+        if (sched64_get_robust_list(target, &head, &length) < 0) {
+            result = (u64)0 - SYS64_ESRCH;
+            break;
+        }
+        if (!copy_to_user64(current_space(), frame->rsi, &head, sizeof(head)) ||
+            !copy_to_user64(current_space(), frame->rdx, &length,
+                            sizeof(length))) {
+            result = (u64)0 - SYS64_EFAULT;
+            break;
+        }
         result = 0;
         break;
+    }
 
     case K64_SYS_UNAME:
         result = sys64_uname(frame->rdi);
@@ -2904,14 +2997,63 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
         break;
 
     case K64_SYS_KILL: {
-        int target = (int)frame->rdi - 1;
+        s64 want = (s64)frame->rdi;
+        u32 signal = (u32)frame->rsi;
+        int me = sched64_current();
+
+        if (signal > K64_NSIG) {
+            result = (u64)0 - SYS64_EINVAL;
+            break;
+        }
 
         /* kill() aimed at the caller's own thread group (its pid or any
          * sibling tid) ends the process and must never resume this frame. */
-        if ((s64)frame->rdi > 0 && frame->rsi != 0 && frame->rsi <= K64_NSIG &&
-            task64_state(target) != (int)K64_TASK_UNUSED &&
-            sched64_tgid(target) == sched64_tgid(sched64_current()))
-            return sched64_signal_group(frame, (u32)frame->rsi);
+        if (want > 0 && want <= (s64)K64_TASK_MAX && signal != 0 &&
+            task64_state((int)want - 1) != (int)K64_TASK_UNUSED &&
+            sched64_tgid((int)want - 1) == sched64_tgid(me))
+            return sched64_signal_group(frame, signal);
+
+        if (want == 0) {
+            /* pid 0: the caller's process group, which contains the caller.
+             * Peers are marked finished here and the caller's own thread
+             * group then goes down the fatal path. */
+            u32 group = sched64_pgrp(me);
+            int peers = sched64_signal_pgrp(group, signal);
+
+            if (signal != 0) return sched64_signal_group(frame, signal);
+            result = peers < 0 ? (u64)peers : 0;
+            break;
+        }
+
+        if (want == -1) {
+            /* -1: every task except the caller. A signal to the whole system
+             * is allowed here for the same reason kill(-pgid) is: there is no
+             * privilege boundary between user processes yet. */
+            int count = 0;
+
+            for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+                if (i == me) continue;
+                if (task64_signal(i, signal) == 0) count++;
+            }
+            result = count || !signal ? 0 : (u64)0 - SYS64_ESRCH;
+            break;
+        }
+
+        if (want < -1) {
+            /* -pgid: every task in that process group. */
+            u32 group = (u32)(-want);
+            int peers = sched64_signal_pgrp(group, signal);
+
+            if (peers < 0) {
+                result = (u64)peers;
+                break;
+            }
+            if (signal != 0 && group == sched64_pgrp(me))
+                return sched64_signal_group(frame, signal);
+            result = 0;
+            break;
+        }
+
         result = sys64_kill(frame->rdi, frame->rsi);
         break;
     }

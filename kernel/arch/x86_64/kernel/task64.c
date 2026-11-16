@@ -43,6 +43,10 @@ typedef struct {
     u64 brk;         /* program break; 0 until the first brk() call */
     u64 futex_addr;  /* user address a K64_TASK_WAIT task is parked on */
     u64 clear_tid;   /* CLONE_CHILD_CLEARTID word, zeroed at exit */
+    u32 pgrp;        /* process group id (user ids: index + 1) */
+    u32 sid;         /* session id */
+    u64 robust_head; /* user struct robust_list_head, walked at exit */
+    u32 detached;    /* a thread with no joiner: its slot is reaped at exit */
     u64 fs_base;     /* user FS base, arch_prctl(ARCH_SET_FS) */
     u64 gs_base;     /* user GS base, arch_prctl(ARCH_SET_GS) */
     char cwd[K64_FS_PATH_MAX + 1]; /* working directory, canonical and absolute */
@@ -92,7 +96,12 @@ static u32 space_refs[K64_TASK_MAX];
  * aliased into the child (the frames are the same memory), while every other
  * range is copied. It is also what tells task exit to leave a file cache
  * page alone when the mapping only borrowed it. */
-#define K64_TASK_MAPS 8u
+/* 64 is the same bound the 32-bit port uses, and for the same reason: a
+ * thread costs one record per mapping it owns (its TLS block, its TEB and its
+ * stack), so a handful of threads would exhaust a smaller table long before
+ * the task slots run out. The scan over it is a linear walk over a fixed
+ * table of at most 64 entries, on the munmap path only. */
+#define K64_TASK_MAPS 64u
 
 typedef struct {
     u64 base;
@@ -201,6 +210,10 @@ void sched64_init(void) {
     tasks[0].fault_address = 0;
     tasks[0].mmap_next = 0;
     tasks[0].futex_addr = 0;
+    tasks[0].clear_tid = 0;
+    tasks[0].pgrp = 0;
+    tasks[0].sid = 0;
+    tasks[0].robust_head = 0;
     tasks[0].fs_base = 0;
     tasks[0].gs_base = 0;
     tasks[0].brk = 0;
@@ -263,6 +276,10 @@ int task64_create_kernel_on(u32 cpu_affinity, void (*entry)(void)) {
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = 0;
     tasks[id].futex_addr = 0;
+    tasks[id].clear_tid = 0;
+    tasks[id].pgrp = (u32)id + 1u;
+    tasks[id].sid = (u32)id + 1u;
+    tasks[id].robust_head = 0;
     tasks[id].fs_base = 0;
     tasks[id].gs_base = 0;
     tasks[id].brk = 0;
@@ -334,6 +351,12 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = K64_USER_MMAP_BASE;
     tasks[id].futex_addr = 0;
+    tasks[id].clear_tid = 0;
+    /* The first process is its own group and session leader, like Linux's
+     * init: a shell started from it inherits that group. */
+    tasks[id].pgrp = (u32)id + 1u;
+    tasks[id].sid = (u32)id + 1u;
+    tasks[id].robust_head = 0;
     tasks[id].fs_base = 0;
     tasks[id].gs_base = 0;
     tasks[id].brk = 0;
@@ -376,6 +399,24 @@ static int pick_or_idle(u32 cpu_index) {
     if (next >= 0) return next;
     if (cpus64[cpu_index].idle == (u32)-1) return -1;
     return (int)cpus64[cpu_index].idle;
+}
+
+/* Release a detached thread that this CPU switched away from earlier. The
+ * call runs on whichever task is current now, never on the one being freed,
+ * so the kernel stack can go back to the heap. The slot is only freed by the
+ * CPU that ran the thread (tasks are pinned and task64_reap() skips detached
+ * threads), which is why no extra lock is needed around the pending word. */
+static void finalize_task(int id);
+static void reap_pending_detached(u32 cpu_index) {
+    int id = (int)cpus64[cpu_index].reap_pending;
+
+    if (id < 0) return;
+    /* Clear the record before anything else: the id belongs to a task that
+     * never runs again, so a stale value must not be able to name a slot
+     * some later task has been given. */
+    cpus64[cpu_index].reap_pending = (u32)-1;
+    if (id == (int)cpus64[cpu_index].current) return;
+    finalize_task(id);            /* frees descriptors, space and the stack */
 }
 
 static regs64_t *switch_to(int next, int save_current) {
@@ -428,6 +469,12 @@ regs64_t *sched64_tick(regs64_t *frame) {
     me = (int)cpu->current;
     if (me < 0) return frame;          /* CPU is not scheduling yet */
 
+    /* A detached thread that exited during the last quantum is finalized
+     * here, on the CPU that ran it and on some other task's stack. Without
+     * this the slot would linger until some task blocked or yielded, and
+     * kill(tid, 0) would keep answering for a thread that is long gone. */
+    reap_pending_detached(cpu->index);
+
     flags = spin64_lock(&sched_lock);
     cpu->ticks++;
     if (tasks[me].state == K64_TASK_RUNNING) tasks[me].frame = frame;
@@ -457,6 +504,7 @@ regs64_t *sched64_yield(regs64_t *frame) {
     me = (int)cpu->current;
     if (me < 0) return frame;
 
+    reap_pending_detached(cpu->index);
     flags = spin64_lock(&sched_lock);
     if (tasks[me].state == K64_TASK_RUNNING) tasks[me].frame = frame;
     next = pick_ready(cpu->index);
@@ -476,9 +524,14 @@ regs64_t *sched64_yield(regs64_t *frame) {
  * because the callers release it after publishing their state change. */
 static regs64_t *switch_away(const char *halt_message) {
     k64_percpu_t *cpu = this_cpu();
-    int next;
+    int next, me;
     regs64_t *result;
     u64 flags;
+
+    me = (int)cpu->current;
+    /* An earlier detached thread can be released now: this CPU is on `me`'s
+     * stack, not the one being freed. */
+    reap_pending_detached(cpu->index);
 
     flags = spin64_lock(&sched_lock);
     next = pick_or_idle(cpu->index);
@@ -488,6 +541,11 @@ static regs64_t *switch_away(const char *halt_message) {
         cli64();
         for (;;) cpu_halt64();
     }
+    /* This thread is never resumed and nobody will wait for it, so its slot
+     * is finalized by this CPU once control is on the incoming stack. */
+    if (me >= 0 && tasks[me].detached &&
+        tasks[me].state == K64_TASK_DONE)
+        cpu->reap_pending = (u32)me;
     result = switch_to(next, 0);
     spin64_unlock(&sched_lock, flags);
     return result;
@@ -507,19 +565,26 @@ typedef struct {
     int id;         /* slot whose word to clear; only used for validation */
     u64 space;      /* address space that holds the word */
     u64 address;    /* user address of the word, 0 when there is none */
+    u64 robust;     /* user robust_list_head, 0 when none was registered */
 } tid_word64_t;
 
 /* Mark `id` finished with `signal` (0 for an exit) and `status`. Called with
- * sched_lock held. Returns the word to clear after the lock is dropped. */
-static u64 finish_locked(int id, u32 signal, u64 status) {
-    u64 address = tasks[id].clear_tid;
+ * sched_lock held. Returns the user words the task still owns, which are
+ * published after the lock is dropped. */
+static tid_word64_t finish_locked(int id, u32 signal, u64 status) {
+    tid_word64_t word;
 
+    word.id = id;
+    word.space = tasks[as_owner(id)].space;
+    word.address = tasks[id].clear_tid;
+    word.robust = tasks[id].robust_head;
     tasks[id].clear_tid = 0;
+    tasks[id].robust_head = 0;
     tasks[id].futex_addr = 0;
     tasks[id].term_signal = signal;
     if (!signal) tasks[id].exit_status = status;
     tasks[id].state = K64_TASK_DONE;
-    return address;
+    return word;
 }
 
 /* Write one byte of a user word through the page tables: never dereferences
@@ -535,6 +600,59 @@ static int store_user_byte(u64 space, u64 address, u8 value) {
         return 0;
     if (!user || !writable) return 0;
     *(volatile u8 *)phys_to_virt64(phys) = value;
+    return 1;
+}
+
+/* Copy `size` bytes out of a user address without dereferencing it. Each
+ * page is validated once and copied in one run, so a four-word record costs
+ * one page walk rather than four. Returns 1 when the whole range was
+ * readable. */
+static int copy_user_out(u64 space, u64 address, void *destination, u32 size) {
+    u8 *out = (u8 *)destination;
+
+    while (size) {
+        u64 phys;
+        int writable, user;
+        u32 chunk;
+
+        if (!space || address < K64_USER_BASE || address >= K64_USER_END)
+            return 0;
+        if (!paging64_query_space(space, address, &phys, &writable, &user))
+            return 0;
+        if (!user) return 0;
+        chunk = (u32)(K64_PAGE_SIZE - (address & (K64_PAGE_SIZE - 1ull)));
+        if (chunk > size) chunk = size;
+        memcpy(out, (const void *)phys_to_virt64(phys), chunk);
+        out += chunk;
+        address += chunk;
+        size -= chunk;
+    }
+    return 1;
+}
+
+/* Write `size` bytes to a user address, one page walk per page. */
+static int copy_user_in(u64 space, u64 address, const void *source,
+                        u32 size) {
+    const u8 *in = (const u8 *)source;
+
+    while (size) {
+        u64 phys;
+        int writable, user;
+        u32 chunk;
+
+        if (!space || address < K64_USER_BASE || address >= K64_USER_END)
+            return 0;
+        if (!paging64_write_prepare(space, address)) return 0;
+        if (!paging64_query_space(space, address, &phys, &writable, &user))
+            return 0;
+        if (!user || !writable) return 0;
+        chunk = (u32)(K64_PAGE_SIZE - (address & (K64_PAGE_SIZE - 1ull)));
+        if (chunk > size) chunk = size;
+        memcpy((void *)phys_to_virt64(phys), in, chunk);
+        in += chunk;
+        address += chunk;
+        size -= chunk;
+    }
     return 1;
 }
 
@@ -555,6 +673,51 @@ static void clear_tid_word(const tid_word64_t *word) {
     (void)sched64_futex_wake(word->id, word->address, 1);
 }
 
+/* Walk the exiting task's robust futex list and hand every mutex it still
+ * owns to the next locker: the kernel writes FUTEX_OWNER_DIED into the futex
+ * word (keeping the WAITERS bit the unlock path sets) and wakes one waiter,
+ * which is how a robust mutex reports EOWNERDEAD instead of deadlocking on a
+ * holder that no longer exists.
+ *
+ * The list is a user structure, so it is read page by page through the page
+ * tables and bounded by K64_ROBUST_LIST_MAX: a cycle, a wild pointer or a
+ * chain longer than the cap stops the walk instead of turning one exit into
+ * unbounded kernel work. Linux anchors the circular list at the head's own
+ * first field, so the walk ends when the next pointer names the head again.
+ */
+static void robust_release(const tid_word64_t *word) {
+    u64 anchor = word->robust;
+    u64 entry;
+    s64 offset;
+    u64 header[2];
+    u32 tid = (u32)word->id + 1u;    /* the id a mutex records as owner */
+    u32 budget = K64_ROBUST_LIST_MAX;
+
+    if (!anchor) return;
+    if (!copy_user_out(word->space, anchor, header, sizeof(header))) return;
+    entry = header[0];
+    offset = (s64)header[1];
+
+    while (entry && entry != anchor && budget--) {
+        u64 next;
+        u64 futex;
+        u32 value;
+        u32 mark;
+
+        if (!copy_user_out(word->space, entry, &next, sizeof(next))) break;
+        /* The futex offset is a signed byte offset from the node, which is
+         * what lets one list carry mutexes from several structures. */
+        futex = entry + (u64)offset;
+        if (!(futex & 3u) && copy_user_out(word->space, futex, &value, 4) &&
+            (value & K64_FUTEX_TID_MASK) == tid) {
+            mark = (value & K64_FUTEX_WAITERS) | K64_FUTEX_OWNER_DIED;
+            if (copy_user_in(word->space, futex, &mark, 4))
+                (void)sched64_futex_wake(word->id, futex, 1);
+        }
+        entry = next;
+    }
+}
+
 /* Called from the system call handler for SYS_EXIT. The exit frame is not
  * saved because the task never resumes; a process that wants to continue
  * after a syscall just returns through the normal path. */
@@ -568,13 +731,12 @@ regs64_t *sched64_exit(regs64_t *frame) {
     me = (int)cpu->current;
 
     flags = spin64_lock(&sched_lock);
-    word.id = me;
-    word.space = tasks[as_owner(me)].space;
     /* exit() passes the status in RDI; the frame is not saved because the
      * task never resumes, but the value is what a parent would read back. */
-    word.address = finish_locked(me, 0, frame->rdi);
+    word = finish_locked(me, 0, frame->rdi);
     spin64_unlock(&sched_lock, flags);
 
+    robust_release(&word);
     clear_tid_word(&word);
     return switch_away("HAKU64-TASK-HALT: no runnable task after exit\r\n");
 }
@@ -608,23 +770,23 @@ static regs64_t *end_group(regs64_t *frame, u32 signal, u64 status,
         if (tasks[i].tgid != tgid) continue;
         /* An existing zombie keeps the status its own exit reported. */
         if (tasks[i].state == K64_TASK_DONE) continue;
-        words[count].id = i;
-        words[count].space = tasks[as_owner(i)].space;
-        words[count].address = finish_locked(i, signal, status);
+        words[count] = finish_locked(i, signal, status);
         count++;
         if (tasks[i].cpu != cpu->index && tasks[i].cpu < K64_SMP_MAX_CPUS)
             cpus_mask |= 1u << tasks[i].cpu;
     }
-    own.id = me;
-    own.space = tasks[as_owner(me)].space;
-    own.address = finish_locked(me, signal, frame->rdi);
+    own = finish_locked(me, signal, frame->rdi);
     spin64_unlock(&sched_lock, flags);
 
     /* The peers' words are cleared first: each belongs to a thread that is
      * already DONE, so a joiner may reap it while the caller finishes. The
      * caller still holds a reference to the shared space until its own reap,
      * so those writes cannot race with the space being released. */
-    for (int i = 0; i < count; i++) clear_tid_word(&words[i]);
+    for (int i = 0; i < count; i++) {
+        robust_release(&words[i]);
+        clear_tid_word(&words[i]);
+    }
+    robust_release(&own);
     clear_tid_word(&own);
 
     /* A peer on another CPU only notices the state change when its own
@@ -682,11 +844,10 @@ void task64_kill(int id) {
 
     if (!valid_id(id) || id == cur_task()) return;
     flags = spin64_lock(&sched_lock);
-    word.id = id;
-    word.space = tasks[as_owner(id)].space;
-    word.address = finish_locked(id, 0, 0);
+    word = finish_locked(id, 0, 0);
     owner = tasks[id].cpu;
     spin64_unlock(&sched_lock, flags);
+    robust_release(&word);
     clear_tid_word(&word);
     /* If another CPU is running it, the state change alone will not make it
      * switch: nudge it. */
@@ -707,6 +868,165 @@ u64 sched64_space(int id) {
 
 int sched64_tgid(int id) {
     return valid_id(id) ? (int)tasks[id].tgid : -1;
+}
+
+/* ------------------------------------------------- process groups and sessions
+ *
+ * The x64 port keeps one process per thread group, and every thread of that
+ * group shares one process group and one session. A group id is the id of the
+ * process that leads it, which is how Linux numbers them and what a shell
+ * prints; the same for a session. Moving a group therefore moves every thread
+ * of the group, not just the caller: a sibling that read getpgrp() must not
+ * see a different answer than the thread that called setpgid().
+ */
+
+u32 sched64_pgrp(int id) {
+    return valid_id(id) ? tasks[id].pgrp : 0;
+}
+
+u32 sched64_sid(int id) {
+    return valid_id(id) ? tasks[id].sid : 0;
+}
+
+/* A group exists while some live task belongs to it. */
+int sched64_pgrp_exists(u32 pgid) {
+    int found = 0;
+    u64 flags;
+
+    if (!pgid) return 0;
+    flags = spin64_lock(&sched_lock);
+    for (int i = 1; i < (int)K64_TASK_MAX; i++)
+        if (tasks[i].state != K64_TASK_UNUSED && tasks[i].pgrp == pgid) {
+            found = 1;
+            break;
+        }
+    spin64_unlock(&sched_lock, flags);
+    return found;
+}
+
+/* setpgid(2): move the thread group `id` belongs to into `pgid`. A group must
+ * exist and must belong to the caller's session, and a session leader cannot
+ * change group (it would leave its own session without a leader). Called with
+ * no lock: it takes the table lock itself because it rewrites several tasks.
+ */
+int sched64_set_pgrp(int id, u32 pgid) {
+    int tgid;
+    u32 sid;
+    int found = 0;
+    u64 flags;
+
+    if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return -3;
+    tgid = (int)tasks[id].tgid;
+    sid = tasks[id].sid;
+    if (!valid_id(tgid)) return -3;
+
+    flags = spin64_lock(&sched_lock);
+    /* A session leader owns the group it leads; moving it would leave the
+     * session without one, so Linux refuses with EPERM. */
+    if (tasks[tgid].pgrp == tasks[tgid].sid) {
+        spin64_unlock(&sched_lock, flags);
+        return -1;
+    }
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (tasks[i].state == K64_TASK_UNUSED || tasks[i].pgrp != pgid)
+            continue;
+        if (tasks[i].sid != sid) {
+            spin64_unlock(&sched_lock, flags);
+            return -1;                   /* EPERM: another session */
+        }
+        found = 1;
+    }
+    if (!found) {
+        spin64_unlock(&sched_lock, flags);
+        return -3;                       /* ESRCH */
+    }
+    for (int i = 1; i < (int)K64_TASK_MAX; i++)
+        if (tasks[i].state != K64_TASK_UNUSED && (int)tasks[i].tgid == tgid)
+            tasks[i].pgrp = pgid;
+    spin64_unlock(&sched_lock, flags);
+    return 0;
+}
+
+/* setsid(2): the caller's process becomes a group and session leader. Fails
+ * with EPERM when it already leads its group, exactly like Linux, because the
+ * id a new session would take is the one it already has. */
+int sched64_setsid(int id) {
+    int tgid;
+    u32 me;
+    u64 flags;
+
+    if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return -3;
+    tgid = (int)tasks[id].tgid;
+    if (!valid_id(tgid)) return -3;
+    me = (u32)tgid + 1u;
+
+    flags = spin64_lock(&sched_lock);
+    if (tasks[tgid].pgrp == me) {
+        spin64_unlock(&sched_lock, flags);
+        return -1;                       /* EPERM: already a group leader */
+    }
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (tasks[i].state == K64_TASK_UNUSED) continue;
+        if ((int)tasks[i].tgid != tgid) continue;
+        tasks[i].pgrp = me;
+        tasks[i].sid = me;
+    }
+    spin64_unlock(&sched_lock, flags);
+    return (int)me;
+}
+
+/* kill(-pgid): deliver `signal` to every task whose process group is `pgid`.
+ * The caller is included in the scan; the dispatcher handles "this is me"
+ * separately, so a task here is only ever a peer. Returns the number of
+ * tasks signalled, or -ESRCH when the group has no task at all, which is what
+ * makes `kill(-1, 0)` a probe rather than an error. */
+int sched64_signal_pgrp(u32 pgid, u32 signal) {
+    int ids[K64_TASK_MAX];
+    int count = 0;
+    u64 flags;
+
+    if (!pgid) return -3;
+    if (signal > K64_NSIG) return -22;
+
+    flags = spin64_lock(&sched_lock);
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (tasks[i].state == K64_TASK_UNUSED || tasks[i].pgrp != pgid)
+            continue;
+        /* A zombie has already stopped: signal 0 still counts it as a group
+         * member, a real signal has nowhere to go. */
+        if (signal && tasks[i].state == K64_TASK_DONE) continue;
+        ids[count++] = i;
+    }
+    spin64_unlock(&sched_lock, flags);
+
+    /* task64_signal() takes the same lock, so delivery happens once the scan
+     * is complete; it reschedules the target's CPU itself. */
+    for (int i = 0; i < count; i++)
+        if (signal) (void)task64_signal(ids[i], signal);
+    return count ? count : -3;
+}
+
+/* set_robust_list(head, length): remember where this thread's robust futex
+ * list starts. The list itself is user memory and is only touched when the
+ * thread exits, so nothing is copied here beyond the address. */
+int sched64_set_robust_list(int id, u64 head, u64 length) {
+    u64 flags;
+
+    if (!valid_id(id)) return -3;
+    if (length != K64_ROBUST_LIST_SIZE) return -22;
+    if (head && (head < K64_USER_BASE || head >= K64_USER_END || (head & 7u)))
+        return -14;
+    flags = spin64_lock(&sched_lock);
+    tasks[id].robust_head = head;
+    spin64_unlock(&sched_lock, flags);
+    return 0;
+}
+
+int sched64_get_robust_list(int id, u64 *head, u64 *length) {
+    if (!valid_id(id)) return -3;
+    if (head) *head = tasks[id].robust_head;
+    if (length) *length = K64_ROBUST_LIST_SIZE;
+    return 0;
 }
 
 u64 task64_exit_status(int id) {
@@ -1094,6 +1414,11 @@ regs64_t *sched64_fork(regs64_t *frame, u64 flags, u64 child_tid) {
      * the clone() asked for it; inheriting the parent's would clear a word in
      * a space the child only copied. */
     tasks[child].clear_tid = 0;
+    /* A new process starts in its parent's group and session; the robust
+     * list belongs to the old image and does not exist here. */
+    tasks[child].pgrp = tasks[parent].pgrp;
+    tasks[child].sid = tasks[parent].sid;
+    tasks[child].robust_head = 0;
     tasks[child].fs_base = tasks[parent].fs_base;
     tasks[child].gs_base = tasks[parent].gs_base;
     tasks[child].brk = 0;
@@ -1208,6 +1533,16 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
     tasks[child].fault_address = 0;
     tasks[child].futex_addr = 0;
     tasks[child].clear_tid = 0;
+    /* Threads share their group's group and session ids. The robust list is
+     * per thread: the new thread starts with none. */
+    tasks[child].pgrp = tasks[parent].pgrp;
+    tasks[child].sid = tasks[parent].sid;
+    tasks[child].robust_head = 0;
+    /* A thread is released by this CPU at its next switch only when it is
+     * detached and therefore unjoinable; a plain cloned thread stays a
+     * waitable child, exactly like the i386 port. */
+    tasks[child].detached = (flags & K64_CLONE_DETACH) &&
+                            (flags & K64_CLONE_THREAD);
     if (flags & K64_CLONE_SETTLS)
         tasks[child].fs_base = tls;
     else
@@ -1373,9 +1708,7 @@ static int exec_take_space(int id) {
         if (i == id || tasks[i].state == K64_TASK_UNUSED) continue;
         if (tasks[i].tgid != tgid) continue;
         if (tasks[i].state == K64_TASK_DONE) continue;
-        words[count].id = i;
-        words[count].space = tasks[as_owner(i)].space;
-        words[count].address = finish_locked(i, 0, 0);
+        words[count] = finish_locked(i, 0, 0);
         count++;
         if (tasks[i].cpu != cpu_index && tasks[i].cpu < K64_SMP_MAX_CPUS)
             cpus_mask |= 1u << tasks[i].cpu;
@@ -1409,7 +1742,10 @@ static int exec_take_space(int id) {
     tasks[id].tgid = (u32)id;
     spin64_unlock(&sched_lock, flags);
 
-    for (int i = 0; i < count; i++) clear_tid_word(&words[i]);
+    for (int i = 0; i < count; i++) {
+        robust_release(&words[i]);
+        clear_tid_word(&words[i]);
+    }
     for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
         if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
     return 1;
@@ -1442,6 +1778,9 @@ int task64_exec(int id, u64 space) {
      * the same address. */
     tasks[id].clear_tid = 0;
     tasks[id].futex_addr = 0;
+    /* The robust list belongs to the old image; the new one registers its
+     * own. The process group and session survive exec, as in Linux. */
+    tasks[id].robust_head = 0;
     /* The old image's thread pointer dies with it. Clearing the fields and
      * the live MSRs means the new program sees FS/GS base 0 until it calls
      * arch_prctl, exactly like a freshly exec'd Linux process. */
@@ -1463,6 +1802,9 @@ int task64_reap(int parent, int pid, u64 *status) {
     for (int i = 1; i < (int)K64_TASK_MAX; i++) {
         if (tasks[i].state == K64_TASK_UNUSED) continue;
         if (tasks[i].parent != parent) continue;
+        /* A detached thread frees its own slot on the CPU that ran it; it is
+         * not waitable, exactly like a detached pthread. */
+        if (tasks[i].detached) continue;
         /* `pid` is the user-visible id (index + 1), not the slot index. */
         if (pid >= 0 && (int)tasks[i].id + 1 != pid) continue;
         if (tasks[i].state == K64_TASK_DONE) {
@@ -1487,6 +1829,7 @@ int task64_reap(int parent, int pid, u64 *status) {
  * because the dispatcher has to know it must not resume the frame; kill()
  * of the caller goes through exit() instead. */
 int task64_signal(int id, u32 signal) {
+    tid_word64_t word;
     u32 owner;
     u64 flags;
 
@@ -1500,10 +1843,11 @@ int task64_signal(int id, u32 signal) {
         spin64_unlock(&sched_lock, flags);
         return 0;
     }
-    tasks[id].term_signal = signal;
-    tasks[id].state = K64_TASK_DONE;
     owner = tasks[id].cpu;
+    word = finish_locked(id, signal, 0);
     spin64_unlock(&sched_lock, flags);
+    robust_release(&word);
+    clear_tid_word(&word);
     smp64_resched_cpu(owner);
     return 0;
 }
@@ -1532,9 +1876,7 @@ int task64_signal_group(int id, u32 signal) {
         found = 1;
         if (signal == 0 || i == me) continue;
         if (tasks[i].state == K64_TASK_DONE) continue;
-        words[count].id = i;
-        words[count].space = tasks[as_owner(i)].space;
-        words[count].address = finish_locked(i, signal, 0);
+        words[count] = finish_locked(i, signal, 0);
         count++;
         if (cpu && tasks[i].cpu != cpu->index &&
             tasks[i].cpu < K64_SMP_MAX_CPUS)
@@ -1542,7 +1884,10 @@ int task64_signal_group(int id, u32 signal) {
     }
     spin64_unlock(&sched_lock, flags);
 
-    for (int i = 0; i < count; i++) clear_tid_word(&words[i]);
+    for (int i = 0; i < count; i++) {
+        robust_release(&words[i]);
+        clear_tid_word(&words[i]);
+    }
     for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
         if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
     return found ? 0 : -3;

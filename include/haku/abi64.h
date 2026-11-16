@@ -77,6 +77,7 @@ typedef long long time_t;
 #define HAKU64_SYS_EXECVE        59
 #define HAKU64_SYS_EXIT          60
 #define HAKU64_SYS_WAIT4         61
+#define HAKU64_SYS_KILL          62
 #define HAKU64_SYS_UNAME         63
 #define HAKU64_SYS_FCNTL         72
 #define HAKU64_SYS_FSYNC         74
@@ -90,7 +91,12 @@ typedef long long time_t;
 #define HAKU64_SYS_MKDIR         83
 #define HAKU64_SYS_RMDIR         84
 #define HAKU64_SYS_UNLINK        87
+#define HAKU64_SYS_SETPGID       109
 #define HAKU64_SYS_GETPPID       110
+#define HAKU64_SYS_GETPGRP       111
+#define HAKU64_SYS_SETSID        112
+#define HAKU64_SYS_GETPGID       121
+#define HAKU64_SYS_GETSID        124
 #define HAKU64_SYS_ARCH_PRCTL    158
 #define HAKU64_SYS_GETTID        186
 #define HAKU64_SYS_FUTEX         202
@@ -103,20 +109,50 @@ typedef long long time_t;
 #define HAKU64_SYS_NEWFSTATAT    262
 #define HAKU64_SYS_UNLINKAT      263
 #define HAKU64_SYS_RENAMEAT      264
+#define HAKU64_SYS_SET_ROBUST_LIST 273
+#define HAKU64_SYS_GET_ROBUST_LIST 274
 #define HAKU64_SYS_DUP3          292
 #define HAKU64_SYS_GETRANDOM     318
 #define HAKU64_SYS_STATX         332
+
+/* Offsets inside the thread control block (the TEB) this library builds. The
+ * +0x30 self pointer and +0x58 TlsSlots pointer are the Windows definitions
+ * the compiler's TLS sequence reads; +0x20 is ours and holds errno, and
+ * +0x50 holds this thread's pthread handle. */
+#define HAKU64_TEB_ERRNO_OFFSET 32
+#define HAKU64_TEB_SELF_OFFSET  48
+#define HAKU64_TEB_THREAD_OFFSET 80
+#define HAKU64_TEB_SLOTS_OFFSET 88
 
 /* clone(2) flags and futex(2) operations the thread API uses. Only the bits
  * below are meaningful here: the kernel refuses the rest rather than
  * pretending to honour them. CHILD_SETTID publishes the new tid in the
  * child's space and CHILD_CLEARTID zeroes that word (and wakes a futex
- * waiter) when the child ends; together they are what a join sleeps on. */
+ * waiter) when the child ends; together they are what a join sleeps on.
+ * DETACH says nobody will wait for the task, so the kernel releases its slot
+ * at the next switch instead of leaving a zombie behind. */
+#define HAKU64_CLONE_VM             0x00000100
+#define HAKU64_CLONE_FS             0x00000200
+#define HAKU64_CLONE_FILES          0x00000400
+#define HAKU64_CLONE_SIGHAND        0x00000800
+#define HAKU64_CLONE_THREAD         0x00010000
+#define HAKU64_CLONE_SYSVSEM        0x00040000
+#define HAKU64_CLONE_SETTLS         0x00080000
 #define HAKU64_CLONE_CHILD_CLEARTID 0x00200000
 #define HAKU64_CLONE_CHILD_SETTID   0x01000000
+#define HAKU64_CLONE_DETACH         0x40000000
 #define HAKU64_FUTEX_WAIT           0
 #define HAKU64_FUTEX_WAKE           1
 #define HAKU64_FUTEX_PRIVATE_FLAG   128
+/* A pthread mutex keeps the owner tid in the low 30 bits of its futex word.
+ * OWNER_DIED is what the kernel's robust-list walk writes when the holder
+ * disappears, and WAITERS marks a word with a sleeper on it so an unlock
+ * knows to wake one. */
+#define HAKU64_FUTEX_TID_MASK       0x3FFFFFFF
+#define HAKU64_FUTEX_OWNER_DIED     0x40000000
+#define HAKU64_FUTEX_WAITERS        0x80000000
+/* sizeof(struct robust_list_head), the size set_robust_list(273) is given. */
+#define HAKU64_ROBUST_LIST_SIZE     24
 
 /* arch_prctl(2) subcommands and the auxv keys crt64.asm and the TLS setup
  * read. The numbers are the Linux x86-64 ones. */
@@ -148,6 +184,7 @@ typedef long long time_t;
  * Only the values this library and its tests compare against. */
 #define HAKU64_EPERM   1
 #define HAKU64_ENOENT  2
+#define HAKU64_ESRCH   3
 #define HAKU64_EIO     5
 #define HAKU64_ENOEXEC 8
 #define HAKU64_EBADF   9
@@ -166,9 +203,12 @@ typedef long long time_t;
 #define HAKU64_ENOSPC  28
 #define HAKU64_ESPIPE  29
 #define HAKU64_ERANGE  34
+#define HAKU64_EDEADLK 35
 #define HAKU64_ENAMETOOLONG 36
 #define HAKU64_ENOSYS  38
 #define HAKU64_ENOTEMPTY 39
+#define HAKU64_EOWNERDEAD 130
+#define HAKU64_ENOTRECOVERABLE 131
 
 /* --------------------------------------------------------- path and flags */
 #define HAKU64_AT_FDCWD -100
@@ -306,7 +346,13 @@ long long haku64_syscall5(long long number, long long a, long long b,
 long long haku64_syscall6(long long number, long long a, long long b,
                           long long c, long long d, long long e, long long f);
 
-extern int errno;
+/* errno is one word per thread. It lives in the thread's control block (the
+ * TEB whose GS base this library installs), so two threads never overwrite
+ * each other's failure code. haku64_errno_slot is a compiler-intrinsic GS
+ * load plus an offset; the macro keeps ordinary `errno = ...` code reading
+ * naturally. */
+int *haku64_errno_slot(void);
+#define errno (*haku64_errno_slot())
 /* Return `result`, or -1 with errno set when it is a -errno value. */
 long long haku64_errno_check(long long result);
 long long haku64_syscall_check6(long long number, long long a, long long b,
@@ -362,6 +408,31 @@ int access(const char *path, int mode);
 int getpid(void);
 int gettid(void);
 int getppid(void);
+/* Process groups and sessions. Ids are pids, as in Linux. `setpgid(0, 0)`
+ * starts a new group led by the caller; `setsid()` starts a new session. */
+int getpgrp(void);
+int getpgid(int pid);
+int setpgid(int pid, int pgid);
+int getsid(int pid);
+int setsid(void);
+/* kill(2) with the Linux pid selectors: > 0 one process, 0 the caller's
+ * process group, -1 every other process, < -1 the group whose id is -pid.
+ * Signal 0 only checks that the target exists. */
+int kill(int pid, int signal);
+
+/* The robust futex list a thread registers so its mutexes are handed on when
+ * it exits. The layout matches Linux's struct robust_list_head: the first
+ * node, the signed byte offset from a node to its futex word, and the node of
+ * an operation in progress (unused here). A thread registers one list; the
+ * kernel walks it at exit and marks every mutex the thread still owned as
+ * owner-died. */
+typedef struct haku64_robust_list {
+    struct haku64_robust_list *next;
+    long long futex_offset;
+    struct haku64_robust_list *pending;
+} haku64_robust_list_t;
+int set_robust_list(haku64_robust_list_t *head, size_t length);
+int get_robust_list(int pid, haku64_robust_list_t **head, size_t *length);
 /* Set or read the user FS/GS base. `address` is a pointer for GET_* and the
  * new base for SET_*; returns 0 or -1 with errno. */
 int arch_prctl(int code, unsigned long long address);
@@ -374,10 +445,12 @@ int haku64_tls_init(const unsigned long long *auxv);
  * that knows the thread is gone should call haku64_tls_free. */
 void *haku64_tls_new(void);
 void haku64_tls_free(void *teb);
-/* Run fn(arg) on a new thread in this process: same address space, files and
- * cwd, its own stack and its own copy of every __declspec(thread) variable.
- * Returns the new tid, or -1 with errno. There is no join; waitpid(tid) reaps
- * it, and the stack/TLS block are released with the address space at exit. */
+/* Run fn(arg) on a detached thread: same address space, files and cwd, its
+ * own stack and its own copy of every __declspec(thread) variable. Returns
+ * the new tid, or -1 with errno. Nobody joins it; when the function returns
+ * the thread frees its TLS block and stack and the kernel reclaims its task
+ * slot, so a long-running program can start detached workers without
+ * accumulating mappings. */
 int haku64_thread_create(int (*fn)(void *), void *arg);
 /* A joinable thread. The handle lives in the thread's own stack mapping, so
  * joining costs no allocation and the handle points into memory that

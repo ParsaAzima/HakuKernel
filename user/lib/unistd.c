@@ -4,6 +4,8 @@
 #include <haku/syscall.h>
 #include <haku/unistd.h>
 
+#include "tls_internal.h"
+
 ssize_t read(int fd, void *buffer, size_t count) {
     return haku_errno_check(
         haku_syscall3(HAKU_SYS_READ, fd, (int)buffer, (int)count));
@@ -121,6 +123,7 @@ int fork(void) {
         errno = -result;
         return -1;
     }
+    if (result == 0) haku_after_fork();
     return result;
 }
 

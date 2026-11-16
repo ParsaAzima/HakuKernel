@@ -47,6 +47,8 @@ typedef struct {
     uint32_t is_thread;     /* created by clone(CLONE_THREAD) */
     uint32_t cpu;           /* the CPU this task is pinned to */
     uint32_t clear_child_tid; /* CLONE_CHILD_CLEARTID word, 0 when unused */
+    uint32_t robust_head;     /* user struct robust_list_head, walked at exit */
+    uint32_t detached;        /* HAKU_CLONE_DETACH: reap the slot at exit */
     task_state_t state;
     loaded_elf_t program;
     uint32_t kernel_stack;
@@ -818,6 +820,67 @@ static void wake_vfork_parent(uint32_t child_pid) {
 /* Thread groups                                                      */
 /* ------------------------------------------------------------------ */
 
+/* Read one 32-bit word from user memory through the current page directory.
+ * Every read of a user structure in this file goes through here, so a wild
+ * pointer from a program stops the walk instead of faulting in the kernel.
+ * The running CR3 at exit is the exiting task's, so a direct read is valid
+ * once the range has been checked. */
+static int read_user_word(uint32_t address, uint32_t *value) {
+    if (!paging_user_range_valid(address, sizeof(*value), 0)) return 0;
+    *value = *(const volatile uint32_t *)address;
+    return 1;
+}
+
+/* Walk the exiting task's robust futex list and hand every mutex it still
+ * owns to the next locker: the kernel writes FUTEX_OWNER_DIED into the futex
+ * word (keeping the WAITERS bit the unlock path sets) and wakes one waiter,
+ * which is how a robust mutex reports EOWNERDEAD instead of deadlocking on a
+ * holder that no longer exists.
+ *
+ * The list is a user structure, bounded by ROBUST_LIST_MAX: a cycle, a wild
+ * pointer or a chain longer than the cap stops the walk instead of turning
+ * one exit into unbounded kernel work. The head's own next field anchors the
+ * circular list, so the walk ends when the next pointer names the head
+ * again. */
+#define ROBUST_LIST_MAX 64u
+
+static void robust_release(task_t *task) {
+    uint32_t anchor = task->robust_head;
+    address_space_t *space = &task->program.address_space;
+    uint32_t header[2];
+    uint32_t entry;
+    int32_t offset;
+    uint32_t budget = ROBUST_LIST_MAX;
+
+    if (!anchor) return;
+    task->robust_head = 0;
+    if (!space->directory_phys) return;
+    if (!read_user_word(anchor, &header[0]) ||
+        !read_user_word(anchor + 4u, &header[1]))
+        return;
+    entry = header[0];
+    offset = (int32_t)header[1];
+
+    while (entry && entry != anchor && budget--) {
+        uint32_t next;
+        uint32_t futex;
+        uint32_t value;
+        uint32_t mark;
+
+        if (!read_user_word(entry, &next)) break;
+        /* The futex offset is a signed byte offset from the node, which is
+         * what lets one list carry mutexes from several structures. */
+        futex = entry + (uint32_t)offset;
+        if (!(futex & 3u) && read_user_word(futex, &value) &&
+            (value & HAKU_FUTEX_TID_MASK) == task->pid) {
+            mark = (value & HAKU_FUTEX_WAITERS) | HAKU_FUTEX_OWNER_DIED;
+            if (paging_copy_to_user_space(space, futex, &mark, 4u))
+                (void)scheduler_futex_wake(futex, 1u, 0u, 0u);
+        }
+        entry = next;
+    }
+}
+
 /* CLONE_CHILD_CLEARTID: zero the word a joiner waits on and wake it, the
  * way a thread's exit does under Linux (pthread_join sleeps there). */
 static void clear_child_tid_word(task_t *task) {
@@ -900,6 +963,7 @@ static void detach_from_group(task_t *exiting) {
  * (vfs_close_all takes the VFS lock). */
 static void end_task_thread(task_t *task, uint32_t wait_status) {
     futex_remove_waiter(task);
+    robust_release(task);
     clear_child_tid_word(task);
     vfs_close_all(task->pid);
     task->program.address_space.directory_phys = 0;
@@ -1029,7 +1093,10 @@ static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status) {
     futex_remove_waiter(exiting);
     /* Zero the join word while the address space is still mapped, then
      * hand the space state to a surviving thread (or keep it when this is
-     * the last user). */
+     * the last user). A robust mutex the task still owns is marked
+     * owner-died first, so whoever waits on it wakes up and gets the
+     * mutex instead of sleeping on a holder that no longer exists. */
+    robust_release(exiting);
     clear_child_tid_word(exiting);
     detach_from_group(exiting);
     /* Closing descriptors takes the task-context VFS lock, so it must run
@@ -1051,7 +1118,9 @@ static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status) {
         child->parent_pid = exiting->pid == 1u ? 0u : 1u;
     }
 
-    if (exiting->parent_pid == 0) {
+    if (exiting->detached || exiting->parent_pid == 0) {
+        /* A detached thread has no joiner, so nothing would ever collect
+         * its exit status: the timer-driven reap releases the slot. */
         exiting->state = TASK_REAP_PENDING;
     } else {
         for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
@@ -1462,6 +1531,11 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     /* execve resets the signal dispositions to the default, but the
      * blocked mask and the pending signals survive. */
     memset(task->sigactions, 0, sizeof(task->sigactions));
+    /* A new image inherits no thread pointer and no robust list: the
+     * library re-installs its control block and registers again. */
+    task->fs_base = 0;
+    task->robust_head = 0;
+    gdt_set_user_fs_base(0);
 
     frame->gs = USER_DS;
     frame->fs = USER_FS;
@@ -1966,7 +2040,8 @@ int32_t scheduler_clone(regs_t *frame, uint32_t flags, uint32_t stack,
                            HAKU_CLONE_THREAD | HAKU_CLONE_SETTLS |
                            HAKU_CLONE_PARENT_SETTID |
                            HAKU_CLONE_CHILD_SETTID |
-                           HAKU_CLONE_CHILD_CLEARTID | HAKU_SIGCHLD;
+                           HAKU_CLONE_CHILD_CLEARTID | HAKU_CLONE_DETACH |
+                           HAKU_SIGCHLD;
     irqflags_t irq;
     task_t *parent;
     task_t *child;
@@ -1987,6 +2062,11 @@ int32_t scheduler_clone(regs_t *frame, uint32_t flags, uint32_t stack,
      * vfork(2)'s job because it parks the parent. */
     if (!share_vm && (flags & (HAKU_CLONE_THREAD | HAKU_CLONE_SIGHAND)))
         return -(int32_t)HAKU_EINVAL;
+    /* A detached thread has no joiner, which only makes sense for a
+     * thread: a whole process that nobody waits for would just leak its
+     * slot, so the bit is refused without CLONE_THREAD. */
+    if ((flags & HAKU_CLONE_DETACH) && !(flags & HAKU_CLONE_THREAD))
+        return -(int32_t)HAKU_EINVAL;
 
     parent = &tasks[current_task];
     child = reserve_task_slot(parent);
@@ -2004,6 +2084,7 @@ int32_t scheduler_clone(regs_t *frame, uint32_t flags, uint32_t stack,
         if (owner) owner->space_users++;
         child->tgid = parent->tgid ? parent->tgid : parent->pid;
         child->is_thread = (flags & HAKU_CLONE_THREAD) ? 1u : 0u;
+        child->detached = (flags & HAKU_CLONE_DETACH) ? 1u : 0u;
         child->fs_base = (flags & HAKU_CLONE_SETTLS) ? tls : parent->fs_base;
     } else {
         /* clone(SIGCHLD): a private address space sharing the parent's
@@ -2994,6 +3075,39 @@ uint32_t scheduler_get_thread_area(void) {
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
         return 0u - HAKU_EINVAL;
     return tasks[current_task].fs_base;
+}
+
+/* set_robust_list(2): the robust futex list a thread wants walked when it
+ * exits. Only the head address is kept; the list itself is a user structure
+ * and is validated lazily, one node at a time, by robust_release(). The
+ * length has to be sizeof(struct robust_list_head), which is how the walk
+ * knows the head layout it is reading. */
+uint32_t scheduler_set_robust_list(uint32_t head, uint32_t length) {
+    task_t *task;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    if (length != HAKU_ROBUST_LIST_SIZE) return 0u - HAKU_EINVAL;
+    if (head && (head < PAGING_USER_MIN || head >= PAGING_USER_LIMIT ||
+                 (head & 3u) != 0u))
+        return 0u - HAKU_EFAULT;
+    task = &tasks[current_task];
+    task->robust_head = head;
+    return 0;
+}
+
+/* get_robust_list(2) for the calling task. A debugger could read another
+ * task's list; without ptrace the only list that is visible is the caller's
+ * own, and the syscall layer enforces that. */
+uint32_t scheduler_get_robust_list(uint32_t *head, uint32_t *length) {
+    task_t *task;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    task = &tasks[current_task];
+    if (head) *head = task->robust_head;
+    if (length) *length = HAKU_ROBUST_LIST_SIZE;
+    return 0;
 }
 
 /* Limited mmap(2): anonymous private pages from the per-process mmap

@@ -156,6 +156,7 @@
 #define HAKU_SYS_FCHMODAT  306u
 #define HAKU_SYS_FACCESSAT 307u
 #define HAKU_SYS_SET_ROBUST_LIST 311u
+#define HAKU_SYS_GET_ROBUST_LIST 312u
 #define HAKU_SYS_UTIMENSAT 320u
 #define HAKU_SYS_DUP3      330u
 #define HAKU_SYS_PIPE2     331u
@@ -181,6 +182,10 @@
 #define HAKU_CLONE_PARENT_SETTID 0x100000u
 #define HAKU_CLONE_CHILD_CLEARTID 0x200000u
 #define HAKU_CLONE_CHILD_SETTID  0x1000000u
+/* Haku's own bit, not a Linux one: the new thread has no joiner, so the
+ * kernel releases its task slot as soon as it exits instead of keeping a
+ * zombie for wait4(2). A detached thread cannot be waited on. */
+#define HAKU_CLONE_DETACH        0x40000000u
 /* wait4(2) options. WUNTRACED and WCONTINUED are accepted and ignored:
  * Haku has no job-control stop/continue states, but a shell that enables
  * job control passes WUNTRACED to every waitpid. */
@@ -274,6 +279,7 @@
 #define HAKU_EROFS         30u
 #define HAKU_EPIPE         32u
 #define HAKU_ERANGE        34u
+#define HAKU_EDEADLK       35u
 #define HAKU_ENAMETOOLONG  36u
 #define HAKU_ENOLCK        37u
 #define HAKU_ENOSYS        38u
@@ -283,6 +289,8 @@
 #define HAKU_EOPNOTSUPP    95u
 #define HAKU_ENOTSUP       HAKU_EOPNOTSUPP
 #define HAKU_ETIMEDOUT     110u
+#define HAKU_EOWNERDEAD    130u
+#define HAKU_ENOTRECOVERABLE 131u
 
 /* futex(2) operations (Linux). The command is the operation without the
  * private and clock flags. */
@@ -305,6 +313,26 @@
 #define HAKU_FUTEX_CLOCK_REALTIME 256u
 #define HAKU_FUTEX_CMD_MASK \
     (~(uint32_t)(HAKU_FUTEX_PRIVATE_FLAG | HAKU_FUTEX_CLOCK_REALTIME))
+/* A pthread mutex keeps the owner tid in the low 30 bits of its futex word.
+ * OWNER_DIED is what the kernel's robust-list walk writes when the holder
+ * disappears, and WAITERS marks a word with a sleeper on it so an unlock
+ * knows to wake one. */
+#define HAKU_FUTEX_TID_MASK     0x3FFFFFFFu
+#define HAKU_FUTEX_OWNER_DIED   0x40000000u
+#define HAKU_FUTEX_WAITERS      0x80000000u
+/* sizeof(struct robust_list_head): next, futex_offset, pending. */
+#define HAKU_ROBUST_LIST_SIZE   12u
+
+/* The i386 thread control block the library installs with
+ * set_thread_area(243), reached as fs:[offset]. The three words are the
+ * thread pointer (what %gs also names), errno, and the pthread handle. The
+ * robust futex list head is not part of the block: a thread frees its own
+ * block before it exits, and the kernel walks the robust list during the
+ * exit syscall, so the head has to outlive the block. */
+#define HAKU_TCB_SELF     0u
+#define HAKU_TCB_ERRNO    4u
+#define HAKU_TCB_PTHREAD  8u
+#define HAKU_TCB_SIZE     12u
 
 /* open(2)/openat(2) flags accepted by the current VFS implementation. The
  * remaining Linux flags are accepted where Haku can honour them: O_CLOEXEC

@@ -258,6 +258,9 @@ typedef signed long long s64;
 #define K64_SYS_SETSID        112u
 #define K64_SYS_GETPGID       121u
 #define K64_SYS_GETSID        124u
+#define K64_SYS_SETPGID       109u
+#define K64_SYS_SET_ROBUST_LIST 273u
+#define K64_SYS_GET_ROBUST_LIST 274u
 #define K64_SYS_PRCTL         157u
 #define K64_SYS_SETRLIMIT     160u
 #define K64_SYS_SYNC          162u
@@ -338,7 +341,9 @@ typedef signed long long s64;
  * the caller's space before clone() returns, CHILD_SETTID writes it into the
  * child's space before the child runs, and CHILD_CLEARTID zeroes that word
  * and wakes one futex waiter when the child ends, which is what makes a
- * join possible. */
+ * join possible. DETACH is the pthread layer's "nobody will wait for this
+ * thread": the slot is released by the CPU that ran it instead of staying
+ * waitable. */
 #define K64_CLONE_VM              0x00000100u
 #define K64_CLONE_FS              0x00000200u
 #define K64_CLONE_FILES           0x00000400u
@@ -349,10 +354,12 @@ typedef signed long long s64;
 #define K64_CLONE_CHILD_CLEARTID  0x00200000u
 #define K64_CLONE_SETTLS          0x00080000u
 #define K64_CLONE_CHILD_SETTID    0x01000000u
+#define K64_CLONE_DETACH          0x40000000u
 #define K64_CLONE_SUPPORTED \
     (K64_CLONE_VM | K64_CLONE_FS | K64_CLONE_FILES | K64_CLONE_SIGHAND | \
      K64_CLONE_THREAD | K64_CLONE_SYSVSEM | K64_CLONE_PARENT_SETTID | \
-     K64_CLONE_CHILD_SETTID | K64_CLONE_CHILD_CLEARTID | K64_CLONE_SETTLS)
+     K64_CLONE_CHILD_SETTID | K64_CLONE_CHILD_CLEARTID | K64_CLONE_SETTLS | \
+     K64_CLONE_DETACH)
 
 /* futex(): op is the low seven bits. FUTEX_PRIVATE_FLAG is accepted and
  * treated like the plain op, because a waiter is matched on the address it
@@ -361,6 +368,24 @@ typedef signed long long s64;
 #define K64_FUTEX_WAKE          1u
 #define K64_FUTEX_PRIVATE_FLAG  128u
 #define K64_FUTEX_OP_MASK       127u
+
+/* The bits a pthread mutex keeps in its futex word. `owner` is the tid of the
+ * holder, so an unlock only releases the mutex if the caller is the owner and
+ * a robust unlock can tell "the owner died" from "the owner released it".
+ * The kernel sets OWNER_DIED when it walks a dead thread's robust list. */
+#define K64_FUTEX_TID_MASK     0x3FFFFFFFu
+#define K64_FUTEX_OWNER_DIED   0x40000000u
+#define K64_FUTEX_WAITERS      0x80000000u
+
+/* struct robust_list_head, the three-word record set_robust_list(273)
+ * registers: the first list node, the offset from a node to its futex word,
+ * and the node of an operation in progress. Only the first two are read at
+ * exit; a thread that dies mid-lock is handled by the mutex's own owner
+ * checks. */
+#define K64_ROBUST_LIST_SIZE 24u
+/* A user list is walked at exit, so it needs a hard bound: a cycle or a
+ * hostile chain must not turn one exit into unbounded work. */
+#define K64_ROBUST_LIST_MAX  512u
 
 /* PROT_* and MAP_* as Linux spells them. mmap takes either an anonymous
  * range (fd must be -1) or an open descriptor from fs64.c. MAP_SHARED
@@ -455,7 +480,12 @@ typedef struct k64_percpu {
     u64 flushes;      /* TLB flushes this CPU performed for another */
     u32 cursor;       /* last task slot this CPU dispatched (round robin) */
     u32 pad1;
-    u8 pad2[32];
+    /* A detached thread that just ended: its slot is finalized at the next
+     * switch on this CPU, once the CPU has left the thread's kernel stack.
+     * (u32)-1 means nothing is pending. Tasks are pinned, so the pending
+     * slot is always one this CPU created and can reap. */
+    u32 reap_pending;
+    u8 pad2[28];
 } k64_percpu_t;
 
 /* A test-and-set lock that also owns interrupts. `flags` is the caller's
@@ -903,6 +933,26 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
                         u64 tls, u64 child_tid);
 /* Process id of the thread group `id` belongs to, as a task index. */
 int sched64_tgid(int id);
+/* Process groups and sessions. A group id and a session id are user-visible
+ * ids (a task index plus one), the way Linux numbers them. Every thread of a
+ * thread group shares one group and one session, so the setters move the whole
+ * group. setpgid/setsid take the user argument, validate it here, and return 0
+ * or a negative errno; kill_pgrp delivers a signal to every task in a group
+ * and answers how many were signalled (0 targets means ESRCH). */
+u32 sched64_pgrp(int id);
+u32 sched64_sid(int id);
+int sched64_set_pgrp(int id, u32 pgid);
+int sched64_pgrp_exists(u32 pgid);
+int sched64_setsid(int id);
+int sched64_signal_pgrp(u32 pgid, u32 signal);
+/* Robust futex list (set_robust_list 273 / get_robust_list 274). `head` is
+ * the user address of a struct robust_list_head; the scheduler walks it when
+ * the registering task exits and marks every futex it finds still owned by
+ * that task as owner-died, which is how a robust pthread mutex tells a
+ * crashed holder from an ordinary release. Registering replaces the previous
+ * list; the head is not copied, since the owner may relink its nodes. */
+int sched64_set_robust_list(int id, u64 head, u64 length);
+int sched64_get_robust_list(int id, u64 *head, u64 *length);
 /* futex wake: make up to `count` tasks parked on `address` runnable again and
  * answer how many were woken. A WAIT is sched64_park_until() with the value
  * recheck as its `ready` hook, which is what closes the lost-wakeup window. */

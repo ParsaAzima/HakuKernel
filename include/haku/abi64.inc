@@ -42,6 +42,7 @@
 %define HAKU64_SYS_EXECVE        59
 %define HAKU64_SYS_EXIT          60
 %define HAKU64_SYS_WAIT4         61
+%define HAKU64_SYS_KILL          62
 %define HAKU64_SYS_UNAME         63
 %define HAKU64_SYS_FCNTL         72
 %define HAKU64_SYS_FSYNC         74
@@ -55,7 +56,12 @@
 %define HAKU64_SYS_MKDIR         83
 %define HAKU64_SYS_RMDIR         84
 %define HAKU64_SYS_UNLINK        87
+%define HAKU64_SYS_SETPGID       109
 %define HAKU64_SYS_GETPPID       110
+%define HAKU64_SYS_GETPGRP       111
+%define HAKU64_SYS_SETSID        112
+%define HAKU64_SYS_GETPGID       121
+%define HAKU64_SYS_GETSID        124
 %define HAKU64_SYS_ARCH_PRCTL    158
 %define HAKU64_SYS_GETTID        186
 %define HAKU64_SYS_GETDENTS64    217
@@ -67,6 +73,8 @@
 %define HAKU64_SYS_NEWFSTATAT    262
 %define HAKU64_SYS_UNLINKAT      263
 %define HAKU64_SYS_RENAMEAT      264
+%define HAKU64_SYS_SET_ROBUST_LIST 273
+%define HAKU64_SYS_GET_ROBUST_LIST 274
 %define HAKU64_SYS_DUP3          292
 %define HAKU64_SYS_GETRANDOM     318
 %define HAKU64_SYS_STATX         332
@@ -99,6 +107,7 @@
 ; errno values the C library and the 64-bit tests compare against.
 %define HAKU64_EPERM   1
 %define HAKU64_ENOENT  2
+%define HAKU64_ESRCH   3
 %define HAKU64_EIO     5
 %define HAKU64_ENOEXEC 8
 %define HAKU64_EBADF   9
@@ -117,9 +126,12 @@
 %define HAKU64_ENOSPC  28
 %define HAKU64_ESPIPE  29
 %define HAKU64_ERANGE  34
+%define HAKU64_EDEADLK 35
 %define HAKU64_ENAMETOOLONG 36
 %define HAKU64_ENOSYS  38
 %define HAKU64_ENOTEMPTY 39
+%define HAKU64_EOWNERDEAD 130
+%define HAKU64_ENOTRECOVERABLE 131
 
 ; *at flags and access modes.
 %define HAKU64_AT_FDCWD          -100
@@ -205,7 +217,16 @@
 %define HAKU64_CLONE_PARENT_SETTID 0x00100000
 %define HAKU64_CLONE_CHILD_CLEARTID 0x00200000
 %define HAKU64_CLONE_CHILD_SETTID  0x01000000
+%define HAKU64_CLONE_DETACH        0x40000000
 
 %define HAKU64_FUTEX_WAIT         0
 %define HAKU64_FUTEX_WAKE         1
 %define HAKU64_FUTEX_PRIVATE_FLAG 128
+%define HAKU64_TEB_ERRNO_OFFSET   32
+%define HAKU64_TEB_SELF_OFFSET    48
+%define HAKU64_TEB_THREAD_OFFSET  80
+%define HAKU64_TEB_SLOTS_OFFSET   88
+%define HAKU64_FUTEX_TID_MASK     0x3FFFFFFF
+%define HAKU64_FUTEX_OWNER_DIED   0x40000000
+%define HAKU64_FUTEX_WAITERS      0x80000000
+%define HAKU64_ROBUST_LIST_SIZE   24

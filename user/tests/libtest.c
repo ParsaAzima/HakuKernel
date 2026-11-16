@@ -1002,6 +1002,229 @@ static int thread_body(void *argument) {
     return 7;
 }
 
+/* The pthread subset: create/join, a mutex, a condition variable, a detached
+ * thread, a robust mutex whose owner dies, and per-thread errno. Every wait is
+ * a futex park on a word the other side changes first, so nothing here polls.
+ * The scheduler has four task slots, so two workers are the limit here. */
+static pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t counter_cond = PTHREAD_COND_INITIALIZER;
+static int counter_value;
+static int counter_done;
+
+static void *counter_worker(void *argument) {
+    int rounds = (int)argument;
+    int i;
+
+    for (i = 0; i < rounds; i++) {
+        if (pthread_mutex_lock(&counter_mutex) != 0) return (void *)1;
+        counter_value++;
+        if (pthread_mutex_unlock(&counter_mutex) != 0) return (void *)1;
+    }
+    if (pthread_mutex_lock(&counter_mutex) != 0) return (void *)1;
+    counter_done++;
+    if (pthread_mutex_unlock(&counter_mutex) != 0) return (void *)1;
+    pthread_cond_signal(&counter_cond);
+    return (void *)2;
+}
+
+static void test_pthreads(void) {
+    pthread_t threads[2];
+    int created = 0;
+    int wait_error = 0;
+    void *value;
+    int i;
+
+    counter_value = 0;
+    counter_done = 0;
+    for (i = 0; i < 2; i++) {
+        if (pthread_create(&threads[i], counter_worker, (void *)40) != 0)
+            break;
+        created++;
+    }
+    expect(created == 2, "pthread_create");
+    if (created != 2) return;
+
+    expect(pthread_self() != 0, "pthread_self");
+    expect(pthread_equal(pthread_self(), pthread_self()) == 1,
+           "pthread_equal");
+
+    /* The predicate changes under the mutex and the signal comes after the
+     * unlock, so a signal that wins the race turns the park into EAGAIN
+     * instead of getting lost. */
+    expect(pthread_mutex_lock(&counter_mutex) == 0,
+           "lock for the condition");
+    while (counter_done < 2) {
+        wait_error = pthread_cond_wait(&counter_cond, &counter_mutex);
+        if (wait_error) break;
+    }
+    expect(wait_error == 0, "pthread_cond_wait");
+    expect(pthread_mutex_unlock(&counter_mutex) == 0,
+           "unlock after cond wait");
+
+    for (i = 0; i < 2; i++) {
+        value = 0;
+        expect(pthread_join(threads[i], &value) == 0, "pthread_join");
+        expect(value == (void *)2, "the thread's return value");
+    }
+    expect(counter_value == 80, "the mutex serialized 80 increments");
+
+    {
+        pthread_mutex_t local = PTHREAD_MUTEX_INITIALIZER;
+
+        expect(pthread_mutex_trylock(&local) == 0, "pthread_mutex_trylock");
+        expect(pthread_mutex_trylock(&local) == EBUSY,
+               "trylock reports a held mutex");
+        expect(pthread_mutex_unlock(&local) == 0, "unlock after trylock");
+        expect(pthread_mutex_destroy(&local) == 0, "destroy a free mutex");
+    }
+    expect(pthread_mutex_destroy(&counter_mutex) == 0,
+           "destroy the counter mutex");
+    printf("USER-PTHREAD-OK: create join mutex cond self\n");
+}
+
+/* A detached pthread frees its own control block and stack, and the kernel
+ * reaps its task slot at the next tick. The gate keeps it alive until
+ * pthread_detach() has returned, so the creator never reads a freed handle. */
+static volatile int detach_gate;
+static volatile int detach_seen;
+
+static void *detached_body(void *argument) {
+    while (detach_gate == 0) futex_wait(&detach_gate, 0, NULL);
+    detach_seen = (int)argument;
+    futex_wake(&detach_seen, 1);
+    return NULL;
+}
+
+static void test_pthread_detach(void) {
+    int before = failures;
+    pthread_t thread;
+    int tid;
+    int gone = 0;
+    int i;
+
+    detach_gate = 0;
+    detach_seen = 0;
+    expect(pthread_create(&thread, detached_body, (void *)0x4242) == 0,
+           "create the detached pthread");
+    if (failures != before) return;
+    tid = thread->tid;
+    expect(tid > 0, "the kernel published the thread id");
+    expect(pthread_detach(thread) == 0, "pthread_detach");
+    detach_gate = 1;
+    futex_wake(&detach_gate, 1);
+    while (detach_seen == 0) futex_wait(&detach_seen, 0, NULL);
+    expect(detach_seen == 0x4242, "the detached pthread ran");
+
+    /* The slot goes back once the timer has reaped it, so give it a few
+     * ticks. kill(tid, 0) only asks whether the task still exists. */
+    for (i = 0; i < 200; i++) {
+        haku_timespec_t nap;
+
+        if (kill(tid, 0) == -1 && errno == ESRCH) {
+            gone = 1;
+            break;
+        }
+        nap.tv_sec = 0;
+        nap.tv_nsec = 1000000u;
+        nanosleep(&nap, NULL);
+    }
+    expect(gone, "the detached thread released its task slot");
+    if (failures == before)
+        printf("USER-DETACH-OK: detached pthread frees itself\n");
+}
+
+/* Robust mutexes: the owner dies while holding the mutex. The kernel's exit
+ * walk marks the futex owner-died, so the next locker gets EOWNERDEAD; one
+ * pthread_mutex_consistent() makes the mutex usable again, and skipping it
+ * poisons the mutex for good. */
+static pthread_mutex_t owner_died_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t poisoned_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int robust_locked;
+
+static void *robust_body(void *argument) {
+    pthread_mutex_t *mutex = (pthread_mutex_t *)argument;
+
+    if (pthread_mutex_lock(mutex) != 0) {
+        robust_locked = -1;
+        futex_wake(&robust_locked, 1);
+        return (void *)1;
+    }
+    robust_locked = 1;
+    futex_wake(&robust_locked, 1);
+    pthread_exit(NULL);             /* dies still holding the mutex */
+    return NULL;
+}
+
+static void test_pthread_robust(void) {
+    int before = failures;
+    pthread_t thread;
+    void *value;
+
+    robust_locked = 0;
+    expect(pthread_create(&thread, robust_body, &owner_died_mutex) == 0,
+           "create the robust owner");
+    while (robust_locked == 0) futex_wait(&robust_locked, 0, NULL);
+    expect(robust_locked == 1, "the robust owner took the mutex");
+    expect(pthread_join(thread, &value) == 0, "join the robust owner");
+    expect(pthread_mutex_lock(&owner_died_mutex) == EOWNERDEAD,
+           "lock reports EOWNERDEAD");
+    expect(pthread_mutex_consistent(&owner_died_mutex) == 0,
+           "pthread_mutex_consistent");
+    expect(pthread_mutex_unlock(&owner_died_mutex) == 0,
+           "unlock a repaired robust mutex");
+
+    robust_locked = 0;
+    expect(pthread_create(&thread, robust_body, &poisoned_mutex) == 0,
+           "create the second robust owner");
+    while (robust_locked == 0) futex_wait(&robust_locked, 0, NULL);
+    expect(robust_locked == 1, "the second robust owner took the mutex");
+    expect(pthread_join(thread, &value) == 0, "join the second robust owner");
+    expect(pthread_mutex_lock(&poisoned_mutex) == EOWNERDEAD,
+           "the second lock reports EOWNERDEAD");
+    expect(pthread_mutex_unlock(&poisoned_mutex) == 0,
+           "unlock without consistent poisons the mutex");
+    expect(pthread_mutex_lock(&poisoned_mutex) == ENOTRECOVERABLE,
+           "a poisoned mutex is not recoverable");
+
+    if (failures == before)
+        printf("USER-ROBUST-OK: EOWNERDEAD consistent poison\n");
+}
+
+/* errno is one word in the thread block, so a thread's failure code never
+ * overwrites its creator's. The gate makes both writes overlap. */
+static volatile int errno_gate;
+static volatile int errno_thread_seen;
+
+static void *errno_body(void *argument) {
+    (void)argument;
+    errno = 4242;
+    while (errno_gate == 0) futex_wait(&errno_gate, 0, NULL);
+    errno_thread_seen = (errno == 4242);
+    futex_wake(&errno_thread_seen, 1);
+    return NULL;
+}
+
+static void test_thread_errno(void) {
+    int before = failures;
+    pthread_t thread;
+
+    errno_gate = 0;
+    errno_thread_seen = 0;
+    expect(pthread_create(&thread, errno_body, NULL) == 0,
+           "create the errno thread");
+    if (failures != before) return;
+    errno = 7777;
+    errno_gate = 1;
+    futex_wake(&errno_gate, 1);
+    while (errno_thread_seen == 0) futex_wait(&errno_thread_seen, 0, NULL);
+    expect(errno_thread_seen == 1, "the thread kept its own errno");
+    expect(pthread_join(thread, NULL) == 0, "join the errno thread");
+    expect(errno == 7777, "the creator's errno was untouched");
+
+    if (failures == before)
+        printf("USER-ERRNO-THREAD-OK: per-thread errno\n");
+}
+
 int main(void) {
     char buffer[64];
     char copy[32];
@@ -1368,8 +1591,12 @@ int main(void) {
         haku_thread_area_t area;
         unsigned int seen = 0;
         unsigned int selector;
+        unsigned int saved_tcb;
         int entry;
 
+        /* The library reads errno through %fs, so the block installed at
+         * startup has to come back when this test moves the base away. */
+        saved_tcb = get_thread_area();
         thread_block[0] = (unsigned int)&thread_block[0];
         area.entry_number = 0xFFFFFFFFu;
         area.base_addr = (unsigned int)&thread_block[0];
@@ -1421,11 +1648,19 @@ int main(void) {
         expect(seen == (unsigned int)&thread_block[0],
                "%gs survives a syscall");
 
-        /* Naming the entry the kernel handed out moves it again. */
+        /* Naming the entry the kernel handed out moves it again. The test
+         * owns the base while it points at thread_block; putting the
+         * library's block back is what keeps errno usable afterwards. */
         area.entry_number = 6u;
-        area.base_addr = 0;
+        area.base_addr = saved_tcb;
         expect(set_thread_area(&area) == 0, "set_thread_area reset");
         expect(area.entry_number == 6u, "the named entry is kept");
+        expect(get_thread_area() == saved_tcb,
+               "the thread pointer is back on the library block");
+        __asm {
+            mov ax, 0x23                 /* USER_DS: drop the test selector */
+            mov gs, ax
+        }
     }
 
     /* futex: a task parks on a word until another task wakes it. */
@@ -1575,6 +1810,11 @@ int main(void) {
             expect(munmap(stack, 0x4000u) == 0, "munmap the thread stack");
         }
     }
+
+    test_pthreads();
+    test_pthread_detach();
+    test_pthread_robust();
+    test_thread_errno();
 
     test_filesystem_abi();
     test_concurrent_filesystem();

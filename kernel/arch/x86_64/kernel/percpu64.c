@@ -55,6 +55,7 @@ static void percpu_install(u32 index, u32 apic_id) {
     cpu->apic_id = apic_id;
     cpu->current = (u32)-1;      /* nothing scheduled yet */
     cpu->idle = (u32)-1;         /* the idle task does not exist yet */
+    cpu->reap_pending = (u32)-1; /* no detached thread waiting to be freed */
     cpu->online = 1;
     cpu->active_space = read_cr3_64() & K64_PAGE_MASK;
 

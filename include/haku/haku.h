@@ -12,6 +12,7 @@
 #include <haku/termios.h>
 #include <haku/futex.h>
 #include <haku/mman.h>
+#include <haku/pthread.h>
 #include <haku/signal.h>
 #include <haku/stdio.h>
 #include <haku/stdlib.h>

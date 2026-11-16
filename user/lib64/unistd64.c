@@ -9,6 +9,8 @@
  */
 #include <haku/abi64.h>
 
+#include "tls64_internal.h"
+
 ssize_t read(int fd, void *buffer, size_t count) {
     return (ssize_t)haku64_errno_check(
         haku64_syscall3(HAKU64_SYS_READ, fd, (long long)buffer,
@@ -99,6 +101,44 @@ int getppid(void) {
     return (int)haku64_syscall0(HAKU64_SYS_GETPPID);
 }
 
+int getpgrp(void) {
+    return (int)haku64_syscall0(HAKU64_SYS_GETPGRP);
+}
+
+int getpgid(int pid) {
+    return (int)haku64_errno_check(haku64_syscall1(HAKU64_SYS_GETPGID, pid));
+}
+
+int setpgid(int pid, int pgid) {
+    return (int)haku64_errno_check(
+        haku64_syscall2(HAKU64_SYS_SETPGID, pid, pgid));
+}
+
+int getsid(int pid) {
+    return (int)haku64_errno_check(haku64_syscall1(HAKU64_SYS_GETSID, pid));
+}
+
+int setsid(void) {
+    return (int)haku64_errno_check(haku64_syscall0(HAKU64_SYS_SETSID));
+}
+
+int kill(int pid, int signal) {
+    return (int)haku64_errno_check(haku64_syscall2(HAKU64_SYS_KILL, pid,
+                                                  signal));
+}
+
+int set_robust_list(haku64_robust_list_t *head, size_t length) {
+    return (int)haku64_errno_check(
+        haku64_syscall2(HAKU64_SYS_SET_ROBUST_LIST, (long long)head,
+                        (long long)length));
+}
+
+int get_robust_list(int pid, haku64_robust_list_t **head, size_t *length) {
+    return (int)haku64_errno_check(
+        haku64_syscall3(HAKU64_SYS_GET_ROBUST_LIST, pid, (long long)head,
+                        (long long)length));
+}
+
 /* arch_prctl(2): the x86-64 thread-pointer call. SET_* installs a user base,
  * GET_* copies the current base through the pointer in `address`. */
 int arch_prctl(int code, unsigned long long address) {
@@ -107,13 +147,17 @@ int arch_prctl(int code, unsigned long long address) {
 }
 
 /* fork(2): the child returns 0 into the same instruction fault frame, so a
- * negative result means the call was refused and becomes errno. */
+ * negative result means the call was refused and becomes errno. The child
+ * keeps the parent's TEB by copy-on-write but has a task id of its own, so
+ * its thread handle and robust head registration are refreshed. */
 int fork(void) {
     long long result = haku64_syscall0(HAKU64_SYS_FORK);
+
     if (result < 0) {
         errno = (int)-result;
         return -1;
     }
+    if (result == 0) haku64_after_fork();
     return (int)result;
 }
 

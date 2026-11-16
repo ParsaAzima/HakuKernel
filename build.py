@@ -701,6 +701,10 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-USER-TLS-OK",
                 "HAKU64-USER-THREAD-OK",
                 "HAKU64-USER-THREAD-JOIN-OK",
+                "HAKU64-USER-PTHREAD-OK",
+                "HAKU64-USER-DETACH-OK",
+                "HAKU64-USER-ROBUST-OK",
+                "HAKU64-USER-ERRNO-THREAD-OK",
                 "HAKU64-USER-THREAD-EXEC-OK",
                 "HAKU64-USER-THREAD-EXEC-IMAGE-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
@@ -1377,6 +1381,10 @@ def main():
             "USER-MMAP-OK",  # mmap2/mprotect/mremap/madvise/set_thread_area
             "USER-FUTEX-OK", # futex wait/wake with a timeout
             "USER-THREAD-OK", # clone shares space/files, distinct tid, same pid
+            "USER-PTHREAD-OK", # pthread create/join, mutex, condition variable
+            "USER-DETACH-OK",  # a detached pthread frees its own pages
+            "USER-ROBUST-OK",  # robust mutex EOWNERDEAD/consistent/poison
+            "USER-ERRNO-THREAD-OK", # errno is per thread
             "USER-FS-ABI-OK", # openat/getdents64/chdir/pipe/poll/fcntl/termios
             "USER-ERRNO-OK", # error matrix: bad fd/pointer/path/argument
             "USER-INITRAMFS-OK", # ramfs root, long names, symlinks, devfs, procfs

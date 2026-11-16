@@ -38,9 +38,21 @@
 #define EPIPE        HAKU_EPIPE
 #define ERANGE       HAKU_ERANGE
 #define ELOOP        HAKU_ELOOP
+#define EDEADLK      HAKU_EDEADLK
 #define EOVERFLOW    HAKU_EOVERFLOW
 #define EOPNOTSUPP   HAKU_EOPNOTSUPP
+/* Robust mutex state reporting: the owner died holding the mutex, and (after
+ * an unlock without pthread_mutex_consistent) that the mutex can never be
+ * used again. */
+#define EOWNERDEAD   HAKU_EOWNERDEAD
+#define ENOTRECOVERABLE HAKU_ENOTRECOVERABLE
 
-extern int errno;
+/* errno is per thread. On i386 it lives in the thread control block, which
+ * crt0 installs in %fs before main() and every thread installs before it can
+ * call a library function; the slot is found through the block's self
+ * pointer, so a caller never needs the segment base. Reading the slot is two
+ * instructions, which is why every failure path can use it. */
+int *haku_errno_slot(void);
+#define errno (*haku_errno_slot())
 
 #endif

@@ -1345,8 +1345,10 @@ static regs_t *sys_nanosleep(regs_t *frame, uint32_t user_req,
 
 static uint32_t sys_kill(uint32_t pid, uint32_t sig) {
     if (sig > SCHEDULER_NSIG) return copy_from_user_error(HAKU_EINVAL);
+    /* pid 0 is the caller's process group, so the signal reaches the caller
+     * and every sibling the way POSIX describes it. */
     if (pid == 0u)
-        return (uint32_t)scheduler_kill_pid(scheduler_current_pid(), sig);
+        return (uint32_t)scheduler_kill_pgrp(scheduler_current_pgrp(), sig);
     /* -1 means every other process; any other negative value is a process
      * group, which is how a shell signals a whole pipeline (killpg). */
     if (pid == 0xFFFFFFFFu) return (uint32_t)scheduler_kill_all(sig);
@@ -2611,6 +2613,32 @@ regs_t *user_syscall(regs_t *r) {
     case HAKU_SYS_GET_THREAD_AREA:
         r->eax = scheduler_get_thread_area();
         return r;
+    case HAKU_SYS_SET_ROBUST_LIST:
+        r->eax = scheduler_set_robust_list(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_GET_ROBUST_LIST: {
+        uint32_t head = 0;
+        uint32_t length = 0;
+        uint32_t result = scheduler_get_robust_list(&head, &length);
+
+        if ((int32_t)result < 0) {
+            r->eax = (uint32_t)result;
+            return r;
+        }
+        /* Without ptrace the only list that is visible is the caller's
+         * own; asking about any other task is refused instead of lying. */
+        if (r->ebx != 0u && r->ebx != scheduler_current_pid()) {
+            r->eax = copy_from_user_error(HAKU_EPERM);
+            return r;
+        }
+        if (!copy_to_user(r->ecx, &head, sizeof(head)) ||
+            !copy_to_user(r->edx, &length, sizeof(length))) {
+            r->eax = copy_from_user_error(HAKU_EFAULT);
+            return r;
+        }
+        r->eax = 0;
+        return r;
+    }
     case HAKU_SYS_FUTEX:
         return sys_futex(r, r->ebx, r->ecx, r->edx, r->esi, r->edi, r->ebp);
     case HAKU_SYS_MUNMAP:

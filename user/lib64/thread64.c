@@ -1,61 +1,69 @@
-/* Haku x86-64 threads.
+/* Haku x86-64 threads: the legacy haku64_thread_* API.
  *
  * clone(2) with CLONE_VM starts a second task in the caller's address space;
  * CLONE_SETTLS gives it an FS base of its own. Haku's compiler TLS uses the
  * Windows x64 convention (`mov rcx, gs:[0x58]` -> TlsSlots -> block), so a
  * thread also needs its own TEB and GS base. The kernel only sets FS from
- * the fifth clone argument — FS is the SysV thread pointer and plainly
- * kernel state — while GS is installed by haku64_thread_entry(), the first
- * user code the child runs, because which TEB a thread uses is a library
- * decision and not something the kernel can infer.
+ * the clone argument - FS is the SysV thread pointer and plainly kernel
+ * state - while GS is installed by the child's first C code, because which
+ * TEB a thread uses is a library decision and not something the kernel can
+ * infer.
  *
- * Everything a thread needs lives at the top of its own stack mapping: the
- * joinable handle, then the start record, then the initial RSP. The parent
- * neither allocates nor frees anything the child may still be reading:
- * thread64.asm reloads the record from a callee-saved register that the
- * kernel copied into the child's frame. Nothing above the initial RSP is
- * touched by the child's stack, so the handle stays readable until
- * haku64_thread_join() releases the whole mapping.
+ * Two APIs share the same machinery:
  *
- * CLONE_CHILD_SETTID makes the kernel write the child's tid into the
- * handle before the child can run, and CLONE_CHILD_CLEARTID makes it zero
- * that word and wake one futex waiter when the child ends. A join is
- * therefore a futex wait on the handle, then waitpid() for the status, then
- * the stack and TLS block are released. The handle points into that stack,
- * so it is dangling once the join succeeds.
+ *   haku64_thread_spawn  a joinable thread whose handle and start record sit
+ *                        in the top of its own stack mapping; the joiner
+ *                        reaps and frees both through haku64_thread_join().
+ *   haku64_thread_create a detached thread with no handle at all: its tid is
+ *                        the only thing the caller gets, and the thread frees
+ *                        its TLS block and stack itself as its last act.
+ *
+ * The pthread layer (pthread64.c) is the third caller: it keeps its handle in
+ * the TEB page and passes haku64_pthread_entry as the entry point, which is
+ * why haku64_clone_thread takes both a record and an entry function.
  */
 #include <haku/abi64.h>
+
+#include "tls64_internal.h"
 
 /* 64 KiB is the same order as a default pthread stack and leaves plenty of
  * room for the printf path and a few nested calls. It is a fixed size, so a
  * hostile program cannot turn this into unbounded allocation. */
 #define HAKU64_THREAD_STACK_SIZE (64 * 1024)
 
-/* Exactly what thread64.asm expects below the handle. Keep the field order
- * and the asm in sync; the struct is 24 bytes. */
+/* Exactly what haku64_thread_entry() expects. The record lives in the top of
+ * the thread's stack mapping, so the parent never frees anything the child
+ * may still be reading. */
 typedef struct {
     int (*fn)(void *);
     void *arg;
     void *teb;
+    unsigned char *stack;           /* base of this thread's stack mapping */
+    unsigned long long stack_size;
+    int detached;                   /* no joiner: the thread cleans up itself */
 } haku64_thread_start_t;
 
-/* thread64.asm: raw clone with CLONE_SETTLS and the two child tid flags.
- * `child_stack` is what the kernel loads into the child's RSP, `record`
- * stays in a register the child inherits, `tls` becomes the child's FS base
- * and `clear_tid` is the word the kernel publishes the tid in and zeroes at
- * exit. Returns the child tid to the parent and does not return at all in
- * the child, which enters haku64_thread_entry() on the new stack. */
-long long haku64_clone_thread(void *child_stack, void *tls, void *record,
-                              int *clear_tid);
+/* The child's first C code. A joinable thread simply _exit()s and leaves its
+ * stack and TLS block for haku64_thread_join(); a detached one releases both
+ * before it goes, which is the whole difference between the two kinds. The
+ * record arrives as an untyped pointer because the clone stub calls every
+ * entry point through one signature. */
+void haku64_thread_entry(void *record) {
+    haku64_thread_start_t *start = (haku64_thread_start_t *)record;
+    int status;
 
-/* The child's first C code. Only r12 (the record pointer) is guaranteed, so
- * everything else is read from the record. */
-void haku64_thread_entry(haku64_thread_start_t *start) {
-    if (arch_prctl(HAKU64_ARCH_SET_GS,
-                   (unsigned long long)start->teb) != 0)
+    /* Raw arch_prctl: errno is already per thread through GS, and this is the
+     * call that installs GS, so a failure must not try to record itself. */
+    if (haku64_syscall2(HAKU64_SYS_ARCH_PRCTL, HAKU64_ARCH_SET_GS,
+                        (long long)start->teb) < 0)
         _exit(70);                    /* EX_SOFTWARE: no TLS for this thread */
     /* _exit ends only this thread; exit() would end the whole group. */
-    _exit(start->fn(start->arg));
+    status = start->fn(start->arg);
+    if (!start->detached) _exit(status);
+    haku64_tls_free(start->teb);
+    haku64_thread_retire(start->stack, start->stack_size, status);
+    for (;;) {
+    }
 }
 
 /* Place `size` bytes so that the result ends at or below `top` and is
@@ -108,9 +116,14 @@ haku64_thread_t *haku64_thread_spawn(int (*fn)(void *), void *arg) {
     start->fn = fn;
     start->arg = arg;
     start->teb = teb;
+    start->stack = stack;
+    start->stack_size = HAKU64_THREAD_STACK_SIZE;
+    start->detached = 0;
 
+    /* Joinable: the tid word is published before the child runs and zeroed at
+     * exit, and the task stays waitable until haku64_thread_join() reaps it. */
     tid = haku64_clone_thread((unsigned char *)start - 32, teb, start,
-                              &thread->done);
+                              &thread->done, 0, haku64_thread_entry);
     if (tid < 0) {
         /* No child exists, so the resources are still ours to release. */
         haku64_tls_free(teb);
@@ -151,11 +164,52 @@ int haku64_thread_join(haku64_thread_t *thread) {
     return (status >> 8) & 0xFF;
 }
 
-/* haku64_thread_create: run fn(arg) and return the tid, or -1 with errno.
- * The thread is a task like any other, so waitpid() reaps it, but there is
- * no handle: its stack and TLS block go away with the address space. */
+/* haku64_thread_create: run fn(arg) on a detached thread and return its tid,
+ * or -1 with errno. There is no handle and nobody joins it: when the function
+ * returns, the thread frees its TLS block, unmaps its own stack and exits,
+ * and the kernel reclaims the task slot at the next switch. The tid is only
+ * useful for kill() and for /proc-style inspection. */
 int haku64_thread_create(int (*fn)(void *), void *arg) {
-    haku64_thread_t *thread = haku64_thread_spawn(fn, arg);
+    unsigned char *stack;
+    haku64_thread_start_t *start;
+    void *teb;
+    long long tid;
 
-    return thread ? thread->tid : -1;
+    if (!fn) {
+        errno = HAKU64_EINVAL;
+        return -1;
+    }
+    stack = (unsigned char *)mmap(NULL, HAKU64_THREAD_STACK_SIZE,
+                                  HAKU64_PROT_READ | HAKU64_PROT_WRITE,
+                                  HAKU64_MAP_PRIVATE | HAKU64_MAP_ANONYMOUS,
+                                  -1, 0);
+    if (stack == (void *)-1) return -1;     /* mmap set errno */
+
+    teb = haku64_tls_new();
+    if (!teb) {
+        munmap(stack, HAKU64_THREAD_STACK_SIZE);
+        errno = HAKU64_ENOMEM;
+        return -1;
+    }
+
+    /* Only the start record lives in the mapping: the child frees the rest,
+     * and there is no handle to keep it readable. */
+    start = (haku64_thread_start_t *)place_below(stack + HAKU64_THREAD_STACK_SIZE,
+                                                 sizeof(*start));
+    start->fn = fn;
+    start->arg = arg;
+    start->teb = teb;
+    start->stack = stack;
+    start->stack_size = HAKU64_THREAD_STACK_SIZE;
+    start->detached = 1;
+
+    tid = haku64_clone_thread((unsigned char *)start - 32, teb, start,
+                              NULL, 1, haku64_thread_entry);
+    if (tid < 0) {
+        haku64_tls_free(teb);
+        munmap(stack, HAKU64_THREAD_STACK_SIZE);
+        errno = (int)-tid;
+        return -1;
+    }
+    return (int)tid;
 }
