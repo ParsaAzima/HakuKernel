@@ -160,6 +160,13 @@ static int boot_file_present(const char *path) {
     return vfs_stat(1, path, &stat) == 1 && stat.st_size > 0;
 }
 
+/* A boot directory exists (the FAT12 backend reports its type in st_mode). */
+static int boot_dir_present(const char *path) {
+    vfs_stat_t stat;
+    return vfs_stat(1, path, &stat) == 1 &&
+           (stat.st_mode & VFS_S_IFMT) == VFS_S_IFDIR;
+}
+
 /* Defined next to load_elf_file; the boot path seeds it before the first
  * exec so the shell does not re-read its own binary from the disk. */
 static int exec_cache_store(const char *path, uint8_t *image, uint32_t size);
@@ -169,10 +176,11 @@ static int exec_cache_store(const char *path, uint8_t *image, uint32_t size);
  * backends; without one the FAT12 volume stays the root so an older image
  * still boots.
  *
- * A BUSYBOX file on the disk takes precedence over the initramfs' /init: it
- * is a whole userland in one binary, so there is nothing for a test program
- * to add. The shell still gets the ramfs root with /dev and /proc mounted,
- * because those are what its applets read.
+ * Three userlands live on that volume. A BUSYBOX file at its root is the
+ * shell image. An INIT plus a BIN directory is a rootfs image: a Linux-shaped
+ * tree whose paths (/etc/rc, /bin/busybox, /dev, /proc) only exist if the
+ * volume itself is the root, so the volume is mounted as / and /disk keeps
+ * pointing at the same bytes. Anything else is the initramfs.
  *
  * Returns the path of the program to run first and sets *argv0 to the name
  * it should see there (busybox dispatches on argv[0], so it has to be "sh",
@@ -183,6 +191,7 @@ static const char *mount_boot_filesystem(const char **argv0) {
     int32_t read_result;
     int32_t mount_point;
     int shell;
+    int rootfs;
 
     if (!vfs_register_device(&console_device)) {
         klog_log(KLOG_ERROR, "VFS-DEVICE-FAIL: console device registration\n");
@@ -213,6 +222,27 @@ static const char *mount_boot_filesystem(const char **argv0) {
     }
 
     shell = boot_file_present("disk/BUSYBOX");
+    /* A rootfs image is recognised before the archive is even read: it has
+     * no INITRD, and its userland expects the volume at / so /etc/rc and
+     * /bin/busybox are the paths the programs were written against. */
+    rootfs = !shell && boot_file_present("disk/INIT") &&
+             boot_dir_present("disk/BIN");
+    if (rootfs) {
+        if (vfs_mount_root("fat12") != 1) {
+            klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: FAT12 rootfs mount\n");
+            return 0;
+        }
+        if (vfs_mount("dev", "devfs", 0) != 1 ||
+            vfs_mount("proc", "procfs", 0) != 1) {
+            klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: /dev or /proc\n");
+            return 0;
+        }
+        klog_prefix();
+        klog_write("ROOTFS-MOUNT-OK: FAT12 is /, /disk is the same volume, "
+                   "INIT is pid 1\n");
+        *argv0 = "init";
+        return "INIT";
+    }
 
     archive = (uint8_t *)kmalloc(USER_INITRAMFS_MAX_SIZE);
     if (!archive) {
