@@ -30,9 +30,11 @@ The build and boot failures that come up most often, and what causes them.
   `ud2`, an SSE prefix such as `66 0F` is vector code).
 - **`ELF-LOAD-FAIL: image is not a 32-bit x86 executable`** — the binary was
   built for the host, not for Haku. `musl-gcc` on an x86-64 machine targets
-  x86-64 unless a cross toolchain is used, so CI builds the musl probe with an
-  `i486-linux-musl` compiler and asserts `ELF32`/`Intel 80386` before booting
-  it. Other reasons in that line name the exact check that refused the image.
+  x86-64 unless a cross toolchain is used, so an ELF passed to
+  `python build.py probe` must be built with an i386 compiler (for example an
+  `i486-linux-musl` cross toolchain), be `ELF32`/`Intel 80386`, and have no
+  `PT_INTERP`. Other reasons in that line name the exact check that refused
+  the image.
 - **NASM not found** — install it, then open a fresh terminal (PATH refresh).
 - **x64: a ring-3 program jumps to address 0 right after `fork`** — a
   copy-on-write break installed a leaf that names the wrong frame. The new

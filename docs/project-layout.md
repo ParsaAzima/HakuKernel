@@ -120,7 +120,7 @@ Haku/
     tests/            libtest.c: C library self-test installed as LIB.ELF
                       init64.c: x86-64 C library self-test installed as
                       INIT.ELF and started by the kernel
-                      musl_probe.c: portable probe built by the CI musl job
+                      musl_probe.c: portable probe for `build.py probe` (run manually)
   include/haku/         abi.h + abi.inc + abi64.h + abi64.inc: shared
                         user/kernel ABI constants (the 64-bit pair carries the
                         x86-64 numbers and layouts)

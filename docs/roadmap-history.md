@@ -112,7 +112,7 @@ compatibility is not a short-term goal.
   `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK`). Its logging, tick and
   heap exports work; device/filesystem registration answers `-ENOSYS` until a
   64-bit VFS exists. Modules are trusted ring-0 code.
-- [x] A statically linked musl binary booted as `/init` in Linux CI
+- [x] A statically linked musl binary booted as `/init`
   (`musl_probe`, `MUSL-PROBE-OK`): Linux-shaped initial stack and auxiliary
   vector, Linux-shaped `set_thread_area`, and the `_llseek`/`readv`/`writev`/
   `set_tid_address` calls an outside libc expects. `python build.py probe`
@@ -576,7 +576,7 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   headless test to assert its behavior (for example `busybox sh -c "echo"`
   and a file round-trip through the RAM filesystem).
   `user/tests/musl_probe.c` is built with an `i486-linux-musl` cross
-  toolchain in a dedicated `musl` CI job and booted as `/init` through the new
+  toolchain and booted as `/init` through the new
   `python build.py probe --init=<elf> --expect=<marker>` mode, which skips
   the keyboard injection and asserts the boot markers plus the requested
   one. Making an outside libc work required four ABI corrections: the
@@ -595,8 +595,8 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   interactive shell: blocking `poll`, `select` through both i386 numbers (142
   and 82), and the legacy `getdents` layout alongside `getdents64`.
   Still missing for a full busybox userland: record locks, and enough of
-  `/proc` for `ps`. The probe ships with the CI artifacts, not
-  with the release image; the release still contains Haku's own userland.
+  `/proc` for `ps`. The probe is not part of the release image; the release
+  still contains Haku's own userland.
 
 **Acceptance criteria:** A statically linked musl binary runs as PID 1 from
 an initramfs or FAT12 data disk, executes shell builtins and applets
