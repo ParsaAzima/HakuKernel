@@ -34,6 +34,25 @@ single-cluster subdirectories with real `.`/`..` entries. Paths are
 `/`-separated and resolved from the root; `.` and `..` are handled during
 resolution. Cluster allocation, release, mirrored FAT updates and
 volume/chain bounds checks are shared by files and directories.
+
+The backend is tuned for the way the VFS drives it, without changing a byte of
+the on-disk format. A one-sector cache sits in front of the FAT: probing an
+entry then costs a compare and two loads instead of a locked 512-byte read
+through the block layer, and the whole 12-bit table of a 1.44 MB volume fits in
+nine sectors, so a chain walk stays in RAM (a miss still goes through the ATA
+read cache described in [kernel internals](kernel-internals.md)). The cache is
+dropped on every FAT write and on raw test writes, so a cached sector is never
+stale. Allocation resumes at the cluster after the last one it handed out and
+wraps once, which makes an appended n-cluster file cost n table probes instead
+of n*(n+1)/2 while still finding a free cluster below the hint. An open file
+remembers the last (index, cluster) pair it resolved and resumes there for a
+forward sequential read or write, keyed on the `first_cluster`+`size` pair that
+`refresh` reads back from the directory entry, so a second descriptor's
+truncate or a backward seek restarts the walk at the head. A directory
+enumeration remembers the slot that produced the last entry, so a full
+`getdents` pass over an n-entry directory reads it once instead of rescanning
+from slot 0 per name; an out-of-order request simply rescans. The self-tests
+that cover rollback and fault injection run through all four of these paths.
 `kernel/fs/vfs/vfs.c` supplies per-process descriptors and the user `open`, `close`,
 `read`, `write`, and `lseek` interface through a filesystem-independent
 operations vector (`vfs_fs_ops`: mount/open/close/read/write/seek/unlink/
@@ -198,7 +217,11 @@ where it is.
   disk and not from an initramfs),
   so nothing survives a reboot — which is exactly what an initramfs needs.
   Unlinking a file that is still open keeps the data alive until the last
-  descriptor closes, the same promise FAT12 makes.
+  descriptor closes, the same promise FAT12 makes. Listing a directory
+  remembers the last child it reported, so walking a d-entry directory takes d
+  link steps instead of d*(d+1)/2; the cached child is re-validated against its
+  `used` flag, inode and parent on every use, and a stale one falls back to a
+  full walk.
 - **`devfs`** (`kernel/fs/devfs`) has six built-in entries — `/dev/null`,
   `/dev/zero`, `/dev/urandom`, `/dev/random`, `/dev/console`, and `/dev/tty` —
   plus four slots a loadable module can fill with `devfs_register_device`. Each
