@@ -79,8 +79,28 @@ void io_wait(void) {
     outb(0x80, 0);
 }
 
+/* The kernel is built with -fno-builtin, so these are the only copies of the
+ * memory primitives. They move whole words after a byte-sized head/tail: the
+ * boot path copies megabytes (ELF segments, the initramfs, page zeroing, every
+ * sector) and a byte loop costs five instructions per byte. The head loop
+ * aligns the destination, which is what makes the word stores safe on x86;
+ * the source side does not need to be aligned. */
+
 void *memset(void *dst, int c, size_t n) {
     uint8_t *p = (uint8_t *)dst;
+    uint32_t word = (uint8_t)c;
+
+    word |= word << 8;
+    word |= word << 16;
+    while (n && ((uint32_t)p & 3u)) {
+        *p++ = (uint8_t)c;
+        n--;
+    }
+    while (n >= 4u) {
+        *(uint32_t *)p = word;
+        p += 4;
+        n -= 4u;
+    }
     while (n--) *p++ = (uint8_t)c;
     return dst;
 }
@@ -88,6 +108,20 @@ void *memset(void *dst, int c, size_t n) {
 void *memcpy(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
+
+    while (n && ((uint32_t)d & 3u)) {
+        *d++ = *s++;
+        n--;
+    }
+    while (n >= 4u) {
+        /* Load then store, one word at a time: that order is what keeps a
+         * forward copy of overlapping regions safe. */
+        uint32_t word = *(const uint32_t *)s;
+        *(uint32_t *)d = word;
+        d += 4;
+        s += 4;
+        n -= 4u;
+    }
     while (n--) *d++ = *s++;
     return dst;
 }
@@ -95,20 +129,57 @@ void *memcpy(void *dst, const void *src, size_t n) {
 void *memmove(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
+
+    if (d == s || n == 0) return dst;
     if (d < s) {
-        while (n--) *d++ = *s++;
-    } else if (d > s) {
-        d += n; s += n;
-        while (n--) *--d = *--s;
+        /* Forward: identical to memcpy, and safe for overlap because the
+         * store of a word lands behind the source byte it just read. */
+        return memcpy(dst, src, n);
     }
+    /* Backward: move the tail bytes until the destination end is word
+     * aligned, then whole words from the end. Each word is read before it
+     * is written, and every later read is at a lower address, so an
+     * overlapping destination never overwrites bytes this loop still needs. */
+    d += n;
+    s += n;
+    while (n && ((uint32_t)d & 3u)) {
+        *--d = *--s;
+        n--;
+    }
+    while (n >= 4u) {
+        uint32_t word;
+        d -= 4;
+        s -= 4;
+        word = *(const uint32_t *)s;
+        *(uint32_t *)d = word;
+        n -= 4u;
+    }
+    while (n--) *--d = *--s;
     return dst;
 }
 
 int memcmp(const void *a, const void *b, size_t n) {
     const uint8_t *p = (const uint8_t *)a, *q = (const uint8_t *)b;
+
+    while (n >= 4u) {
+        uint32_t left = *(const uint32_t *)p;
+        uint32_t right = *(const uint32_t *)q;
+
+        if (left != right) {
+            /* Report the first differing byte, not the word difference:
+             * callers compare the result against zero, but the byte keeps
+             * the exact memcmp contract. */
+            for (uint32_t i = 0; i < 4u; i++)
+                if (p[i] != q[i]) return (int)p[i] - (int)q[i];
+        }
+        p += 4;
+        q += 4;
+        n -= 4u;
+    }
     while (n--) {
-        if (*p != *q) return *p - *q;
-        p++; q++;
+        if (*p != *q) return (int)*p - (int)*q;
+        p++;
+        q++;
     }
     return 0;
 }

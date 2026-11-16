@@ -114,6 +114,28 @@ sectors belong to whichever drive is active. The boot self-test reads one
 sector twice and requires the second read to hit (`ATA-CACHE-OK`), so a cache
 that silently serves stale data fails the headless run.
 
+FAT12 keeps a second, smaller cache of its own in front of that one: the sector
+of the allocation table it last read (`kernel/fs/fat12/fat12.c`). The table is
+the hottest metadata on the volume and a chain walk revisits the same sector
+once per cluster, so answering from a 512-byte buffer avoids the lock, the copy
+and the block-layer entry for every probe. Every FAT write drops it, and so does
+the raw fault-injection hook, so the two layers cannot disagree.
+
+## Freestanding string primitives
+
+There is no C library. `kernel/arch/x86/kernel/cpu.c` (i386) and
+`kernel/arch/x86_64/kernel/serial64.c` (x86-64) define `memset`, `memcpy`,
+`memmove` and `memcmp` for the whole kernel, and every compile line carries
+`-fno-builtin` so clang cannot rewrite those loops into calls to themselves.
+They move whole words (4 bytes on i386, 8 on x86-64) after a byte-sized head
+that aligns the destination: the boot path pushes megabytes through them (ELF
+segments, the initramfs, zeroed pages, every ATA sector), and a byte-at-a-time
+loop costs five instructions per byte. `memmove` keeps the overlap contract by
+copying forward, loading each word before storing it, when the destination is
+below the source, and from the tail after aligning the end when it is above.
+`memcmp` returns the first differing byte, not the difference of the words it
+compared.
+
 ## ELF32 program loading
 
 `kernel/arch/x86/elf/elf.c` loads static ELF32 little-endian i386 `ET_EXEC` images read

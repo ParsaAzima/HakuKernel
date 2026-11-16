@@ -53,24 +53,74 @@ void k64_fail(const char *what) {
 /* ---------------------------------------------------------------- libc bits
  * The compiler may emit calls to these even in freestanding mode (/Zl only
  * stops it from naming a default library), so they have to be defined. */
+/* Whole u64 words after a byte head: a byte loop costs five instructions per
+ * byte and these run over ELF images, initramfs payloads, page zeroing and
+ * every sector the block layer copies. The head loop aligns the destination,
+ * which is all x86-64 needs for a legal word store; the source side is
+ * unaligned-safe, so it is copied as-is. */
 void *memset(void *dst, int value, usize count) {
     u8 *out = (u8 *)dst;
-    for (usize i = 0; i < count; i++) out[i] = (u8)value;
+    u64 word = (u8)value;
+
+    word |= word << 8;
+    word |= word << 16;
+    word |= word << 32;
+    while (count && ((usize)out & 7u)) {
+        *out++ = (u8)value;
+        count--;
+    }
+    while (count >= 8u) {
+        *(u64 *)out = word;
+        out += 8;
+        count -= 8u;
+    }
+    while (count--) *out++ = (u8)value;
     return dst;
 }
 
 void *memcpy(void *dst, const void *src, usize count) {
     u8 *out = (u8 *)dst;
     const u8 *in = (const u8 *)src;
-    for (usize i = 0; i < count; i++) out[i] = in[i];
+
+    while (count && ((usize)out & 7u)) {
+        *out++ = *in++;
+        count--;
+    }
+    while (count >= 8u) {
+        /* Load before store: that order keeps a forward copy of overlapping
+         * regions correct, exactly like the word loop on the 32-bit port. */
+        u64 word = *(const u64 *)in;
+        *(u64 *)out = word;
+        out += 8;
+        in += 8;
+        count -= 8u;
+    }
+    while (count--) *out++ = *in++;
     return dst;
 }
 
 int memcmp(const void *a, const void *b, usize count) {
     const u8 *left = (const u8 *)a;
     const u8 *right = (const u8 *)b;
-    for (usize i = 0; i < count; i++) {
-        if (left[i] != right[i]) return (int)left[i] - (int)right[i];
+
+    while (count >= 8u) {
+        u64 l = *(const u64 *)left;
+        u64 r = *(const u64 *)right;
+
+        if (l != r) {
+            /* Report the first differing byte so the result still follows
+             * the memcmp contract callers rely on. */
+            for (u32 i = 0; i < 8u; i++)
+                if (left[i] != right[i]) return (int)left[i] - (int)right[i];
+        }
+        left += 8;
+        right += 8;
+        count -= 8u;
+    }
+    while (count--) {
+        if (*left != *right) return (int)*left - (int)*right;
+        left++;
+        right++;
     }
     return 0;
 }
@@ -83,10 +133,28 @@ void *memmove(void *dst, const void *src, usize count) {
 
     if (out == in || count == 0) return dst;
     if (out < in) {
-        for (usize i = 0; i < count; i++) out[i] = in[i];
-    } else {
-        for (usize i = count; i > 0; i--) out[i - 1] = in[i - 1];
+        /* Forward: same as memcpy, and safe because each word is read before
+         * the store that could overwrite it. */
+        return memcpy(dst, src, count);
     }
+    /* Backward: align the destination end with byte moves, then copy whole
+     * words from the end. Every later read is at a lower address than the
+     * store that preceded it, so an overlapping tail stays intact. */
+    out += count;
+    in += count;
+    while (count && ((usize)out & 7u)) {
+        *--out = *--in;
+        count--;
+    }
+    while (count >= 8u) {
+        u64 word;
+        out -= 8;
+        in -= 8;
+        word = *(const u64 *)in;
+        *(u64 *)out = word;
+        count -= 8u;
+    }
+    while (count--) *--out = *--in;
     return dst;
 }
 
