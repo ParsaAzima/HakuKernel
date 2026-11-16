@@ -108,29 +108,26 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install NASM, LLVM, and QEMU
+      - name: Install NASM, LLVM, QEMU, and the i686 cross compiler
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            nasm clang lld qemu-system-x86
+            nasm clang lld qemu-system-x86 gcc-i686-linux-gnu
 
-      # musl-tools on an x86-64 runner builds host binaries, so `musl-gcc`
-      # produces a 64-bit ELF that a 32-bit kernel must reject. Haku needs an
-      # i386 musl build: musl.cc ships a prebuilt i486 cross toolchain that
-      # includes musl's static startup files. Cached because it is ~105 MiB.
-      - name: Cache the i486 musl toolchain
-        uses: actions/cache@v4
-        with:
-          path: ~/i486-linux-musl-cross
-          key: i486-linux-musl-cross-gcc11.2.1-musl1.2.2
-
-      - name: Install the i486 musl toolchain
+      # Ubuntu stopped publishing most i386 packages, so musl's headers and
+      # static libc come from Debian's musl-dev:i386. The package ships
+      # i386-linux-musl-gcc (a wrapper around i686-linux-gnu-gcc from apt),
+      # the crt objects, and libc.a; its spec file refers to absolute paths,
+      # hence the unpack at /. The SHA-256 pins the exact .deb.
+      - name: Install i386 musl headers and static libc
         run: |
-          if [ ! -x "$HOME/i486-linux-musl-cross/bin/i486-linux-musl-gcc" ]; then
-            curl -fsSL https://musl.cc/i486-linux-musl-cross.tgz |
-              tar xz -C "$HOME"
-          fi
-          echo "$HOME/i486-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          curl -fsSL --retry 5 --retry-delay 2 -o /tmp/musl-dev.deb \
+            https://deb.debian.org/debian/pool/main/m/musl/musl-dev_1.2.3-1_i386.deb
+          echo "e7e49904a302b4c986cc7729b1af9117f7a01a928b12c43e75bdd015697bff82  /tmp/musl-dev.deb" \
+            | sha256sum -c -
+          sudo dpkg-deb -x /tmp/musl-dev.deb /
+          i386-linux-musl-gcc --version
+          ls /usr/lib/i386-linux-musl/libc.a
 
       - name: Build the probe against musl
         run: |
@@ -138,13 +135,16 @@ jobs:
           # -Wl,-z,separate-code pins the segment layout Haku's loader needs:
           # no two PT_LOAD segments share a page. It is binutils' default on
           # i386, but the loader rejects page-rounded overlap outright.
-          i486-linux-musl-gcc -static -no-pie -fno-pie -Os -Wall -Wextra \
+          # The kernel loads ET_EXEC images, so -no-pie is required, not just
+          # desirable; the type check below fails the job if that changes.
+          i386-linux-musl-gcc -static -no-pie -fno-pie -Os -Wall -Wextra \
             -Wl,-z,separate-code \
             -o build/musl_probe user/tests/musl_probe.c
           file build/musl_probe
           readelf -h build/musl_probe
           readelf -h build/musl_probe | grep -q 'Class:.*ELF32'
           readelf -h build/musl_probe | grep -q 'Machine:.*Intel 80386'
+          readelf -h build/musl_probe | grep -q 'Type:.*EXEC'
           if readelf -l build/musl_probe | grep -q INTERP; then
             echo "musl_probe must be statically linked" >&2
             exit 1

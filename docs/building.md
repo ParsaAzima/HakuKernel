@@ -264,13 +264,18 @@ QEMU log, and the CTest log as artifacts even when a boot check fails. A
 missing marker, an unexpected `*-FAIL` marker, or `KERNEL PANIC` fails the
 job.
 
-A second job, `musl`, builds `user/tests/musl_probe.c` with a prebuilt
-`i486-linux-musl` cross toolchain and boots it as `/init` with
+A second job, `musl`, builds `user/tests/musl_probe.c` with an i386 musl
+toolchain and boots it as `/init` with
 `python build.py probe --init=build/musl_probe --expect=MUSL-PROBE-OK`. The
-cross compiler matters: `musl-gcc` from `musl-tools` is host-native, so on an
-x86-64 runner it produces a 64-bit ELF that a 32-bit kernel must reject. The
-job checks `ELF32`/`Intel 80386` before booting so that mistake fails at the
-build step instead of looking like a loader bug. This
+toolchain is assembled from packages: `gcc-i686-linux-gnu` from apt, plus
+Debian's checksum-pinned `musl-dev:i386` package, which provides the
+`i386-linux-musl-gcc` wrapper, the headers, the crt objects, and `libc.a`.
+Ubuntu no longer publishes an i386 musl package, and host-native `musl-gcc`
+from `musl-tools` would produce a 64-bit ELF that a 32-bit kernel must reject.
+Before booting, the job checks that the probe is `ELF32`/`Intel 80386`,
+`ET_EXEC` (the loader does not remap position-independent executables), and
+has no `PT_INTERP`; those failures are reported at the build step instead of
+looking like a loader bug. This
 is the only check that runs an outside C library on top of the kernel, so it
 is what proves the ABI in [the syscall documentation](syscalls.md): musl's own
 `_start`, auxiliary-vector
