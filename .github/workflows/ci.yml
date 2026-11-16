@@ -14,17 +14,26 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Headless boot waits for the keyboard-injection point; slower hosted
-  # runners need more slack than a local workstation.
-  HAKU_BOOT_DELAY: "3"
-  HAKU_HEADLESS_TIMEOUT: "60"
-  HAKU_X64_TIMEOUT: "90"
+  # Headless boot waits for the keyboard-injection point; hosted runners need
+  # more slack than a local workstation. All three are upper bounds: a green
+  # run returns as soon as the marker (or guest exit) arrives.
+  HAKU_BOOT_DELAY: "30"
+  HAKU_HEADLESS_TIMEOUT: "120"
+  HAKU_X64_TIMEOUT: "180"
 
 jobs:
   headless:
-    name: Build and boot test
+    name: Headless ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            name: x86-64 (default smp and smp=4)
+          - arch: i386
+            name: i386 (default smp and smp=4)
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -34,42 +43,51 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install NASM, LLVM, and QEMU
+      - name: Install NASM, LLVM, QEMU, CMake, and Ninja
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            nasm clang lld qemu-system-x86
+            nasm clang lld qemu-system-x86 cmake ninja-build
 
       - name: Show tool versions
         run: |
           nasm -v
           clang --version
           lld-link --version
-          qemu-system-i386 --version
+          cmake --version
+          ninja --version
           qemu-system-x86_64 --version
+          qemu-system-i386 --version
 
-      - name: Build and run the x86-64 headless test
-        run: python build.py headless
+      # CMake only registers the gates; build.py performs every build and
+      # boot. Ninja is a single-config generator, so `ctest` needs no -C.
+      - name: Configure the CTest suite
+        run: cmake -S . -B build/ctest -G Ninja
 
-      - name: Build and run the 32-bit headless test
-        run: python build.py headless --arch=i386
+      # `x64` matches x64 and x64-smp4; `i386` matches i386 and i386-smp4.
+      # The tests are marked RUN_SERIAL, so the two QEMU runs share no ports
+      # or disk images.
+      - name: Build and boot the headless gates
+        run: ctest --test-dir build/ctest --output-on-failure -R "^${{ matrix.arch }}"
 
       - name: Upload boot artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: haku-boot-${{ github.run_id }}
+          name: haku-headless-${{ matrix.arch }}-${{ github.run_id }}
           path: |
             haku64.img
             build/haku64_fs.img
             build/serial64.log
+            build/screen64.ppm
             haku.img
             build/haku_fs.img
             build/serial.log
-            build/qemu.log
-            build/regs.txt
             build/screen.png
             build/screen.ppm
+            build/regs.txt
+            build/qemu.log
+            build/ctest/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
           retention-days: 14
 

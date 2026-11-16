@@ -232,18 +232,37 @@ and `--check` enforces the kernel's mount invariants (BPB sanity, mirrored
 FATs, exact chains, no orphans) with a nonzero exit on any damage.
 The build is one Python script on purpose — `cmd.exe` quoting of spaced
 paths (e.g. `C:\Program Files\...`) is fragile, while `subprocess` argument
-lists just work.
+lists just work. The root `CMakeLists.txt` does not build anything; it only
+registers the validation gates with CTest (see below) so CI and a workstation
+run the same names.
 
 ### Continuous integration and releases
 
 `.github/workflows/ci.yml` runs on every push to `main`, every pull request,
-and manual dispatch. It uses `ubuntu-latest`, installs NASM, Clang/LLD, and
-QEMU from apt, runs `python build.py headless` (x86-64) and then
-`python build.py headless --arch=i386` (the 32-bit suite) through the
-`clang-cl`/`lld-link` path in `build.py`, and uploads both images, the data
-images, serial/QEMU logs, and any crash screenshots as artifacts even when a
-boot check fails. A missing marker, an unexpected `*-FAIL` marker, or
-`KERNEL PANIC` fails the job.
+and manual dispatch. The `headless` job is a two-entry matrix (x86-64 and
+i386) on `ubuntu-latest`; each entry installs NASM, Clang/LLD, QEMU, and CMake
+from apt, configures the CTest suite, and runs the two gates for that
+architecture: the default two-CPU boot and the four-CPU boot (`--smp=4`).
+CMake is only the runner. `CMakeLists.txt` registers the four gates as
+`x64`, `x64-smp4`, `i386`, and `i386-smp4`, plus the build-only targets
+`haku-x64` and `haku-i386`; `build.py` still performs every build and boot
+step. The same gates run locally with:
+
+```bash
+cmake -S . -B build/ctest -G Ninja
+ctest --test-dir build/ctest --output-on-failure
+ctest --test-dir build/ctest -R "^i386"    # one architecture only
+```
+
+Ninja is a single-config generator, so `ctest` finds the tests directly. With
+a multi-config generator such as Visual Studio's, pass `-C <config>` (for
+example `ctest --test-dir build/ctest -C Debug`) or configure with
+`-G Ninja`.
+
+Each matrix entry uploads its image, data disk, serial and framebuffer logs,
+QEMU log, and the CTest log as artifacts even when a boot check fails. A
+missing marker, an unexpected `*-FAIL` marker, or `KERNEL PANIC` fails the
+job.
 
 A second job, `musl`, builds `user/tests/musl_probe.c` with a prebuilt
 `i486-linux-musl` cross toolchain and boots it as `/init` with
@@ -274,7 +293,7 @@ git push origin v0.2.0
 ```
 
 Slow runners can tune the checks with `HAKU_BOOT_DELAY` (seconds before the
-injected key, default 1), `HAKU_HEADLESS_TIMEOUT` (seconds to wait for the
+injected key, default 15), `HAKU_HEADLESS_TIMEOUT` (seconds to wait for the
 32-bit guest shutdown, default 30) and `HAKU_X64_TIMEOUT` (seconds to wait for
 `HAKU64-SELFTEST-OK`, default 60).
 

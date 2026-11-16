@@ -145,8 +145,10 @@ Haku/
   tools/mkhakumod.py   relocatable objects (NASM ELF32 or COFF i386/amd64) →
                        packed .hkm module; links C objects, folds COMDAT, drops
                        unreachable sections
-  .github/workflows/  ci.yml: hosted x86-64 + i386 headless build/test, artifacts
-                      release.yml: tag-driven bootable image release
+  .github/workflows/  ci.yml: hosted x86-64 + i386 headless gates via CTest,
+                      artifacts; release.yml: tag-driven bootable image release
+  CMakeLists.txt       CTest front end: registers the four headless gates and
+                      the haku-x64/haku-i386 build targets (no C sources)
   build.py             the whole build: cl/link/nasm/qemu orchestration
   build/               generated files (stage*.bin, *.obj/pe, haku64.img, ...)
   haku64.img           primary bootable floppy image (x86-64)
