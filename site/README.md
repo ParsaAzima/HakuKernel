@@ -37,9 +37,17 @@ The site is written for indexing first, then for reading:
   and Open Graph/Twitter card metadata;
 - JSON-LD (`WebSite`, `SoftwareSourceCode`, `FAQPage`, `CollectionPage`,
   `BreadcrumbList`) that mirrors the visible text, including the FAQ answers;
-- `robots.txt` plus `sitemap.xml`, and a custom `404.html` marked `noindex`;
+- `robots.txt` plus `sitemap.xml`, and a custom `404.html` marked `noindex`
+  that uses absolute URLs (Pages serves it at the requested path, where
+  relative assets would not resolve);
 - no client-side rendering, no external requests, so the text is all in the
   HTML that a crawler receives.
+
+A project Pages URL is a subdirectory of the host, so crawlers read
+`robots.txt` at `https://parsaazima.github.io/robots.txt`, not at
+`/HakuKernel/robots.txt`. Submit `sitemap.xml` in Search Console (or move to a
+custom domain) to make the crawl policy authoritative; the sitemap itself is
+absolute and works either way.
 
 The canonical base is the GitHub Pages project URL,
 `https://parsaazima.github.io/HakuKernel/`. If the site moves to a custom
