@@ -45,7 +45,10 @@ the byte the console prints indexes the glyph directly; the renderer is
 generic over the cell size, and `fbcon_init` rejects a font whose width is not
 a multiple of 8. Scrolling moves the whole screen up one row and blanks the
 last one; the VGA text backend is the same 80x25 grid with nothing carved out
-of it.
+of it. A cell is bounds-checked once and then painted as one linear store run
+per scanline, and the blanked row and the cursor underline use the same clamped
+rectangle filler, so no pixel is drawn through a per-pixel bounds test and
+multiply.
 
 Console output is filtered for control codes on the 32-bit console: a CSI
 sequence (`ESC '[' params final`) is consumed instead of drawn, so an escape

@@ -66,21 +66,6 @@ static uint32_t compose(uint32_t r, uint32_t g, uint32_t b) {
 
 /* --- pixels ------------------------------------------------------------ */
 
-static inline void fb_put_pixel(uint32_t x, uint32_t y, uint32_t color) {
-    uint8_t *pixel;
-
-    if (x >= fb_width || y >= fb_height) return;
-    pixel = fb_base + y * fb_pitch + x * fb_bytes_per_pixel;
-    if (fb_bytes_per_pixel == 4) {
-        *(uint32_t *)pixel = color;
-    } else {
-        /* 24 bpp: the pixel is stored blue, green, red */
-        pixel[0] = (uint8_t)(color & 0xFFu);
-        pixel[1] = (uint8_t)((color >> 8) & 0xFFu);
-        pixel[2] = (uint8_t)((color >> 16) & 0xFFu);
-    }
-}
-
 /* One colour over an axis-aligned rectangle. The bounds are clamped once and
  * the scanline walk sits outside the pixel loop, so a full-screen clear is one
  * pass of stores and not a bounds-checked call per pixel. */
@@ -114,7 +99,9 @@ static void fb_fill(uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
 
 /* Paint one cell in the requested colours. `ch` selects the glyph; the row
  * bytes come from the font's stride, so a 16-pixel-wide cut works without a
- * second code path. */
+ * second code path. The cell is bounds-checked once, then each scanline is
+ * one linear store run: the old shape paid a bounds compare and a multiply
+ * per pixel, which is sixteen times the work for the same 128 pixels. */
 static void fb_draw_glyph(uint32_t col, uint32_t row, char ch,
                           uint32_t fg, uint32_t bg) {
     const uint8_t *glyph = fb_font->glyphs +
@@ -125,9 +112,23 @@ static void fb_draw_glyph(uint32_t col, uint32_t row, char ch,
     if (x0 + fb_cell_w > fb_width || y0 + fb_cell_h > fb_height) return;
     for (uint32_t gy = 0; gy < fb_cell_h; gy++) {
         const uint8_t *bits = glyph + gy * fb_cell_stride;
-        for (uint32_t gx = 0; gx < fb_cell_w; gx++) {
-            uint32_t on = (bits[gx >> 3] >> (7u - (gx & 7u))) & 1u;
-            fb_put_pixel(x0 + gx, y0 + gy, on ? fg : bg);
+        uint8_t *line = fb_base + (y0 + gy) * fb_pitch +
+                        x0 * fb_bytes_per_pixel;
+
+        if (fb_bytes_per_pixel == 4u) {
+            uint32_t *pixel = (uint32_t *)line;
+            for (uint32_t gx = 0; gx < fb_cell_w; gx++)
+                pixel[gx] = ((bits[gx >> 3] >> (7u - (gx & 7u))) & 1u) ? fg : bg;
+        } else {
+            /* 24 bpp: the pixel is stored blue, green, red. */
+            for (uint32_t gx = 0; gx < fb_cell_w; gx++) {
+                uint32_t color =
+                    ((bits[gx >> 3] >> (7u - (gx & 7u))) & 1u) ? fg : bg;
+                uint8_t *p = line + gx * 3u;
+                p[0] = (uint8_t)(color & 0xFFu);
+                p[1] = (uint8_t)((color >> 8) & 0xFFu);
+                p[2] = (uint8_t)((color >> 16) & 0xFFu);
+            }
         }
     }
 }
@@ -153,9 +154,7 @@ static void fb_draw_cursor(void) {
     uint32_t y0 = fb_cursor_y * fb_cell_h + fb_cell_h - 2u;
     uint32_t x0 = fb_cursor_x * fb_cell_w;
 
-    for (uint32_t y = y0; y < y0 + 2u; y++)
-        for (uint32_t x = x0; x < x0 + fb_cell_w; x++)
-            fb_put_pixel(x, y, fb_cursor_fg);
+    fb_fill(x0, y0, fb_cell_w, 2u, fb_cursor_fg);
 }
 
 /* Repaint the cell the underline covers, so moving the cursor leaves no
@@ -177,10 +176,9 @@ static void fb_scroll(void) {
     uint8_t *src = dst + row_bytes;
 
     memmove(dst, src, total);
-    for (uint32_t y = (fb_rows - 1u) * fb_cell_h;
-         y < fb_rows * fb_cell_h; y++)
-        for (uint32_t x = 0; x < fb_width; x++)
-            fb_put_pixel(x, y, fb_bg);
+    /* Blank the new last row with the scanline filler, not a per-pixel
+     * put: it is the same clamped rectangle and a fraction of the calls. */
+    fb_fill(0, (fb_rows - 1u) * fb_cell_h, fb_width, fb_cell_h, fb_bg);
 
     if (fb_shadowed) {
         memmove(fbcon_shadow, fbcon_shadow + fb_cols,
