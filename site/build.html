@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building Haku — LLVM toolchain, QEMU test gates and CI</title>
+<meta name="description" content="Build and test Haku with clang-cl, lld-link, NASM and QEMU. Four headless CTest gates boot x86-64 and i386 at two and four CPUs.">
+<meta name="keywords" content="Haku build, clang-cl kernel, lld-link, NASM bootloader, QEMU kernel test, CTest, headless CI, x86-64 OS build">
+<meta name="author" content="ParsaAzima">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
+<link rel="canonical" href="https://parsaazima.github.io/HakuKernel/build.html">
+<meta name="theme-color" content="#f7f4ec" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14120f" media="(prefers-color-scheme: dark)">
+<meta property="og:site_name" content="Haku">
+<meta property="og:locale" content="en_US">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Building Haku — LLVM toolchain, QEMU test gates and CI">
+<meta property="og:description" content="Prerequisites, build targets, the four headless CTest gates, boot images and the release pipeline for the x86-64 and i386 ports.">
+<meta property="og:url" content="https://parsaazima.github.io/HakuKernel/build.html">
+<meta property="og:image" content="https://parsaazima.github.io/HakuKernel/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Haku — a small operating system, from boot sector to ring 3">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Building Haku — LLVM toolchain, QEMU test gates and CI">
+<meta name="twitter:description" content="Prerequisites, build targets, the four headless CTest gates, boot images and the release pipeline for the x86-64 and i386 ports.">
+<meta name="twitter:image" content="https://parsaazima.github.io/HakuKernel/og.png">
+<meta name="twitter:image:alt" content="Haku — a small operating system, from boot sector to ring 3">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebPage",
+      "@id": "https://parsaazima.github.io/HakuKernel/build.html#webpage",
+      "url": "https://parsaazima.github.io/HakuKernel/build.html",
+      "name": "Building Haku — LLVM toolchain, QEMU test gates and CI",
+      "description": "Prerequisites, build targets, the four headless CTest gates, boot images and the release pipeline for the x86-64 and i386 ports.",
+      "inLanguage": "en",
+      "dateModified": "2026-11-16",
+      "isPartOf": {
+        "@type": "WebSite",
+        "url": "https://parsaazima.github.io/HakuKernel/",
+        "name": "Haku"
+      },
+      "about": {
+        "@type": "SoftwareSourceCode",
+        "name": "Haku",
+        "codeRepository": "https://github.com/ParsaAzima/HakuKernel"
+      },
+      "breadcrumb": { "@id": "https://parsaazima.github.io/HakuKernel/build.html#breadcrumb" }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "@id": "https://parsaazima.github.io/HakuKernel/build.html#breadcrumb",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Haku",
+          "item": "https://parsaazima.github.io/HakuKernel/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Building Haku",
+          "item": "https://parsaazima.github.io/HakuKernel/build.html"
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap masthead__inner">
+    <a class="wordmark" href="index.html"><span class="wordmark__mark" aria-hidden="true"></span>Haku</a>
+    <nav class="nav" aria-label="Site">
+      <a href="index.html">Overview</a>
+      <a href="build.html" aria-current="page">Build</a>
+      <a href="docs.html">Docs</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel">Source</a>
+    </nav>
+  </div>
+</header>
+
+<div class="banner">
+  <div class="wrap banner__inner">
+    <span>Windows and Linux hosts · LLVM 19+</span>
+    <span><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/building.md">Building and running guide</a></span>
+  </div>
+</div>
+
+<main id="main">
+
+<section class="hero wrap">
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="index.html">Haku</a>
+    <span aria-hidden="true">/</span>
+    <span aria-current="page">Building</span>
+  </nav>
+  <p class="eyebrow">Building the Haku kernel</p>
+  <h1>One script builds the image, boots QEMU and checks the log.</h1>
+  <p class="deck">
+    <code>build.py</code> owns every step: NASM, <code>clang-cl</code>,
+    <code>lld-link</code>, the FAT12 and cpio packers, and the QEMU runs. CMake
+    is only a test front end — it registers the four headless gates under
+    stable names so CI and a workstation run the same commands.
+  </p>
+</section>
+
+<section class="chapter wrap" id="requirements">
+  <div class="num">01</div>
+  <h2>Host requirements</h2>
+  <div class="table-scroll">
+    <table class="grid">
+      <caption>Host tools</caption>
+      <thead>
+        <tr><th scope="col">Tool</th><th scope="col">Version</th><th scope="col">Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">LLVM</th><td>19+</td><td><code>clang-cl</code> and <code>lld-link</code>; no Visual Studio install and no MSVC headers are needed. CI builds with the distro package.</td></tr>
+        <tr><th scope="row">NASM</th><td>2.16+</td><td>The boot sector, entry paths and ISR stubs. The local build uses 3.02; CI uses the distro package.</td></tr>
+        <tr><th scope="row">QEMU</th><td>8+</td><td>Both <code>qemu-system-x86_64</code> and <code>qemu-system-i386</code>.</td></tr>
+        <tr><th scope="row">Python</th><td>3.13+</td><td>Runs <code>build.py</code> and the image helpers in <code>tools/</code>.</td></tr>
+        <tr><th scope="row">CMake</th><td>3.20+</td><td>Optional. Only for <code>ctest</code>; <code>build.py</code> works alone.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">
+    <strong>Toolchain discovery.</strong> On Windows the script looks in
+    <code>C:\Program Files\LLVM\bin</code> first and falls back to
+    <code>PATH</code>. The switches it passes (<code>/c</code>,
+    <code>/Fo</code>, <code>/ENTRY</code>, <code>/ALIGN</code>,
+    <code>/NODEFAULTLIB</code>) are the MSVC-compatible ones
+    <code>clang-cl</code> accepts; only the <code>--target</code> triple
+    changes between ports.
+  </p>
+</section>
+
+<section class="chapter wrap" id="commands">
+  <div class="num">02</div>
+  <h2>Build targets and options</h2>
+  <div class="table-scroll">
+    <table class="grid">
+      <caption>From the repository root</caption>
+      <thead>
+        <tr><th scope="col">Command</th><th scope="col">Does</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row"><code>python build.py</code></th><td>Builds <code>haku64.img</code>, the x86-64 boot image. This is the default target.</td></tr>
+        <tr><th scope="row"><code>python build.py run</code></th><td>Builds and boots it in a QEMU window.</td></tr>
+        <tr><th scope="row"><code>python build.py headless</code></th><td>Builds, boots headless, captures the serial log and validates every marker. Prints <code>X64 CHECK PASSED</code>.</td></tr>
+        <tr><th scope="row"><code>python build.py headless --arch=i386</code></th><td>The same for the 32-bit port. Prints <code>HEADLESS CHECK PASSED</code>.</td></tr>
+        <tr><th scope="row"><code>python build.py shell</code></th><td>Boots the 32-bit image with a static busybox as PID&nbsp;1 and lands in <code>ash</code>, with job control and pipelines.</td></tr>
+        <tr><th scope="row"><code>python build.py shell --check</code></th><td>Scripted shell run; prints <code>SHELL CHECK PASSED</code>.</td></tr>
+        <tr><th scope="row"><code>python build.py probe --init=FILE</code></th><td>Boots an external static ELF32 as <code>/init</code> on the 32-bit image. Manual use only; it is not a CI gate.</td></tr>
+        <tr><th scope="row"><code>python build.py inspect ...</code></th><td>Lists, checks or extracts a FAT12 image without modifying it.</td></tr>
+        <tr><th scope="row"><code>--smp=N</code></th><td>Guest CPUs. 1–8 on x86-64, 1–4 on i386; the default is 2.</td></tr>
+        <tr><th scope="row"><code>--memory=N</code></th><td>Guest RAM in MiB. The default is 512; the 32-bit direct map stops at about 1000&nbsp;MiB.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    The <code>headless</code> mode exits nonzero on a missing marker, an
+    unexpected <code>*-FAIL</code> line or a kernel panic. It never reports
+    success from a timeout.
+  </p>
+</section>
+
+<section class="chapter wrap" id="gates">
+  <div class="num">03</div>
+  <h2>The four QEMU test gates</h2>
+  <p>
+    Every push builds and boots four guests. Each one asserts a marker set, so a
+    regression in paging, the disk, the scheduler or ring-3 has to show up as a
+    failed run rather than a log nobody reads.
+  </p>
+<pre><code>cmake -S . -B build/ctest -G Ninja
+ctest --test-dir build/ctest --output-on-failure</code></pre>
+
+  <div class="table-scroll">
+    <table class="grid">
+      <caption>Registered tests</caption>
+      <thead>
+        <tr><th scope="col">CTest name</th><th scope="col">Guest</th><th scope="col">Success line</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row"><code>x64</code></th><td>x86-64, 2 CPUs</td><td><code>X64 CHECK PASSED</code></td></tr>
+        <tr><th scope="row"><code>x64-smp4</code></th><td>x86-64, 4 CPUs</td><td><code>X64 CHECK PASSED</code></td></tr>
+        <tr><th scope="row"><code>i386</code></th><td>i386, 2 CPUs</td><td><code>HEADLESS CHECK PASSED</code></td></tr>
+        <tr><th scope="row"><code>i386-smp4</code></th><td>i386, 4 CPUs</td><td><code>HEADLESS CHECK PASSED</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    The <code>--smp=4</code> legs matter: the default two-CPU run confirms that
+    one application processor comes online and dispatches a task, while the
+    four-CPU run makes three of them pull work from the shared table and
+    checks the TLB shootdown counter. A uniprocessor machine fails the
+    <code>SMP-AP-OK</code> assertion instead of passing quietly.
+  </p>
+  <p>
+    The tests are <code>RUN_SERIAL</code> because each one builds an image,
+    binds a QEMU monitor port and writes its own serial log. CMake's timeout is
+    a backstop for a wedged emulator; the waits inside <code>build.py</code>
+    are shorter and name the marker that never arrived.
+  </p>
+</section>
+
+<section class="chapter wrap" id="images">
+  <div class="num">04</div>
+  <h2>Boot and data images</h2>
+  <div class="table-scroll">
+    <table class="grid">
+      <caption>What the build produces</caption>
+      <thead>
+        <tr><th scope="col">Path</th><th scope="col">Role</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row"><code>haku64.img</code></th><td>Primary bootable floppy image for x86-64.</td></tr>
+        <tr><th scope="row"><code>build/haku64_fs.img</code></th><td>1.44&nbsp;MB FAT12 ATA disk seeded with the test files, <code>INIT.ELF</code> and <code>X64MOD.HKM</code>. Rebuilt on every run.</td></tr>
+        <tr><th scope="row"><code>haku.img</code></th><td>Bootable floppy image for the 32-bit port.</td></tr>
+        <tr><th scope="row"><code>build/haku_fs.img</code></th><td>32-bit data disk with the user ELFs and initramfs. Treated as user data.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">
+    <strong>On the 32-bit data disk.</strong> <code>build/haku_fs.img</code> is
+    reused untouched unless you pass <code>--fresh</code>.
+    <code>python build.py inspect --check</code> verifies its BPB, FAT mirrors
+    and cluster chains without writing to it. If it is damaged, report it
+    instead of deleting it out of hand.
+  </p>
+</section>
+
+<section class="chapter wrap" id="ci">
+  <div class="num">05</div>
+  <h2>CI and release pipeline</h2>
+  <p>
+    GitHub Actions runs the gates on <code>ubuntu-latest</code>: one matrix leg
+    for x86-64 and one for i386, each installing NASM, LLVM, QEMU, CMake and
+    Ninja from apt, configuring the CTest suite with the Ninja generator, and
+    running <code>ctest -R "^x64"</code> or <code>-R "^i386"</code> so both the
+    default and the four-CPU test run. The serial logs, screen captures,
+    register dumps and both boot images are uploaded as artifacts for fourteen
+    days.
+  </p>
+  <p>
+    A tag builds the release: both ports boot headless, the data images are
+    rebuilt from scratch, and <code>haku64.img</code>,
+    <code>build/haku64_fs.img</code>, <code>haku.img</code>,
+    <code>build/haku_fs.img</code>, the README and the licence are zipped with
+    a <code>SHA256SUMS.txt</code>.
+  </p>
+  <ul class="links">
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/actions/workflows/ci.yml">CI workflow runs</a></li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/actions/workflows/release.yml">Release workflow</a></li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/releases">Downloads</a></li>
+  </ul>
+</section>
+
+<section class="chapter wrap" id="trouble">
+  <div class="num">06</div>
+  <h2>Troubleshooting the build</h2>
+  <p>
+    The troubleshooting document covers the failures that actually come up:
+    a missing <code>clang-cl</code> on <code>PATH</code>, NASM section and
+    symbol mismatches against LLVM COFF objects, an x86-64 image that will not
+    fit the loader's window, QEMU monitor ports still held by an earlier run,
+    and a 32-bit data disk the kernel refuses to mount.
+  </p>
+  <ul class="links">
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/troubleshooting.md">Troubleshooting guide</a></li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/issues">File an issue</a></li>
+    <li><a href="docs.html">Documentation index</a></li>
+  </ul>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <div class="wrap colophon__inner">
+    <div>
+      <p class="colophon__brand">Haku</p>
+      <p>
+        Free software under the GNU General Public License, version 3. The
+        Terminus font in <code>kernel/drivers/font_terminus.c</code> keeps the
+        SIL Open Font License 1.1. This site is static HTML and CSS: no
+        scripts, no trackers, no external assets.
+      </p>
+    </div>
+    <nav aria-label="Project links">
+      <a href="https://github.com/ParsaAzima/HakuKernel">Repository</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel/issues">Issues</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel/actions">CI runs</a>
+      <a href="docs.html">Documentation</a>
+      <a href="index.html">Overview</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Haku documentation — kernel design, syscalls and storage</title>
+<meta name="description" content="Haku kernel documentation: boot chain, paging, scheduler, syscall ABI, userland, storage, modules and the LLVM build pipeline.">
+<meta name="keywords" content="Haku documentation, x86-64 kernel design, syscall ABI, FAT12 VFS, kernel modules, SMP scheduling, clang-cl kernel">
+<meta name="author" content="ParsaAzima">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
+<link rel="canonical" href="https://parsaazima.github.io/HakuKernel/docs.html">
+<meta name="theme-color" content="#f7f4ec" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14120f" media="(prefers-color-scheme: dark)">
+<meta property="og:site_name" content="Haku">
+<meta property="og:locale" content="en_US">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Haku documentation — kernel design, syscalls and storage">
+<meta property="og:description" content="Design notes for the boot chain, paging, scheduler, syscall ABI, userland, terminal, storage and module loader, plus the project policies.">
+<meta property="og:url" content="https://parsaazima.github.io/HakuKernel/docs.html">
+<meta property="og:image" content="https://parsaazima.github.io/HakuKernel/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Haku — a small operating system, from boot sector to ring 3">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Haku documentation — kernel design, syscalls and storage">
+<meta name="twitter:description" content="Design notes for the boot chain, paging, scheduler, syscall ABI, userland, terminal, storage and module loader, plus the project policies.">
+<meta name="twitter:image" content="https://parsaazima.github.io/HakuKernel/og.png">
+<meta name="twitter:image:alt" content="Haku — a small operating system, from boot sector to ring 3">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "CollectionPage",
+      "@id": "https://parsaazima.github.io/HakuKernel/docs.html#webpage",
+      "url": "https://parsaazima.github.io/HakuKernel/docs.html",
+      "name": "Haku documentation — kernel design, syscalls and storage",
+      "description": "Design notes for the boot chain, paging, scheduler, syscall ABI, userland, terminal, storage and module loader, plus the project policies.",
+      "inLanguage": "en",
+      "dateModified": "2026-11-16",
+      "isPartOf": {
+        "@type": "WebSite",
+        "url": "https://parsaazima.github.io/HakuKernel/",
+        "name": "Haku"
+      },
+      "about": {
+        "@type": "SoftwareSourceCode",
+        "name": "Haku",
+        "codeRepository": "https://github.com/ParsaAzima/HakuKernel"
+      },
+      "breadcrumb": { "@id": "https://parsaazima.github.io/HakuKernel/docs.html#breadcrumb" },
+      "hasPart": [
+        { "@type": "TechArticle", "name": "Architecture", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/architecture.md" },
+        { "@type": "TechArticle", "name": "Processes and scheduling", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/processes.md" },
+        { "@type": "TechArticle", "name": "System calls and the POSIX subset", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/syscalls.md" },
+        { "@type": "TechArticle", "name": "Userland", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/userland.md" },
+        { "@type": "TechArticle", "name": "x86-64 C library", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/libc64.md" },
+        { "@type": "TechArticle", "name": "Terminal and display", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/terminal.md" },
+        { "@type": "TechArticle", "name": "Storage and filesystems", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/storage.md" },
+        { "@type": "TechArticle", "name": "Kernel internals", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/kernel-internals.md" },
+        { "@type": "TechArticle", "name": "Building and running", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/building.md" },
+        { "@type": "TechArticle", "name": "Project layout", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/project-layout.md" },
+        { "@type": "TechArticle", "name": "Troubleshooting", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/troubleshooting.md" },
+        { "@type": "TechArticle", "name": "Roadmap history", "url": "https://github.com/ParsaAzima/HakuKernel/blob/main/docs/roadmap-history.md" }
+      ]
+    },
+    {
+      "@type": "BreadcrumbList",
+      "@id": "https://parsaazima.github.io/HakuKernel/docs.html#breadcrumb",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Haku",
+          "item": "https://parsaazima.github.io/HakuKernel/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Documentation",
+          "item": "https://parsaazima.github.io/HakuKernel/docs.html"
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap masthead__inner">
+    <a class="wordmark" href="index.html"><span class="wordmark__mark" aria-hidden="true"></span>Haku</a>
+    <nav class="nav" aria-label="Site">
+      <a href="index.html">Overview</a>
+      <a href="build.html">Build</a>
+      <a href="docs.html" aria-current="page">Docs</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel">Source</a>
+    </nav>
+  </div>
+</header>
+
+<div class="banner">
+  <div class="wrap banner__inner">
+    <span>The documents live next to the source</span>
+    <span><a href="https://github.com/ParsaAzima/HakuKernel/tree/main/docs">Browse docs/</a></span>
+  </div>
+</div>
+
+<main id="main">
+
+<section class="hero wrap">
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="index.html">Haku</a>
+    <span aria-hidden="true">/</span>
+    <span aria-current="page">Documentation</span>
+  </nav>
+  <p class="eyebrow">Haku kernel documentation</p>
+  <h1>What the kernel does, how it is built, and where the edges are.</h1>
+  <p class="deck">
+    The documents describe the implemented subset only. A capability that has
+    no boot-log marker is not claimed as done, and every page names the limits
+    of the subsystem it covers — the cache size, the missing call, the port
+    that does not have it yet.
+  </p>
+</section>
+
+<section class="chapter wrap" id="design">
+  <div class="num">01</div>
+  <h2>Kernel design documents</h2>
+  <div class="table-scroll">
+    <table class="grid">
+      <caption>docs/ in the repository</caption>
+      <thead>
+        <tr><th scope="col">Document</th><th scope="col">Covers</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/architecture.md">Architecture</a></th><td>The boot chain, memory map, IDT, frame allocator, the x86-64 port, SMP bring-up and per-CPU scheduling, and the module loader.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/processes.md">Processes</a></th><td><code>fork</code>, copy-on-write address spaces, the 100&nbsp;Hz scheduler, job control and resource accounting.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/syscalls.md">System calls</a></th><td>The i386 ABI and the x86-64 numbers, the call table, memory-management calls and the supported POSIX subset.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/userland.md">Userland</a></th><td>The freestanding user C library, busybox and musl on top of the ABI, and the 32-bit shell image.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/libc64.md">x86-64 C library</a></th><td><code>user/lib64</code>, the Microsoft x64 ABI decision, the <code>_start</code> stack image and the <code>/INIT.ELF</code> self-test.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/terminal.md">Terminal and display</a></th><td>Console backends, keyboard input, the kernel-log latch, and panic and crash reports.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/storage.md">Storage</a></th><td>ATA PIO, FAT12, the VFS layer, the boot namespace and why the filesystem is deliberately small.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/kernel-internals.md">Kernel internals</a></th><td>Locking, the sector cache, ELF loading, module packing, and the <code>lld-link</code> plus <code>pe2bin.py</code> build strategy.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/building.md">Building and running</a></th><td>Prerequisites, every target, the image lifecycle, CI, releases and manual runs.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/project-layout.md">Project layout</a></th><td>Where sources, build outputs and generated artifacts live.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/troubleshooting.md">Troubleshooting</a></th><td>The build and boot failures that come up most often, and what causes them.</td></tr>
+        <tr><th scope="row"><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/docs/roadmap-history.md">Roadmap history</a></th><td>The decisions, markers and milestones through v0.2.0, kept for reference.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="chapter wrap" id="project">
+  <div class="num">02</div>
+  <h2>Project pages and policies</h2>
+  <ul class="plain">
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/README.md">README</a> — what Haku is, its status by subsystem, and the quick start.</li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/ROADMAP.md">Roadmap</a> — open milestones, dependencies and the marker each one exits on.</li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/CONTRIBUTING.md">Contributing</a> — development setup and pull-request expectations.</li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/SECURITY.md">Security policy</a> — private vulnerability reporting.</li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/SUPPORT.md">Support</a> — where to ask, and what a reproducible report needs.</li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a> — expectations for project spaces.</li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/AGENTS.md">Agent instructions</a> — the repository-wide rules for automated changes.</li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/LICENSE">Licence</a> — GNU GPL v3, with the Terminus font under the SIL OFL 1.1.</li>
+  </ul>
+</section>
+
+<section class="chapter wrap" id="conventions">
+  <div class="num">03</div>
+  <h2>Kernel ABI and development conventions</h2>
+  <p>
+    A handful of rules run through both ports. They explain most of the code
+    that looks unusual at first read, and they are what the test markers assert.
+  </p>
+  <dl class="spec">
+    <dt>Errors</dt>
+    <dd>Every syscall returns a negative <code>errno</code> value in the result register — never <code>-1</code> plus a global. <code>ENOSYS</code> means exactly that the call is not implemented on this port.</dd>
+    <dt>User pointers</dt>
+    <dd>Pointers are validated page by page and copied in page-sized chunks, never dereferenced first. The validation and the copy happen once per page, not once per byte.</dd>
+    <dt>Markers</dt>
+    <dd>Observable behaviour gets a boot-log marker, and the headless runner asserts it. A change without a marker is a change nobody can verify.</dd>
+    <dt>Both ports</dt>
+    <dd>A capability lands on x86-64 and i386, or it is documented as absent from one. Drift is a bug, not a release note.</dd>
+    <dt>No hosted code</dt>
+    <dd>The kernel links no C runtime and calls no firmware service after boot. The boot loader is the only code that trusts the BIOS.</dd>
+  </dl>
+  <ul class="links">
+    <li><a href="build.html">Build the kernel</a></li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel">Repository</a></li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/issues">Issues</a></li>
+  </ul>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <div class="wrap colophon__inner">
+    <div>
+      <p class="colophon__brand">Haku</p>
+      <p>
+        Free software under the GNU General Public License, version 3. The
+        Terminus font in <code>kernel/drivers/font_terminus.c</code> keeps the
+        SIL Open Font License 1.1. This site is static HTML and CSS: no
+        scripts, no trackers, no external assets.
+      </p>
+    </div>
+    <nav aria-label="Project links">
+      <a href="https://github.com/ParsaAzima/HakuKernel">Repository</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel/issues">Issues</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel/actions">CI runs</a>
+      <a href="index.html">Overview</a>
+      <a href="build.html">Building</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

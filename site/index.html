@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Haku — a small x86-64 operating system kernel in C</title>
+<meta name="description" content="Haku is a freestanding x86-64 and i386 operating system: NASM boot loader, C kernel built with clang-cl, ring-3 ELF programs and loadable modules.">
+<meta name="keywords" content="Haku, HakuKernel, operating system, x86-64 kernel, i386 kernel, hobby OS, freestanding kernel, NASM, clang-cl, lld-link, QEMU, syscall ABI">
+<meta name="author" content="ParsaAzima">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
+<link rel="canonical" href="https://parsaazima.github.io/HakuKernel/">
+<meta name="theme-color" content="#f7f4ec" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14120f" media="(prefers-color-scheme: dark)">
+<meta property="og:site_name" content="Haku">
+<meta property="og:locale" content="en_US">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Haku — a small x86-64 operating system kernel in C">
+<meta property="og:description" content="A freestanding x86-64 and i386 kernel: NASM boot loader, ring-3 ELF programs, a Linux-inspired syscall ABI and loadable modules.">
+<meta property="og:url" content="https://parsaazima.github.io/HakuKernel/">
+<meta property="og:image" content="https://parsaazima.github.io/HakuKernel/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Haku — a small operating system, from boot sector to ring 3">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Haku — a small x86-64 operating system kernel in C">
+<meta name="twitter:description" content="A freestanding x86-64 and i386 kernel: NASM boot loader, ring-3 ELF programs, a Linux-inspired syscall ABI and loadable modules.">
+<meta name="twitter:image" content="https://parsaazima.github.io/HakuKernel/og.png">
+<meta name="twitter:image:alt" content="Haku — a small operating system, from boot sector to ring 3">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://parsaazima.github.io/HakuKernel/#website",
+      "url": "https://parsaazima.github.io/HakuKernel/",
+      "name": "Haku",
+      "alternateName": "HakuKernel",
+      "description": "A small freestanding operating system for x86-64 and i386, written in C and NASM.",
+      "inLanguage": "en",
+      "publisher": { "@id": "https://parsaazima.github.io/HakuKernel/#author" }
+    },
+    {
+      "@type": "Person",
+      "@id": "https://parsaazima.github.io/HakuKernel/#author",
+      "name": "ParsaAzima",
+      "url": "https://github.com/ParsaAzima"
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "https://parsaazima.github.io/HakuKernel/#software",
+      "name": "Haku",
+      "description": "A freestanding x86-64 and i386 operating system with its own boot loader, kernel, scheduler, filesystems and user C library.",
+      "codeRepository": "https://github.com/ParsaAzima/HakuKernel",
+      "sameAs": "https://github.com/ParsaAzima/HakuKernel",
+      "programmingLanguage": ["C", "Assembly"],
+      "runtimePlatform": ["x86-64", "i386"],
+      "operatingSystem": "Bare metal (x86-64, i386)",
+      "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+      "author": { "@id": "https://parsaazima.github.io/HakuKernel/#author" },
+      "mainEntityOfPage": "https://parsaazima.github.io/HakuKernel/",
+      "image": "https://parsaazima.github.io/HakuKernel/og.png"
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://parsaazima.github.io/HakuKernel/#faq",
+      "url": "https://parsaazima.github.io/HakuKernel/#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is Haku?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Haku is a small freestanding operating system for x86-64 and 32-bit x86. It has its own boot loader, kernel, scheduler, filesystems and user C library, and it boots on QEMU or a BIOS PC from a 1.44 MB floppy image."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Which architectures does Haku support?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Two. x86-64 is the primary target, with long mode, four-level paging, SYSCALL/SYSRET and per-CPU scheduling. The i386 port keeps the 32-bit protected-mode kernel and runs a static busybox ash shell as PID 1."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is Haku POSIX compatible?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. Haku implements a Linux-inspired subset of the POSIX interface, and everything outside that subset returns ENOSYS. It has no networking, no demand paging and no dynamic linker."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How is Haku built and tested?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "clang-cl compiles the C sources, NASM assembles the boot and entry paths, and lld-link links the image. build.py drives the pipeline and QEMU; CI runs four headless boots — x86-64 and i386, each at two and four CPUs — and asserts a marker set for every subsystem."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can Haku run Linux binaries?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Only statically linked programs that stay inside the implemented syscall subset. The 32-bit image boots a static musl busybox, and a musl probe can be run manually; the x86-64 side runs its own C library and /INIT.ELF."
+          }
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap masthead__inner">
+    <a class="wordmark" href="index.html"><span class="wordmark__mark" aria-hidden="true"></span>Haku</a>
+    <nav class="nav" aria-label="Site">
+      <a href="index.html" aria-current="page">Overview</a>
+      <a href="build.html">Build</a>
+      <a href="docs.html">Docs</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel">Source</a>
+    </nav>
+  </div>
+</header>
+
+<div class="banner">
+  <div class="wrap banner__inner">
+    <span>v0.2.0 · two ports, one source tree</span>
+    <span><a href="https://github.com/ParsaAzima/HakuKernel/releases">Release notes and tagged images</a></span>
+  </div>
+</div>
+
+<main id="main">
+
+<section class="hero wrap">
+  <p class="eyebrow">Freestanding x86 kernel · GPL-3.0</p>
+  <h1>A small operating system that boots from a floppy and runs code at ring&nbsp;3.</h1>
+  <p class="deck">
+    Haku is an operating system written in C and NASM. A two-stage BIOS loader
+    enters long mode; the kernel builds its own page tables, heap, scheduler,
+    filesystems and module loader; static ELF programs run unprivileged against
+    a Linux-inspired syscall ABI. No C runtime underneath, no hosted library
+    inside, no hardware virtualization.
+  </p>
+  <p class="deck__aside">Primary target x86-64 · second port i386 · <span class="nowrap">clang-cl + lld-link</span> · QEMU for tests</p>
+
+  <dl class="facts">
+    <div>
+      <dt>Targets</dt>
+      <dd>x86-64 <span>primary</span><br>i386</dd>
+    </div>
+    <div>
+      <dt>Boot</dt>
+      <dd>1.44&nbsp;MB floppy image<br>BIOS, no UEFI</dd>
+    </div>
+    <div>
+      <dt>Console</dt>
+      <dd>VBE text, 128×48<br>Terminus 8×16 + COM1</dd>
+    </div>
+    <div>
+      <dt>Source</dt>
+      <dd>C11 + NASM<br>no C runtime</dd>
+    </div>
+  </dl>
+</section>
+
+<section class="chapter wrap" id="shape">
+  <div class="num">01</div>
+  <h2>A freestanding x86-64 kernel</h2>
+  <p>
+    Haku is a teaching-sized kernel with production habits. It boots on a BIOS
+    machine from a 1.44&nbsp;MB image, takes the memory map from E820, builds
+    page tables and a direct map over physical memory, installs its own
+    descriptor tables and interrupt gates, then hands the machine to a 100&nbsp;Hz
+    preemptive scheduler. From there it loads a static ELF image into a
+    per-process address space and drops to privilege level 3.
+  </p>
+  <p>
+    The kernel never links a hosted library. LLVM's <code>clang-cl</code>
+    compiles the same C sources for the i686 and x86-64 System V targets, NASM
+    assembles the entry paths, and <code>lld-link</code> produces a fixed-base
+    image that <code>tools/pe2bin.py</code> flattens for the loader. The build
+    and the QEMU test runs are driven by one Python script.
+  </p>
+  <ul class="plain">
+    <li>Two-stage boot loader: A20, GDT, protected mode, E820, then PAE and long mode on x86-64.</li>
+    <li>Frame allocator, kernel heap, copy-on-write <code>fork</code>, <code>execve</code>, <code>wait4</code>, process groups and sessions.</li>
+    <li><code>clone</code> threads with <code>futex</code>, a pthread subset, robust mutexes and condition variables, per-thread <code>errno</code>.</li>
+    <li>ATA PIO, a writable FAT12 driver behind a VFS, ramfs, devfs, procfs and a cpio initramfs.</li>
+    <li>A ring-3 ELF loader with validated user pointers, <code>-errno</code> results and NX enforcement.</li>
+    <li>Loadable <code>.hkm</code> modules with an export table and a strict unload protocol.</li>
+  </ul>
+</section>
+
+<section class="chapter wrap" id="boot">
+  <div class="num">02</div>
+  <h2>Boot chain and memory management</h2>
+  <p>
+    The x86-64 port reads the E820 map, maps physical memory with 2&nbsp;MiB
+    pages, sizes its frame pool from what the firmware reports, and installs a
+    four-level address space with a supervisor direct map. The i386 port keeps
+    its two-level tables and a direct map that stops below the local-APIC
+    window. Both ports read the ACPI MADT, start the application processors
+    through an INIT–SIPI trampoline, and give each CPU a private GDT and TSS
+    over the shared IDT.
+  </p>
+
+  <figure>
+    <pre class="log"><code><span class="m">HAKU64-BOOT-OK:</span> long mode, 64-bit C
+<span class="m">HAKU64-E820-OK:</span> entries=7 usable=511MiB top=0x1ffe0000
+<span class="m">HAKU64-PAGING-OK:</span> physmap=1024MiB at 0xffff800000000000
+<span class="m">HAKU64-FRAME-OK:</span> limit=511MiB usable=124896 free=124896 top=0x1ffdf000
+<span class="m">HAKU64-FB-OK:</span> vbe linear framebuffer 1024x768 grid=128x48 font=terminus-8x16
+<span class="m">HAKU64-HEAP-OK:</span> window=8MiB free=8388576
+<span class="m">FAT12-MOUNT-OK:</span> VFS mounted, sectors=2880 clusters=2847
+<span class="m">HAKU64-SMP-OK:</span> cpus=4 lapic=0xfee00000 madt=4 parked=1
+<span class="m">HAKU64-SMP-SCHED-OK:</span> cpus=4 workers=3 lapic_hz=62005810
+<span class="m">HAKU64-SMP-TLB-OK:</span> targets=3 flushes=3 timeouts=0
+<span class="m">HAKU64-USER-OK:</span> ring 3 entered cs=0x23 rip=0x800000001b
+<span class="m">HAKU64-ELF-OK:</span> entry=0x8000400000 pages=7 bss=0x8000402000
+<span class="m">HAKU64-USER-PTHREAD-OK:</span> create, join, mutex and cond
+<span class="m">HAKU64-LIBC-OK:</span> printf, malloc, files, fork, mmap at ring 3
+<span class="m">HAKU64-SELFTEST-OK:</span> physmap, frames, 4 KiB mapping, heap, FAT12 disk, exceptions, timer, RTC, spaces, tasks, ring 3, syscalls, fork/wait, NX, ELF64, modules</code></pre>
+    <figcaption>COM1 output from <code>python build.py headless --smp=4</code>, 15 consecutive lines.</figcaption>
+  </figure>
+</section>
+
+<section class="chapter wrap" id="processes">
+  <div class="num">03</div>
+  <h2>Processes, threads and scheduling</h2>
+  <p>
+    Every process owns an address space built from validated ELF segments and
+    an 8&nbsp;KiB kernel stack. <code>fork</code> copies pages on write,
+    <code>execve</code> replaces the image and rebuilds the initial stack with
+    <code>argc</code>, <code>argv</code> and <code>envp</code>, and
+    <code>wait4</code> reaps the exit status. Process groups and sessions carry
+    <code>kill(-pgid)</code> and the console's foreground group.
+  </p>
+  <p>
+    Threads come from <code>clone</code>: the address space and descriptor
+    table are shared, the thread id is distinct, and a detached thread's slot
+    and pages are reclaimed as soon as it exits. On top of that sits a pthread
+    subset — create, join, detach, exit, robust mutexes, condition variables —
+    with per-thread <code>errno</code> and TLS. Both ports pass the same
+    create-join-mutex-cond, detach and <code>EOWNERDEAD</code> tests.
+  </p>
+  <p>
+    Every CPU schedules. On x86-64 a GS-based per-CPU block, a local-APIC timer
+    per CPU, per-CPU idle tasks, reschedule IPIs and TLB shootdown keep tasks
+    running in parallel and prove the shootdown reaches the target. The i386
+    port has the same shape: the bootstrap processor keeps IRQ0 as its tick,
+    and the APs take their own local-APIC timer.
+  </p>
+</section>
+
+<section class="chapter wrap" id="storage">
+  <div class="num">04</div>
+  <h2>Storage: ATA PIO, FAT12 and the VFS</h2>
+  <p>
+    ATA polling PIO on both legacy channels, with software-reset recovery and a
+    sector cache in front of the disk. On top of it a writable FAT12 driver
+    handles files, subdirectories and 8.3 names; the VFS gives each process its
+    own descriptor table and one mount table for the whole system.
+  </p>
+  <dl class="spec">
+    <dt>Root</dt>
+    <dd>An in-RAM root populated from a cpio <code>newc</code> initramfs embedded in the boot image.</dd>
+    <dt>Disk</dt>
+    <dd>FAT12 at <code>/disk</code> on both ports, behind one mount table with longest-prefix resolution.</dd>
+    <dt>Generated</dt>
+    <dd><code>/proc/meminfo</code>, <code>/proc/uptime</code>, <code>/proc/self/cmdline</code>; <code>/dev/null</code>, <code>zero</code>, <code>console</code>.</dd>
+    <dt>Writes</dt>
+    <dd>Files are written back through the page cache; file-backed <code>mmap</code> maps those pages directly.</dd>
+    <dt>Ceiling</dt>
+    <dd>Eight cached paths of at most 128&nbsp;KiB each, 8.3 names, no timestamps and no permission bits.</dd>
+  </dl>
+</section>
+
+<section class="chapter wrap" id="console">
+  <div class="num">05</div>
+  <h2>Framebuffer console and PS/2 input</h2>
+  <p>
+    One renderer in <code>kernel/drivers/fbcon.c</code> draws the Terminus 8×16
+    font into a VBE linear framebuffer as plain full-screen text — no status
+    bar, no window chrome, no reserved rows — and falls back to VGA text when
+    the firmware gives no usable mode. The same output is mirrored to COM1, so
+    a headless run reads exactly what the screen shows.
+  </p>
+  <p>
+    A PS/2 keyboard decoder fills an interrupt-driven queue. The i386 port adds
+    the line discipline and CSI handling; the x86-64 port lets a blocking
+    <code>read()</code> on the console wake on IRQ1, which is what the
+    <code>HAKU64-KEY-OK</code> test proves.
+  </p>
+</section>
+
+<section class="chapter wrap" id="modules">
+  <div class="num">06</div>
+  <h2>Loadable kernel modules</h2>
+  <p>
+    A module is a packed <code>.hkm</code> container built on the host from
+    NASM ELF32 or COFF i386/amd64 objects. The loader validates it, relocates
+    it against an eleven-entry export table, and runs it at ring 0. A module can
+    register a <code>/dev</code> character device or a filesystem backend and
+    mount it at its own prefix; the kernel ties both to the module slot,
+    refuses <code>delete_module</code> while a descriptor is open with
+    <code>-EBUSY</code>, and detaches everything before freeing the image.
+  </p>
+  <p>
+    C modules are first-class: <code>include/haku/module.h</code> declares the
+    services, <code>libhakumod</code> supplies the string and 64-bit helpers
+    the compiler emits calls to, and the packer drops whatever a module does
+    not reach. The i386 loader ships device and filesystem registration; the
+    x86-64 loader offers logging, ticks and the kernel heap, and answers
+    filesystem registration with <code>-ENOSYS</code> until it is wired to the
+    mount table.
+  </p>
+</section>
+
+<section class="chapter wrap" id="ports">
+  <div class="num">07</div>
+  <h2>The x86-64 and i386 ports</h2>
+  <p>
+    Each capability is expected on both architectures. The differences below
+    are the ones that remain — some hardware, some still open work — and the
+    documentation names them instead of hiding them.
+  </p>
+  <div class="table-scroll">
+    <table class="grid">
+      <caption>Implemented surface, by port</caption>
+      <thead>
+        <tr><th scope="col">Area</th><th scope="col">x86-64</th><th scope="col">i386</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">Entry</th><td>PAE, <code>EFER.LME</code>, long-mode far jump</td><td>16-bit loader → protected mode</td></tr>
+        <tr><th scope="row">Paging</th><td>four levels, 1&nbsp;GiB physmap with 2&nbsp;MiB pages</td><td>two levels, sized direct map, no PAE</td></tr>
+        <tr><th scope="row">Syscalls</th><td><code>SYSCALL</code>/<code>SYSRET</code> plus <code>INT 0x80</code></td><td><code>INT 0x80</code></td></tr>
+        <tr><th scope="row">Scheduling</th><td>per-CPU LAPIC timers, every CPU dispatches</td><td>PIT wall clock, APs dispatch from the shared table</td></tr>
+        <tr><th scope="row">Signals</th><td>default actions</td><td>handlers, dispositions and job control</td></tr>
+        <tr><th scope="row">Pipes</th><td class="no">no</td><td class="yes">yes</td></tr>
+        <tr><th scope="row">Userland</th><td><code>user/lib64</code> and <code>/INIT.ELF</code> from disk</td><td>user C library and <code>busybox ash</code> as PID&nbsp;1</td></tr>
+        <tr><th scope="row">Modules</th><td>v2: log, ticks, heap, device registration</td><td>v1: device and filesystem registration</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="chapter wrap" id="limits">
+  <div class="num">08</div>
+  <h2>Limits and unsupported features</h2>
+  <p>
+    Haku does not claim POSIX compatibility. The target is an honest subset,
+    and everything outside it returns <code>ENOSYS</code> rather than
+    pretending to work. The limitations below are part of the design record,
+    not a wish list.
+  </p>
+  <ul class="plain">
+    <li>No networking, no demand paging, no swap, no load balancing, no CPU migration.</li>
+    <li>No SMP-tested ring-3 task: the user-space concurrency tests still run on the bootstrap processor.</li>
+    <li>The x86-64 side has no pipes, no signal handlers, no shell and no line discipline.</li>
+    <li>FAT12 only: 8.3 names, no timestamps, no permission bits, eight cached paths of 128&nbsp;KiB.</li>
+    <li>The x86-64 module loader answers filesystem registration with <code>-ENOSYS</code>.</li>
+    <li>Modules are trusted ring-0 code. There is no sandbox and no signature check.</li>
+  </ul>
+</section>
+
+<section class="chapter wrap" id="faq">
+  <div class="num">09</div>
+  <h2>Frequently asked questions</h2>
+  <div class="faq">
+    <h3>What is Haku?</h3>
+    <p>
+      Haku is a small freestanding operating system for x86-64 and 32-bit x86.
+      It has its own boot loader, kernel, scheduler, filesystems and user C
+      library, and it boots on QEMU or a BIOS PC from a 1.44&nbsp;MB floppy
+      image.
+    </p>
+    <h3>Which architectures does Haku support?</h3>
+    <p>
+      Two. x86-64 is the primary target, with long mode, four-level paging,
+      <code>SYSCALL</code>/<code>SYSRET</code> and per-CPU scheduling. The i386
+      port keeps the 32-bit protected-mode kernel and runs a static busybox
+      <code>ash</code> shell as PID&nbsp;1.
+    </p>
+    <h3>Is Haku POSIX compatible?</h3>
+    <p>
+      No. Haku implements a Linux-inspired subset of the POSIX interface, and
+      everything outside that subset returns <code>ENOSYS</code>. It has no
+      networking, no demand paging and no dynamic linker.
+    </p>
+    <h3>How is Haku built and tested?</h3>
+    <p>
+      <code>clang-cl</code> compiles the C sources, NASM assembles the boot and
+      entry paths, and <code>lld-link</code> links the image.
+      <code>build.py</code> drives the pipeline and QEMU; CI runs four headless
+      boots — x86-64 and i386, each at two and four CPUs — and asserts a marker
+      set for every subsystem.
+    </p>
+    <h3>Can Haku run Linux binaries?</h3>
+    <p>
+      Only statically linked programs that stay inside the implemented syscall
+      subset. The 32-bit image boots a static musl busybox, and a musl probe
+      can be run manually; the x86-64 side runs its own C library and
+      <code>/INIT.ELF</code>.
+    </p>
+  </div>
+</section>
+
+<section class="chapter wrap" id="start">
+  <div class="num">10</div>
+  <h2>Build and run Haku in QEMU</h2>
+  <p>
+    You need LLVM (nineteen or newer), NASM, QEMU and Python 3 on the
+    <code>PATH</code>; no Visual Studio install is required. The build retargets
+    the same <code>clang-cl</code> for <code>i686-pc-windows-msvc</code> or
+    <code>x86_64-pc-windows-msvc</code> and links with <code>lld-link</code>.
+  </p>
+<pre><code><span class="c">:: build the x86-64 boot image</span>
+python build.py
+
+<span class="c">:: build, boot headless and verify the marker set</span>
+python build.py headless
+
+<span class="c">:: the 32-bit port, with its busybox shell</span>
+python build.py headless --arch=i386
+python build.py shell</code></pre>
+
+  <div class="strip">
+    <div><strong>x64 CHECK PASSED</strong>boot, storage, processes, syscalls, modules</div>
+    <div><strong>HEADLESS CHECK PASSED</strong>the 32-bit suite, including the shell image</div>
+    <div><strong>4 gates in CI</strong>x64 and i386, at one CPU and at four</div>
+    <div><strong>Exit code 0</strong>or the run failed; the scripts never guess</div>
+  </div>
+
+  <ul class="links">
+    <li><a href="build.html">Build instructions</a></li>
+    <li><a href="docs.html">Documentation</a></li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel">Source on GitHub</a></li>
+    <li><a href="https://github.com/ParsaAzima/HakuKernel/blob/main/ROADMAP.md">Roadmap</a></li>
+  </ul>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <div class="wrap colophon__inner">
+    <div>
+      <p class="colophon__brand">Haku</p>
+      <p>
+        Free software under the GNU General Public License, version 3. The
+        Terminus font in <code>kernel/drivers/font_terminus.c</code> keeps the
+        SIL Open Font License 1.1. This site is static HTML and CSS: no
+        scripts, no trackers, no external assets.
+      </p>
+    </div>
+    <nav aria-label="Project links">
+      <a href="https://github.com/ParsaAzima/HakuKernel">Repository</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel/issues">Issues</a>
+      <a href="https://github.com/ParsaAzima/HakuKernel/actions">CI runs</a>
+      <a href="docs.html">Documentation</a>
+      <a href="build.html">Building</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>
