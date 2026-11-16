@@ -11,6 +11,8 @@ Usage:
     python build.py inspect ...     examine a FAT12 image (see --help there)
 
     python build.py shell           busybox ash on the 32-bit kernel
+    python build.py rootfs          boot a minimal Linux-style rootfs (32-bit)
+    python build.py rootfs --check  boot it headless and assert the markers
     python build.py probe --init=P --expect=M
                                     run an ELF32 probe as /init (32-bit)
     python build.py run --arch=i386 --fresh
@@ -28,11 +30,13 @@ Pipeline (x86-64, the default):
     QEMU boots haku64.img and attaches build/haku64_fs.img as the
     primary-master ATA disk, then verifies the volume after QEMU exits.
 
-The 32-bit pipeline (`--arch=i386`, `shell`, `probe`) builds haku.img from
-kernel/**/*.c and arch/x86, and attaches build/haku_fs.img plus a generated
-spare disk on the secondary channel. It remains the one with the user C
-library, busybox and the shell. `python build.py x64` is kept as an alias for
-the x64 headless check; it shares nothing with the i386 link line.
+The 32-bit pipeline (`--arch=i386`, `shell`, `rootfs`, `probe`) builds
+haku.img from kernel/**/*.c and arch/x86, and attaches build/haku_fs.img plus
+a generated spare disk on the secondary channel. It remains the one with the
+user C library, busybox and the shell. `shell` keeps the RAM root and puts
+busybox on the data disk; `rootfs` mounts that same volume at / instead and
+runs /INIT from it. `python build.py x64` is kept as an alias for the x64
+headless check; it shares nothing with the i386 link line.
 
 The 32-bit data image (build/haku_fs.img) is user data: an existing image is
 reused as-is so files from previous QEMU sessions survive the build, and
@@ -102,6 +106,27 @@ SHELL_CHECK_SCRIPT = (
 SHELL_EXPECTED = ["SHELL-BOOT", "SHELL-OK", "UNAME:haku", "HakuKernel",
                   "TERMINAL-CSI-OK", "SHELL-JOBCTL-OK", "PIPE-OUT",
                   "PIPE-DONE", "SHELL-DONE"]
+
+# What `rootfs --check` writes to /etc/rc, the script /INIT hands to `sh -c`.
+# The volume holds one busybox binary and FAT12 has no symlinks, so an applet
+# is reached through the multiplexer (`/bin/busybox uname`), not through $PATH.
+# The checks prove the boot reached ring 3, read /etc/motd and /etc/rc off the
+# FAT12 root, dispatched applets, read /proc and listed the root directory.
+ROOTFS_CHECK_SCRIPT = (
+    'echo ROOTFS-SH-OK; '
+    'echo UNAME:$(/bin/busybox uname -n); '
+    '/bin/busybox cat /proc/version; '
+    '/bin/busybox ls /; '
+    'echo ROOTFS-DONE; '
+    'exec /bin/busybox sh')
+ROOTFS_EXPECTED = ["ROOTFS-MOUNT-OK",   # the kernel chose the FAT12 volume
+                   "ROOTFS-INIT-OK",    # /INIT ran as pid 1
+                   "ROOTFS-EXEC: /bin/busybox sh -c /etc/rc",
+                   "HakuKernel rootfs", # /etc/motd was read and printed
+                   "ROOTFS-SH-OK",      # busybox ash parsed /etc/rc
+                   "UNAME:haku",        # an applet ran through the multiplexer
+                   "HakuKernel",        # /proc/version was read
+                   "ROOTFS-DONE"]
 
 
 def log(msg):
@@ -383,6 +408,92 @@ def build_shell_image(py, user_elf, busybox, command):
         args.append(f"INIT.CMD={cmd_path}")
     run(args)
     log(f"shell image ready ({os.path.getsize(image)} bytes, "
+        f"busybox {os.path.getsize(busybox)} bytes)")
+    return image
+
+
+def write_rootfs_tar(path, entries):
+    """Pack the same tree as a tar so a host can inspect or unpack it.
+
+    Entries are (name, source-or-None); None marks a directory. Timestamps and
+    owners are fixed so the archive is byte-identical across builds.
+    """
+    import tarfile
+
+    with tarfile.open(path, "w", format=tarfile.GNU_FORMAT) as archive:
+        for name, source in entries:
+            info = tarfile.TarInfo(name)
+            info.uid = 0
+            info.gid = 0
+            info.uname = "root"
+            info.gname = "root"
+            info.mtime = 0
+            if source is None:
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                archive.addfile(info)
+                continue
+            info.mode = 0o755 if name in ("INIT", "BIN/BUSYBOX") else 0o644
+            info.size = os.path.getsize(source)
+            with open(source, "rb") as handle:
+                archive.addfile(info, handle)
+
+
+def build_rootfs_image(py, init_elf, busybox, command):
+    """Stage the Linux-shaped tree and pack it as a FAT12 volume plus a tar.
+
+    The volume is what QEMU mounts as /: /INIT is pid 1, /BIN/BUSYBOX the
+    whole userland, /ETC/{MOTD,PROFILE,RC} the text /INIT reads, and /DEV,
+    /PROC, /TMP the mount points the kernel fills. FAT12 names are 8.3, so
+    the tree is upper case here; the filesystem folds case, which is what
+    makes /etc/rc and /bin/busybox work from user space. The tar is the same
+    tree for a host, so the image can be inspected without QEMU.
+    """
+    stage = os.path.join(BUILD, "rootfs")
+    os.makedirs(stage, exist_ok=True)
+    texts = [
+        ("ETC/MOTD",
+         "HakuKernel rootfs\n"
+         "32-bit x86 port, FAT12 root, busybox 1.37\n"
+         "applets run as `/bin/busybox APP` (the volume has no symlinks)\n"
+         "type `exit` to stop the guest\n"),
+        ("ETC/PROFILE",
+         "PATH=/bin\n"
+         "HOME=/\n"
+         "TERM=linux\n"
+         "PS1=haku# \n"
+         "export PATH HOME TERM PS1\n"),
+        ("README.TXT",
+         "HakuKernel rootfs tree\n"
+         "\n"
+         "INIT            pid 1, reads /etc/motd and /etc/rc\n"
+         "BIN/BUSYBOX     static musl busybox; every applet is this file\n"
+         "ETC/MOTD        banner /INIT prints\n"
+         "ETC/PROFILE     login shell environment\n"
+         "ETC/RC          boot command, when built with --check or --cmd\n"
+         "DEV, PROC       mount points for devfs and procfs\n"
+         "TMP             scratch space\n"),
+    ]
+    if command is not None:
+        texts.append(("ETC/RC", command + "\n"))
+    entries = []
+    for name, text in texts:
+        source = os.path.join(stage, name.replace("/", "_").lower())
+        with open(source, "w", encoding="ascii", newline="\n") as handle:
+            handle.write(text)
+        entries.append((name, source))
+
+    image = os.path.join(BUILD, "haku_rootfs.img")
+    run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
+         f"INIT={init_elf}", f"BIN/BUSYBOX={busybox}"]
+        + [f"{name}={source}" for name, source in entries]
+        + [f"--dir={name}" for name in ("DEV", "PROC", "TMP")])
+    write_rootfs_tar(os.path.join(BUILD, "haku_rootfs.tar"),
+                     [("BIN", None), ("DEV", None), ("ETC", None),
+                      ("PROC", None), ("TMP", None),
+                      ("INIT", init_elf), ("BIN/BUSYBOX", busybox)]
+                     + entries)
+    log(f"rootfs image ready ({os.path.getsize(image)} bytes, "
         f"busybox {os.path.getsize(busybox)} bytes)")
     return image
 
@@ -834,19 +945,19 @@ def main():
     smp_cpus = 2
     smp_explicit = False
     busybox_path = None
-    shell_command = None
-    shell_check = False
+    boot_command = None
+    boot_check = False
     for flag in raw_args:
         if flag == "--fresh":
             continue
         if flag == "--check":
-            shell_check = True
+            boot_check = True
             continue
         if flag.startswith("--busybox="):
             busybox_path = flag.split("=", 1)[1]
             continue
         if flag.startswith("--cmd="):
-            shell_command = flag.split("=", 1)[1]
+            boot_command = flag.split("=", 1)[1]
             continue
         if flag.startswith("--init="):
             init_override = flag.split("=", 1)[1]
@@ -895,25 +1006,28 @@ def main():
         if not expectations:
             sys.exit("probe needs at least one --expect=MARKER")
     elif mode == "shell":
-        if shell_command is None:
-            shell_command = (SHELL_CHECK_SCRIPT if shell_check
-                             else SHELL_INTERACTIVE_SCRIPT)
+        if boot_command is None:
+            boot_command = (SHELL_CHECK_SCRIPT if boot_check
+                            else SHELL_INTERACTIVE_SCRIPT)
         elif init_override or expectations:
             sys.exit("--init and --expect do not apply to `shell`")
-        if shell_check and init_override:
-            sys.exit("--init does not apply to `shell`")
+    elif mode == "rootfs":
+        if boot_check and boot_command is None:
+            boot_command = ROOTFS_CHECK_SCRIPT
+        if init_override or expectations:
+            sys.exit("--init and --expect do not apply to `rootfs`")
     elif init_override or expectations:
         sys.exit("--init and --expect only apply to `probe`")
-    if shell_check and mode != "shell":
-        sys.exit("--check only applies to `shell`")
+    if boot_check and mode not in ("shell", "rootfs"):
+        sys.exit("--check only applies to `shell` and `rootfs`")
 
     if mode == "x64":
         build_x64(nasm, py, memory_mb, smp_cpus, "headless")
         return
 
-    if mode in ("probe", "shell"):
+    if mode in ("probe", "shell", "rootfs"):
         if arch_explicit and arch != "i386":
-            sys.exit("`probe` and `shell` run the 32-bit userland; "
+            sys.exit("`probe`, `shell` and `rootfs` run the 32-bit kernel; "
                      "use --arch=i386")
         arch = "i386"
     if mode in ("build", "run", "headless") and arch == "x64":
@@ -1015,19 +1129,13 @@ def main():
     stage2_bin = os.path.join(BUILD, "stage2.bin")
     img = os.path.join(ROOT, "haku.img")
 
-    # The shell target boots a different data disk: busybox plus, for the
-    # scripted check, an INIT.CMD. Keeping it separate means the test image
-    # and the shell image never overwrite each other.
-    if mode == "shell":
-        filesystem_image = build_shell_image(py, user_elf,
-                                             shell_busybox(busybox_path),
-                                             shell_command)
-
     # 1. User ELFs are always rebuilt (build artifacts), but the FAT12 data
     #    disk is user data: an existing image is reused untouched so files
     #    from previous QEMU sessions survive, and mkfat12 runs only for an
     #    initial image or an explicit --fresh. headless always recreates —
     #    its fault-injection tests require pristine, deterministic state.
+    #    The shell and rootfs images are generated artifacts instead, so
+    #    they are rebuilt below once their userland exists.
     nasm_include = include_dir + os.sep
     run([nasm, "-I" + nasm_include, "-f", "bin", user_asm, "-o", user_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", exec_target_asm,
@@ -1099,13 +1207,41 @@ def main():
     run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Od", "/Oi-", "/W3"]
         + no_sse + ["/I" + include_dir, "/Fo" + user_test_obj,
                     user_test_source])
-    user_objects.append(user_test_obj)
+    library_objects = user_objects
     run(linker + ["/nologo", "/MACHINE:X86", "/SUBSYSTEM:CONSOLE",
                   "/ENTRY:start", "/BASE:0x40000000", "/FIXED",
                   "/DYNAMICBASE:NO", "/NXCOMPAT:NO", "/SAFESEH:NO",
                   "/ALIGN:4096", "/FILEALIGN:512", "/NODEFAULTLIB",
-                  "/OUT:" + libtest_pe] + user_objects)
+                  "/OUT:" + libtest_pe] + library_objects + [user_test_obj])
     run([py, pe2elf_script, libtest_pe, libtest_elf])
+
+    # The shell and rootfs targets boot their own data disks. Both are
+    # generated on every run (unlike haku_fs.img, which is user data) and
+    # both are built here because they need the userland above: the shell
+    # image carries the boot ELF, the rootfs image carries /INIT.
+    if mode == "shell":
+        filesystem_image = build_shell_image(py, user_elf,
+                                             shell_busybox(busybox_path),
+                                             boot_command)
+    elif mode == "rootfs":
+        rootfs_init_source = os.path.join(ROOT, "user", "rootfs", "init.c")
+        rootfs_init_obj = os.path.join(BUILD, "rootfs_init.obj")
+        rootfs_init_pe = os.path.join(BUILD, "rootfs_init.exe")
+        rootfs_init_elf = os.path.join(BUILD, "INIT")
+        run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Od", "/Oi-", "/W3"]
+            + no_sse + ["/I" + include_dir, "/Fo" + rootfs_init_obj,
+                        rootfs_init_source])
+        run(linker + ["/nologo", "/MACHINE:X86", "/SUBSYSTEM:CONSOLE",
+                      "/ENTRY:start", "/BASE:0x40000000", "/FIXED",
+                      "/DYNAMICBASE:NO", "/NXCOMPAT:NO", "/SAFESEH:NO",
+                      "/ALIGN:4096", "/FILEALIGN:512", "/NODEFAULTLIB",
+                      "/OUT:" + rootfs_init_pe]
+            + library_objects + [rootfs_init_obj])
+        run([py, pe2elf_script, rootfs_init_pe, rootfs_init_elf])
+        log("rootfs /INIT built and packed as ELF32")
+        filesystem_image = build_rootfs_image(py, rootfs_init_elf,
+                                              shell_busybox(busybox_path),
+                                              boot_command)
 
     # The initramfs holds the userland image the kernel unpacks into its RAM
     # filesystem at boot: /init is the first program, and the helper
@@ -1119,7 +1255,10 @@ def main():
          f"LIB.ELF={libtest_elf}", *module_archives,
          "--dir=dev", "--dir=proc", "--dir=disk"])
 
-    if mode in ("headless", "probe") or fresh or \
+    if mode in ("shell", "rootfs"):
+        # Built above from the generated tree; never treated as user data.
+        pass
+    elif mode in ("headless", "probe") or fresh or \
             not os.path.isfile(filesystem_image):
         if mode in ("headless", "probe") and os.path.isfile(filesystem_image):
             log(f"{mode}: recreating the data image "
@@ -1215,48 +1354,68 @@ def main():
     if mode == "run":
         log("Booting Haku in QEMU (close the window to return)...")
         subprocess.run(disk)
-    elif mode == "shell" and not shell_check:
-        log("Booting the Haku shell in QEMU (close the window to return)...")
-        log("busybox ash is pid 1: type a command at the prompt")
+    elif mode in ("shell", "rootfs") and not boot_check:
+        if mode == "shell":
+            log("Booting the Haku shell in QEMU (close the window to return)...")
+            log("busybox ash is pid 1: type a command at the prompt")
+        else:
+            log("Booting the Haku rootfs in QEMU "
+                "(close the window to return)...")
+            log("/INIT starts /bin/busybox as pid 1; type exit to stop")
         subprocess.run(disk)
-    elif mode == "shell":
+    elif mode in ("shell", "rootfs"):
+        name = "shell" if mode == "shell" else "rootfs"
+        done_marker, expected = (("SHELL-DONE", SHELL_EXPECTED)
+                                 if mode == "shell"
+                                 else ("ROOTFS-DONE", ROOTFS_EXPECTED))
         serial = os.path.join(BUILD, "serial.log")
         if os.path.exists(serial):
             os.remove(serial)
         proc = subprocess.Popen(disk + ["-display", "none",
                                         "-serial", f"file:{serial}"])
-        reached = wait_for_serial(serial, "SHELL-DONE",
-                                  float(os.environ.get("HAKU_SHELL_TIMEOUT",
-                                                       "300")))
+        reached = wait_for_serial(
+            serial, done_marker,
+            float(os.environ.get("HAKU_SHELL_TIMEOUT" if mode == "shell"
+                                 else "HAKU_ROOTFS_TIMEOUT", "300")))
         proc.kill()
         proc.wait()
         with open(serial, errors="replace") as f:
             content = f.read()
-        log("--- serial log (shell) ---")
+        log(f"--- serial log ({name}) ---")
         log(content)
-        missing = [marker for marker in SHELL_EXPECTED if marker not in content]
-        # The applet count is the one thing a marker cannot express: it proves
-        # that /bin was filled and that a directory listing came back through
-        # getdents, so a boot that reaches the prompt but cannot run anything
-        # still fails here.
-        applets = re.search(r"APPS:(\d+)", content)
-        if not applets or int(applets.group(1)) < 100:
-            missing.append("APPS:<count >= 100>")
+        missing = [marker for marker in expected if marker not in content]
+        applets = None
+        if mode == "shell":
+            # The applet count is the one thing a marker cannot express: it
+            # proves that /bin was filled and that a directory listing came
+            # back through getdents, so a boot that reaches the prompt but
+            # cannot run anything still fails here.
+            applets = re.search(r"APPS:(\d+)", content)
+            if not applets or int(applets.group(1)) < 100:
+                missing.append("APPS:<count >= 100>")
         if "PANIC" in content or "FAIL" in content:
             for line in content.splitlines():
                 if "PANIC" in line or "FAIL" in line:
                     log("  " + line.strip())
                     missing.append("no PANIC/FAIL")
-        if "can't access tty" in content or "job control turned off" in content:
-            missing.append("no tty warning")
-        if "can't set tty process group" in content:
-            missing.append("no process-group error")
+        if mode == "shell":
+            if "can't access tty" in content or \
+                    "job control turned off" in content:
+                missing.append("no tty warning")
+            if "can't set tty process group" in content:
+                missing.append("no process-group error")
         if missing or not reached:
-            sys.exit("SHELL CHECK FAILED: missing " + ", ".join(missing))
-        log(f"SHELL CHECK PASSED: busybox ash ran as pid 1, "
-            f"{applets.group(1)} applets resolved through $PATH, "
-            f"uname and /proc answered, job control enabled, "
-            f"a foreground pipeline forked and ran")
+            sys.exit(f"{name.upper()} CHECK FAILED: missing "
+                     + ", ".join(missing))
+        if mode == "shell":
+            log(f"SHELL CHECK PASSED: busybox ash ran as pid 1, "
+                f"{applets.group(1)} applets resolved through $PATH, "
+                f"uname and /proc answered, job control enabled, "
+                f"a foreground pipeline forked and ran")
+        else:
+            log("ROOTFS CHECK PASSED: /INIT ran as pid 1 on the FAT12 root, "
+                "/etc/motd and /etc/rc were read, busybox parsed the script, "
+                "applets ran, and /proc and / listed")
     elif mode in ("headless", "probe"):
         serial = os.path.join(BUILD, "serial.log")
         shot = os.path.join(BUILD, "screen.png")
@@ -1481,8 +1640,9 @@ def main():
             sys.exit("HEADLESS CHECK FAILED: " + "; ".join(failures))
     elif mode != "build":
         sys.exit(f"unknown mode: {mode} "
-                 f"(use: build | run [--fresh] | headless | shell | probe | "
-                 f"x64 | inspect [...]; --arch=i386 for the 32-bit kernel)")
+                 f"(use: build | run [--fresh] | headless | shell | rootfs | "
+                 f"probe | x64 | inspect [...]; --arch=i386 for the 32-bit "
+                 f"kernel)")
 
 
 if __name__ == "__main__":
