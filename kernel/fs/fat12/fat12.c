@@ -30,6 +30,13 @@ typedef struct {
 static fat12_volume_t volume;
 static uint8_t sector_buffer[FAT12_SECTOR_SIZE];
 
+/* Where the next allocation search starts. Without it every new cluster probes
+ * the volume from cluster 2, so writing an n-cluster file costs about n*n/2
+ * table probes; the hint makes an append one probe per cluster. A release
+ * rolls it back to the freed cluster, so space is still handed out from the
+ * front first. */
+static uint16_t free_hint = 2u;
+
 /* Live open handles, by pointer. unlink/rename/close consult this table
  * to flag, repoint, or release exactly the handles of one directory slot.
  * 32 slots can never fill via VFS (4 processes x 5 file descriptors, plus
@@ -99,6 +106,38 @@ static int read_volume_sector(uint32_t relative_lba, void *buffer) {
     return ata_read_sectors(relative_lba, 1, buffer);
 }
 
+/* One-sector cache for the FAT itself. Every chain step, allocation probe and
+ * release used to fetch a FAT sector over the bus, and a 1.44 MiB volume keeps
+ * its whole table in a handful of sectors: walking an n-cluster chain cost n
+ * disk reads for what this cache answers from RAM. The table only changes
+ * through write_fat_byte (and the raw test hook), and both drop the cache, so
+ * a cached sector is never stale. */
+static uint8_t fat_cache[FAT12_SECTOR_SIZE];
+static uint32_t fat_cache_lba;
+static int fat_cache_valid;
+
+static void fat_cache_drop(void) { fat_cache_valid = 0; }
+
+/* Return a pointer to FAT sector `sector_index`, loading it on a miss. */
+static int read_fat_sector(uint32_t sector_index, const uint8_t **sector) {
+    uint32_t lba;
+
+    if (sector_index >= volume.fat_sectors) return 0;
+    lba = volume.fat_start + sector_index;
+    if (fat_cache_valid && fat_cache_lba == lba) {
+        *sector = fat_cache;
+        return 1;
+    }
+    if (!read_volume_sector(lba, fat_cache)) {
+        fat_cache_valid = 0;
+        return 0;
+    }
+    fat_cache_lba = lba;
+    fat_cache_valid = 1;
+    *sector = fat_cache;
+    return 1;
+}
+
 const char *fat12_error_name(int result) {
     if (result == 1) return "OK";
     switch (-result) {
@@ -138,6 +177,9 @@ int fat12_test_read_sector(uint32_t lba, void *buffer) {
 int fat12_test_write_sector(uint32_t lba, const void *buffer) {
     if (!volume.mounted || !buffer) return -FAT12_ERR_INVALID;
     if (lba >= volume.total_sectors) return -FAT12_ERR_INVALID;
+    /* The self-test writes raw sectors, which may be the FAT: a cached copy
+     * would then describe the volume as it was before the fault injection. */
+    fat_cache_drop();
     return ata_write_sectors(lba, 1, buffer) ? 1 : -FAT12_ERR_IO;
 }
 
@@ -205,6 +247,8 @@ int fat12_mount(void) {
     int last_error = -FAT12_ERR_IO;
 
     memset(&volume, 0, sizeof(volume));
+    fat_cache_drop();
+    free_hint = 2u;
     if (!ata_init()) return -FAT12_ERR_IO;
 
     /* Every detected ATA disk is probed: the FAT12 volume may live on the
@@ -596,21 +640,20 @@ static int read_fat_entry(uint16_t cluster, uint16_t *value) {
     uint32_t fat_offset = cluster + cluster / 2u;
     uint32_t sector_index = fat_offset / FAT12_SECTOR_SIZE;
     uint32_t offset = fat_offset % FAT12_SECTOR_SIZE;
+    const uint8_t *sector;
     uint8_t low;
     uint8_t high;
 
-    if (sector_index >= volume.fat_sectors ||
-        !read_volume_sector(volume.fat_start + sector_index, sector_buffer))
-        return 0;
-    low = sector_buffer[offset];
+    if (!read_fat_sector(sector_index, &sector)) return 0;
+    /* The low byte is read before the high byte may pull the *next* sector
+     * into the one-sector cache, so an entry straddling two sectors still
+     * sees both halves intact. */
+    low = sector[offset];
     if (offset == FAT12_SECTOR_SIZE - 1u) {
-        if (sector_index + 1u >= volume.fat_sectors ||
-            !read_volume_sector(volume.fat_start + sector_index + 1u,
-                                sector_buffer))
-            return 0;
-        high = sector_buffer[0];
+        if (!read_fat_sector(sector_index + 1u, &sector)) return 0;
+        high = sector[0];
     } else {
-        high = sector_buffer[offset + 1u];
+        high = sector[offset + 1u];
     }
     *value = (cluster & 1u)
            ? (uint16_t)(((uint16_t)low | ((uint16_t)high << 8)) >> 4)
@@ -620,6 +663,9 @@ static int read_fat_entry(uint16_t cluster, uint16_t *value) {
 
 static int write_fat_byte(uint32_t fat_copy, uint32_t offset, uint8_t value) {
     uint32_t sector = offset / FAT12_SECTOR_SIZE;
+    /* The read-modify-write below goes to the disk, so whatever the cache
+     * holds for this volume stops matching the moment it lands. */
+    fat_cache_drop();
     if (sector >= volume.fat_sectors ||
         !read_volume_sector(volume.fat_start +
                             fat_copy * volume.fat_sectors + sector,
@@ -745,17 +791,29 @@ static int zero_cluster(uint16_t cluster) {
 }
 
 static int allocate_cluster(uint16_t *result) {
-    for (uint32_t candidate = 2; candidate < volume.cluster_count + 2u;
-         candidate++) {
-        uint16_t value;
-        if (!read_fat_entry((uint16_t)candidate, &value))
-            return -FAT12_ERR_IO;
-        if (value != FAT12_CLUSTER_FREE) continue;
-        if (!zero_cluster((uint16_t)candidate) ||
-            !write_fat_entry((uint16_t)candidate, FAT12_CLUSTER_END))
-            return -FAT12_ERR_IO;
-        *result = (uint16_t)candidate;
-        return 1;
+    uint32_t limit = volume.cluster_count + 2u;
+    uint32_t start = free_hint;
+
+    if (start < 2u || start >= limit) start = 2u;
+    /* Two passes: hint..limit, then 2..hint. Together they cover every data
+     * cluster exactly once, so a volume with a free cluster below the hint is
+     * never reported full; the common append case finds the next cluster on
+     * the first probe instead of re-reading the table from cluster 2. */
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        uint32_t begin = pass ? 2u : start;
+        uint32_t end = pass ? start : limit;
+        for (uint32_t candidate = begin; candidate < end; candidate++) {
+            uint16_t value;
+            if (!read_fat_entry((uint16_t)candidate, &value))
+                return -FAT12_ERR_IO;
+            if (value != FAT12_CLUSTER_FREE) continue;
+            if (!zero_cluster((uint16_t)candidate) ||
+                !write_fat_entry((uint16_t)candidate, FAT12_CLUSTER_END))
+                return -FAT12_ERR_IO;
+            free_hint = (uint16_t)(candidate + 1u);
+            *result = (uint16_t)candidate;
+            return 1;
+        }
     }
     return -FAT12_ERR_NO_SPACE;
 }
@@ -763,6 +821,11 @@ static int allocate_cluster(uint16_t *result) {
 static int free_cluster_chain(uint16_t first) {
     uint32_t iterations = 0;
     uint16_t current = first;
+    /* Space released below the hint is handed out first again, so a
+     * create/write/delete loop keeps the volume compact instead of drifting
+     * toward the end. */
+    if (first >= 2u && first < volume.cluster_count + 2u && first < free_hint)
+        free_hint = first;
     while (current >= 2u && current < volume.cluster_count + 2u) {
         uint16_t following;
         if (iterations++ >= volume.cluster_count ||
@@ -776,18 +839,49 @@ static int free_cluster_chain(uint16_t first) {
     return first == 0;
 }
 
+/* The chain cursor is keyed on the head cluster and the size the walk was
+ * taken at: refresh_file re-reads both from the directory entry, so a
+ * different pair means some other descriptor changed the file and the cached
+ * link can no longer be trusted. */
+static void chain_reset(fat12_file_t *file) {
+    file->chain_valid = 0;
+    file->chain_index = 0;
+    file->chain_size = 0;
+    file->chain_cluster = 0;
+    file->chain_first = 0;
+}
+
+/* Re-key a cursor after this handle itself extended the chain: appending
+ * keeps every link the cursor could point at, so only the size key moves. */
+static void chain_settle(fat12_file_t *file) {
+    if (!file->chain_valid) return;
+    file->chain_first = file->first_cluster;
+    file->chain_size = file->size;
+}
+
 static int file_cluster_at(fat12_file_t *file, uint32_t index, int create,
                            uint16_t *result) {
-    uint16_t cluster = file->first_cluster;
+    uint16_t cluster;
+    uint32_t i;
     uint32_t iterations = 0;
     int allocated;
+
+    if (file->chain_valid && file->chain_first == file->first_cluster &&
+        file->chain_size == file->size && index >= file->chain_index) {
+        cluster = file->chain_cluster;
+        i = file->chain_index;
+    } else {
+        cluster = file->first_cluster;
+        i = 0;
+    }
     if (cluster == 0) {
         if (!create) return -FAT12_ERR_IO;
         allocated = allocate_cluster(&cluster);
         if (allocated != 1) return allocated;
         file->first_cluster = cluster;
+        i = 0;
     }
-    for (uint32_t i = 0; i < index; i++) {
+    for (; i < index; i++) {
         uint16_t following;
         if (cluster < 2u || cluster >= volume.cluster_count + 2u ||
             iterations++ >= volume.cluster_count)
@@ -804,6 +898,11 @@ static int file_cluster_at(fat12_file_t *file, uint32_t index, int create,
         }
         cluster = following;
     }
+    file->chain_valid = 1;
+    file->chain_index = index;
+    file->chain_cluster = cluster;
+    file->chain_first = file->first_cluster;
+    file->chain_size = file->size;
     *result = cluster;
     return 1;
 }
@@ -1001,6 +1100,10 @@ static int truncate_chain_to(fat12_file_t *file, uint32_t keep_size) {
         keep_size ? (keep_size - 1u) / bytes_per_cluster + 1u : 0u;
     uint16_t cluster = file->first_cluster;
     uint16_t rest;
+    /* The tail is about to go back to the FAT, so any cached link may point
+     * into a cluster that is free again: make the next walk start at the
+     * head. */
+    chain_reset(file);
     if (needed == 0) {
         int freed = free_cluster_chain(cluster);
         file->first_cluster = 0;
@@ -1075,6 +1178,7 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
             file->size = original_size + zeroed;
             file->position = file->size;
             persist_file(file);
+            chain_settle(file);
             *write_count = 0;
             return status;
         }
@@ -1089,6 +1193,11 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
     if (original_position + written > file->size)
         file->size = original_position + written;
     file->position = original_position + written;
+    /* This call only appended (truncate_chain_to resets), so the cursor
+     * still names a live cluster; move its size key to the new length so the
+     * next call in a stream of chunked writes can resume instead of
+     * restarting the walk at first_cluster. */
+    chain_settle(file);
     /* A detached handle has no directory entry: its size lives and dies
      * with the handle, so there is nothing to persist (and the persist
      * failure below must not trigger a rollback of live data). */
@@ -1359,17 +1468,31 @@ int fat12_dir_open(const char *path, fat12_dir_t *dir) {
     if (resolved != 1) return resolved;
     if (!is_dir) return -FAT12_ERR_NOT_DIR;
     dir->first_cluster = cluster;
+    dir->cursor_index = 0;
+    dir->cursor_slot = 0;
+    dir->cursor_offset = 0;
     dir->opened = 1;
     return 1;
 }
 
+/* Report the index-th live entry, remembering where it was so the next
+ * ordinal in sequence resumes from that slot instead of rescanning the
+ * directory from the beginning: a 300-name /bin would otherwise cost about
+ * 45k entry visits per listing. The cursor is only trusted for the exact
+ * successor index, so any caller-chosen ordinal still works. */
 int fat12_dir_read(fat12_dir_t *dir, uint32_t index, fat12_stat_t *out,
                    char name[13], uint32_t *next_index) {
     uint32_t seen = 0;
     uint32_t slot = 0;
+    uint32_t offset = 0;
     if (!dir || !dir->opened || !out || !name || !next_index)
         return -FAT12_ERR_INVALID;
-    for (;; slot++) {
+    if (index != 0 && index == dir->cursor_index) {
+        seen = dir->cursor_index;
+        slot = dir->cursor_slot;
+        offset = dir->cursor_offset + 32u;
+    }
+    for (;; slot++, offset = 0) {
         uint32_t lba;
         int located;
         if (dir->first_cluster == 0 &&
@@ -1379,7 +1502,7 @@ int fat12_dir_read(fat12_dir_t *dir, uint32_t index, fat12_stat_t *out,
         if (located == 0) return 0;
         if (located < 0) return -FAT12_ERR_IO;
         if (!read_volume_sector(lba, sector_buffer)) return -FAT12_ERR_IO;
-        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE; offset += 32u) {
+        for (; offset < FAT12_SECTOR_SIZE; offset += 32u) {
             const uint8_t *entry = &sector_buffer[offset];
             if (entry[0] == 0) return 0;
             if (entry[0] == 0xE5u ||
@@ -1394,6 +1517,9 @@ int fat12_dir_read(fat12_dir_t *dir, uint32_t index, fat12_stat_t *out,
                 out->ino = slot * FAT12_ENTRIES_PER_SECTOR +
                            offset / 32u + 1u;
                 out->is_dir = (entry[11] & FAT12_ATTR_DIRECTORY) != 0;
+                dir->cursor_index = index + 1u;
+                dir->cursor_slot = slot;
+                dir->cursor_offset = offset;
                 *next_index = index + 1u;
                 return 1;
             }
@@ -1437,6 +1563,7 @@ int fat12_file_truncate(fat12_file_t *file, uint32_t size) {
             }
         }
         file->size = size;
+        chain_settle(file);
         if (attached && !persist_file(file)) return -FAT12_ERR_IO;
         return 1;
     }

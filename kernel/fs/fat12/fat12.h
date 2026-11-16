@@ -18,6 +18,18 @@ typedef struct {
     uint32_t dir_lba;
     uint32_t dir_off;
     int unlinked;
+    /* Chain cursor for sequential I/O: the cluster at chain_index on the
+     * chain headed by chain_first while the file was chain_size bytes long.
+     * Reading or writing an n-sector file asks for cluster 0, 1, 2, ... one
+     * sector at a time, so restarting the walk at first_cluster on every
+     * request costs n*n/2 FAT reads. Resuming is safe only while the chain
+     * is unchanged, and the first_cluster+size pair read back by refresh
+     * is what proves that; a backward request restarts at the head. */
+    uint32_t chain_index;
+    uint32_t chain_size;
+    uint16_t chain_cluster;
+    uint16_t chain_first;
+    int chain_valid;
 } fat12_file_t;
 
 /* File metadata for stat/fstat: the backend maps its directory-entry
@@ -30,10 +42,16 @@ typedef struct {
 } fat12_stat_t;
 
 /* Directory enumeration handle: the directory's first cluster (0 is the
- * fixed root region). The VFS keeps the entry cursor, so the backend stays
- * stateless and a getdents64 call can start at any ordinal. */
+ * fixed root region). The VFS owns the ordinal, so any getdents64 call can
+ * start it at any index; the backend only remembers the slot that produced
+ * the last entry so the common 0, 1, 2, ... scan does not rescan the
+ * directory from slot 0 per name (quadratic in the entry count). The
+ * cursor is used only when the request continues it in order. */
 typedef struct {
     uint32_t first_cluster;
+    uint32_t cursor_index;  /* ordinal this cursor can resume at */
+    uint32_t cursor_slot;   /* sector index holding the last entry */
+    uint32_t cursor_offset; /* byte offset of the last entry in that sector */
     int opened;
 } fat12_dir_t;
 
