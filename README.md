@@ -36,7 +36,9 @@ The practical target is a small, honest POSIX-*inspired* subset that a real
 static Linux binary can use. CI boots both ports headless and checks their
 marker sets on every push, and the `python build.py shell` target brings up a
 1 MiB static **busybox** as PID 1 and lands in `ash` with job control and
-pipelines working.
+pipelines working. `python build.py rootfs` boots the same busybox from a
+Linux-style FAT12 root — `/init`, `/bin`, `/etc`, `/dev`, `/proc` — with the
+volume itself as `/`.
 
 ## Status
 
@@ -85,6 +87,7 @@ pipelines working.
   fallback, PS/2 keyboard, serial mirror, CSI sequence handling with DSR
   replies, kernel-log display latch.
 - **Userland** — freestanding C library (`user/lib`), busybox/musl as PID 1,
+  a Linux-style rootfs image whose `/INIT` starts `sh` from the FAT12 root,
   headless self-tests for every subsystem listed above.
 - **x86-64** — the primary target: long-mode entry, four-level paging with a
   physmap, frame allocator, heap, GDT/TSS with IST stacks, IDT/PIC, timer, RTC
@@ -126,6 +129,8 @@ python build.py run             :: build + boot in a QEMU window
 python build.py headless        :: build + boot headless, verify
 python build.py shell           :: boot a busybox ash shell (32-bit image)
 python build.py shell --check   :: scripted shell run, assert its markers
+python build.py rootfs          :: boot a Linux-style rootfs (32-bit image)
+python build.py rootfs --check  :: scripted rootfs boot, assert its markers
 python build.py probe --init=X  :: boot an external ELF32 as /init (32-bit)
 python build.py headless --arch=i386   :: the full 32-bit headless suite
 ```
@@ -134,14 +139,18 @@ python build.py headless --arch=i386   :: the full 32-bit headless suite
 storage, process, syscall, memory and module self-test markers.
 `headless --arch=i386` prints `HEADLESS CHECK PASSED` for the 32-bit suite.
 `shell --check` prints `SHELL CHECK PASSED` after a forked foreground pipeline
-and a PATH lookup run inside `sh -i -c`. All exit nonzero on a missing marker,
-an unexpected `*-FAIL`, or `KERNEL PANIC`.
+and a PATH lookup run inside `sh -i -c`. `rootfs --check` prints
+`ROOTFS CHECK PASSED` after `/INIT` mounts the FAT12 volume as `/`, reads
+`/etc/motd` and `/etc/rc`, and runs busybox applets. All exit nonzero on a
+missing marker, an unexpected `*-FAIL`, or `KERNEL PANIC`.
 
 `build/haku_fs.img` and `build/haku64_fs.img` are the ATA data disks. The
 32-bit image is user data: it is reused untouched unless you pass `--fresh`,
 and `python build.py inspect --check` verifies its BPB, FAT mirrors, and
 cluster chains without modifying it. Report a damaged image rather than
-deleting it out of hand. The x64 seed disk is rebuilt on every run.
+deleting it out of hand. The x64 seed disk is rebuilt on every run. `shell`
+and `rootfs` boot their own generated volumes, `build/haku_shell.img` and
+`build/haku_rootfs.img` (plus `build/haku_rootfs.tar` for a host).
 
 ## Documentation
 
@@ -155,7 +164,7 @@ index for a browser: <https://parsaazima.github.io/HakuKernel/>.
 | [Architecture](docs/architecture.md) | Boot chain, memory map, IDT, frame allocator, the x86-64 port, and modules. |
 | [Processes and scheduling](docs/processes.md) | Process creation, COW forks, scheduler, job control, accounting. |
 | [System calls](docs/syscalls.md) | The syscall ABI, the call table, mmap/brk/mprotect, POSIX subset. |
-| [Userland](docs/userland.md) | User C library, busybox/musl, the shell image. |
+| [Userland](docs/userland.md) | User C library, busybox/musl, the shell and the rootfs image. |
 | [x86-64 C library](docs/libc64.md) | `user/lib64`, the Microsoft x64 ABI, the `/INIT.ELF` self-test and its limits. |
 | [Terminal and display](docs/terminal.md) | Console backends, input, logging latch, panic/crash reports. |
 | [Storage](docs/storage.md) | ATA PIO, FAT12, VFS, boot namespace, design limits. |

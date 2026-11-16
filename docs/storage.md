@@ -180,6 +180,16 @@ unpacks the cpio archive into the RAM root. `/init` from that archive runs as
 PID 1; the FAT volume stays reachable at `/disk`, and an image without an
 archive still boots the old way with FAT12 as the root.
 
+A rootfs image (`python build.py rootfs`) takes the third path: the kernel
+sees `disk/INIT` and a `disk/BIN` directory and mounts the FAT12 volume as `/`
+instead of the RAM filesystem. `/dev` and `/proc` are then mounted on the
+volume's own `DEV` and `PROC` directories, `/disk` stays as a second prefix
+over the same bytes, and `/INIT` runs as PID 1. That is what makes a
+Linux-shaped tree — `/etc/rc`, `/bin/busybox`, `/dev/tty`, `/proc/version` —
+the real paths for the programs inside the image; nothing is copied into RAM,
+so the 256 KiB ramfs file limit does not apply and the 1 MiB busybox lives
+where it is.
+
 - **`ramfs`** (`kernel/fs/ramfs`) is the writable root: long names (48 bytes
   per component), permission bits, timestamps from the PIT, nested
   directories, and symbolic links with a hop limit of 8. Nodes come from a

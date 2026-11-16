@@ -32,15 +32,16 @@ that needs new kernel work is 2.
 | Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
 | Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
 | Modules | version 2 loader: log, ticks, heap, device registration; filesystem registration/mount return `-ENOSYS` | version 1 loader with device and filesystem registration |
-| Userland | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device | freestanding user C library, `busybox ash`, probes |
+| Userland | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device | freestanding user C library, `busybox ash`, the FAT12 rootfs image, probes |
 
 CI runs the two headless gates at one and four CPUs on every push; the shell
-check is a local gate:
+and rootfs checks are local gates:
 
 ```cmd
 python build.py headless                  :: x64: prints "X64 CHECK PASSED"
 python build.py headless --arch=i386      :: 32-bit: "HEADLESS CHECK PASSED"
 python build.py shell --check             :: 32-bit busybox shell markers
+python build.py rootfs --check            :: 32-bit rootfs (init + busybox) markers
 ```
 
 A change is not done until both headless runs are green, the relevant

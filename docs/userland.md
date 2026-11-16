@@ -200,3 +200,24 @@ it missing, and `free` prints zeros because there is no `sysinfo` syscall.
 There is also no `/etc`, no line discipline beyond what the console
 provides, and `--install -s /bin` only fills the FAT12 image, which is
 regenerated on every build.
+
+## A Linux-style rootfs
+
+`python build.py rootfs` is the same busybox with a real tree around it. The
+image is a FAT12 volume whose root *is* the namespace root, so the files in it
+are the files the programs open: `/bin/busybox`, `/etc/motd`, `/etc/profile`,
+`/etc/rc`, with `/dev` and `/proc` mounted over the directory entries of the
+same volume. `/INIT` is a small ELF32 built from `user/rootfs/init.c` against
+`user/lib`; as PID 1 it prints `/etc/motd`, runs `/etc/rc` through
+`sh -c` when the image carries one, and otherwise starts `sh -l`, which reads
+`/etc/profile` like a login shell. It is the first program in the tree that
+is not a test: its only job is to become the shell.
+
+The volume has one binary and no symlinks, because FAT12 cannot store them, so
+the applets are reached through the multiplexer (`/bin/busybox ls`,
+`/bin/busybox cat`) instead of through `$PATH`. That is the honest shape of a
+1.44 MB root: `busybox` alone takes 1.03 MB of the 1.39 MB data area, which
+leaves room for `INIT`, the text files, and five directory clusters. The
+scripted check proves the boot path end to end: `/etc/motd` and `/etc/rc` were
+read from the volume, busybox parsed the script, `uname` and `cat` ran as
+applets, `/proc/version` and `ls /` answered, and the shell stayed as PID 1.

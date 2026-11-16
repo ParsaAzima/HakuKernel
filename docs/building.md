@@ -31,14 +31,16 @@ python build.py headless --arch=i386    :: 32-bit headless run
 python build.py run --arch=i386 --fresh :: 32-bit window, fresh data image
 python build.py shell           :: 32-bit busybox ash shell (interactive)
 python build.py shell --check   :: scripted shell run, assert its markers
+python build.py rootfs          :: 32-bit Linux-style rootfs (busybox + init)
+python build.py rootfs --check  :: scripted rootfs boot, assert its markers
 python build.py probe --init=X  :: boot an external ELF32 as /init (32-bit)
 python build.py --memory=1024   :: guest RAM in MiB (default 512, 32-bit map cap 1000)
 python build.py --smp=4         :: guest CPUs (x86-64 1..8, 32-bit 1..4; default 2)
 python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
-x86-64 is the primary target. `shell` and `probe` force the 32-bit image
-because the 64-bit side has a FAT12 root with a `/dev` but no shell yet;
+x86-64 is the primary target. `shell`, `rootfs` and `probe` force the 32-bit
+image because the 64-bit side has a FAT12 root with a `/dev` but no shell yet;
 passing
 `--arch=x64` with either is an error rather than a silent switch.
 
@@ -199,6 +201,38 @@ machines, CI). `--cmd=TEXT` replaces the boot command line, and
 `SHELL-BOOT`, `SHELL-OK`, `UNAME:haku`, `APPS:<count ≥ 100>`, `HakuKernel`,
 and `SHELL-DONE`. Today it reports 306 applets resolved through `$PATH`.
 
+`python build.py rootfs` boots a small Linux-style root filesystem instead:
+the data volume itself is the root. `build/haku_rootfs.img` is a 1.44 MB
+FAT12 volume carrying
+
+```
+INIT            pid 1, built from user/rootfs/init.c against user/lib
+BIN/BUSYBOX     the same static musl busybox, as the whole userland
+ETC/MOTD        the banner /INIT prints
+ETC/PROFILE     login-shell environment (PATH, HOME, TERM, PS1)
+ETC/RC          one-line boot command, only with --check or --cmd
+DEV, PROC, TMP  mount points for devfs, procfs and scratch space
+README.TXT      the tree, described inside the image
+```
+
+The kernel recognises `disk/INIT` plus `disk/BIN` before it reads `INITRD`,
+mounts that FAT12 volume as `/` — so `/etc/rc` and `/bin/busybox` are the
+paths the programs were written against — keeps `/disk` on the same volume,
+mounts `/dev` and `/proc`, and starts `/INIT` (`ROOTFS-MOUNT-OK`). `/INIT`
+prints `/etc/motd`, then hands `/etc/rc` to `sh -c`; without a script it
+starts `sh -l`, which reads `/etc/profile`. FAT12 has no symlinks, so the
+image carries one busybox binary and applets are reached through the
+multiplexer (`/bin/busybox ls`), not through `$PATH`.
+
+`rootfs --check` writes a script into `/etc/rc` and asserts
+`ROOTFS-MOUNT-OK`, `ROOTFS-INIT-OK`, the `/etc/motd` banner, `ROOTFS-SH-OK`,
+`UNAME:haku`, a `/proc/version` read and `ROOTFS-DONE`. `--cmd=TEXT` replaces
+the script, and `HAKU_ROOTFS_TIMEOUT` (default 300 s) bounds the headless
+run. The build also writes `build/haku_rootfs.tar`: the same tree for a host,
+with fixed owner and timestamps, so the image can be inspected without QEMU.
+Like `shell`, this is a manual gate — busybox is fetched on first use, which
+CI does not do.
+
 ### Data image lifecycle
 
 `build/haku_fs.img` is the ATA data disk and is treated as user data: an
@@ -230,6 +264,13 @@ directory and FAT summary without touching the image; `--chains` also prints
 cluster chains, `--cat NAME.EXT` / `--dump NAME.EXT OUT.BIN` extract a file,
 and `--check` enforces the kernel's mount invariants (BPB sanity, mirrored
 FATs, exact chains, no orphans) with a nonzero exit on any damage.
+
+The images themselves come from `tools/mkfat12.py`. An entry is
+`NAME.EXT=FILE`, and the name may be a path (`BIN/BUSYBOX=build/busybox`):
+missing parent directories are created, `--dir=NAME` adds an empty one, and
+`--empty` writes only the named entries. Directories are single-cluster (16
+entries including `.` and `..`), which is all a boot volume needs — a full
+directory or a duplicate name is an error rather than a silent truncation.
 The build is one Python script on purpose — `cmd.exe` quoting of spaced
 paths (e.g. `C:\Program Files\...`) is fragile, while `subprocess` argument
 lists just work. The root `CMakeLists.txt` does not build anything; it only
