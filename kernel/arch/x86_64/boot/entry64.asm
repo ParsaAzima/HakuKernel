@@ -28,6 +28,11 @@
 %define PAGE_2MB        0x080
 
 %define CR4_PAE         (1 << 5)
+%define CR4_OSFXSR      (1 << 9)    ; SSE state is saved by FXSAVE/context switch
+%define CR4_OSXMMEXCPT  (1 << 10)   ; unmasked SIMD exceptions reach #XM
+%define CR0_MP          (1 << 1)
+%define CR0_EM          (1 << 2)
+%define CR0_TS          (1 << 3)
 %define CR0_PG          (1 << 31)
 %define CR0_PE          (1 << 0)
 %define EFER_LME        (1 << 8)
@@ -73,9 +78,19 @@ entry64:
     loop .fill_pd
 
     ; --- enter long mode: CR4.PAE, EFER.LME, CR3, CR0.PG -------------------
+    ; SSE2 is part of the x86-64 baseline, so the compiler emits XMM
+    ; instructions even in integer code (Clang moves stack slots with
+    ; movdqa). CR4.OSFXSR/OSXMMEXCPT and a non-trapping FPU have to be in
+    ; place before the first line of 64-bit C runs; task64_init's later
+    ; enable_sse64() call is then just a no-op reassert.
     mov eax, cr4
-    or eax, CR4_PAE
+    or eax, CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT
     mov cr4, eax
+
+    mov eax, cr0
+    and eax, ~(CR0_EM | CR0_TS)
+    or eax, CR0_MP
+    mov cr0, eax
 
     mov ecx, MSR_EFER
     rdmsr

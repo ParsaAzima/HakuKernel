@@ -55,9 +55,16 @@ ap64_protected:
     mov gs, ax
     mov ss, ax
 
+    ; SSE2 is baseline on x86-64, so enable it before any 64-bit C runs:
+    ; CR4.OSFXSR/OSXMMEXCPT plus a non-trapping FPU (EM/TS clear, MP set).
     mov eax, cr4
-    or eax, 0x20                  ; CR4.PAE
+    or eax, 0x620                 ; CR4.PAE | OSFXSR | OSXMMEXCPT
     mov cr4, eax
+
+    mov eax, cr0
+    and eax, ~0xC                 ; clear EM (bit 2) and TS (bit 3)
+    or eax, 0x2                   ; MP
+    mov cr0, eax
 
     mov eax, [AP_PARAM_CR3]       ; BSP's PML4, physical
     mov cr3, eax

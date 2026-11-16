@@ -42,12 +42,12 @@ verifies the disk again after QEMU exits (tools/lsfat12.py --check). The x64
 seed disk is rebuilt on every run because the kernel writes NOTE.TXT into it.
 
 All tools are invoked with argument lists (never through cmd.exe), so paths
-with spaces just work. The C compiler and linker are the only host-specific
-piece: Windows uses VS2022's cl.exe + link.exe for both targets, while other
-platforms use clang-cl + lld-link. Both accept the identical MSVC-style
-switches (/c, /Fo, /ENTRY, /ALIGN, /NODEFAULTLIB ...); the architecture comes
-from the tool (x86 vs x64 cl.exe) or --target (clang-cl), so only tool
-discovery differs.
+with spaces just work. Both targets are built by Clang in its MSVC-compatible
+driver mode (clang-cl) and linked with lld-link: the kernel needs no Visual
+Studio install, only LLVM, and the switches (/c, /Fo, /ENTRY, /ALIGN,
+/NODEFAULTLIB ...) are the same ones the build always used. On Windows the
+tools are taken from C:\Program Files\LLVM\bin when it exists; the
+architecture comes from --target, so only tool discovery differs.
 """
 
 import glob
@@ -247,36 +247,22 @@ def verify_abi64_headers(include_dir):
                  + ", ".join(missing))
 
 
-def find_msvc():
-    """Find an x86-hosted cl.exe from any VS 2022+ installation.
+def _llvm_bin_dirs():
+    """Directories to search for LLVM tools before PATH.
 
-    CI images may expose cl through PATH (developer prompt) or only through
-    the Visual Studio directories, so check both. Prefer an x86 target
-    toolset: an x64 cl.exe cannot produce the 32-bit COFF objects we link.
+    Windows installs Clang to Program Files\LLVM\bin and does not put it on
+    PATH unless the installer is told to, so check the standard location
+    first. The Linux paths below keep the existing distro layout working.
     """
-    found = shutil.which("cl")
-    if found and re.search(r"[\\/]Hostx(?:64|86)[\\/]x86[\\/]cl\.exe$",
-                           found, re.IGNORECASE):
-        return found
-    patterns = [
-        r"C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC"
-        r"\*\bin\Hostx64\x86\cl.exe",
-        r"C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\MSVC"
-        r"\*\bin\Hostx64\x86\cl.exe",
-    ]
-    cands = []
-    for pattern in patterns:
-        cands += glob.glob(pattern)
-
-    def version(path):
-        match = re.search(r"[\\/]MSVC[\\/]([\d.]+)[\\/]bin[\\/]", path)
-        return tuple(int(part) for part in match.group(1).split(".")) \
-            if match else ()
-
-    if not cands:
-        sys.exit('x86 cl.exe not found: install VS2022 '
-                 '"Desktop development with C++"')
-    return max(cands, key=version)
+    dirs = [r"C:\Program Files\LLVM\bin", r"C:\Program Files (x86)\LLVM\bin"]
+    dirs += ["/usr/lib/llvm-*/bin", "/usr/bin", "/usr/local/bin"]
+    found = []
+    for d in dirs:
+        if "*" in d:
+            found += glob.glob(d)
+        elif os.path.isdir(d):
+            found.append(d)
+    return found
 
 
 def _latest(paths):
@@ -289,72 +275,71 @@ def _latest(paths):
 
 def find_clang_cl():
     """Locate a cl-driver clang: clang-cl, a versioned one, or clang in cl mode."""
+    for d in _llvm_bin_dirs():
+        direct = os.path.join(d, "clang-cl.exe" if os.name == "nt"
+                              else "clang-cl")
+        if os.path.isfile(direct):
+            return [direct]
     direct = shutil.which("clang-cl")
     if direct:
         return [direct]
     cands = []
-    for d in ("/usr/lib/llvm-*/bin", "/usr/bin", "/usr/local/bin"):
-        cands += glob.glob(os.path.join(d, "clang-cl-*"))
-        cands += glob.glob(os.path.join(d, "clang-cl"))
+    for d in _llvm_bin_dirs():
+        cands += glob.glob(os.path.join(d, "clang-cl*"))
+    cands = [c for c in cands if not c.endswith(".lib")]
     if cands:
         return [_latest(cands)]
     clang = shutil.which("clang")
     if clang:
         return [clang, "--driver-mode=cl"]
-    sys.exit("clang-cl not found: install Clang (e.g. apt install clang lld)")
+    sys.exit("clang-cl not found: install LLVM (C:\\Program Files\\LLVM\\bin "
+             "on Windows, e.g. apt install clang lld elsewhere)")
 
 
 def find_lld_link():
     """Locate lld-link (or a versioned lld-link-19)."""
+    for d in _llvm_bin_dirs():
+        direct = os.path.join(d, "lld-link.exe" if os.name == "nt"
+                              else "lld-link")
+        if os.path.isfile(direct):
+            return [direct]
     direct = shutil.which("lld-link")
     if direct:
         return [direct]
     cands = []
-    for d in ("/usr/lib/llvm-*/bin", "/usr/bin", "/usr/local/bin"):
-        cands += glob.glob(os.path.join(d, "lld-link-*"))
-        cands += glob.glob(os.path.join(d, "lld-link"))
+    for d in _llvm_bin_dirs():
+        cands += glob.glob(os.path.join(d, "lld-link*"))
     if not cands:
-        sys.exit("lld-link not found: install LLVM lld (e.g. apt install lld)")
+        sys.exit("lld-link not found: install LLVM lld (it ships with "
+                 "C:\\Program Files\\LLVM\\bin; e.g. apt install lld)")
     return [_latest(cands)]
 
 
 def detect_toolchain():
-    """Return (cc, linker, label): a compiler+linker that share MSVC switches.
+    """Return (cc, linker, label) for the 32-bit target.
 
-    Windows keeps VS2022's 32-bit cl.exe + link.exe. Everywhere else MSVC is
-    unavailable, so clang-cl + lld-link drive the same /c, /Fo, /ENTRY, /ALIGN
-    command lines targeting i686 COFF, keeping NASM win32 objects, the linked
-    PE, and pe2bin's output identical to a Windows build.
+    Clang in cl mode emits i686 COFF with the MSVC ABI and lld-link accepts
+    the same /ENTRY, /ALIGN and /NODEFAULTLIB switches as link.exe, so the
+    NASM win32 objects, the linked PE and pe2bin's output are unchanged; only
+    the tool that produces them differs. `-fno-builtin` is required: Clang
+    turns the counted-store loop in the project's own memset/memcpy into a call
+    to those same functions, and a freestanding kernel has no libc to break
+    the recursion.
     """
-    if os.name == "nt":
-        cl = find_msvc()
-        link = os.path.join(os.path.dirname(cl), "link.exe")
-        if not os.path.isfile(link):
-            sys.exit(f"link.exe not found next to cl.exe: {cl}")
-        return [cl], [link], "MSVC cl.exe/link.exe"
-    cc = find_clang_cl() + ["--target=i686-pc-windows-msvc"]
+    cc = find_clang_cl() + ["--target=i686-pc-windows-msvc",
+                            "-fno-builtin"]
     return cc, find_lld_link(), "clang-cl/lld-link (i686-pc-windows-msvc)"
 
 
 def find_x64_toolchain():
     """Return (cc, linker, label) for x86-64, or exit with a clear reason.
 
-    Windows keeps the x64 tools next to the 32-bit ones
-    (bin\\Hostx64\\x64), so the same VS install covers both. Elsewhere
-    clang-cl is retargeted at x86_64-pc-windows-msvc, mirroring the i686
-    path, so NASM win64 objects, the PE32+ image, and pe2bin line up.
+    The same clang-cl/lld-link pair is retargeted at
+    x86_64-pc-windows-msvc, mirroring the i686 path, so NASM win64 objects,
+    the PE32+ image, and pe2bin line up.
     """
-    if os.name == "nt":
-        cl = find_msvc()                       # ...\bin\Hostx64\x86\cl.exe
-        x64 = os.path.join(os.path.dirname(os.path.dirname(cl)), "x64")
-        cl64 = os.path.join(x64, "cl.exe")
-        link64 = os.path.join(x64, "link.exe")
-        if not (os.path.isfile(cl64) and os.path.isfile(link64)):
-            sys.exit("x64 MSVC tools not found; install "
-                     "'Desktop development with C++' for x64 in the "
-                     "Visual Studio Installer")
-        return [cl64], [link64], "MSVC cl.exe/link.exe (x64)"
-    cc = find_clang_cl() + ["--target=x86_64-pc-windows-msvc"]
+    cc = find_clang_cl() + ["--target=x86_64-pc-windows-msvc",
+                            "-fno-builtin"]
     return cc, find_lld_link(), "clang-cl/lld-link (x86_64-pc-windows-msvc)"
 
 
@@ -616,6 +601,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
 
     run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:NATIVE",
                   "/ENTRY:entry64", "/BASE:0x10000", "/ALIGN:16", "/FIXED",
+                  "/MAP:" + os.path.join(BUILD, "kernel64.map"),
                   "/NODEFAULTLIB", "/OUT:" + kernel_pe,
                   entry_obj, isr_obj, ap_trampoline64_obj,
                   user_image_obj] + objects)

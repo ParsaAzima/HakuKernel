@@ -82,13 +82,43 @@ int strcmp(const char *left, const char *right) {
 
 /* ---- 64-bit helpers --------------------------------------------------
  *
- * The compiler calls these by their documented runtime names, `__allmul`
- * and so on, and emits those names verbatim: unlike an ordinary C
- * function, a helper reference is not decorated a second time. Defining
- * `__allmul` in C would therefore produce `___allmul`, one underscore too
- * many, so each helper is spelled `_allmul` here and the C decoration puts
- * exactly `__allmul` in the symbol table.
+ * i386 code that multiplies or divides a 64-bit value reaches these
+ * routines through a call the compiler emits itself, and that call does not
+ * follow the convention of an ordinary C function: the compiler pushes the
+ * four argument words and then leaves them for the callee to pop, so the
+ * call site has no `add esp, 16` after it. That is the convention the
+ * original CRT helpers used, and why MSVC's `_aulldiv` ends in `ret 16`
+ * rather than `ret`. A cdecl definition would return with the stack
+ * sixteen bytes lower than the caller believes, so the *second* helper
+ * call in a function reads the first call's arguments — the hello module's
+ * self-check sees `-1000 % 7` where it asked for `(1 << 40) % 1000`.
+ *
+ * Each helper is therefore declared __stdcall, whose epilogue pops the
+ * arguments, with an asm label keeping the symbol at the compiler's own
+ * undecorated name (`__aulldiv`) instead of the `_aulldiv@16` form
+ * __stdcall would otherwise produce. The label belongs on the declaration:
+ * clang rejects an asm label on a definition, and a definition that
+ * repeats the label gets a fresh, mismatched symbol.
+ *
+ * On x86-64 the compiler divides and multiplies with the hardware
+ * instructions, so the helpers stay plain C there and the packer's
+ * reachability pass drops the ones the x64 module never references.
  */
+
+#if defined(_M_IX86)
+#define HAKU_MOD_HELPER_CONV __stdcall
+haku_i64 __stdcall _allmul(haku_i64 left, haku_i64 right) __asm__("__allmul");
+haku_u64 __stdcall _aulldiv(haku_u64 numerator, haku_u64 denominator)
+    __asm__("__aulldiv");
+haku_u64 __stdcall _aullrem(haku_u64 numerator, haku_u64 denominator)
+    __asm__("__aullrem");
+haku_i64 __stdcall _alldiv(haku_i64 numerator, haku_i64 denominator)
+    __asm__("__alldiv");
+haku_i64 __stdcall _allrem(haku_i64 numerator, haku_i64 denominator)
+    __asm__("__allrem");
+#else
+#define HAKU_MOD_HELPER_CONV
+#endif
 
 static haku_u32 high_word(haku_u64 value) {
     return (haku_u32)(value >> 32);
@@ -104,7 +134,7 @@ static haku_u64 join_words(haku_u32 high, haku_u32 low) {
 
 /* Low 64 bits of the product, computed from 16-bit limbs so no partial
  * product ever needs a 64-bit multiply. O(1): sixteen 16x16 multiplies. */
-haku_i64 _allmul(haku_i64 left, haku_i64 right) {
+haku_i64 HAKU_MOD_HELPER_CONV _allmul(haku_i64 left, haku_i64 right) {
     haku_u32 a[4], b[4], product[4];
     haku_u32 l_hi = high_word((haku_u64)left);
     haku_u32 l_lo = low_word((haku_u64)left);
@@ -179,21 +209,23 @@ static void divide64(haku_u64 numerator, haku_u64 denominator,
     *remainder = join_words(r_hi, r_lo);
 }
 
-haku_u64 _aulldiv(haku_u64 numerator, haku_u64 denominator) {
+haku_u64 HAKU_MOD_HELPER_CONV _aulldiv(haku_u64 numerator,
+                                       haku_u64 denominator) {
     haku_u64 quotient;
     haku_u64 remainder;
     divide64(numerator, denominator, &quotient, &remainder);
     return quotient;
 }
 
-haku_u64 _aullrem(haku_u64 numerator, haku_u64 denominator) {
+haku_u64 HAKU_MOD_HELPER_CONV _aullrem(haku_u64 numerator,
+                                       haku_u64 denominator) {
     haku_u64 quotient;
     haku_u64 remainder;
     divide64(numerator, denominator, &quotient, &remainder);
     return remainder;
 }
 
-haku_i64 _alldiv(haku_i64 numerator, haku_i64 denominator) {
+haku_i64 HAKU_MOD_HELPER_CONV _alldiv(haku_i64 numerator, haku_i64 denominator) {
     haku_u64 quotient;
     haku_u64 remainder;
     int negative = (numerator < 0) != (denominator < 0);
@@ -202,7 +234,7 @@ haku_i64 _alldiv(haku_i64 numerator, haku_i64 denominator) {
     return negative ? -(haku_i64)quotient : (haku_i64)quotient;
 }
 
-haku_i64 _allrem(haku_i64 numerator, haku_i64 denominator) {
+haku_i64 HAKU_MOD_HELPER_CONV _allrem(haku_i64 numerator, haku_i64 denominator) {
     haku_u64 quotient;
     haku_u64 remainder;
     divide64(unsigned_abs(numerator), unsigned_abs(denominator),
