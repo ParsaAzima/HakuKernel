@@ -145,6 +145,9 @@ deleting it out of hand. The x64 seed disk is rebuilt on every run.
 
 ## Documentation
 
+The project site renders the overview, build instructions and documentation
+index for a browser: <https://parsaazima.github.io/HakuKernel/>.
+
 | Document | Covers |
 |---|---|
 | [docs/](docs/README.md) | Documentation index. |
