@@ -114,7 +114,8 @@ volume itself as `/`.
   The disk is `/disk`, a cpio initramfs is the RAM root, `/proc` generates
   `meminfo`/`uptime`/`self/cmdline`, and `/dev` provides `null`, `zero`,
   `console` and devices a module registers; there is no shell, no module
-  filesystem yet, and no pipes or signal handlers.
+  filesystem yet, and no signal handlers, but `pipe`/`pipe2` and a blocking
+  `poll` connect a forked parent and child.
 
 ## Quick start
 
@@ -200,7 +201,7 @@ its own current task, idle task and timer, and wakes other CPUs with an IPI.
 Tasks are pinned to the CPU that created them, there is no load balancing or
 migration, and the user-space concurrency tests still run on the bootstrap
 processor, so a ring-3 task running on an AP is not yet covered. The x86-64
-kernel also lacks signal handlers, pipes, a line discipline, the kernel-log
+kernel also lacks signal handlers, a line discipline, the kernel-log
 latch and any namespace beyond a FAT12 root with `/dev` (`null`, `zero`,
 `console`), so its userland is a C library (`user/lib64`) plus the
 `/INIT.ELF` self-test rather than a shell; its console and PS/2 keyboard

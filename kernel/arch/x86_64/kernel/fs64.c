@@ -63,6 +63,8 @@ typedef struct {
     int slot;
     u32 backend;                   /* VFS64_MOUNT_FAT/RAM/DEV */
     int dev;                       /* device number when backend is dev */
+    u32 pipe;                      /* ring index when slot is FS64_PIPE */
+    u32 nonblock;                  /* O_NONBLOCK on this description */
     u32 flags;                     /* 0 read, 1 write, 2 read-write */
     u64 pos;
 } fs64_desc_t;
@@ -72,6 +74,8 @@ typedef struct {
 /* A descriptor that names a directory: it has no cache slot, it keeps the
  * path and an entry cursor. */
 #define FS64_DIR      (-3)
+/* One end of a pipe: no cache slot either, just an index into pipe64.c. */
+#define FS64_PIPE     (-4)
 
 /* One descriptor table per task: an index into the description table. -1 is
  * a free descriptor, and for 0..2 it is also the implicit console every task
@@ -97,6 +101,8 @@ static char dir_paths[FS64_DESC_MAX][K64_FS_PATH_MAX + 1];
 #define FS64_ENOTDIR  20
 #define FS64_EISDIR   21
 #define FS64_EINVAL   22
+#define FS64_ENFILE   23
+#define FS64_EMFILE   24
 #define FS64_ENOSPC   28
 #define FS64_ENOTEMPTY 39
 
@@ -789,6 +795,7 @@ int fs64_fd_sync(int task, int fd) {
     if (!valid_fd(task, fd)) return -FS64_EBADF;
     desc = fd_get(task, fd);
     if (!desc) return fd <= 2 ? 0 : -FS64_EBADF;
+    if (desc->slot == FS64_PIPE) return -FS64_EINVAL;
     if (desc->slot < 0) return 0;
     if ((u32)desc->slot >= FS64_CACHE_MAX) return -FS64_EBADF;
     if (!cache[desc->slot].used) return -FS64_EBADF;
@@ -819,6 +826,12 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
         if (size) *size = 0;
         if (ino) *ino = 0;
         if (kind) *kind = FS64_KIND_CHAR;
+        return 0;
+    }
+    if (desc->slot == FS64_PIPE) {
+        if (size) *size = 0;
+        if (ino) *ino = (u32)desc->pipe;
+        if (kind) *kind = FS64_KIND_FIFO;
         return 0;
     }
     if (desc->backend == VFS64_MOUNT_DEV)
@@ -977,6 +990,8 @@ static fs64_desc_t *desc_alloc(void) {
         descs[i].slot = -1;
         descs[i].backend = VFS64_MOUNT_FAT;
         descs[i].dev = -1;
+        descs[i].pipe = 0;
+        descs[i].nonblock = 0;
         return &descs[i];
     }
     return 0;
@@ -1303,9 +1318,102 @@ int fs64_fd_access(int task, int fd) {
 
     if (!desc) return -1;
     if (desc->slot < 0 && desc->slot != FS64_CONSOLE &&
-        desc->backend != VFS64_MOUNT_DEV)
+        desc->slot != FS64_PIPE && desc->backend != VFS64_MOUNT_DEV)
         return -1;
     return (int)desc->flags;
+}
+
+/* One end of a pipe. fs64_fd_file() reports its negative slot, so a caller
+ * that handles files must ask this first and never treat -4 as a cache
+ * index. */
+int fs64_fd_pipe(int task, int fd) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    return desc && desc->slot == FS64_PIPE;
+}
+
+int fs64_fd_pipe_index(int task, int fd) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    return desc && desc->slot == FS64_PIPE ? (int)desc->pipe : -1;
+}
+
+int fs64_fd_pipe_writer(int task, int fd) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    return desc && desc->slot == FS64_PIPE && desc->flags != K64_O_RDONLY;
+}
+
+int fs64_fd_nonblock(int task, int fd) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    return desc ? (int)desc->nonblock : 0;
+}
+
+/* F_SETFL: only O_NONBLOCK matters here, and it is per description, so a dup
+ * shares it exactly as POSIX requires. */
+int fs64_fd_set_nonblock(int task, int fd, int on) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    if (!desc) return -FS64_EBADF;
+    desc->nonblock = on ? 1u : 0u;
+    return 0;
+}
+
+/* pipe()/pipe2(). Both ends are fresh descriptions, so each one owns exactly
+ * one reader or writer reference until it is closed; a dup() or fork() shares
+ * the description and must not add another. The lowest two free descriptors
+ * above the console are chosen before anything is allocated, and the two
+ * table entries are published last, so a preempted task never sees one end of
+ * a half-built pipe. */
+int fs64_pipe(int task, u64 flags, int *read_fd, int *write_fd) {
+    fs64_desc_t *reader;
+    fs64_desc_t *writer;
+    int index, fd_read = -1, fd_write = -1;
+
+    if (!read_fd || !write_fd) return -FS64_EINVAL;
+    if (flags & ~(u64)(K64_O_NONBLOCK | K64_O_CLOEXEC)) return -FS64_EINVAL;
+    if (task < 0 || task >= (int)K64_TASK_MAX) return -FS64_EINVAL;
+    task = fd_task(task);
+
+    for (int fd = 3; fd < (int)FS64_FD_MAX; fd++) {
+        if (fd_desc[task][fd] >= 0) continue;
+        if (fd_read < 0) {
+            fd_read = fd;
+            continue;
+        }
+        fd_write = fd;
+        break;
+    }
+    if (fd_read < 0 || fd_write < 0) return -FS64_EMFILE;
+
+    index = pipe64_alloc();
+    if (index < 0) return -FS64_ENFILE;
+
+    reader = desc_alloc();
+    writer = desc_alloc();
+    if (!reader || !writer) {
+        if (reader) reader->used = 0;
+        if (writer) writer->used = 0;
+        pipe64_unref(index, 0);
+        pipe64_unref(index, 1);
+        return -FS64_ENOSPC;
+    }
+
+    reader->slot = FS64_PIPE;
+    reader->flags = K64_O_RDONLY;
+    reader->pipe = (u32)index;
+    reader->nonblock = (flags & K64_O_NONBLOCK) ? 1u : 0u;
+    writer->slot = FS64_PIPE;
+    writer->flags = K64_O_WRONLY;
+    writer->pipe = (u32)index;
+    writer->nonblock = reader->nonblock;
+
+    fd_desc[task][fd_read] = desc_index(reader);
+    fd_desc[task][fd_write] = desc_index(writer);
+    *read_fd = fd_read;
+    *write_fd = fd_write;
+    return 0;
 }
 
 /* Move `fd` to `target`: close whatever target held, then point it at the
@@ -1366,6 +1474,12 @@ void fs64_fd_close(int task, int fd) {
     if (desc->refs == 0) {
         if (desc->backend == VFS64_MOUNT_DEV && slot_index != FS64_CONSOLE)
             vfs64_dev_closed(desc->dev);
+        /* The last descriptor on this description takes the end with it. A
+         * dup or a forked sibling shares the description, so both keep the
+         * pipe open without adding a reader or writer reference. */
+        if (slot_index == FS64_PIPE)
+            pipe64_unref((int)desc->pipe,
+                         desc->flags == K64_O_RDONLY ? 0 : 1);
         desc->used = 0;
         desc->slot = -1;
     }

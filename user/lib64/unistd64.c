@@ -4,8 +4,8 @@
  * argument order are the Linux x86-64 ones, so the code reads the same as a
  * Linux libc and the kernel's dispatch table stays the single reference.
  * Anything the kernel does not implement is not declared here at all: there
- * are no pipe() or signal() wrappers yet, because claiming them in a header
- * would be worse than leaving them out.
+ * is no signal() wrapper yet, because claiming it in a header would be worse
+ * than leaving it out.
  */
 #include <haku/abi64.h>
 
@@ -49,6 +49,28 @@ int dup2(int old_fd, int new_fd) {
 int dup3(int old_fd, int new_fd, int flags) {
     return (int)haku64_errno_check(
         haku64_syscall3(HAKU64_SYS_DUP3, old_fd, new_fd, flags));
+}
+
+/* pipe()/pipe2(): two descriptors into the user int[2]. pipe2 additionally
+ * accepts O_NONBLOCK (and O_CLOEXEC, which this port accepts but does not act
+ * on yet because execve does not close descriptors). */
+int pipe(int fds[2]) {
+    return (int)haku64_errno_check(
+        haku64_syscall1(HAKU64_SYS_PIPE, (long long)fds));
+}
+
+int pipe2(int fds[2], int flags) {
+    return (int)haku64_errno_check(
+        haku64_syscall2(HAKU64_SYS_PIPE2, (long long)fds, flags));
+}
+
+/* poll(2): a snapshot of readiness, or a timed wait spent in kernel slices.
+ * The kernel parks a task on an infinite pipe poll; the timeout here is in
+ * milliseconds and -1 means wait without one. */
+int poll(haku64_pollfd_t *fds, unsigned int count, int timeout) {
+    return (int)haku64_errno_check(
+        haku64_syscall3(HAKU64_SYS_POLL, (long long)fds, (long long)count,
+                        timeout));
 }
 
 int unlink(const char *path) {

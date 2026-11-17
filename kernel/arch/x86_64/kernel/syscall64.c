@@ -34,6 +34,12 @@ static u64 sys64_random_next(void);
 #define SYS64_IOV_SIZE    16ull
 #define SYS64_TIMESPEC    16ull
 
+/* A pipe write that found no reader has to end the process with SIGPIPE, and
+ * only the dispatcher may do that (it must not resume this frame). The write
+ * path returns this value instead of an errno; every errno is -1..-4095, so
+ * bit 63 plus a zero low half cannot collide with one. */
+#define SYS64_PIPE_SIGPIPE 0x8000000000000000ull
+
 #define SYS64_EPERM  1ull
 #define SYS64_ENOENT 2ull
 #define SYS64_ESRCH  3ull
@@ -222,6 +228,7 @@ typedef char sys64_statx_must_be_256_bytes[
 #define SYS64_S_IFREG 0x8000u
 #define SYS64_S_IFDIR 0x4000u
 #define SYS64_S_IFCHR 0x2000u
+#define SYS64_S_IFIFO 0x1000u
 #define SYS64_DT_CHR  2u
 #define SYS64_DT_DIR  4u
 #define SYS64_DT_REG  8u
@@ -334,6 +341,8 @@ static void sys64_fill_stat(sys64_stat_t *st, u64 size, u32 ino, int kind) {
         st->st_mode = SYS64_S_IFDIR | 0755u;
     else if (kind == FS64_KIND_CHAR)
         st->st_mode = SYS64_S_IFCHR | 0666u;
+    else if (kind == FS64_KIND_FIFO)
+        st->st_mode = SYS64_S_IFIFO | 0666u;
     else
         st->st_mode = SYS64_S_IFREG | 0644u;
     st->st_blksize = 512;
@@ -417,7 +426,9 @@ static u64 sys64_statx(int id, int dirfd, u64 user_path, u64 flags,
                              ? (SYS64_S_IFDIR | 0755u)
                              : (kind == FS64_KIND_CHAR)
                                    ? (SYS64_S_IFCHR | 0666u)
-                                   : (SYS64_S_IFREG | 0644u));
+                                   : (kind == FS64_KIND_FIFO)
+                                         ? (SYS64_S_IFIFO | 0666u)
+                                         : (SYS64_S_IFREG | 0644u));
     out.stx_ino = ino;
     out.stx_size = size;
     out.stx_blocks = (size + 511u) / 512u;
@@ -698,6 +709,12 @@ static u64 sys64_fcntl(int id, u64 fd, u64 command, u64 argument) {
         return result < 0 ? (u64)result : 0;
 
     case K64_F_GETFL:
+        if (fs64_fd_pipe(id, (int)fd)) {
+            result = fs64_fd_access(id, (int)fd);
+            if (result < 0) return (u64)0 - SYS64_EBADF;
+            return (u64)(u32)result |
+                   (fs64_fd_nonblock(id, (int)fd) ? (u64)K64_O_NONBLOCK : 0);
+        }
         result = fs64_stat_fd(id, (int)fd, &size, &ino, &kind);
         if (result < 0) return (u64)result;
         if (kind == FS64_KIND_CHAR) {
@@ -709,6 +726,9 @@ static u64 sys64_fcntl(int id, u64 fd, u64 command, u64 argument) {
         return result < 0 ? 0 : (u64)(u32)result;
 
     case K64_F_SETFL:
+        if (fs64_fd_pipe(id, (int)fd))
+            return (u64)(s64)fs64_fd_set_nonblock(
+                id, (int)fd, (argument & K64_O_NONBLOCK) != 0);
         return 0;
 
     case K64_F_GETLK: {
@@ -823,6 +843,90 @@ static void note_write(u64 count) {
     k64_puts("\r\n");
 }
 
+/* A pipe read or write blocks until the ring changes, and the port's way of
+ * blocking is the one wait4() and poll() already use: enable interrupts,
+ * halt the CPU, and let the timer preempt the task while the other end runs.
+ * That is a real block (the CPU is not spinning) and it works on one CPU
+ * because the producer is a different task, so both the same-process thread
+ * and a forked child make progress. Parking instead would resume the frame
+ * with -EAGAIN and force every caller to retry, which is the console's
+ * contract but not what a file descriptor read should look like.
+ *
+ * The staging buffer is 64 bytes, so the hold on the ring is bounded and the
+ * user pointer is validated page by page by the copy, never by count. */
+static u64 sys64_pipe_read(int id, int fd, u64 buffer, u64 count) {
+    int index = fs64_fd_pipe_index(id, fd);
+    u64 space, done = 0;
+    u8 chunk[64];
+
+    if (index < 0 || fs64_fd_pipe_writer(id, fd))
+        return (u64)0 - SYS64_EBADF;
+    if (count == 0) return 0;
+    if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+    space = current_space();
+
+    for (;;) {
+        u64 want = count - done;
+        int got;
+
+        if (want > sizeof(chunk)) want = sizeof(chunk);
+        got = pipe64_read(index, chunk, (u32)want);
+        if (got > 0) {
+            if (!copy_to_user64(space, buffer + done, chunk, (u64)got)) {
+                if (done) break;
+                return (u64)0 - SYS64_EFAULT;
+            }
+            done += (u64)got;
+            if (done >= count) break;
+            continue;                  /* the ring may still hold bytes */
+        }
+        if (!pipe64_writers(index)) break;   /* no writer left: EOF */
+        if (done) break;                     /* a short read beats blocking */
+        if (fs64_fd_nonblock(id, fd)) return (u64)0 - SYS64_EAGAIN;
+        sti64();
+        cpu_halt64();
+        cli64();
+    }
+    return done;
+}
+
+static u64 sys64_pipe_write(int id, int fd, u64 buffer, u64 count) {
+    int index = fs64_fd_pipe_index(id, fd);
+    u64 space, done = 0;
+    u8 chunk[64];
+
+    if (index < 0 || !fs64_fd_pipe_writer(id, fd))
+        return (u64)0 - SYS64_EBADF;
+    if (count == 0) return 0;
+    if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+    space = current_space();
+
+    for (;;) {
+        u64 want = count - done;
+        int put;
+
+        if (!pipe64_readers(index))
+            return done ? done : SYS64_PIPE_SIGPIPE;
+        if (want > sizeof(chunk)) want = sizeof(chunk);
+        if (!copy_from_user64(space, chunk, buffer + done, want)) {
+            if (done) break;
+            return (u64)0 - SYS64_EFAULT;
+        }
+        put = pipe64_write(index, chunk, (u32)want);
+        if (put > 0) {
+            done += (u64)put;
+            if (done >= count) break;
+            continue;
+        }
+        if (done) break;
+        if (fs64_fd_nonblock(id, fd)) return (u64)0 - SYS64_EAGAIN;
+        sti64();
+        cpu_halt64();
+        cli64();
+    }
+    return done;
+}
+
 /* write(fd, buffer, count). The console descriptors (0..2 until redirected,
  * and any descriptor dup()ed from them) go to COM1; a file descriptor from
  * fs64.c writes into the page cache, which is flushed to the FAT12 volume
@@ -832,6 +936,8 @@ static u64 sys64_write(u64 fd, u64 buffer, u64 count) {
     int id = sched64_current(), file, access;
     u64 space, written = 0;
 
+    if (fs64_fd_pipe(id, (int)fd))
+        return sys64_pipe_write(id, (int)fd, buffer, count);
     if (!fs64_fd_console(id, (int)fd)) {
         u8 chunk[64];
         u64 pos, done = 0;
@@ -1200,6 +1306,8 @@ static u64 sys64_read(u64 fd, u64 buffer, u64 count) {
     u64 space, pos, size, done = 0;
     u8 chunk[64];
 
+    if (fs64_fd_pipe(id, (int)fd))
+        return sys64_pipe_read(id, (int)fd, buffer, count);
     file = fs64_fd_file(id, (int)fd);
     if (fs64_fd_device(id, (int)fd)) {
         space = current_space();
@@ -1258,7 +1366,8 @@ static u64 sys64_close(u64 fd) {
     int id = sched64_current();
 
     if (fs64_fd_file(id, (int)fd) < 0 && !fs64_fd_console(id, (int)fd) &&
-        !fs64_fd_device(id, (int)fd) && !fs64_fd_is_dir(id, (int)fd))
+        !fs64_fd_device(id, (int)fd) && !fs64_fd_is_dir(id, (int)fd) &&
+        !fs64_fd_pipe(id, (int)fd))
         return (u64)0 - SYS64_EBADF;
     fs64_fd_close(id, (int)fd);
     return 0;
@@ -1279,6 +1388,27 @@ static u64 sys64_dup2(u64 fd, u64 target) {
     int result = fs64_fd_dup2(sched64_current(), (int)fd, (int)target);
 
     return (u64)(s64)result;
+}
+
+/* pipe(fds) and pipe2(fds, flags): two descriptors into a user int[2]. The
+ * range is validated for writing once, before either end exists; if the copy
+ * still fails (a page unmapped in between is only possible on another CPU
+ * changing the map, which cannot happen for this address space here) both
+ * descriptors are closed again so a failed call leaks neither a slot nor the
+ * ring. */
+static u64 sys64_pipe(u64 user_fds, u64 flags) {
+    int id = sched64_current(), fds[2], result;
+
+    if (!user_fds || !user_page64(current_space(), user_fds, 0, 1))
+        return (u64)0 - SYS64_EFAULT;
+    result = fs64_pipe(id, flags, &fds[0], &fds[1]);
+    if (result < 0) return (u64)(s64)result;
+    if (!copy_to_user64(current_space(), user_fds, fds, sizeof(fds))) {
+        fs64_fd_close(id, fds[0]);
+        fs64_fd_close(id, fds[1]);
+        return (u64)0 - SYS64_EFAULT;
+    }
+    return 0;
 }
 
 /* execve's argv/envp arrive as a user array of user string pointers. Both are
@@ -1603,6 +1733,7 @@ static u64 sys64_lseek(u64 fd, u64 offset, u64 whence) {
     int file = fs64_fd_file(id, (int)fd);
     s64 delta = (s64)offset, pos;
 
+    if (fs64_fd_pipe(id, (int)fd)) return (u64)0 - SYS64_ESPIPE;
     if (fs64_fd_device(id, (int)fd)) {
         /* A device has a position but no end: SEEK_END is zero, and the
          * device itself ignores the offset it is read or written at. */
@@ -2325,11 +2456,13 @@ static u64 sys64_fsync(u64 fd) {
 
 /* --------------------------------------------------------- polling
  *
- * poll() answers from the descriptor table without a wait queue: the console
- * is always readable and writable, a regular file is readable while its
- * position is below the size, and every open descriptor is writable. A
- * positive timeout is spent with interrupts enabled in tick slices, which is
- * the same technique nanosleep uses.
+ * poll() answers from the descriptor table: the console is always readable and
+ * writable, a regular file is readable while its position is below the size,
+ * and every open descriptor is writable. A pipe is different: its readiness
+ * comes from the ring's fill level and its reader/writer counts, and an
+ * infinite timeout on a pipe is a real block, because a pipeline stage has no
+ * other way to wait. A positive timeout is spent with interrupts enabled in
+ * tick slices, which is the same technique nanosleep uses.
  */
 
 #define SYS64_POLLIN   0x0001u
@@ -2344,6 +2477,27 @@ static u32 sys64_poll_events(int id, int fd, u16 requested) {
     int kind, file;
 
     if (fd < 0) return SYS64_POLLNVAL;
+    if (fs64_fd_pipe(id, fd)) {
+        int index = fs64_fd_pipe_index(id, fd);
+        u32 ready = 0;
+
+        if (!fs64_fd_pipe_writer(id, fd)) {
+            /* No writer left: the reader is at EOF, which is readable and a
+             * hangup in one report. */
+            if (!pipe64_writers(index)) ready |= SYS64_POLLHUP;
+            if ((requested & SYS64_POLLIN) &&
+                (pipe64_readable(index) || !pipe64_writers(index)))
+                ready |= SYS64_POLLIN;
+        } else {
+            /* No reader left: further writes fail, which poll reports as an
+             * error on the write end. */
+            if (!pipe64_readers(index)) ready |= SYS64_POLLERR;
+            if ((requested & SYS64_POLLOUT) &&
+                (pipe64_writable(index) || !pipe64_readers(index)))
+                ready |= SYS64_POLLOUT;
+        }
+        return ready;
+    }
     file = fs64_fd_file(id, fd);
     if (file < 0) {
         if (fs64_fd_console(id, fd) || fd <= 2)
@@ -2375,6 +2529,7 @@ static u64 sys64_poll(u64 fds, u64 nfds, u64 timeout_ms) {
 
     for (;;) {
         u8 entry[8];
+        int waiting = 0;
 
         ready = 0;
         for (u64 i = 0; i < nfds; i++) {
@@ -2383,6 +2538,7 @@ static u64 sys64_poll(u64 fds, u64 nfds, u64 timeout_ms) {
 
             if (!copy_from_user64(space, entry, fds + i * 8, sizeof(entry)))
                 return (u64)0 - SYS64_EFAULT;
+            if (fs64_fd_pipe(id, *(int *)entry)) waiting = 1;
             events = *(u16 *)(entry + 4);
             revents = sys64_poll_events(id, *(int *)entry, events);
             *(u16 *)(entry + 6) = (u16)revents;
@@ -2407,6 +2563,12 @@ static u64 sys64_poll(u64 fds, u64 nfds, u64 timeout_ms) {
                     cli64();
                 }
             }
+        } else if (waiting) {
+            /* An infinite poll on a pipe is a real block: the writer's task
+             * runs while this CPU halts, and the next pass sees the bytes. */
+            sti64();
+            cpu_halt64();
+            cli64();
         } else {
             /* An infinite poll with nothing to wait on would hang the test
              * image; treat it as "no more work" and return zero. */
@@ -2673,6 +2835,14 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
     case K64_SYS_DUP3:
         result = sys64_dup3(sched64_current(), frame->rdi, frame->rsi,
                             frame->rdx);
+        break;
+
+    case K64_SYS_PIPE:
+        result = sys64_pipe(frame->rdi, 0);
+        break;
+
+    case K64_SYS_PIPE2:
+        result = sys64_pipe(frame->rdi, frame->rsi);
         break;
 
     case K64_SYS_FCNTL:
@@ -2959,11 +3129,15 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     case K64_SYS_WRITE:
         result = sys64_write(frame->rdi, frame->rsi, frame->rdx);
+        if (result == SYS64_PIPE_SIGPIPE)
+            return sched64_signal_group(frame, K64_SIGPIPE);
         wrote = 1;
         break;
 
     case K64_SYS_WRITEV:
         result = sys64_writev(frame->rdi, frame->rsi, frame->rdx);
+        if (result == SYS64_PIPE_SIGPIPE)
+            return sched64_signal_group(frame, K64_SIGPIPE);
         wrote = 1;
         break;
 

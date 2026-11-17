@@ -28,7 +28,7 @@ that needs new kernel work is 2.
 | Interrupts | 64-bit IDT/TSS with IST, 8259 + PIT, RTC; SMP bring-up with per-CPU scheduling, LAPIC timers and TLB shootdown | same, including per-CPU scheduling on the APs (`--smp=1..4`) |
 | Ring 3 | `SYSCALL`/`SYSRET` + `INT 0x80`, page-by-page user copies, NX | `INT 0x80`, page-by-page user copies |
 | Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads and the pthread subset, `futex`, process groups and sessions | same, plus signal handlers, job control and wait queues |
-| Syscalls | ported subset on the x86-64 numbers; no pipes, no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
+| Syscalls | ported subset on the x86-64 numbers, including pipes and a blocking `poll`; no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
 | Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
 | Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
 | Modules | version 2 loader: log, ticks, heap, device registration; filesystem registration/mount return `-ENOSYS` | version 1 loader with device and filesystem registration |
@@ -210,9 +210,15 @@ continue, and a foreground process group tied to the console.
 
 **Work.**
 
-- [ ] `pipe`/`pipe2` with a bounded ring buffer, shared by both descriptors,
+- [x] `pipe`/`pipe2` with a bounded ring buffer, shared by both descriptors,
       EOF when the last writer closes, and `SIGPIPE` on a write with no reader.
-      Wire pipes into `poll`/`select` and into `vfs_read`/`vfs_write` waits.
+      Eight 4 KiB rings, counted per open description so `dup`/`fork` share
+      one end, blocking reads and writes in the halt loop, and readiness wired
+      into `poll`/`select`. Proven by `HAKU64-USER-PIPE-OK` (ring, EOF,
+      `poll`, `O_NONBLOCK`) and `HAKU64-USER-PIPE-SIGPIPE-OK` (a forked
+      child's write with no reader ends in the default `SIGPIPE` action) and
+      `HAKU64-USER-PIPE-BLOCK-OK` (a write larger than the ring blocks until
+      the reader drains it).
 - [ ] Real signal delivery: `rt_sigaction` (13), `rt_sigprocmask` (14) and
       `rt_sigreturn` (15) on the x86-64 numbers, a user handler frame with a
       restorer, `sigaltstack` (131), and correct pending/masked state across
@@ -229,7 +235,10 @@ continue, and a foreground process group tied to the console.
 
 **Acceptance.** `HAKU64-PIPE-OK`, `HAKU64-SIGNAL-OK`, `HAKU64-JOBCTL-OK`; a
 ring-3 test runs a two-stage pipeline, catches and returns from a handler,
-stops and resumes a child, and observes the foreground group change.
+stops and resumes a child, and observes the foreground group change. The pipe
+half is done: `HAKU64-USER-PIPE-OK` and `HAKU64-USER-PIPE-SIGPIPE-OK` already
+run in `/INIT.ELF`, and the remaining markers wait for real signal delivery
+and a TTY.
 
 ## 4. Interactive x86-64 userland (console, TTY, busybox)
 

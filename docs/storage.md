@@ -250,3 +250,11 @@ describes the last component itself (ramfs walks with `follow_last = 0`),
 without links answers exactly like `stat`. `symlink` and `readlink` are
 available to user mode; `readlink` truncates to the caller's buffer instead
 of failing, like Linux.
+
+The x86-64 page cache is not the only kind of open description. `pipe` and
+`pipe2` create two descriptors onto a 4 KiB byte ring in
+`kernel/arch/x86_64/kernel/pipe64.c` with no path and no cache slot: `fstat`
+reports such a descriptor as `S_IFIFO`, `lseek` as `ESPIPE`, and neither end
+appears in a directory listing because this port has no named FIFOs. The ring,
+its reference counting and its `poll` readiness are described with the syscall
+surface in [system calls](syscalls.md#user-mode-system-calls).

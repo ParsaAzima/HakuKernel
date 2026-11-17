@@ -347,7 +347,7 @@
         <tr><th scope="row">Syscalls</th><td><code>SYSCALL</code>/<code>SYSRET</code> plus <code>INT 0x80</code></td><td><code>INT 0x80</code></td></tr>
         <tr><th scope="row">Scheduling</th><td>per-CPU LAPIC timers, every CPU dispatches</td><td>PIT wall clock, APs dispatch from the shared table</td></tr>
         <tr><th scope="row">Signals</th><td>default actions</td><td>handlers, dispositions and job control</td></tr>
-        <tr><th scope="row">Pipes</th><td class="no">no</td><td class="yes">yes</td></tr>
+        <tr><th scope="row">Pipes</th><td class="yes">yes</td><td class="yes">yes</td></tr>
         <tr><th scope="row">Userland</th><td><code>user/lib64</code> and <code>/INIT.ELF</code> from disk</td><td>user C library, <code>busybox ash</code> as PID&nbsp;1, and a FAT12 rootfs whose <code>/INIT</code> starts the shell</td></tr>
         <tr><th scope="row">Modules</th><td>v2: log, ticks, heap, device registration</td><td>v1: device and filesystem registration</td></tr>
       </tbody>
@@ -367,7 +367,7 @@
   <ul class="plain">
     <li>No networking, no demand paging, no swap, no load balancing, no CPU migration.</li>
     <li>No SMP-tested ring-3 task: the user-space concurrency tests still run on the bootstrap processor.</li>
-    <li>The x86-64 side has no pipes, no signal handlers, no shell and no line discipline.</li>
+    <li>The x86-64 side has no signal handlers, no shell and no line discipline; pipes exist with <code>SIGPIPE</code> as the default action only.</li>
     <li>FAT12 only: 8.3 names, no timestamps, no permission bits, eight cached paths of 128&nbsp;KiB.</li>
     <li>The rootfs is a 1.44&nbsp;MB FAT12 volume: one busybox binary, no symlinks and no <code>/etc/fstab</code>, so applets run as <code>/bin/busybox APP</code>.</li>
     <li>The x86-64 module loader answers filesystem registration with <code>-ENOSYS</code>.</li>

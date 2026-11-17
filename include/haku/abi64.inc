@@ -34,6 +34,7 @@
 %define HAKU64_SYS_PWRITE64      18
 %define HAKU64_SYS_WRITEV        20
 %define HAKU64_SYS_ACCESS        21
+%define HAKU64_SYS_PIPE          22
 %define HAKU64_SYS_DUP           32
 %define HAKU64_SYS_DUP2          33
 %define HAKU64_SYS_NANOSLEEP     35
@@ -76,6 +77,7 @@
 %define HAKU64_SYS_SET_ROBUST_LIST 273
 %define HAKU64_SYS_GET_ROBUST_LIST 274
 %define HAKU64_SYS_DUP3          292
+%define HAKU64_SYS_PIPE2         293
 %define HAKU64_SYS_GETRANDOM     318
 %define HAKU64_SYS_STATX         332
 
@@ -125,6 +127,7 @@
 %define HAKU64_EMFILE  24
 %define HAKU64_ENOSPC  28
 %define HAKU64_ESPIPE  29
+%define HAKU64_EPIPE   32
 %define HAKU64_ERANGE  34
 %define HAKU64_EDEADLK 35
 %define HAKU64_ENAMETOOLONG 36
@@ -132,6 +135,8 @@
 %define HAKU64_ENOTEMPTY 39
 %define HAKU64_EOWNERDEAD 130
 %define HAKU64_ENOTRECOVERABLE 131
+
+%define HAKU64_SIGPIPE 13
 
 ; *at flags and access modes.
 %define HAKU64_AT_FDCWD          -100
@@ -206,6 +211,9 @@
 %define HAKU64_PR_GET_NAME 16
 %define HAKU64_POLLIN  1
 %define HAKU64_POLLOUT 4
+%define HAKU64_POLLERR 8
+%define HAKU64_POLLHUP 16
+%define HAKU64_POLLNVAL 32
 
 %define HAKU64_CLONE_VM            0x00000100
 %define HAKU64_CLONE_FS            0x00000200

@@ -45,6 +45,8 @@ Haku/
                         fallback and the ported call table;
                         fs64.c: page cache in front of the FAT12 disk and the
                         RAM root;
+                        pipe64.c: the bounded 4 KiB rings behind pipe() and
+                        pipe2(), shared by both ends;
                         ramfs64.c: RAM root node table; its pages are the
                         frames the cache aliases;
                         initramfs64.c: cpio "newc" unpacker for /disk/INITRD;

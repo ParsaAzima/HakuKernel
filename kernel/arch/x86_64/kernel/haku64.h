@@ -426,6 +426,7 @@ typedef signed long long s64;
 #define K64_SIGINT  2u
 #define K64_SIGKILL 9u
 #define K64_SIGSEGV 11u
+#define K64_SIGPIPE 13u
 #define K64_SIGTERM 15u
 #define K64_SIGCHLD 17u
 #define K64_NSIG    31u
@@ -1011,6 +1012,18 @@ int fs64_fd_dev_write(int task, int fd, const void *src, u64 count);
 u64 fs64_fd_pos(int task, int fd);
 int fs64_fd_seek(int task, int fd, u64 pos);
 int fs64_fd_access(int task, int fd);
+/* A pipe end is a description with no cache slot: both ends name the same
+ * index in pipe64.c, and the writer flag is the access mode the end was
+ * created with. nonblock is the per-description O_NONBLOCK bit F_SETFL
+ * controls. */
+int fs64_fd_pipe(int task, int fd);
+int fs64_fd_pipe_index(int task, int fd);
+int fs64_fd_pipe_writer(int task, int fd);
+int fs64_fd_nonblock(int task, int fd);
+int fs64_fd_set_nonblock(int task, int fd, int on);
+/* pipe()/pipe2(): two fresh descriptions on the lowest free descriptors, or a
+ * negative errno. `flags` accepts O_NONBLOCK and O_CLOEXEC. */
+int fs64_pipe(int task, u64 flags, int *read_fd, int *write_fd);
 int fs64_fd_dup(int task, int fd, int minimum);
 int fs64_fd_dup2(int task, int fd, int target);
 int fs64_fd_console(int task, int fd);
@@ -1029,6 +1042,7 @@ void fs64_task_cleanup(int task);
 #define FS64_KIND_FILE   0
 #define FS64_KIND_DIR    1
 #define FS64_KIND_CHAR   2
+#define FS64_KIND_FIFO   3
 int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind);
 int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind);
 int fs64_unlink(const char *path);
@@ -1045,6 +1059,19 @@ int fs64_fd_entry(int task, int fd, u32 index, char name[FS64_NAME_MAX],
                   u32 *ino, int *kind, u32 *next_index);
 int fs64_dir_entries(const char *path, u32 index, char name[FS64_NAME_MAX],
                      u32 *ino, int *kind, u32 *next_index);
+
+/* pipe64.c: the bounded ring behind one pipe. fs64.c owns the descriptions and
+ * the reference accounting; this module owns the bytes and the fill level.
+ * `writer` selects the end for unref and for the reader/writer counts, so a
+ * close of one end never disturbs the other. */
+int pipe64_alloc(void);
+void pipe64_unref(int index, int writer);
+u32 pipe64_readable(int index);
+u32 pipe64_writable(int index);
+int pipe64_readers(int index);
+int pipe64_writers(int index);
+int pipe64_read(int index, void *dst, u32 count);
+int pipe64_write(int index, const void *src, u32 count);
 
 /* initramfs64.c: read /disk/INITRD and unpack its cpio "newc" archive into
  * the RAM root. When the archive is absent, the FAT12 volume becomes the

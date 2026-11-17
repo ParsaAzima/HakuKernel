@@ -68,6 +68,7 @@ typedef long long time_t;
 #define HAKU64_SYS_PWRITE64      18
 #define HAKU64_SYS_WRITEV        20
 #define HAKU64_SYS_ACCESS        21
+#define HAKU64_SYS_PIPE          22
 #define HAKU64_SYS_DUP           32
 #define HAKU64_SYS_DUP2          33
 #define HAKU64_SYS_NANOSLEEP     35
@@ -112,6 +113,7 @@ typedef long long time_t;
 #define HAKU64_SYS_SET_ROBUST_LIST 273
 #define HAKU64_SYS_GET_ROBUST_LIST 274
 #define HAKU64_SYS_DUP3          292
+#define HAKU64_SYS_PIPE2         293
 #define HAKU64_SYS_GETRANDOM     318
 #define HAKU64_SYS_STATX         332
 
@@ -202,6 +204,7 @@ typedef long long time_t;
 #define HAKU64_EMFILE  24
 #define HAKU64_ENOSPC  28
 #define HAKU64_ESPIPE  29
+#define HAKU64_EPIPE   32
 #define HAKU64_ERANGE  34
 #define HAKU64_EDEADLK 35
 #define HAKU64_ENAMETOOLONG 36
@@ -209,6 +212,10 @@ typedef long long time_t;
 #define HAKU64_ENOTEMPTY 39
 #define HAKU64_EOWNERDEAD 130
 #define HAKU64_ENOTRECOVERABLE 131
+
+/* Signals the library names. Only the default action exists, and it ends the
+ * process: a write to a pipe with no reader raises SIGPIPE. */
+#define HAKU64_SIGPIPE 13
 
 /* --------------------------------------------------------- path and flags */
 #define HAKU64_AT_FDCWD -100
@@ -323,6 +330,12 @@ typedef struct {
     short revents;
 } haku64_pollfd_t;
 
+#define HAKU64_POLLIN  0x0001
+#define HAKU64_POLLOUT 0x0004
+#define HAKU64_POLLERR 0x0008
+#define HAKU64_POLLHUP 0x0010
+#define HAKU64_POLLNVAL 0x0020
+
 /* Linux x86-64 utsname: six 65-byte fields. */
 typedef struct {
     char sysname[65];
@@ -398,6 +411,16 @@ off_t lseek(int fd, off_t offset, int whence);
 int dup(int fd);
 int dup2(int old_fd, int new_fd);
 int dup3(int old_fd, int new_fd, int flags);
+/* pipe()/pipe2(): fds[0] reads and fds[1] writes the same ring. pipe2 also
+ * takes O_NONBLOCK and O_CLOEXEC. A read of an empty pipe blocks until data
+ * or the last writer closes (then it returns 0); a write with no reader ends
+ * the process with the default SIGPIPE action. */
+int pipe(int fds[2]);
+int pipe2(int fds[2], int flags);
+/* poll(2): `count` entries of haku64_pollfd_t, `timeout` in milliseconds and
+ * -1 to wait for a pipe to change. Returns the number of entries with events
+ * or 0 on timeout. */
+int poll(haku64_pollfd_t *fds, unsigned int count, int timeout);
 int unlink(const char *path);
 int rename(const char *old_path, const char *new_path);
 int mkdir(const char *path, ...);

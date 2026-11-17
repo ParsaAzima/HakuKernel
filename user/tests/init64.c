@@ -716,6 +716,168 @@ static void test_mappings_and_time(void) {
           "monotonic clock moves forward");
 }
 
+/* Pipes: one bounded ring shared by fds[0] and fds[1]. The ring is 4 KiB and
+ * the kernel copies through a 64-byte staging buffer, so a 512-byte transfer
+ * exercises several chunks and a full read drains it. poll must see the fill
+ * level, close(fds[1]) must turn the next read into EOF, and O_NONBLOCK must
+ * make an empty read return -EAGAIN instead of blocking. */
+static void test_pipes(void) {
+    int before = failures;
+    int fds[2];
+    char text[8];
+    char data[512];
+    haku64_pollfd_t pfd;
+    long long flags;
+
+    check(pipe(fds) == 0, "pipe");
+    check(fds[0] >= 3 && fds[1] > fds[0],
+          "pipe hands out two descriptors above the console");
+
+    for (int i = 0; i < (int)sizeof(data); i++)
+        data[i] = (char)(i * 7 + 1);
+    check(write(fds[1], data, sizeof(data)) == (ssize_t)sizeof(data),
+          "write 512 bytes into a pipe");
+
+    pfd.fd = fds[0];
+    pfd.events = HAKU64_POLLIN;
+    pfd.revents = 0;
+    check(poll(&pfd, 1, 100) == 1 && (pfd.revents & HAKU64_POLLIN),
+          "poll reports pipe data");
+
+    memset(text, 0, sizeof(text));
+    check(read(fds[0], text, 5) == 5 && memcmp(text, data, 5) == 0,
+          "read the first five pipe bytes");
+    memset(data, 0, sizeof(data));
+    check(read(fds[0], data, sizeof(data) - 5) ==
+              (ssize_t)(sizeof(data) - 5),
+          "read the rest of the pipe bytes");
+
+    pfd.revents = 0;
+    check(poll(&pfd, 1, 0) == 0 && pfd.revents == 0,
+          "poll reports a drained pipe");
+
+    check(close(fds[1]) == 0, "close the pipe writer");
+    check(read(fds[0], text, 1) == 0,
+          "read returns EOF after the last writer closes");
+    check(close(fds[0]) == 0, "close the pipe reader");
+
+    check(pipe2(fds, HAKU64_O_NONBLOCK) == 0, "pipe2 O_NONBLOCK");
+    flags = haku64_syscall3(HAKU64_SYS_FCNTL, fds[0], HAKU64_F_GETFL, 0);
+    check(flags >= 0 && ((int)flags & HAKU64_O_NONBLOCK) != 0,
+          "fcntl F_GETFL sees O_NONBLOCK on a pipe");
+    errno = 0;
+    check(read(fds[0], text, 1) == -1 && errno == HAKU64_EAGAIN,
+          "nonblocking pipe read reports EAGAIN");
+    check(close(fds[0]) == 0 && close(fds[1]) == 0,
+          "close the nonblocking pipe");
+
+    if (failures == before)
+        printf("HAKU64-USER-PIPE-OK: ring, EOF, poll and O_NONBLOCK\n");
+}
+
+/* A write with no reader must not return EPIPE quietly: the default action of
+ * SIGPIPE ends the process. fork() shares the open descriptions, so the read
+ * end only counts as closed once both the child's and the parent's descriptor
+ * are gone; the child blocks on a second pipe until the parent has done its
+ * close, which makes the test deterministic instead of a race. */
+static void test_pipe_sigpipe(void) {
+    int before = failures;
+    int data[2], sync[2];
+    int child, status = 0;
+    char byte = '!';
+
+    check(pipe(data) == 0 && pipe(sync) == 0, "pipes for SIGPIPE");
+    child = fork();
+    check(child >= 0, "fork for SIGPIPE");
+    if (child < 0) {
+        close(data[0]);
+        close(data[1]);
+        close(sync[0]);
+        close(sync[1]);
+        return;
+    }
+    if (child == 0) {
+        close(sync[1]);
+        close(data[0]);
+        if (read(sync[0], &byte, 1) != 1) _exit(9);
+        (void)write(data[1], "z", 1);
+        _exit(7);                   /* only reached if SIGPIPE was not raised */
+    }
+
+    close(sync[0]);
+    close(data[0]);                 /* the last read description */
+    check(write(sync[1], &byte, 1) == 1, "release the SIGPIPE child");
+    check(waitpid(child, &status, 0) == child, "wait for the SIGPIPE child");
+    check(status == HAKU64_SIGPIPE, "a write with no reader kills with SIGPIPE");
+    check(close(sync[1]) == 0 && close(data[1]) == 0,
+          "close the SIGPIPE pipes");
+
+    if (failures == before)
+        printf("HAKU64-USER-PIPE-SIGPIPE-OK: write with no reader ends in SIGPIPE\n");
+}
+
+/* A write larger than the ring blocks until the reader drains it, which is the
+ * other half of the blocking contract: the child hands 8 KiB to a 4 KiB ring
+ * one 1 KiB chunk at a time and cannot finish until the parent has taken it
+ * all. The parent sleeps first so the ring is full when it starts reading; if
+ * it woke early the read would simply block instead, so the test is not a race
+ * with boot time. Both sides stream through a small buffer and the parent
+ * checks every byte against the pattern, so the test needs no large frame. */
+static void test_pipe_blocking(void) {
+    int before = failures;
+    int fds[2];
+    int child, status = 0;
+    unsigned char chunk[1024];
+    unsigned char back[1024];
+    unsigned long long total = 0;
+    int expected = 0, mismatch = 0;
+    haku64_timespec_t pause;
+
+    check(pipe(fds) == 0, "pipe for a blocking write");
+    child = fork();
+    check(child >= 0, "fork for a blocking write");
+    if (child < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return;
+    }
+    if (child == 0) {
+        int sent = 1;
+
+        close(fds[0]);
+        for (int i = 0; i < 8 && sent; i++) {
+            for (int j = 0; j < (int)sizeof(chunk); j++)
+                chunk[j] = (unsigned char)(expected++ * 13 + 5);
+            if (write(fds[1], chunk, sizeof(chunk)) != (ssize_t)sizeof(chunk))
+                sent = 0;
+        }
+        _exit(sent ? 0 : 1);
+    }
+
+    close(fds[1]);
+    pause.tv_sec = 0;
+    pause.tv_nsec = 50 * 1000 * 1000;        /* 50 ms */
+    (void)nanosleep(&pause, NULL);
+
+    while (total < 8192) {
+        ssize_t n = read(fds[0], back, sizeof(back));
+
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++)
+            if (back[i] != (unsigned char)(expected++ * 13 + 5)) mismatch = 1;
+        total += (unsigned long long)n;
+    }
+    check(total == 8192 && !mismatch,
+          "a full pipe blocks the writer until the reader drains it");
+    check(waitpid(child, &status, 0) == child,
+          "wait for the blocking writer");
+    check(((status >> 8) & 0xFF) == 0, "the blocked write completed");
+    check(close(fds[0]) == 0, "close the blocking pipe");
+
+    if (failures == before)
+        printf("HAKU64-USER-PIPE-BLOCK-OK: a full ring blocks the writer\n");
+}
+
 /* The console read blocks: when the keyboard queue is empty the kernel parks
  * the task with -EAGAIN and IRQ1 wakes it, so this loop retries until a byte
  * arrives. build.py types 'x' only after it reads the marker below, which is
@@ -871,6 +1033,9 @@ int main(int argc, char **argv, char **envp) {
     test_thread_exec();
     test_processes();
     test_mappings_and_time();
+    test_pipes();
+    test_pipe_sigpipe();
+    test_pipe_blocking();
     test_console();
 
     if (failures) {

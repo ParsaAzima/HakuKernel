@@ -9,8 +9,8 @@ The x86-64 kernel serves the ported subset under the x86-64 Linux numbers with
 `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` arguments and `rax` for the number and the
 result, entered by `SYSCALL` with an `INT 0x80` fallback. This page documents
 the 32-bit table in full because it is the complete one; the 64-bit image still
-lacks pipes, module-backed filesystem mounting (it has FAT12 at `/disk`, an
-initramfs root, procfs and devfs) and signal handlers.
+lacks module-backed filesystem mounting (it has FAT12 at `/disk`, an initramfs
+root, procfs and devfs) and signal handlers.
 
 ## Syscall ABI
 
@@ -301,6 +301,30 @@ and `F_DUPFD`/`F_DUPFD_CLOEXEC`; `F_GETLK` reports "unlocked" and
 `dup3` is `dup2` with an `O_CLOEXEC` flag check and rejects identical
 descriptors with `EINVAL`.
 
+The x86-64 kernel implements the same two calls (`pipe` 22, `pipe2` 293) with
+its own semantics: a pipe is one 4 KiB byte ring shared by both ends, at most
+eight exist at once (`ENFILE` when the ring table is full, `EMFILE` when no
+descriptor is free), and both ends are ordinary descriptions, so `fstat`
+reports `S_IFIFO` and `lseek` reports `ESPIPE`. The reader and writer counts
+count open *descriptions*, not descriptors: `dup` and `fork` share a
+description and therefore keep a pipe alive until the last descriptor of that
+end closes, while the first descriptor to close does not change what the other
+end sees. A read returns the buffered bytes and then `0` once every writer
+description is gone; a write that finds no reader left reports any bytes it
+already stored and otherwise ends the process with the default action of
+`SIGPIPE`, so `EPIPE` is never returned to the caller. Blocking is a real
+block, not a parked `EAGAIN`: an empty read or a full write re-enables
+interrupts, halts the CPU and is preempted by the timer, so the producer on the
+same CPU makes progress; `O_NONBLOCK` (from `pipe2` or `fcntl(F_SETFL)`) turns
+the same wait into `EAGAIN`. `poll` reads the ring under its lock, so a
+reader either sees the new fill level or sleeps until the next write: data is
+`POLLIN`, EOF adds `POLLHUP`, the write end is `POLLOUT` while there is room and
+after the readers close (with `POLLERR`), and an infinite timeout blocks when a
+pipe is in the set; `select` builds the same readiness from that scan but
+returns a snapshot, since this port's `select` has no blocking path yet.
+`pipe2` accepts `O_NONBLOCK` and `O_CLOEXEC`; the latter is accepted but does
+not take effect yet because `execve` does not close descriptors on this port.
+
 `ioctl` on the console answers `TCGETS` with the terminal's fixed mode
 (`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`, erase `0x7F`,
 EOF `^D`), accepts `TCSETS`/`TCSETSW`/`TCSETSF` without changing that mode,
@@ -498,7 +522,7 @@ Deliberately absent: job-control stop/continue states (the group and session
 calls are real, but stop signals still end a process), hard links, file-backed
 mappings, `socket`, a user-facing `mount` (users cannot reparent the boot
 namespace; loadable modules mount their own prefix during init), networking,
-pipes on x86-64, the rest of the 64-bit namespace (FAT12 at `/disk`, the RAM
+the rest of the 64-bit namespace (FAT12 at `/disk`, the RAM
 initramfs at `/`, procfs at `/proc` and devfs at `/dev` exist; module
 filesystem registration and mounting do not), and the filesystem half of the
 x64 module API (it answers `-ENOSYS`; device registration is wired).

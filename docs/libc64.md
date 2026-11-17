@@ -42,7 +42,7 @@ compiles the two independently, and neither build touches the other's files.
 | `string64.c` | `mem*` and `str*`: `memcpy`, `memmove`, `memset`, `memcmp`, `memchr`, `strlen`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strcmp`, `strncmp`, `strchr`, `strrchr`, `strstr`. |
 | `stdio64.c` | `printf`, `snprintf`, `puts`, `putchar`; the formatter builds each line in a 1 KiB buffer on the caller's stack. |
 | `memory64.c` | `malloc`, `calloc`, `realloc`, `free` (first fit over a `brk` heap with block splitting) and `atoi`. |
-| `unistd64.c` | `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `dup3`, `unlink`, `rename`, `mkdir`, `rmdir`, `chdir`, `getcwd`, `access`, `getpid`, `gettid`, `getppid`, `arch_prctl`, `fork`, `waitpid`, `execve`, `exit`, `_exit`, `brk`, `sbrk`, `stat`, `lstat`, `fstat`, `nanosleep`, `sleep`, `clock_gettime`, `uname`. |
+| `unistd64.c` | `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `dup3`, `pipe`, `pipe2`, `poll`, `unlink`, `rename`, `mkdir`, `rmdir`, `chdir`, `getcwd`, `access`, `getpid`, `gettid`, `getppid`, `arch_prctl`, `fork`, `waitpid`, `execve`, `exit`, `_exit`, `brk`, `sbrk`, `stat`, `lstat`, `fstat`, `nanosleep`, `sleep`, `clock_gettime`, `uname`. |
 | `mman64.c` | `mmap`, `munmap`, `mprotect`. |
 
 Everything returns `-1` and sets `errno` on failure, using the kernel's
@@ -280,6 +280,9 @@ regression says what broke instead of only changing an exit status:
 | `HAKU64-USER-PTHREAD-OK` | three `pthread_create` workers serialized 150 increments under a mutex and woke the main thread through a condition variable, then joined with their return values |
 | `HAKU64-USER-DETACH-OK` | a detached pthread freed its own pages and `kill(tid, 0)` then reported `ESRCH` |
 | `HAKU64-USER-ROBUST-OK` | a thread died holding a robust mutex: `EOWNERDEAD`, then `pthread_mutex_consistent` to repair it, and a second one left `ENOTRECOVERABLE` |
+| `HAKU64-USER-PIPE-OK` | a 512-byte transfer through a 4 KiB ring arrived intact, `poll` saw data then an empty pipe, the last writer's close turned the next read into EOF, and `O_NONBLOCK` reported `EAGAIN` |
+| `HAKU64-USER-PIPE-SIGPIPE-OK` | a forked child's write to a pipe with no reader ended it with the default `SIGPIPE` action instead of returning `EPIPE` |
+| `HAKU64-USER-PIPE-BLOCK-OK` | a child's 8 KiB write to a 4 KiB ring blocked until the parent drained it, and every byte arrived intact |
 | `HAKU64-USER-ERRNO-THREAD-OK` | a thread's `errno` write did not reach its creator's |
 | `HAKU64-USER-THREAD-EXEC-IMAGE-OK` | the image a thread `execve`d is running (printed by the new image) |
 | `HAKU64-USER-THREAD-EXEC-OK` | the exec ended the group leader, which was reaped, and the thread's image exited with 42 |
@@ -318,8 +321,12 @@ detached worker, the two robust-mutex outcomes, and per-thread `errno`.
 - **No floating point in `printf`.** `%f`, `%e` and `%g` are not implemented;
   the kernel has no FPU context switch for user tasks beyond FXSAVE/FXRSTOR of
   the SSE state.
-- **No signals, no pipes.** `sigaction` and `pipe` have no syscall on the
-  64-bit side yet, so a thread cannot be cancelled or woken by either.
+- **No signal handlers, but `SIGPIPE` exists as a default action.** There is no
+  `sigaction`, so a program cannot catch, block or ignore a signal, and a
+  thread cannot be cancelled through one. `pipe`/`pipe2` and `poll` do exist;
+  a write with no reader ends the process with the default `SIGPIPE` action
+  instead of returning `EPIPE`, and `fcntl` is reached through the raw
+  `haku64_syscall3` wrapper because the library does not wrap it yet.
 - **`haku64_thread_create` is detached, not joinable.** Its thread frees its
   own stack and TLS block on return, so there is no status to collect; use
   `haku64_thread_spawn`/`haku64_thread_join` or `pthread_create` when the

@@ -77,7 +77,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
 | threads | `clone(CLONE_VM)` shares one space and, with `CLONE_FILES`, one descriptor table; a futex hands the flag over | `HAKU64-THREAD-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, process, time, limits, `poll`/`select` (pipes are still missing) | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, pipes, process, time, limits, `poll`/`select` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK`, `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | modules | `X64MOD.HKM` is read from the disk, relocated and run; duplicate, truncated and bad-magic images refused | `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK` |
