@@ -1,7 +1,7 @@
 /* Haku x86-64 mount table and the /dev backend.
  *
  * See vfs64.h for the contract. The table is tiny and scanned linearly on
- * every lookup: four entries is the whole namespace, so a hash or a sorted
+ * every lookup: six entries is the whole namespace, so a hash or a sorted
  * table would cost more in code than the scan costs in cycles. The scan keeps
  * the longest match rather than the first, which is what makes "/dev" win
  * over "/" without depending on mount order.
@@ -11,11 +11,15 @@
 
 #define VFS64_ENOENT  2
 #define VFS64_EFAULT  14
+#define VFS64_EBUSY   16
 #define VFS64_EEXIST  17
+#define VFS64_EXDEV   18
 #define VFS64_ENOTDIR 20
 #define VFS64_EISDIR  21
 #define VFS64_EINVAL  22
 #define VFS64_ENOSPC  28
+#define VFS64_EROFS   30
+#define VFS64_EOPNOTSUPP 95
 
 /* A device read is copied into a syscall-sized buffer, and the count reaches
  * here already clipped; this bound only keeps the int return honest. */
@@ -24,10 +28,28 @@
 typedef struct {
     char prefix[VFS64_PREFIX_MAX];
     u32 kind;
+    /* A module mount keeps the backend table it was mounted with, so a
+     * descriptor does not have to resolve the name again. `owner` is the
+     * module slot, and `opens` counts live descriptors. */
+    const vfs64_fs_ops_t *ops;
+    u32 flags;
+    int owner;
+    u32 opens;
 } vfs64_mount_t;
 
 static vfs64_mount_t mounts[VFS64_MAX_MOUNTS];
 static u32 mount_count;
+
+/* Registered module backends. A linear scan over two slots is the whole
+ * lookup; the table is tiny on purpose and the name comparison is bounded by
+ * VFS64_PREFIX_MAX. */
+typedef struct {
+    u32 used;
+    int owner;
+    const vfs64_fs_ops_t *ops;
+} vfs64_fs_entry_t;
+
+static vfs64_fs_entry_t fs_entries[VFS64_FS_MAX];
 
 /* Module-published character devices. The built-ins keep numbers 0..2, so a
  * module device is device VFS64_DEV_COUNT + slot. The kernel refuses unload
@@ -91,6 +113,10 @@ static int mount_add(const char *prefix, u32 kind) {
     if (!length || length >= VFS64_PREFIX_MAX) return 0;
     for (u32 i = 0; i <= length; i++) mounts[mount_count].prefix[i] = prefix[i];
     mounts[mount_count].kind = kind;
+    mounts[mount_count].ops = 0;
+    mounts[mount_count].flags = 0;
+    mounts[mount_count].owner = -1;
+    mounts[mount_count].opens = 0;
     mount_count++;
     return 1;
 }
@@ -130,6 +156,11 @@ u32 vfs64_mount_kind(u32 index) {
 }
 
 int vfs64_resolve(const char *path, u32 *kind, char rel[VFS64_REL_MAX]) {
+    return vfs64_resolve_mount(path, kind, rel, 0);
+}
+
+int vfs64_resolve_mount(const char *path, u32 *kind, char rel[VFS64_REL_MAX],
+                        u32 *index) {
     u32 best = VFS64_MAX_MOUNTS;
     u32 best_length = 0;
 
@@ -156,6 +187,7 @@ int vfs64_resolve(const char *path, u32 *kind, char rel[VFS64_REL_MAX]) {
     if (best >= mount_count) return -VFS64_ENOENT;
 
     if (kind) *kind = mounts[best].kind;
+    if (index) *index = best;
     if (rel) {
         /* The root mount hands the backend the absolute path it already
          * has; any other mount strips its prefix, leaving "" at the mount
@@ -170,6 +202,14 @@ int vfs64_resolve(const char *path, u32 *kind, char rel[VFS64_REL_MAX]) {
         rel[at] = 0;
     }
     return 0;
+}
+
+const vfs64_fs_ops_t *vfs64_mount_ops(u32 index) {
+    return index < mount_count ? mounts[index].ops : 0;
+}
+
+int vfs64_fs_readonly(u32 index) {
+    return index < mount_count && (mounts[index].flags & VFS64_FS_RDONLY);
 }
 
 const char *vfs64_dev_name(int device) {
@@ -388,4 +428,352 @@ int vfs64_dev_entry(u32 index, char name[FS64_NAME_MAX], u32 *ino, int *kind,
         return 1;
     }
     return 0;
+}
+
+/* ---- module filesystems ----------------------------------------------- */
+
+static vfs64_fs_entry_t *fs_entry_by_owner(int owner) {
+    for (u32 i = 0; i < VFS64_FS_MAX; i++)
+        if (fs_entries[i].used && fs_entries[i].owner == owner)
+            return &fs_entries[i];
+    return 0;
+}
+
+static vfs64_fs_entry_t *fs_entry_by_name(const char *name) {
+    for (u32 i = 0; i < VFS64_FS_MAX; i++)
+        if (fs_entries[i].used &&
+            text_equal_nocase(fs_entries[i].ops->name, name))
+            return &fs_entries[i];
+    return 0;
+}
+
+/* A backend has to answer the operations the descriptor path can reach. The
+ * optional ones (write, truncate, links) are checked where they are called,
+ * so a read-only backend leaves them null. This is the same required set the
+ * 32-bit vfs_register_fs enforces. */
+static int fs_ops_valid(const vfs64_fs_ops_t *ops) {
+    if (!ops || !ops->name || !ops->name[0]) return 0;
+    if (!ops->mount || !ops->open || !ops->close || !ops->read ||
+        !ops->seek || !ops->unlink || !ops->rename || !ops->mkdir ||
+        !ops->rmdir || !ops->stat || !ops->fstat || !ops->opendir ||
+        !ops->readdir || !ops->closedir)
+        return 0;
+    return 1;
+}
+
+int vfs64_fs_register(const vfs64_fs_ops_t *ops, int owner) {
+    u32 length = 0;
+
+    if (!fs_ops_valid(ops) || owner < 0) return -VFS64_EINVAL;
+    while (ops->name[length]) {
+        if (length >= 32u) return -VFS64_EINVAL;
+        length++;
+    }
+    if (fs_entry_by_owner(owner) || fs_entry_by_name(ops->name))
+        return -VFS64_EEXIST;
+    for (u32 i = 0; i < VFS64_FS_MAX; i++) {
+        if (fs_entries[i].used) continue;
+        fs_entries[i].used = 1;
+        fs_entries[i].owner = owner;
+        fs_entries[i].ops = ops;
+        return 0;
+    }
+    return -VFS64_ENOSPC;
+}
+
+/* Mark every mount of a backend gone. A mount that still has a live
+ * descriptor is left alone; vfs64_fs_owner_busy() is what the unload path
+ * checks first, so this is the defensive half of the same rule. */
+static void fs_detach_mounts(const vfs64_fs_ops_t *ops) {
+    for (u32 i = 0; i < mount_count; i++) {
+        if (mounts[i].ops != ops || mounts[i].opens) continue;
+        for (u32 j = i; j + 1u < mount_count; j++) mounts[j] = mounts[j + 1u];
+        mount_count--;
+        i--;
+    }
+}
+
+int vfs64_fs_mount(const char *prefix, const char *name, u32 flags, int owner) {
+    char full[VFS64_PREFIX_MAX];
+    vfs64_fs_entry_t *entry;
+    u32 length = 0, at;
+    int result;
+
+    if (!prefix || !prefix[0] || prefix[0] == '/' || !name)
+        return -VFS64_EINVAL;
+    if (flags & ~VFS64_FS_RDONLY) return -VFS64_EINVAL;
+    while (prefix[length]) {
+        if (prefix[length] == '/' &&
+            (length == 0 || prefix[length + 1u] == 0))
+            return -VFS64_EINVAL;
+        length++;
+    }
+    if (length >= VFS64_PREFIX_MAX - 1u) return -VFS64_EINVAL;
+
+    entry = fs_entry_by_owner(owner);
+    if (!entry || !text_equal_nocase(entry->ops->name, name))
+        return -VFS64_EINVAL;
+    /* One mount per registration, like the 32-bit module slot rule: a second
+     * mount would make unload detach a namespace the module did not expect. */
+    for (u32 i = 0; i < mount_count; i++)
+        if (mounts[i].ops == entry->ops) return -VFS64_EBUSY;
+
+    full[0] = '/';
+    for (at = 0; at <= length; at++) full[at + 1u] = prefix[at];
+    for (u32 i = 0; i < mount_count; i++)
+        if (text_equal_nocase(mounts[i].prefix, full))
+            return -VFS64_EBUSY;
+
+    if (entry->ops->mount) {
+        result = entry->ops->mount();
+        if (result < 0) return result;
+    }
+    if (!mount_add(full, VFS64_MOUNT_MODULE)) return -VFS64_ENOSPC;
+    mounts[mount_count - 1u].ops = entry->ops;
+    mounts[mount_count - 1u].flags = flags;
+    mounts[mount_count - 1u].owner = owner;
+    mounts[mount_count - 1u].opens = 0;
+    return 0;
+}
+
+int vfs64_fs_owner_busy(int owner) {
+    for (u32 i = 0; i < mount_count; i++)
+        if (mounts[i].owner == owner && mounts[i].opens) return 1;
+    return 0;
+}
+
+void vfs64_fs_remove_owner(int owner) {
+    vfs64_fs_entry_t *entry = fs_entry_by_owner(owner);
+
+    if (!entry) return;
+    fs_detach_mounts(entry->ops);
+    /* A mount the detach refused to remove still points at this table. */
+    for (u32 i = 0; i < mount_count; i++)
+        if (mounts[i].ops == entry->ops) return;
+    memset(entry, 0, sizeof(*entry));
+}
+
+void vfs64_backend_path(const char *rel, char out[VFS64_REL_MAX]) {
+    u32 at = 0;
+
+    if (rel && rel[0] == '/') rel++;
+    if (!rel || !rel[0]) {
+        out[0] = '.';
+        out[1] = 0;
+        return;
+    }
+    while (rel[at] && at + 1u < VFS64_REL_MAX) {
+        out[at] = rel[at];
+        at++;
+    }
+    out[at] = 0;
+}
+
+static const vfs64_fs_ops_t *mount_fs(u32 index) {
+    if (index >= mount_count) return 0;
+    if (mounts[index].kind != VFS64_MOUNT_MODULE) return 0;
+    return mounts[index].ops;
+}
+
+int vfs64_fs_open(u32 index, const char *rel, u32 flags, void **handle) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    char path[VFS64_REL_MAX];
+    int result;
+
+    if (!ops || !handle) return -VFS64_EINVAL;
+    if (mounts[index].flags & VFS64_FS_RDONLY) {
+        u32 write_bits = K64_O_WRONLY | K64_O_RDWR | K64_O_CREAT |
+                         K64_O_TRUNC | K64_O_APPEND;
+
+        if (flags & write_bits) return -VFS64_EROFS;
+        if (!ops->write) {
+            /* A backend without write cannot be opened read-write even when
+             * the mount flags forgot to say so. */
+            if ((flags & 3u) != K64_O_RDONLY) return -VFS64_EROFS;
+        }
+    }
+    vfs64_backend_path(rel, path);
+    *handle = 0;
+    result = ops->open(path, flags, handle);
+    if (result < 0) return result;
+    if (!*handle) return -VFS64_EINVAL;
+    mounts[index].opens++;
+    return 0;
+}
+
+int vfs64_fs_opendir(u32 index, const char *rel, void **handle) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    char path[VFS64_REL_MAX];
+    int result;
+
+    if (!ops || !handle) return -VFS64_EINVAL;
+    vfs64_backend_path(rel, path);
+    *handle = 0;
+    result = ops->opendir(path, handle);
+    if (result < 0) return result;
+    if (!*handle) return -VFS64_EINVAL;
+    mounts[index].opens++;
+    return 0;
+}
+
+int vfs64_fs_close(u32 index, void *handle, int directory) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    int (*close_fn)(void *) = 0;
+
+    if (!ops || !handle) return 0;
+    close_fn = directory ? ops->closedir : ops->close;
+    if (!close_fn) close_fn = ops->close;
+    if (close_fn) (void)close_fn(handle);
+    if (mounts[index].opens) mounts[index].opens--;
+    return 0;
+}
+
+int vfs64_fs_read(u32 index, void *handle, void *dst, u32 count) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    u32 got = 0;
+    int result;
+
+    if (!ops || !handle) return -VFS64_EINVAL;
+    if (!ops->read) return -VFS64_EOPNOTSUPP;
+    if (!count) return 0;
+    result = ops->read(handle, dst, count, &got);
+    if (result < 0) return result;
+    if (got > count) got = count;
+    return (int)got;
+}
+
+int vfs64_fs_write(u32 index, void *handle, const void *src, u32 count) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    u32 put = 0;
+    int result;
+
+    if (!ops || !handle) return -VFS64_EINVAL;
+    if (mounts[index].flags & VFS64_FS_RDONLY) return -VFS64_EROFS;
+    if (!ops->write) return -VFS64_EOPNOTSUPP;
+    if (!count) return 0;
+    result = ops->write(handle, src, count, &put);
+    if (result < 0) return result;
+    if (put > count) put = count;
+    return (int)put;
+}
+
+int vfs64_fs_seek(u32 index, void *handle, s64 offset, u32 whence,
+                  u64 *position) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    u32 pos = 0;
+    int result;
+
+    if (!ops || !handle) return -VFS64_EINVAL;
+    if (whence > K64_SEEK_END) return -VFS64_EINVAL;
+    if (offset > 0x7FFFFFFFll || offset < -0x80000000ll)
+        return -VFS64_EINVAL;
+    if (!ops->seek) return -VFS64_EOPNOTSUPP;
+    result = ops->seek(handle, (int)offset, whence, &pos);
+    if (result < 0) return result;
+    if (position) *position = pos;
+    return 0;
+}
+
+int vfs64_fs_fstat(u32 index, void *handle, vfs64_stat_t *out) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    int result;
+
+    if (!ops || !handle || !out) return -VFS64_EINVAL;
+    if (!ops->fstat) return -VFS64_EOPNOTSUPP;
+    result = ops->fstat(handle, out);
+    return result < 0 ? result : 0;
+}
+
+int vfs64_fs_stat(u32 index, const char *rel, vfs64_stat_t *out) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    char path[VFS64_REL_MAX];
+    int result;
+
+    if (!ops || !out) return -VFS64_EINVAL;
+    if (!ops->stat) return -VFS64_EOPNOTSUPP;
+    vfs64_backend_path(rel, path);
+    result = ops->stat(path, out);
+    return result < 0 ? result : 0;
+}
+
+int vfs64_fs_readdir(u32 index, void *handle, u32 slot, vfs64_dirent_t *out,
+                     u32 *next_index) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    u32 next = slot;
+    int result;
+
+    if (!ops || !handle || !out) return -VFS64_EINVAL;
+    if (!ops->readdir) return -VFS64_EOPNOTSUPP;
+    result = ops->readdir(handle, slot, out, &next);
+    if (result < 0) return result;
+    if (result == 0) return 0;
+    if (next <= slot) return -VFS64_EINVAL;    /* never loop on one entry */
+    if (next_index) *next_index = next;
+    return 1;
+}
+
+int vfs64_fs_unlink(u32 index, const char *rel) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    char path[VFS64_REL_MAX];
+    int result;
+
+    if (!ops) return -VFS64_EINVAL;
+    if (mounts[index].flags & VFS64_FS_RDONLY) return -VFS64_EROFS;
+    if (!ops->unlink) return -VFS64_EOPNOTSUPP;
+    vfs64_backend_path(rel, path);
+    result = ops->unlink(path);
+    return result < 0 ? result : 0;
+}
+
+int vfs64_fs_rename(u32 index, const char *oldrel, const char *newrel) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    char oldpath[VFS64_REL_MAX];
+    char newpath[VFS64_REL_MAX];
+    int result;
+
+    if (!ops) return -VFS64_EINVAL;
+    if (mounts[index].flags & VFS64_FS_RDONLY) return -VFS64_EROFS;
+    if (!ops->rename) return -VFS64_EOPNOTSUPP;
+    vfs64_backend_path(oldrel, oldpath);
+    vfs64_backend_path(newrel, newpath);
+    result = ops->rename(oldpath, newpath);
+    return result < 0 ? result : 0;
+}
+
+int vfs64_fs_mkdir(u32 index, const char *rel) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    char path[VFS64_REL_MAX];
+    int result;
+
+    if (!ops) return -VFS64_EINVAL;
+    if (mounts[index].flags & VFS64_FS_RDONLY) return -VFS64_EROFS;
+    if (!ops->mkdir) return -VFS64_EOPNOTSUPP;
+    vfs64_backend_path(rel, path);
+    result = ops->mkdir(path);
+    return result < 0 ? result : 0;
+}
+
+int vfs64_fs_rmdir(u32 index, const char *rel) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    char path[VFS64_REL_MAX];
+    int result;
+
+    if (!ops) return -VFS64_EINVAL;
+    if (mounts[index].flags & VFS64_FS_RDONLY) return -VFS64_EROFS;
+    if (!ops->rmdir) return -VFS64_EOPNOTSUPP;
+    vfs64_backend_path(rel, path);
+    result = ops->rmdir(path);
+    return result < 0 ? result : 0;
+}
+
+int vfs64_fs_truncate(u32 index, void *handle, u64 size) {
+    const vfs64_fs_ops_t *ops = mount_fs(index);
+    int result;
+
+    if (!ops || !handle) return -VFS64_EINVAL;
+    if (mounts[index].flags & VFS64_FS_RDONLY) return -VFS64_EROFS;
+    if (size > 0xFFFFFFFFull) return -VFS64_ENOSPC;
+    if (!ops->truncate) return -VFS64_EOPNOTSUPP;
+    result = ops->truncate(handle, (u32)size);
+    return result < 0 ? result : 0;
 }

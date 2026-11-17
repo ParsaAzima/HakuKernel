@@ -9,9 +9,11 @@
  * an amd64 pointer is packed as its low half with a zero upper half.
  *
  * This loader exports logging, the tick counter, the heap, the device
- * registration call and the two struct fillers. A module can therefore
- * publish a character device in `/dev`; filesystem registration and mounting
- * still answer -ENOSYS because this port has no module-backed filesystem.
+ * registration call, filesystem registration and mount, and the two struct
+ * fillers. A module can therefore publish a character device in `/dev` and a
+ * filesystem at its own prefix; vfs64.c routes stat, directory, read/write and
+ * seek calls to the backend, and module64_unload refuses to free the image
+ * while a descriptor (device or mount) still reaches it.
  *
  * Modules are trusted ring-0 code. The loader validates the container so a
  * malformed file cannot escape the image, and a four-slot table makes the
@@ -43,7 +45,17 @@ typedef struct {
     u8 *base;
     module64_entry_fn init;
     module64_exit_fn exit;
+    /* The filesystem table and the prefix it mounted, if any. The table
+     * lives in the module image, so unload detaches the mount before the
+     * image is freed. */
+    const vfs64_fs_ops_t *fs_ops;
 } module64_slot_t;
+
+/* A module builds its filesystem table in its own image, so the public ABI
+ * mirrors the kernel's 64-bit table. If one gains a field without the other,
+ * the kernel would call through the wrong slot; fail the build instead. */
+typedef char module64_fs_ops_mirror_size[
+    (sizeof(haku_module_fs_ops_t) == sizeof(vfs64_fs_ops_t)) ? 1 : -1];
 
 static module64_slot_t module64_slots[HAKU_MODULE_TABLE_SIZE];
 static volatile u32 module64_lock = 0;
@@ -91,44 +103,81 @@ void haku_module_free(void *pointer) {
 static volatile u32 module64_active = MODULE64_NO_SLOT;
 
 /* Device registration is wired to the VFS; filesystem registration and
- * mount remain -ENOSYS until a module backend exists on this port. */
+ * mount reach the same module mount table the built-ins use. */
 haku_i32 haku_module_register_device(const char *name,
                                      haku_module_device_read_t read,
                                      haku_module_device_write_t write) {
     u32 owner = module64_active;
 
-    if (owner >= HAKU_MODULE_TABLE_SIZE) return -HAKU_ENOSYS;
+    if (owner >= HAKU_MODULE_TABLE_SIZE) return -HAKU_EPERM;
     return vfs64_dev_register(name, (vfs64_dev_read_fn)read,
                               (vfs64_dev_write_fn)write, (int)owner);
 }
 
 haku_i32 haku_module_register_fs(const haku_module_fs_ops_t *ops) {
-    (void)ops;
-    return -HAKU_ENOSYS;
+    u32 owner = module64_active;
+    int result;
+
+    if (owner >= HAKU_MODULE_TABLE_SIZE) return -HAKU_EPERM;
+    if (!ops) return -HAKU_EINVAL;
+    if (module64_slots[owner].fs_ops) return -HAKU_EEXIST;
+    result = vfs64_fs_register((const vfs64_fs_ops_t *)ops, (int)owner);
+    if (result < 0) return result;
+    module64_slots[owner].fs_ops = (const vfs64_fs_ops_t *)ops;
+    return 0;
 }
 
 haku_i32 haku_module_mount(const char *prefix, const char *name,
                            haku_u32 flags) {
-    (void)prefix;
-    (void)name;
-    (void)flags;
-    return -HAKU_ENOSYS;
+    u32 owner = module64_active;
+    int result;
+
+    if (owner >= HAKU_MODULE_TABLE_SIZE) return -HAKU_EPERM;
+    if (!module64_slots[owner].fs_ops) return -HAKU_EINVAL;
+    /* Only the flags the VFS understands are accepted; a mount that asked
+     * for anything else would silently not get it. */
+    if (flags & ~(haku_u32)VFS64_FS_RDONLY) return -HAKU_EINVAL;
+    result = vfs64_fs_mount(prefix, name, (u32)flags, (int)owner);
+    return result;
 }
 
+/* The two struct fillers keep a module from knowing the kernel's layouts.
+ * `out` is kernel memory the module only writes through this call, so a null
+ * pointer is a caller bug the helper absorbs rather than a fault. */
 void haku_module_fill_stat(void *stat, haku_u32 mode, haku_u32 size,
                            haku_u32 ino) {
-    (void)stat;
-    (void)mode;
-    (void)size;
-    (void)ino;
+    vfs64_stat_t *out = (vfs64_stat_t *)stat;
+    u32 format = mode & HAKU_S_IFMT;
+
+    if (!out) return;
+    out->mode = mode;
+    out->ino = ino;
+    out->size = size;
+    out->kind = format == HAKU_S_IFDIR ? FS64_KIND_DIR
+              : format == HAKU_S_IFCHR ? FS64_KIND_CHAR
+              : format == HAKU_S_IFIFO ? FS64_KIND_FIFO
+                                       : FS64_KIND_FILE;
 }
 
 void haku_module_fill_dirent(void *dirent, haku_u32 ino, haku_u32 type,
                              const char *name) {
-    (void)dirent;
-    (void)ino;
-    (void)type;
-    (void)name;
+    vfs64_dirent_t *out = (vfs64_dirent_t *)dirent;
+    u32 length = 0;
+
+    if (!out) return;
+    out->ino = ino;
+    out->type = type;
+    out->kind = type == HAKU_DT_DIR ? FS64_KIND_DIR
+              : type == HAKU_DT_CHR ? FS64_KIND_CHAR
+              : type == HAKU_DT_FIFO ? FS64_KIND_FIFO
+                                     : FS64_KIND_FILE;
+    out->name[0] = 0;
+    if (!name) return;
+    while (name[length] && length + 1u < FS64_NAME_MAX) {
+        out->name[length] = name[length];
+        length++;
+    }
+    out->name[length] = 0;
 }
 
 /* The export table. A linear scan over a fixed eleven-entry array is the
@@ -257,6 +306,7 @@ static void module64_clear_slot(u32 slot) {
     module64_slots[slot].base = 0;
     module64_slots[slot].init = (module64_entry_fn)0;
     module64_slots[slot].exit = (module64_exit_fn)0;
+    module64_slots[slot].fs_ops = 0;
 }
 
 int module64_load(const u8 *file, u32 size) {
@@ -364,9 +414,11 @@ int module64_load(const u8 *file, u32 size) {
     module64_acquire();
     module64_active = MODULE64_NO_SLOT;
     if (init_result != 0) {
-        /* init may have registered a device before failing; detach it with
-         * the rest of the slot so a later load does not collide with it. */
+        /* init may have registered a device or mounted a filesystem before
+         * failing; detach both with the rest of the slot so a later load
+         * does not collide with them. */
         vfs64_dev_remove_owner((int)slot);
+        vfs64_fs_remove_owner((int)slot);
         module64_clear_slot(slot);
         module64_release();
         kfree64(base);
@@ -404,9 +456,10 @@ int module64_unload(const char *name) {
             result = -HAKU_EBUSY;
             break;
         }
-        /* An open descriptor on a device this module published keeps the
-         * module's text alive: the read and write callbacks live there. */
-        if (vfs64_dev_owner_busy((int)i)) {
+        /* An open descriptor on a device or a filesystem this module
+         * published keeps the module's text alive: the read, write and
+         * backend callbacks live there. */
+        if (vfs64_dev_owner_busy((int)i) || vfs64_fs_owner_busy((int)i)) {
             result = -HAKU_EBUSY;
             break;
         }
@@ -414,9 +467,11 @@ int module64_unload(const char *name) {
         exit_fn = module64_slots[i].exit;
         base = module64_slots[i].base;
         module64_slots[i].state = MODULE64_UNLOADING;
-        /* Detach the device before the image is freed: a later open finds no
-         * node, and one that raced the check cannot reach module code. */
+        /* Detach the device and the mount before the image is freed: a later
+         * lookup finds no node, and one that raced the check cannot reach
+         * module code. */
         vfs64_dev_remove_owner((int)i);
+        vfs64_fs_remove_owner((int)i);
         result = 0;
         break;
     }

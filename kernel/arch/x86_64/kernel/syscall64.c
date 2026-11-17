@@ -152,6 +152,7 @@ static int copy_from_user64(u64 space, void *dst, u64 address, u64 length) {
 
 #define SYS64_ENOTDIR      20ull
 #define SYS64_EISDIR       21ull
+#define SYS64_ENODEV       19ull
 #define SYS64_ENOTTY       25ull
 #define SYS64_ESPIPE       29ull
 #define SYS64_EPIPE        32ull
@@ -615,6 +616,11 @@ static u64 sys64_truncate(int id, u64 user_path, u64 length) {
         fs64_fd_close(id, fd);
         return (u64)0 - SYS64_EINVAL;
     }
+    if (fs64_fd_module(id, fd)) {
+        result = fs64_fd_module_truncate(id, fd, length);
+        fs64_fd_close(id, fd);
+        return result < 0 ? (u64)result : 0;
+    }
     file = fs64_fd_file(id, fd);
     if (file < 0) {
         fs64_fd_close(id, fd);
@@ -628,6 +634,11 @@ static u64 sys64_truncate(int id, u64 user_path, u64 length) {
 static u64 sys64_ftruncate(int id, u64 fd, u64 length) {
     int file = fs64_fd_file(id, (int)fd);
 
+    if (fs64_fd_module(id, (int)fd)) {
+        int result = fs64_fd_module_truncate(id, (int)fd, length);
+
+        return result < 0 ? (u64)result : 0;
+    }
     if (file < 0 && !fs64_fd_device(id, (int)fd))
         return (u64)0 - SYS64_EBADF;
     if (fs64_fd_device(id, (int)fd)) return (u64)0 - SYS64_EINVAL;
@@ -963,6 +974,29 @@ static u64 sys64_write(u64 fd, u64 buffer, u64 count) {
             return done;
         }
 
+        if (fs64_fd_module(id, (int)fd)) {
+            access = fs64_fd_access(id, (int)fd);
+            if (access == 0) return (u64)0 - SYS64_EBADF;   /* O_RDONLY */
+            if (count == 0) return 0;
+            if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+            space = current_space();
+            while (done < count) {
+                u64 n = count - done;
+                int put;
+
+                if (n > sizeof(chunk)) n = sizeof(chunk);
+                if (!copy_from_user64(space, chunk, buffer + done, n)) {
+                    if (done) break;
+                    return (u64)0 - SYS64_EFAULT;
+                }
+                put = fs64_fd_module_write(id, (int)fd, chunk, n);
+                if (put < 0) return done ? done : (u64)put;
+                if (put == 0) break;
+                done += (u64)put;
+            }
+            return done;
+        }
+
         file = fs64_fd_file(id, (int)fd);
         if (file < 0) return (u64)0 - SYS64_EBADF;
         access = fs64_fd_access(id, (int)fd);
@@ -1083,6 +1117,9 @@ static u64 sys64_mmap(u64 address, u64 length, u64 prot, u64 flags, u64 fd,
     } else {
         if ((offset & (K64_PAGE_SIZE - 1)) != 0)
             return (u64)0 - SYS64_EINVAL;
+        /* A module file has no page cache to alias; ENODEV is what Linux
+         * reports for a filesystem that cannot mmap. */
+        if (fs64_fd_module(id, (int)fd)) return (u64)0 - SYS64_ENODEV;
         file = fs64_fd_file(id, (int)fd);
         if (file < 0) return (u64)0 - SYS64_EBADF;
         file_size = fs64_pages(file) * K64_PAGE_SIZE;
@@ -1332,6 +1369,30 @@ static u64 sys64_read(u64 fd, u64 buffer, u64 count) {
         }
         return done;
     }
+    if (fs64_fd_module(id, (int)fd)) {
+        if (fs64_fd_access(id, (int)fd) == 1) return (u64)0 - SYS64_EBADF;
+        if (count == 0) return 0;
+        if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+        space = current_space();
+        while (done < count) {
+            u64 n = count - done;
+            int got;
+
+            if (n > sizeof(chunk)) n = sizeof(chunk);
+            got = fs64_fd_module_read(id, (int)fd, chunk, n);
+            if (got < 0) return done ? done : (u64)got;
+            if (got == 0) break;
+            if (!copy_to_user64(space, buffer + done, chunk, (u64)got)) {
+                if (done) break;
+                return (u64)0 - SYS64_EFAULT;
+            }
+            done += (u64)got;
+            /* A short transfer is end of file or the backend's own limit;
+             * stop rather than ask for the same range again. */
+            if ((u64)got < n) break;
+        }
+        return done;
+    }
     if (file < 0) return (u64)0 - SYS64_EBADF;
     if (fs64_fd_access(id, (int)fd) == 1) return (u64)0 - SYS64_EBADF;
     if (count == 0) return 0;
@@ -1367,7 +1428,7 @@ static u64 sys64_close(u64 fd) {
 
     if (fs64_fd_file(id, (int)fd) < 0 && !fs64_fd_console(id, (int)fd) &&
         !fs64_fd_device(id, (int)fd) && !fs64_fd_is_dir(id, (int)fd) &&
-        !fs64_fd_pipe(id, (int)fd))
+        !fs64_fd_pipe(id, (int)fd) && !fs64_fd_module(id, (int)fd))
         return (u64)0 - SYS64_EBADF;
     fs64_fd_close(id, (int)fd);
     return 0;
@@ -1734,6 +1795,14 @@ static u64 sys64_lseek(u64 fd, u64 offset, u64 whence) {
     s64 delta = (s64)offset, pos;
 
     if (fs64_fd_pipe(id, (int)fd)) return (u64)0 - SYS64_ESPIPE;
+    if (fs64_fd_module(id, (int)fd)) {
+        /* The backend keeps the position; it reports the result. A negative
+         * result is -errno, a non-negative one the new offset. */
+        int result = fs64_fd_module_seek(id, (int)fd, delta, whence, 0);
+
+        if (result < 0) return (u64)result;
+        return fs64_fd_pos(id, (int)fd);
+    }
     if (fs64_fd_device(id, (int)fd)) {
         /* A device has a position but no end: SEEK_END is zero, and the
          * device itself ignores the offset it is read or written at. */
@@ -2388,11 +2457,63 @@ static u64 sys64_brk(u64 value) {
 
 /* pread64/pwrite64: the same page cache I/O as read/write, but at an
  * explicit offset and without moving the description's position. */
+static u64 sys64_module_at(int id, int fd, u64 buffer, u64 count, u64 offset,
+                           int writing) {
+    int access = fs64_fd_access(id, fd);
+    u64 space, saved, done = 0;
+    u8 chunk[64];
+
+    if (writing ? access == 0 : access == 1) return (u64)0 - SYS64_EBADF;
+    if (count == 0) return 0;
+    if (count > SYS64_MAX_WRITE) count = SYS64_MAX_WRITE;
+    /* The module ABI carries 32-bit positions, so a larger offset is past
+     * every file a backend can hold: zero bytes, not an error. */
+    if (offset > 0xFFFFFFFFull) return 0;
+
+    saved = fs64_fd_pos(id, fd);
+    if (fs64_fd_module_seek(id, fd, (s64)offset, K64_SEEK_SET, 0) < 0)
+        return (u64)0 - SYS64_EINVAL;
+    space = current_space();
+    while (done < count) {
+        u64 n = count - done;
+        int moved;
+
+        if (n > sizeof(chunk)) n = sizeof(chunk);
+        if (writing) {
+            if (!copy_from_user64(space, chunk, buffer + done, n)) {
+                if (done) break;
+                done = (u64)0 - SYS64_EFAULT;
+                break;
+            }
+            moved = fs64_fd_module_write(id, fd, chunk, n);
+        } else {
+            moved = fs64_fd_module_read(id, fd, chunk, n);
+            if (moved > 0 &&
+                !copy_to_user64(space, buffer + done, chunk, (u64)moved)) {
+                if (done) break;
+                done = (u64)0 - SYS64_EFAULT;
+                break;
+            }
+        }
+        if (moved < 0) {
+            if (!done) done = (u64)moved;
+            break;
+        }
+        if (moved == 0) break;
+        done += (u64)moved;
+        if ((u64)moved < n) break;
+    }
+    (void)fs64_fd_module_seek(id, fd, (s64)saved, K64_SEEK_SET, 0);
+    return done;
+}
+
 static u64 sys64_pread64(u64 fd, u64 buffer, u64 count, u64 offset) {
     int id = sched64_current(), file;
     u64 space, size, done = 0;
     u8 chunk[64];
 
+    if (fs64_fd_module(id, (int)fd))
+        return sys64_module_at(id, (int)fd, buffer, count, offset, 0);
     file = fs64_fd_file(id, (int)fd);
     if (file < 0) return (u64)0 - SYS64_EBADF;
     if (fs64_fd_access(id, (int)fd) == 1) return (u64)0 - SYS64_EBADF;
@@ -2424,6 +2545,8 @@ static u64 sys64_pwrite64(u64 fd, u64 buffer, u64 count, u64 offset) {
     u64 space, done = 0;
     u8 chunk[64];
 
+    if (fs64_fd_module(id, (int)fd))
+        return sys64_module_at(id, (int)fd, buffer, count, offset, 1);
     file = fs64_fd_file(id, (int)fd);
     if (file < 0) return (u64)0 - SYS64_EBADF;
     if (fs64_fd_access(id, (int)fd) == 0) return (u64)0 - SYS64_EBADF;
@@ -2496,6 +2619,18 @@ static u32 sys64_poll_events(int id, int fd, u16 requested) {
                 (pipe64_writable(index) || !pipe64_readers(index)))
                 ready |= SYS64_POLLOUT;
         }
+        return ready;
+    }
+    if (fs64_fd_module(id, fd)) {
+        u32 ready = 0;
+
+        if (fs64_fd_is_dir(id, fd)) return SYS64_POLLNVAL;
+        if (fs64_stat_fd(id, fd, &size, &ino, &kind) < 0)
+            return SYS64_POLLNVAL;
+        if ((requested & SYS64_POLLIN) && fs64_fd_pos(id, fd) < size)
+            ready |= SYS64_POLLIN;
+        if ((requested & SYS64_POLLOUT) && fs64_fd_access(id, fd) != 0)
+            ready |= SYS64_POLLOUT;
         return ready;
     }
     file = fs64_fd_file(id, fd);

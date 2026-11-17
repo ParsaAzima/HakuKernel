@@ -1009,6 +1009,16 @@ int fs64_fd_file(int task, int fd);
 int fs64_fd_device(int task, int fd);
 int fs64_fd_dev_read(int task, int fd, void *dst, u64 count);
 int fs64_fd_dev_write(int task, int fd, const void *src, u64 count);
+/* Module-backed files: the backend owns the handle and the position, so these
+ * forward to the module and mirror the offset into the description. They
+ * return a byte count or a negative -errno; seek returns 0 and reports the
+ * new offset through `position`. */
+int fs64_fd_module(int task, int fd);
+int fs64_fd_module_read(int task, int fd, void *dst, u64 count);
+int fs64_fd_module_write(int task, int fd, const void *src, u64 count);
+int fs64_fd_module_seek(int task, int fd, s64 offset, u64 whence,
+                        u64 *position);
+int fs64_fd_module_truncate(int task, int fd, u64 size);
 u64 fs64_fd_pos(int task, int fd);
 int fs64_fd_seek(int task, int fd, u64 pos);
 int fs64_fd_access(int task, int fd);
@@ -1080,11 +1090,12 @@ int initramfs64_init(void);
 
 /* module64.c: the x86-64 loader for the container in
  * kernel/module/haku_module.h. It accepts version 2 only, applies the two
- * 32-bit-word relocations module code produces, and exports logging, ticks
- * and the heap. The capability exports (device/fs registration, mount,
- * stat/dirent fillers) resolve but answer -ENOSYS because the 64-bit kernel
- * has no VFS or devfs yet. `file` is kernel memory holding the whole .hkm
- * image and is not retained. */
+ * 32-bit-word relocations module code produces, and exports logging, ticks,
+ * the heap, device and filesystem registration, mount and the stat/dirent
+ * fillers. Registration is only valid inside the init hook and is bound to
+ * the loading slot; unload reports -EBUSY while any descriptor opened through
+ * a device or mount that slot owns is still live. `file` is kernel memory
+ * holding the whole .hkm image and is not retained. */
 int module64_load(const u8 *file, u32 size);
 int module64_unload(const char *name);
 u32 module64_count(void);

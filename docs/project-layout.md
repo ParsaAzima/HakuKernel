@@ -53,10 +53,12 @@ Haku/
                         procfs64.c: generated /proc/meminfo, uptime,
                         self/cmdline;
                         vfs64.c: mount table, path resolution, devfs
-                        (null, zero, console) and module device slots;
+                        (null, zero, console), module device slots and
+                        module filesystem dispatch;
                         rtc64.c: CMOS wall clock;
                         smp64.c: ACPI MADT, local APIC and AP bring-up;
-                        module64.c: .hkm version 2 loader, exports and slots;
+                        module64.c: .hkm version 2 loader, exports, slots and
+                        capability ownership;
                         console64.c: serial+display console tee and
                         console read;
                         fb64.c: maps the VBE aperture into K64_FB_VIRT;
@@ -133,9 +135,7 @@ Haku/
                         library headers
                         module.h: the C interface a kernel module is written
                         against (services, device callbacks, fs ops table) on
-                        both architectures; capability calls answer -ENOSYS
-                        on x86-64 until module registration into the mount
-                        table and devfs is wired up
+                        both architectures
                         plus haku.h
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks

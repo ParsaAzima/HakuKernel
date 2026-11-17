@@ -1228,6 +1228,214 @@ static int test_module(void) {
     return 1;
 }
 
+/* ROMFS.HKM is the same C source as the 32-bit /rom, repacked for amd64. The
+ * test drives the whole capability chain from ring 0: the module registers a
+ * vfs_ops table and mounts it at /rom while its init hook runs, the VFS routes
+ * stat/open/read/opendir/readdir to module code, a read-only mount refuses
+ * every mutation with -EROFS, and an open descriptor on the mount makes
+ * delete_module answer -EBUSY. It stays mounted across test_libc64() so the
+ * ring-3 program can read it too; test_module_fs_release() unloads it after
+ * that program has exited. */
+static int test_module_fs(void) {
+    static const char readme_text[] =
+        "Haku romfs: a read-only filesystem served by a loadable module.\n";
+    static const char version_text[] = "romfs 1.0 (haku module)\n";
+    u8 *image;
+    u64 size;
+    u32 ino;
+    int file, kind, fd = -1, dirfd = -1, ok = 1;
+    int error = 0;
+    const char *stage = "lookup";
+
+    if (vfs64_mount_count() != 4 || module64_count() != 0) return 0;
+    file = fs64_lookup("/ROMFS.HKM");
+    if (file < 0) return 0;
+    size = fs64_size(file);
+    if (size < HAKU_MODULE_HEADER_SIZE || size > HAKU_MODULE_MAX_FILE) {
+        fs64_release(file);
+        return 0;
+    }
+    image = (u8 *)kmalloc64(size);
+    if (!image) {
+        fs64_release(file);
+        return 0;
+    }
+    if (fs64_read(file, 0, image, size) != size) {
+        kfree64(image);
+        fs64_release(file);
+        return 0;
+    }
+    fs64_release(file);
+
+    if (module64_load(image, (u32)size) != 0) ok = 0;
+    kfree64(image);
+    stage = "mount";
+    if (ok && (module64_count() != 1 || vfs64_mount_count() != 5)) ok = 0;
+    if (ok) {
+        u32 mount = 0;
+
+        for (; mount < vfs64_mount_count(); mount++)
+            if (memcmp(vfs64_mount_prefix(mount), "/rom", 5) == 0) break;
+        if (mount >= vfs64_mount_count() ||
+            vfs64_mount_kind(mount) != VFS64_MOUNT_MODULE)
+            ok = 0;
+    }
+
+    if (ok && (fs64_stat_path("/rom", &size, &ino, &kind) != 0 ||
+               kind != FS64_KIND_DIR)) {
+        stage = "stat-root";
+        ok = 0;
+    }
+    if (ok && (fs64_stat_path("/rom/README", &size, &ino, &kind) != 0 ||
+               kind != FS64_KIND_FILE || size == 0 ||
+               size > sizeof(readme_text) - 1u)) {
+        stage = "stat-readme";
+        ok = 0;
+    }
+
+    if (ok) {
+        fd = fs64_open_fd(0, "/rom/README", K64_O_RDONLY, &error);
+        if (fd < 0) {
+            stage = "open";
+            ok = 0;
+        }
+    }
+    if (ok) {
+        char text[128];
+        int got = fs64_fd_module_read(0, fd, text, sizeof(text) - 1u);
+
+        if (got != (int)(sizeof(readme_text) - 1u) ||
+            memcmp(text, readme_text, sizeof(readme_text) - 1u) != 0) {
+            stage = "read";
+            ok = 0;
+        }
+    }
+
+    /* A read-only mount refuses to open for writing before module code runs,
+     * and every path mutation answers -EROFS from the backend. */
+    if (ok) {
+        error = 0;
+        if (fs64_open_fd(0, "/rom/README", K64_O_WRONLY, &error) >= 0 ||
+            error != -HAKU_EROFS) {
+            stage = "ro-open";
+            ok = 0;
+        }
+    }
+    if (ok && fs64_unlink("/rom/README") != -HAKU_EROFS) {
+        stage = "ro-unlink";
+        ok = 0;
+    }
+    if (ok && fs64_rename("/rom/README", "/rom/OTHER") != -HAKU_EROFS) {
+        stage = "ro-rename";
+        ok = 0;
+    }
+    if (ok && fs64_create_dir("/rom/sub") != -HAKU_EROFS) {
+        stage = "ro-mkdir";
+        ok = 0;
+    }
+    if (ok && fs64_rmdir("/rom/README") != -HAKU_EROFS) {
+        stage = "ro-rmdir";
+        ok = 0;
+    }
+
+    if (ok) {
+        char name[FS64_NAME_MAX];
+        u32 next = 0, entry_ino = 0;
+        int entry_kind = 0, entry;
+
+        dirfd = fs64_open_fd(0, "/rom", K64_O_RDONLY | K64_O_DIRECTORY,
+                             &error);
+        if (dirfd < 0) {
+            stage = "list-open";
+            ok = 0;
+        }
+        if (ok) {
+            entry = fs64_fd_entry(0, dirfd, 0, name, &entry_ino, &entry_kind,
+                                  &next);
+            if (entry != 1 || memcmp(name, "README", 7) != 0 ||
+                entry_kind != FS64_KIND_FILE) {
+                stage = "list-readme";
+                ok = 0;
+            }
+        }
+        if (ok) {
+            entry = fs64_fd_entry(0, dirfd, next, name, &entry_ino,
+                                  &entry_kind, &next);
+            if (entry != 1 || memcmp(name, "VERSION", 8) != 0) {
+                stage = "list-version";
+                ok = 0;
+            }
+        }
+        if (ok &&
+            fs64_fd_entry(0, dirfd, next, name, &entry_ino, &entry_kind,
+                          &next) != 0) {
+            stage = "list-end";
+            ok = 0;
+        }
+    }
+
+    /* VERSION is reachable by name as well, not only through readdir. */
+    if (ok) {
+        char text[32];
+        int vfd = fs64_open_fd(0, "/rom/VERSION", K64_O_RDONLY, &error);
+        int got = vfd < 0 ? -1
+                          : fs64_fd_module_read(0, vfd, text, sizeof(text) - 1u);
+
+        stage = "version";
+        if (vfd < 0) {
+            ok = 0;
+        } else {
+            if (got != (int)(sizeof(version_text) - 1u) ||
+                memcmp(text, version_text, sizeof(version_text) - 1u) != 0)
+                ok = 0;
+            fs64_fd_close(0, vfd);
+        }
+    }
+
+    /* Both descriptors are live, so the module that owns the callbacks and
+     * the mount table cannot be unloaded yet. */
+    if (ok) {
+        stage = "busy";
+        if (module64_unload("HAKU-ROMFS") != -HAKU_EBUSY) ok = 0;
+    }
+    if (ok && module64_count() != 1) {
+        stage = "count";
+        ok = 0;
+    }
+
+    if (dirfd >= 0) fs64_fd_close(0, dirfd);
+    if (fd >= 0) fs64_fd_close(0, fd);
+    if (!ok) {
+        k64_puts("HAKU64-MODULE-FS-FAIL: stage=");
+        k64_puts(stage);
+        k64_puts("\r\n");
+        return 0;
+    }
+
+    k64_puts("HAKU64-MODULE-FS-OK: /rom README/VERSION listed, mutations"
+             " -EROFS, unload -EBUSY while open\r\n");
+    return 1;
+}
+
+/* Called after the ring-3 program exits: unloading the module must detach
+ * the mount before the image is freed, so /rom and its files disappear. */
+static int test_module_fs_release(void) {
+    u64 size;
+    u32 ino;
+    int kind;
+
+    if (module64_count() != 1) return 0;
+    if (module64_unload("HAKU-ROMFS") != 0) return 0;
+    if (module64_count() != 0 || vfs64_mount_count() != 4) return 0;
+    if (fs64_stat_path("/rom", &size, &ino, &kind) != -HAKU_ENOENT)
+        return 0;
+    if (fs64_stat_path("/rom/README", &size, &ino, &kind) != -HAKU_ENOENT)
+        return 0;
+
+    k64_puts("HAKU64-MODULE-FS-RELEASE-OK: unload removed /rom\r\n");
+    return 1;
+}
+
 /* /INIT.ELF is the C program built against user/lib64. The kernel reads it
  * from the FAT12 volume, loads it through the ELF64 loader, builds the same
  * argc/argv/envp/auxv stack execve would and starts it at ring 3. Everything
@@ -1540,7 +1748,10 @@ void kernel64_main(void) {
     k64_puts("HAKU64-ELF-REJECT-OK: six malformed images refused\r\n");
 
     if (!test_elf64()) k64_fail("ELF64 loader self-test");
+    if (!test_module_fs()) k64_fail("module filesystem self-test");
     if (!test_libc64()) k64_fail("x86-64 user library self-test");
+    if (!test_module_fs_release())
+        k64_fail("module filesystem unload self-test");
     if (!test_disk_note()) k64_fail("FAT12 disk write self-test");
     if (!test_module()) k64_fail("x86-64 module loader self-test");
 

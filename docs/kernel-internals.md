@@ -193,11 +193,14 @@ them in both the initramfs and the FAT12 seed disk, so a user program can read
 them and call `init_module`. `haku_demo.asm` keeps the NASM/ELF32 path alive
 and proves relocation and logging, `hello.c` registers a character device and
 checks the C runtime it linked, and `romfs.c` registers and mounts a read-only
-filesystem. The x64 build packs one module, `build/X64MOD.HKM` from
-`x64demo.c`, and seeds it on `build/haku64_fs.img`; the boot self-test reads it
-back from the FAT12 volume, so the disk path is part of the check. Its init
-registers `/dev/hello`, which the same test reads before proving
-`delete_module` reports `-EBUSY` while the descriptor is open.
+filesystem. The x64 build packs `build/X64MOD.HKM` from `x64demo.c` and
+`build/ROMFS.HKM` from the same `romfs.c`, and seeds both in the cpio archive
+and on `build/haku64_fs.img`; the boot self-test reads them back from the FAT12
+volume, so the disk path is part of the check. The demo's init registers
+`/dev/hello`, which the same test reads before proving `delete_module` reports
+`-EBUSY` while the descriptor is open. The romfs module mounts `/rom`, the test
+reads and lists its files, and the mount stays in place until the ring-3
+program has read it too.
 
 The loader does no symbol table lookup at run time. The host has already
 reduced `haku_module_init`/`haku_module_exit` to offsets inside the image and
@@ -215,12 +218,15 @@ half). Its export table has the same eleven names so `include/haku/module.h`
 and `libhakumod` are shared. The six utilities work;
 `haku_module_register_device` adds a character device to the 64-bit devfs table
 with the loading slot as its owner, so unload is `-EBUSY` while a descriptor
-is open and detaches the node before freeing the image. Filesystem registration,
-mount and the two struct fillers still answer `-ENOSYS`. User space reaches
-both loaders through `init_module` (175) and
-`delete_module` (176); `syscall64.c` bounds the image length by the container's
-worst case, copies it page by page, and copies the name into a 25-byte stack
-buffer.
+is open and detaches the node before freeing the image.
+`haku_module_register_fs` records a `vfs64_fs_ops_t` in a two-slot backend
+table, `haku_module_mount` adds a `VFS64_MOUNT_MODULE` entry that the VFS
+dispatch calls with the path relative to the mount (`"."` at the root), and
+the two struct fillers copy a module's mode and entry type into the kernel's
+`vfs64_stat_t`/`vfs64_dirent_t`. User space reaches both loaders through
+`init_module` (175) and `delete_module` (176); `syscall64.c` bounds the image
+length by the container's worst case, copies it page by page, and copies the
+name into a 25-byte stack buffer.
 
 Slot states make concurrent calls safe without holding a lock across a hook.
 `module_load` reserves the slot (copying the name and the function pointers
@@ -232,8 +238,8 @@ it asks for that same name. The token is what makes the capability calls safe:
 `haku_module_mount` bind the resource to the slot that is currently running its
 init hook, and report `-EPERM` from anywhere else — including the exit hook.
 The x86-64 loader records the loading slot in `module64_active` for the same
-purpose; device registration uses it as the owner, and registration outside an
-init hook answers `-ENOSYS`.
+purpose; device and filesystem registration use it as the owner, and
+registration outside an init hook answers `-EPERM`.
 
 Teardown is detached-before-free. `delete_module` marks the slot `UNLOADING`,
 unmounts the module's prefix (`-EBUSY` while any open description points at

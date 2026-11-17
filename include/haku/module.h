@@ -27,9 +27,12 @@
  * or filesystem is still reachable.
  *
  * Modules run in ring 0 on the current task's kernel stack, which is two
- * 4 KiB pages: keep frames small, do not block, and never sleep or spin
- * waiting for another task. A module is trusted kernel code — the loader
- * validates the container, not the module's intent.
+ * 4 KiB pages on i386 and 16 KiB on x86-64: keep frames small, do not block,
+ * and never sleep or spin waiting for another task. The same source builds
+ * for both ports; the container records the architecture (version 1 is i386,
+ * version 2 is x86-64) and the loader only accepts its own. A module is
+ * trusted kernel code — the loader validates the container, not the module's
+ * intent.
  */
 #ifndef HAKU_MODULE_ABI_H
 #define HAKU_MODULE_ABI_H

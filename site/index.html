@@ -320,10 +320,9 @@
     C modules are first-class: <code>include/haku/module.h</code> declares the
     services, <code>libhakumod</code> supplies the string and 64-bit helpers
     the compiler emits calls to, and the packer drops whatever a module does
-    not reach. The i386 loader ships device and filesystem registration; the
-    x86-64 loader offers logging, ticks and the kernel heap, and answers
-    filesystem registration with <code>-ENOSYS</code> until it is wired to the
-    mount table.
+    not reach. Both loaders offer the full set, and `romfs.c` is one C source
+    for both ports: it registers a read-only filesystem and mounts it at
+    <code>/rom</code>, which the kernel and a ring-3 program then read.
   </p>
 </section>
 
@@ -370,7 +369,7 @@
     <li>The x86-64 side has no signal handlers, no shell and no line discipline; pipes exist with <code>SIGPIPE</code> as the default action only.</li>
     <li>FAT12 only: 8.3 names, no timestamps, no permission bits, eight cached paths of 128&nbsp;KiB.</li>
     <li>The rootfs is a 1.44&nbsp;MB FAT12 volume: one busybox binary, no symlinks and no <code>/etc/fstab</code>, so applets run as <code>/bin/busybox APP</code>.</li>
-    <li>The x86-64 module loader answers filesystem registration with <code>-ENOSYS</code>.</li>
+    <li>A module filesystem has no page cache and cannot be mapped; <code>mmap</code> answers <code>-ENODEV</code> and <code>execve</code> does not search module mounts.</li>
     <li>Modules are trusted ring-0 code. There is no sandbox and no signature check.</li>
   </ul>
 </section>

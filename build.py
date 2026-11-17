@@ -498,7 +498,7 @@ def build_rootfs_image(py, init_elf, busybox, command):
     return image
 
 
-def build_x64_fs(py, image, exec_elf, module_image, init_elf):
+def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf):
     """Seed the x86-64 disk: a FAT12 volume with the boot archive on it.
 
     The kernel mounts FAT12 at /disk, reads /disk/INITRD, and unpacks it into
@@ -507,7 +507,8 @@ def build_x64_fs(py, image, exec_elf, module_image, init_elf):
     PATTERN.BIN with three pages of a byte pattern, USER.ELF (the program the
     ring-3 test execs, so the kernel image does not contain it), INIT.ELF (the
     C program built against user/lib64 that the kernel starts first),
-    X64MOD.HKM (the packed module the loader reads and relocates), and
+    X64MOD.HKM (the packed module the loader reads and relocates), ROMFS.HKM
+    (the read-only filesystem module the capability test mounts at /rom), and
     etc/banner.txt for the ring-3 initramfs check. The pattern is the same
     (offset*37+11) & 0xFF formula boot64.c uses to verify it.
 
@@ -536,14 +537,16 @@ def build_x64_fs(py, image, exec_elf, module_image, init_elf):
          "--dir=tmp", "--dir=dev", "--dir=disk",
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
          f"USER.ELF={exec_elf}", f"INIT.ELF={init_elf}",
-         f"X64MOD.HKM={module_image}", f"etc/banner.txt={banner_path}"])
+         f"X64MOD.HKM={module_image}", f"ROMFS.HKM={romfs_image}",
+         f"etc/banner.txt={banner_path}"])
     if os.path.getsize(archive) > 32 * 4096:
         raise SystemExit("x64 initramfs exceeds the 128 KiB cached-file limit")
 
     run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
          f"INITRD={archive}", f"USER.ELF={exec_elf}",
-         f"INIT.ELF={init_elf}", f"X64MOD.HKM={module_image}"])
+         f"INIT.ELF={init_elf}", f"X64MOD.HKM={module_image}",
+         f"ROMFS.HKM={romfs_image}"])
     log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes, "
         f"initramfs {os.path.getsize(archive)} bytes)")
 
@@ -554,10 +557,11 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     The entry path, memory subsystem, interrupts, per-process address
     spaces, the scheduler, ring-3 entry, the six-argument syscall ABI, the
     ELF64 loader, a FAT12 disk (the same ATA driver and filesystem the
-    32-bit kernel uses, behind a small compatibility layer) and the module
-    loader are all 64-bit. `mode` is "build" (compile and lay out the
-    images), "run" (boot with a QEMU window) or "headless" (boot, capture
-    the serial log and assert the marker list).
+    32-bit kernel uses, behind a small compatibility layer), the module
+    loader and its device/filesystem capabilities (the ROMFS module mounts a
+    read-only filesystem at /rom) are all 64-bit. `mode` is "build" (compile
+    and lay out the images), "run" (boot with a QEMU window) or "headless"
+    (boot, capture the serial log and assert the marker list).
     """
     cc, linker, label = find_x64_toolchain()
     log(f"x64 toolchain: {label}")
@@ -653,7 +657,19 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     run([py, os.path.join(ROOT, "tools", "mkhakumod.py"),
          x64_demo, x64_modlib, x64_modruntime, x64_module_image,
          "--name", "HAKU-X64"])
-    log("libhakumod built for x86-64 (modlib + runtime64), X64MOD.HKM packed")
+    # The 32-bit demo romfs.c is portable C: the same source becomes an
+    # amd64 module that publishes a read-only filesystem, which is what
+    # proves the capability chain (register -> mount -> VFS dispatch) on
+    # this port too.
+    x64_romfs = os.path.join(BUILD, "x64_romfs.obj")
+    run(cc + module_flags +
+        ["/Fo" + x64_romfs, os.path.join(module_dir, "demo", "romfs.c")])
+    x64_romfs_image = os.path.join(BUILD, "ROMFS.HKM")
+    run([py, os.path.join(ROOT, "tools", "mkhakumod.py"),
+         x64_romfs, x64_modlib, x64_modruntime, x64_romfs_image,
+         "--name", "HAKU-ROMFS"])
+    log("libhakumod built for x86-64 (modlib + runtime64), "
+        "X64MOD.HKM and ROMFS.HKM packed")
 
     # 2. the ring-3 test program: flat binary -> static ELF64 -> embedded
     #    .rdata object. The program outgrew one code page, so it carries its
@@ -743,7 +759,8 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     # 4. a fresh FAT12 volume for the disk filesystem test. The kernel
     #    creates /TMP and writes NOTE.TXT during the run, so the seed files
     #    are rebuilt every time rather than reused.
-    build_x64_fs(py, fs_img, exec_elf, x64_module_image, init64_elf)
+    build_x64_fs(py, fs_img, exec_elf, x64_module_image, x64_romfs_image,
+                 init64_elf)
 
     # 5. boot it when asked. qemu-system-i386 refuses long mode without a
     #    64-bit CPU model, so every x64 boot uses the x86_64 binary;
@@ -830,6 +847,8 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-MODULE-OK", "HAKU64-MODULE-LIB-OK",
                 "HAKU64-MODULE-LOAD-OK", "HAKU64-MODULE-REJECT-OK",
                 "HAKU64-MODULE-DEV-OK",
+                "HAKU64-MODULE-FS-OK", "HAKU64-MODULE-FS-RELEASE-OK",
+                "HAKU64-USER-MODULE-OK",
                 "HAKU64-MODULE-UNLOAD-OK", "HAKU64-LIBC-OK",
                 "HAKU64-SELFTEST-OK"]
     if smp_cpus == 1:

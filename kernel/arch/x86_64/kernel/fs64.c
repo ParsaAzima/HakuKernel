@@ -15,6 +15,13 @@
  * a RAM file the cached page *is* the file page, so the data is already
  * where it belongs and closing only publishes the new length.
  *
+ * Two backends deliberately bypass the cache. A devfs descriptor records the
+ * device and is served by vfs64.c. A file or directory a loadable module
+ * mounted keeps its position in the module's own handle: read, write and seek
+ * go straight to the backend, the descriptor only mirrors the resulting offset
+ * for fstat and pread, and there is no cache slot to alias, so mmap answers
+ * -ENODEV.
+ *
  * Limits, stated rather than hidden: a cached file is at most 32 pages
  * (128 KiB), at most 8 paths are cached at once, and the cache is shared by
  * every descriptor of the same path (opened read-write internally). FAT12
@@ -61,12 +68,17 @@ typedef struct {
     u32 used;
     u32 refs;
     int slot;
-    u32 backend;                   /* VFS64_MOUNT_FAT/RAM/DEV */
+    u32 backend;                   /* VFS64_MOUNT_FAT/RAM/DEV/PROC/MODULE */
     int dev;                       /* device number when backend is dev */
     u32 pipe;                      /* ring index when slot is FS64_PIPE */
     u32 nonblock;                  /* O_NONBLOCK on this description */
     u32 flags;                     /* 0 read, 1 write, 2 read-write */
     u64 pos;
+    /* A module backend owns its per-open handle. The description keeps the
+     * mount index so the callbacks and the open count stay bound to the
+     * mount it was opened through. */
+    u32 module_mount;
+    void *module_handle;
 } fs64_desc_t;
 
 #define FS64_DESC_MAX 64u
@@ -76,6 +88,10 @@ typedef struct {
 #define FS64_DIR      (-3)
 /* One end of a pipe: no cache slot either, just an index into pipe64.c. */
 #define FS64_PIPE     (-4)
+/* A file or directory a module backend owns: no cache slot, a handle in the
+ * module image. */
+#define FS64_MODFILE  (-5)
+#define FS64_MODDIR   (-6)
 
 /* One descriptor table per task: an index into the description table. -1 is
  * a free descriptor, and for 0..2 it is also the implicit console every task
@@ -105,6 +121,7 @@ static char dir_paths[FS64_DESC_MAX][K64_FS_PATH_MAX + 1];
 #define FS64_EMFILE   24
 #define FS64_ENOSPC   28
 #define FS64_ENOTEMPTY 39
+#define FS64_EROFS    30
 
 static int fat_error(int result) {
     switch (result) {
@@ -479,7 +496,8 @@ int fs64_lookup(const char *path) {
     int error;
 
     if (vfs64_resolve(path, &backend, rel) != 0) return -1;
-    if (backend == VFS64_MOUNT_DEV) return -1;
+    if (backend == VFS64_MOUNT_DEV || backend == VFS64_MOUNT_MODULE)
+        return -1;
     slot = cache_open(path, rel[0] ? rel : "/", backend, FAT12_OPEN_READ,
                       &error);
     if (!slot) return -1;
@@ -621,12 +639,15 @@ int fs64_truncate(int file, u64 size) {
  * interpreting "/dev/null" as a file name. */
 int fs64_create_dir(const char *path) {
     char rel[VFS64_REL_MAX];
-    u32 backend;
+    u32 backend, mount_index = 0;
 
     if (!path || !*path) return -FS64_EINVAL;
-    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (vfs64_resolve_mount(path, &backend, rel, &mount_index) != 0)
+        return -FS64_ENOENT;
     if (backend == VFS64_MOUNT_RAM)
         return ramfs64_create_dir(rel[0] ? rel : "/");
+    if (backend == VFS64_MOUNT_MODULE)
+        return vfs64_fs_mkdir(mount_index, rel);
     if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
     return fat_error(fat12_dir_create(rel[0] ? rel : "/"));
 }
@@ -652,12 +673,15 @@ static void cache_unname(const char *key, int *found) {
 int fs64_unlink(const char *path) {
     char key[K64_FS_PATH_MAX + 1];
     char rel[VFS64_REL_MAX];
-    u32 backend;
+    u32 backend, mount_index = 0;
     int result;
 
-    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (vfs64_resolve_mount(path, &backend, rel, &mount_index) != 0)
+        return -FS64_ENOENT;
     if (backend == VFS64_MOUNT_DEV || backend == VFS64_MOUNT_PROC)
         return -FS64_EACCES;
+    if (backend == VFS64_MOUNT_MODULE)
+        return vfs64_fs_unlink(mount_index, rel);
     if (!cache_key(path, key)) return -FS64_EINVAL;
 
     if (backend == VFS64_MOUNT_RAM) {
@@ -685,16 +709,22 @@ int fs64_rename(const char *oldpath, const char *newpath) {
     char newrel[VFS64_REL_MAX];
     fs64_cache_t *slot;
     u32 oldbackend, newbackend;
+    u32 oldmount = 0, newmount = 0;
     int result;
 
-    if (vfs64_resolve(oldpath, &oldbackend, oldrel) != 0)
+    if (vfs64_resolve_mount(oldpath, &oldbackend, oldrel, &oldmount) != 0)
         return -FS64_ENOENT;
-    if (vfs64_resolve(newpath, &newbackend, newrel) != 0)
+    if (vfs64_resolve_mount(newpath, &newbackend, newrel, &newmount) != 0)
         return -FS64_ENOENT;
     if (oldbackend == VFS64_MOUNT_DEV || newbackend == VFS64_MOUNT_DEV ||
         oldbackend == VFS64_MOUNT_PROC || newbackend == VFS64_MOUNT_PROC)
         return -FS64_EACCES;
     if (oldbackend != newbackend) return -FS64_EXDEV;
+    if (oldbackend == VFS64_MOUNT_MODULE) {
+        /* Two mounts of the same backend are still different filesystems. */
+        if (oldmount != newmount) return -FS64_EXDEV;
+        return vfs64_fs_rename(oldmount, oldrel, newrel);
+    }
     if (!cache_key(oldpath, oldkey) || !cache_key(newpath, newkey))
         return -FS64_EINVAL;
     slot = cache_find(oldkey);
@@ -722,12 +752,15 @@ int fs64_rename(const char *oldpath, const char *newpath) {
 
 int fs64_rmdir(const char *path) {
     char rel[VFS64_REL_MAX];
-    u32 backend;
+    u32 backend, mount_index = 0;
 
     if (!path || !*path) return -FS64_EINVAL;
-    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (vfs64_resolve_mount(path, &backend, rel, &mount_index) != 0)
+        return -FS64_ENOENT;
     if (backend == VFS64_MOUNT_RAM)
         return ramfs64_rmdir(rel[0] ? rel : "/");
+    if (backend == VFS64_MOUNT_MODULE)
+        return vfs64_fs_rmdir(mount_index, rel);
     if (backend != VFS64_MOUNT_FAT) return -FS64_EACCES;
     return fat_error(fat12_dir_remove(rel[0] ? rel : "/"));
 }
@@ -735,14 +768,25 @@ int fs64_rmdir(const char *path) {
 int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind) {
     fat12_stat_t st;
     char rel[VFS64_REL_MAX];
-    u32 backend;
+    u32 backend, mount_index = 0;
     int result, device, lookup_kind;
 
-    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (vfs64_resolve_mount(path, &backend, rel, &mount_index) != 0)
+        return -FS64_ENOENT;
     if (backend == VFS64_MOUNT_DEV) {
         result = vfs64_dev_lookup(rel, &device, &lookup_kind);
         if (result < 0) return result;
         return vfs64_dev_stat(device, size, ino, kind);
+    }
+    if (backend == VFS64_MOUNT_MODULE) {
+        vfs64_stat_t out;
+
+        result = vfs64_fs_stat(mount_index, rel, &out);
+        if (result < 0) return result;
+        if (size) *size = out.size;
+        if (ino) *ino = out.ino;
+        if (kind) *kind = out.kind;
+        return 0;
     }
     if (backend == VFS64_MOUNT_PROC) {
         int entry;
@@ -768,7 +812,7 @@ int fs64_stat_path(const char *path, u64 *size, u32 *ino, int *kind) {
 int fs64_fd_is_dir(int task, int fd) {
     fs64_desc_t *desc = fd_get(fd_task(task), fd);
 
-    return desc && desc->slot == FS64_DIR;
+    return desc && (desc->slot == FS64_DIR || desc->slot == FS64_MODDIR);
 }
 
 /* The path a directory descriptor was opened with, for the *at calls that
@@ -777,7 +821,8 @@ int fs64_fd_dir_path(int task, int fd, char out[K64_FS_PATH_MAX + 1]) {
     fs64_desc_t *desc = fd_get(fd_task(task), fd);
     u64 i = 0;
 
-    if (!desc || desc->slot != FS64_DIR) return -FS64_ENOTDIR;
+    if (!desc || (desc->slot != FS64_DIR && desc->slot != FS64_MODDIR))
+        return -FS64_ENOTDIR;
     if (!out) return -FS64_EFAULT;
     while (dir_paths[desc_index(desc)][i] && i < K64_FS_PATH_MAX) {
         out[i] = dir_paths[desc_index(desc)][i];
@@ -796,6 +841,9 @@ int fs64_fd_sync(int task, int fd) {
     desc = fd_get(task, fd);
     if (!desc) return fd <= 2 ? 0 : -FS64_EBADF;
     if (desc->slot == FS64_PIPE) return -FS64_EINVAL;
+    /* A module backend has no write-back of its own; whatever it cached is
+     * the module's business, and it has no sync op in the ABI. */
+    if (desc->slot == FS64_MODFILE || desc->slot == FS64_MODDIR) return 0;
     if (desc->slot < 0) return 0;
     if ((u32)desc->slot >= FS64_CACHE_MAX) return -FS64_EBADF;
     if (!cache[desc->slot].used) return -FS64_EBADF;
@@ -836,6 +884,17 @@ int fs64_stat_fd(int task, int fd, u64 *size, u32 *ino, int *kind) {
     }
     if (desc->backend == VFS64_MOUNT_DEV)
         return vfs64_dev_stat(desc->dev, size, ino, kind);
+    if (desc->slot == FS64_MODFILE || desc->slot == FS64_MODDIR) {
+        vfs64_stat_t st;
+        int result = vfs64_fs_fstat(desc->module_mount, desc->module_handle,
+                                    &st);
+
+        if (result < 0) return result;
+        if (size) *size = st.size;
+        if (ino) *ino = st.ino;
+        if (kind) *kind = st.kind;
+        return 0;
+    }
     if (desc->slot == FS64_DIR) {
         const char *path = dir_paths[desc_index(desc)];
         char rel[VFS64_REL_MAX];
@@ -912,10 +971,11 @@ int fs64_dir_entries(const char *path, u32 index, char name[FS64_NAME_MAX],
     fat12_dir_t dir;
     fat12_stat_t st;
     char rel[VFS64_REL_MAX];
-    u32 backend;
+    u32 backend, mount_index = 0;
     int result;
 
-    if (vfs64_resolve(path, &backend, rel) != 0) return -FS64_ENOENT;
+    if (vfs64_resolve_mount(path, &backend, rel, &mount_index) != 0)
+        return -FS64_ENOENT;
     if (backend == VFS64_MOUNT_DEV) {
         int device, lookup_kind;
 
@@ -923,6 +983,29 @@ int fs64_dir_entries(const char *path, u32 index, char name[FS64_NAME_MAX],
         if (result < 0) return result;
         if (lookup_kind != FS64_KIND_DIR) return -FS64_ENOTDIR;
         return vfs64_dev_entry(index, name, ino, kind, next_index);
+    }
+    if (backend == VFS64_MOUNT_MODULE) {
+        vfs64_dirent_t entry;
+        void *handle = 0;
+        u32 length = 0;
+
+        /* A module lists entries by index, so a throwaway handle answers a
+         * path-based listing. The syscall path keeps one handle per open
+         * directory instead. */
+        result = vfs64_fs_opendir(mount_index, rel, &handle);
+        if (result < 0) return result;
+        result = vfs64_fs_readdir(mount_index, handle, index, &entry,
+                                  next_index);
+        vfs64_fs_close(mount_index, handle, 1);
+        if (result <= 0) return result;
+        while (entry.name[length] && length + 1u < FS64_NAME_MAX) {
+            name[length] = entry.name[length];
+            length++;
+        }
+        name[length] = 0;
+        if (ino) *ino = entry.ino;
+        if (kind) *kind = entry.kind;
+        return 1;
     }
     if (backend == VFS64_MOUNT_PROC) {
         int entry, lookup_kind;
@@ -949,8 +1032,25 @@ int fs64_dir_entries(const char *path, u32 index, char name[FS64_NAME_MAX],
 int fs64_fd_entry(int task, int fd, u32 index, char name[FS64_NAME_MAX],
                   u32 *ino, int *kind, u32 *next_index) {
     fs64_desc_t *desc = fd_get(fd_task(task), fd);
+    vfs64_dirent_t entry;
+    u32 length = 0;
+    int result;
 
-    if (!desc || desc->slot != FS64_DIR) return -FS64_ENOTDIR;
+    if (!desc) return -FS64_ENOTDIR;
+    if (desc->slot == FS64_MODDIR) {
+        result = vfs64_fs_readdir(desc->module_mount, desc->module_handle,
+                                  index, &entry, next_index);
+        if (result <= 0) return result;
+        while (entry.name[length] && length + 1u < FS64_NAME_MAX) {
+            name[length] = entry.name[length];
+            length++;
+        }
+        name[length] = 0;
+        if (ino) *ino = entry.ino;
+        if (kind) *kind = entry.kind;
+        return 1;
+    }
+    if (desc->slot != FS64_DIR) return -FS64_ENOTDIR;
     return fs64_dir_entries(dir_paths[desc_index(desc)], index, name, ino,
                             kind, next_index);
 }
@@ -1051,7 +1151,7 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
     fs64_cache_t *slot;
     fs64_desc_t *desc;
     char rel[VFS64_REL_MAX];
-    u32 kind;
+    u32 kind, mount_index = 0;
     int fd, resolved;
     u8 fat_flags = FAT12_OPEN_READ | FAT12_OPEN_WRITE;
     u32 access = (u32)(flags & 3u);
@@ -1070,7 +1170,7 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
         if (error) *error = -FS64_EINVAL;
         return -1;
     }
-    if (vfs64_resolve(path, &kind, rel) != 0) {
+    if (vfs64_resolve_mount(path, &kind, rel, &mount_index) != 0) {
         if (error) *error = -FS64_ENOENT;
         return -1;
     }
@@ -1182,11 +1282,62 @@ int fs64_open_fd(int task, const char *path, u64 flags, int *error) {
         return fd;
     }
 
-    if (flags & K64_O_DIRECTORY) {
-        if (flags & (K64_O_CREAT | K64_O_TRUNC)) {
-            if (error) *error = -FS64_EINVAL;
+    if (kind == VFS64_MOUNT_MODULE) {
+        void *handle = 0;
+
+        if (flags & K64_O_DIRECTORY) {
+            if (flags & (K64_O_CREAT | K64_O_TRUNC)) {
+                if (error) *error = -FS64_EINVAL;
+                return -1;
+            }
+            resolved = vfs64_fs_opendir(mount_index, rel, &handle);
+            if (resolved < 0) {
+                if (error) *error = resolved;
+                return -1;
+            }
+            desc = fd_reserve(task, &fd);
+            if (!desc) {
+                vfs64_fs_close(mount_index, handle, 1);
+                if (error) *error = -FS64_ENOSPC;
+                return -1;
+            }
+            desc->slot = FS64_MODDIR;
+            desc->backend = VFS64_MOUNT_MODULE;
+            desc->module_mount = mount_index;
+            desc->module_handle = handle;
+            desc->flags = K64_O_RDONLY;
+            desc->pos = 0;
+            dir_path_set(desc, path);
+            fd_desc[task][fd] = desc_index(desc);
+            return fd;
+        }
+
+        /* The backend sees the same open flags the caller passed, including
+         * O_CREAT/O_TRUNC/O_APPEND, so a writable module filesystem decides
+         * what it supports. A read-only mount is refused here, before the
+         * module code runs. */
+        resolved = vfs64_fs_open(mount_index, rel, (u32)flags, &handle);
+        if (resolved < 0) {
+            if (error) *error = resolved;
             return -1;
         }
+        desc = fd_reserve(task, &fd);
+        if (!desc) {
+            vfs64_fs_close(mount_index, handle, 0);
+            if (error) *error = -FS64_ENOSPC;
+            return -1;
+        }
+        desc->slot = FS64_MODFILE;
+        desc->backend = VFS64_MOUNT_MODULE;
+        desc->module_mount = mount_index;
+        desc->module_handle = handle;
+        desc->flags = access;
+        desc->pos = 0;
+        fd_desc[task][fd] = desc_index(desc);
+        return fd;
+    }
+
+    if (flags & K64_O_DIRECTORY) {
         if (kind == VFS64_MOUNT_RAM) {
             u32 node, entry_ino;
             u64 entry_size;
@@ -1281,6 +1432,73 @@ int fs64_fd_dev_write(int task, int fd, const void *src, u64 count) {
     return vfs64_dev_write(desc->dev, src, count);
 }
 
+/* ---- module-backed files -------------------------------------------------
+ *
+ * A module file has no page cache: the backend keeps the position in its own
+ * handle, so every read, write and seek goes straight to the module and the
+ * description mirrors the resulting offset for fstat and for a later pread.
+ * The counters are 32-bit because the module ABI is: one call moves at most
+ * 4 GiB - 1 bytes, which the syscall layer has already clipped anyway.
+ */
+
+/* 1 when the descriptor names a file or directory a module backend owns.
+ * fs64_fd_file() reports the negative FS64_MOD* marker for these, so callers
+ * that look for a cache slot must ask this first. */
+int fs64_fd_module(int task, int fd) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    return desc && (desc->slot == FS64_MODFILE || desc->slot == FS64_MODDIR);
+}
+
+int fs64_fd_module_read(int task, int fd, void *dst, u64 count) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    if (!desc || desc->slot != FS64_MODFILE) return -FS64_EBADF;
+    if (desc->flags == K64_O_WRONLY) return -FS64_EBADF;
+    if (!count) return 0;
+    if (count > 0x7FFFFFFFu) count = 0x7FFFFFFFu;
+    return vfs64_fs_read(desc->module_mount, desc->module_handle, dst,
+                         (u32)count);
+}
+
+int fs64_fd_module_write(int task, int fd, const void *src, u64 count) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    if (!desc || desc->slot != FS64_MODFILE) return -FS64_EBADF;
+    if (desc->flags == K64_O_RDONLY) return -FS64_EBADF;
+    if (!count) return 0;
+    if (count > 0x7FFFFFFFu) count = 0x7FFFFFFFu;
+    return vfs64_fs_write(desc->module_mount, desc->module_handle, src,
+                          (u32)count);
+}
+
+/* lseek through the backend, then record the resulting offset. The module's
+ * seek takes a 32-bit signed offset and a 32-bit position, so a request past
+ * those bounds is refused before any module code runs. */
+int fs64_fd_module_seek(int task, int fd, s64 offset, u64 whence,
+                        u64 *position) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+    u64 pos = 0;
+    int result;
+
+    if (!desc || desc->slot != FS64_MODFILE) return -FS64_EBADF;
+    if (whence > K64_SEEK_END) return -FS64_EINVAL;
+    result = vfs64_fs_seek(desc->module_mount, desc->module_handle, offset,
+                           (u32)whence, &pos);
+    if (result < 0) return result;
+    desc->pos = pos;
+    if (position) *position = pos;
+    return 0;
+}
+
+int fs64_fd_module_truncate(int task, int fd, u64 size) {
+    fs64_desc_t *desc = fd_get(fd_task(task), fd);
+
+    if (!desc || desc->slot != FS64_MODFILE) return -FS64_EBADF;
+    if (desc->flags == K64_O_RDONLY) return -FS64_EINVAL;
+    return vfs64_fs_truncate(desc->module_mount, desc->module_handle, size);
+}
+
 /* The cache slot behind `fd`, or a negative value: -1 for a free or console
  * descriptor, -2 for a duplicated console descriptor. */
 int fs64_fd_file(int task, int fd) {
@@ -1301,9 +1519,12 @@ int fs64_fd_seek(int task, int fd, u64 pos) {
 
     /* Directory descriptors keep their entry cursor here too, so seekdir
      * and getdents64 share one position. A device has a position as well
-     * (the console alias does not: it is a terminal). */
+     * (the console alias does not: it is a terminal). A module file's
+     * position lives in the backend handle; the syscall mirrors it here so
+     * fstat and pread see the same number. */
     if (!desc) return 0;
     if (desc->slot < 0 && desc->slot != FS64_DIR &&
+        desc->slot != FS64_MODFILE && desc->slot != FS64_MODDIR &&
         desc->backend != VFS64_MOUNT_DEV)
         return 0;
     desc->pos = pos;
@@ -1318,7 +1539,8 @@ int fs64_fd_access(int task, int fd) {
 
     if (!desc) return -1;
     if (desc->slot < 0 && desc->slot != FS64_CONSOLE &&
-        desc->slot != FS64_PIPE && desc->backend != VFS64_MOUNT_DEV)
+        desc->slot != FS64_PIPE && desc->slot != FS64_MODFILE &&
+        desc->slot != FS64_MODDIR && desc->backend != VFS64_MOUNT_DEV)
         return -1;
     return (int)desc->flags;
 }
@@ -1474,6 +1696,13 @@ void fs64_fd_close(int task, int fd) {
     if (desc->refs == 0) {
         if (desc->backend == VFS64_MOUNT_DEV && slot_index != FS64_CONSOLE)
             vfs64_dev_closed(desc->dev);
+        /* The last descriptor on a module file or directory releases the
+         * backend handle and drops the mount's open count, which is what
+         * lets delete_module stop answering -EBUSY. */
+        if ((slot_index == FS64_MODFILE || slot_index == FS64_MODDIR) &&
+            desc->module_handle)
+            vfs64_fs_close(desc->module_mount, desc->module_handle,
+                           slot_index == FS64_MODDIR);
         /* The last descriptor on this description takes the end with it. A
          * dup or a forked sibling shares the description, so both keep the
          * pipe open without adding a reader or writer reference. */

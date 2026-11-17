@@ -71,7 +71,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | keyboard | PC/8042 in set-1 mode: IRQ1 unmasked after a decode-only self-test | `HAKU64-KBD-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
 | files | FAT12 on an ATA disk at `/disk` plus a RAM initramfs root, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
-| namespace | a four-entry mount table with longest-prefix resolution; FAT12 at `/disk`, `ramfs64` at `/`, `procfs64` at `/proc` with generated `meminfo`/`uptime`/`self/cmdline`, devfs at `/dev` with `null`, `zero`, `console` and module-registered devices, filled at boot from the `INITRD` cpio archive | `HAKU64-VFS-OK`, `HAKU64-PROCFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-INITRAMFS-OK`, `HAKU64-USER-DEV-OK`, `HAKU64-USER-PROCFS-OK`, `HAKU64-USER-INITRAMFS-OK` |
+| namespace | a six-entry mount table with longest-prefix resolution; FAT12 at `/disk`, `ramfs64` at `/`, `procfs64` at `/proc` with generated `meminfo`/`uptime`/`self/cmdline`, devfs at `/dev` with `null`, `zero`, `console` and module-registered devices, and module filesystems such as `/rom`, filled at boot from the `INITRD` cpio archive | `HAKU64-VFS-OK`, `HAKU64-PROCFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-INITRAMFS-OK`, `HAKU64-USER-DEV-OK`, `HAKU64-USER-PROCFS-OK`, `HAKU64-USER-INITRAMFS-OK` |
 | spaces | two PML4s map one address to different frames; CR3 switches them | `HAKU64-VM-OK` |
 | tasks | two 16 KiB kernel stacks preempted by IRQ0 | `HAKU64-PROC-OK` |
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
@@ -80,7 +80,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, pipes, process, time, limits, `poll`/`select` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK`, `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
-| modules | `X64MOD.HKM` is read from the disk, relocated and run; duplicate, truncated and bad-magic images refused | `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK` |
+| modules | `X64MOD.HKM` and `ROMFS.HKM` are read from the disk, relocated and run; duplicate, truncated and bad-magic images refused; the second registers a read-only filesystem mounted at `/rom` and cannot unload while it has open files | `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK`, `HAKU64-MODULE-FS-OK`, `HAKU64-MODULE-FS-RELEASE-OK`, `HAKU64-USER-MODULE-OK` |
 | self-test | physmap alias, alloc/free, a 4 KiB mapping, heap coalescing | `HAKU64-SELFTEST-OK` |
 
 The physmap is why the 64-bit build has no equivalent of the 32-bit
@@ -238,9 +238,10 @@ cached file at 32 pages, and a writable `MAP_SHARED` mapping requires a
 writable descriptor that stays open, because only descriptors pin a cache
 slot.
 
-The namespace is not the volume. `vfs64.c` holds a four-entry mount table:
-`/disk` is the FAT12 backend, `/` is the RAM root, `/proc` is procfs and `/dev`
-is devfs. Resolution matches the longest prefix case-insensitively on a
+The namespace is not the volume. `vfs64.c` holds a six-entry mount table:
+`/disk` is the FAT12 backend, `/` is the RAM root, `/proc` is procfs, `/dev`
+is devfs, and the last two slots are for module filesystems. Resolution
+matches the longest prefix case-insensitively on a
 component boundary, so `/DEV/NULL` and `/dev/null` name the same file, while
 `/device.txt` belongs to the RAM root because `/dev` does not own it. Every
 descriptor records the backend it was opened through, which is how `read`,
@@ -255,6 +256,21 @@ hold device names a loaded module registered, with a per-device open count that
 makes `delete_module` report `-EBUSY` until the last descriptor closes. The
 device namespace is read-only: create, unlink, rename and rmdir below `/dev`
 fail with `-EACCES`, and truncating a device is `-EINVAL`.
+
+A module filesystem reuses the same dispatch. `haku_module_mount` adds an entry
+with kind `VFS64_MOUNT_MODULE`, the `vfs64_fs_ops_t` the module registered, a
+read-only flag and the owning module slot. The VFS converts the path below the
+mount point to the 32-bit convention — `"."` at the root, bare names below it —
+before calling the backend, so `romfs.c` is one source file for both ports.
+Each mount counts live descriptions: `open`/`opendir` increment it, `close`
+decrements it once per description (a `dup` or `fork` shares the description and
+adds nothing), and `delete_module` answers `-EBUSY` while it is non-zero. A
+read-only mount refuses `O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`/`O_APPEND` with
+`-EROFS` before any module code runs. Module files have no page cache: the
+backend handle owns the position, `read`/`write`/`lseek` go straight through,
+and `pread`/`pwrite` save the offset, seek, transfer and restore it.
+`mmap` of one answers `-ENODEV`, and `execve` refuses it because path lookup for
+an executable deliberately skips module mounts.
 
 `/proc` is generated, not stored. `procfs64.c` answers `meminfo`, `uptime`,
 `self` and `self/cmdline`; the content is produced when the cache slot for that
@@ -434,21 +450,22 @@ the current task and is simply resumed, and `remaining` is never written
 because nothing interrupts the sleep. `poll` and `select` answer from the
 descriptor table instead of wait queues: the console is always readable and
 writable, a file is readable while its position is below the size, and a
-positive timeout is spent in tick slices; an infinite wait with nothing
-ready returns 0 rather than blocking. Pipes, symlinks and real signal
-handlers are still missing; the syscall port that is there covers what the
-tests and a static libc probe need.
+positive timeout is spent in tick slices; a `poll` on a pipe waits for the peer
+to move data (or for the timeout), while an infinite `select` with nothing
+ready returns 0 rather than blocking. Symlinks and real signal handlers are
+still missing; the syscall port that is there covers what the tests and a
+static libc probe need.
 
 The 64-bit path now has an ELF64 loader, a FAT12 data disk at `/disk`, a RAM
 initramfs root at `/`, procfs at `/proc`, a `/dev` with `null`, `zero`,
-`console` and module-registered devices, the syscall table, a module loader
-with device registration, and a user C library (`user/lib64`) with `/INIT.ELF`
-as the first real ring-3 program. A shell therefore still requires the 32-bit
+`console` and module-registered devices, a module filesystem at `/rom`, the
+syscall table, a module loader with device and filesystem registration, and a
+user C library (`user/lib64`) with `/INIT.ELF` as the first real ring-3
+program. A shell therefore still requires the 32-bit
 side, which is where the full userland lives. [The roadmap](../ROADMAP.md)
-(milestones 1 to 4) lists the remaining stages: a TLS base and the musl probe
-for milestone 1, then module filesystems, pipes and signals, and the
-interactive shell. The 64-bit sources are excluded from the 32-bit link line,
-so both targets build from one tree.
+(milestones 1 to 4) lists the remaining stages: the musl probe for milestone 1,
+then signals and job control, and the interactive shell. The 64-bit sources are
+excluded from the 32-bit link line, so both targets build from one tree.
 
 `kernel/arch/x86_64/elf/elf64.c` follows the 32-bit loader's rules — validate
 the whole image before mapping, accept only static `ET_EXEC`, require
@@ -832,11 +849,13 @@ Logging, ticks and the heap exist as on the 32-bit side;
 `haku_module_register_device` publishes a character device in the 64-bit devfs
 table and records the loading slot as its owner, so unload reports `-EBUSY`
 while any descriptor still has it open and detaches the node before the image
-is freed. `haku_module_register_fs`, `haku_module_mount` and the two struct
-fillers still answer `-ENOSYS`, because no module-backed filesystem backend is
-wired on this port. The lifecycle is the same four-slot table, with the
-transitions under an atomic lock, and `init_module`/`delete_module` copy the
-user buffer page by page through `copy_from_user64` before the loader sees it.
+is freed. `haku_module_register_fs` records a `vfs64_fs_ops_t` in a two-slot
+backend table, `haku_module_mount` adds a `VFS64_MOUNT_MODULE` entry to the
+mount table, and the two struct fillers translate the module's mode and type
+values into the kernel's `vfs64_stat_t`/`vfs64_dirent_t` layouts. The lifecycle
+is the same four-slot table, with the transitions under an atomic lock, and
+`init_module`/`delete_module` copy the user buffer page by page through
+`copy_from_user64` before the loader sees it.
 
 #### Writing a module in C
 
@@ -910,10 +929,8 @@ keeps the default library out.
 #### Capabilities owned by a module
 
 A module is more than code: it can expose kernel functionality. There are two
-capability kinds, and the module slot owns them. The 32-bit kernel implements
-both. The x86-64 build exports the same calls so one header serves both, and
-wires character-device registration into its devfs and mount table; filesystem
-registration and mount answer `-ENOSYS`. The two kinds are:
+capability kinds, and the module slot owns them. Both kernels implement both.
+The two kinds are:
 
 - a character device, registered in devfs and reached as `/dev/<name>`;
 - a filesystem backend (`vfs_fs_ops_t`, which `haku_module_fs_ops_t` mirrors
@@ -921,11 +938,11 @@ registration and mount answer `-ENOSYS`. The two kinds are:
 
 Registration is only valid while that slot's init hook is running. The 32-bit
 loader sets a single `module_api_owner` token around the hook, and the 64-bit
-loader sets `module64_active`; the registration calls answer `-ENOSYS` (or
-`-EPERM` on the 32-bit side) from any other context — including the module's
-own exit hook, which runs with no token. Each slot may own at most one device
-and one filesystem, and may mount that filesystem once. The root prefix is
-refused: a module adds a namespace instead of replacing the boot one.
+loader sets `module64_active`; the registration calls answer `-EPERM` from any
+other context — including the module's own exit hook, which runs with no
+token. Each slot may own at most one device and one filesystem, and may mount
+that filesystem once. The root prefix is refused: a module adds a namespace
+instead of replacing the boot one.
 
 Unloading is ordered so freed module code is never reachable. `delete_module`
 first detaches the mount, then unregisters the filesystem, then removes the
@@ -946,6 +963,10 @@ device. Each step checks its own liveness:
   (`vfs64_dev_register`) has three built-in devices and four module slots; the
   same open count makes `module64_unload` return `-EBUSY`, and a successful
   unload detaches every device owned by that slot before the image is freed.
+- `vfs64_fs_remove_owner` detaches every mount that backend owns. A mount
+  entry carries `owner` (the module slot) and `opens` (live descriptions, not
+  descriptors: `dup` and `fork` share one), so `vfs64_fs_owner_busy` makes
+  `delete_module` answer `-EBUSY` until the last descriptor on `/rom` closes.
 
 If any of those checks fails, `delete_module` restores `MODULE_LIVE` and
 returns the error, leaving the module fully usable; closing the last descriptor
@@ -970,33 +991,44 @@ the initramfs and the FAT12 seed disk:
   read-only filesystem and mounts it at `/rom` with `README` and `VERSION`
   (`ROMFS-MODULE-OK`).
 
-The x86-64 build packs a fourth, `X64MOD.HKM` from `x64demo.c`. It is seeded on
-the x64 data disk rather than installed in an image, so the boot test exercises
-the whole on-disk path: read the file, validate the version 2 container,
-relocate `R_64_ABS`/`R_64_PC32` (including a pointer table that becomes
-`DIR64` relocations), resolve imports, run the init hook, then unload and free
-the image. Its init calls `haku_module_register_device("hello", ...)`, so the
-test reads `HAKU64-MODULE-DEV-OK` from `/dev/hello`, confirms
-`module64_unload` is `-EBUSY` while that descriptor is open, closes it, and
-then unloads. The same run covers the library's strings, a heap round trip, the
-tick counter and a pointer table (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`,
+The x86-64 build packs two, `X64MOD.HKM` from `x64demo.c` and `ROMFS.HKM` from
+the same `romfs.c` compiled with the amd64 triple. Both are seeded in the cpio
+archive and on the x64 data disk rather than installed in an image, so the boot
+test exercises the whole on-disk path: read the file, validate the version 2
+container, relocate `R_64_ABS`/`R_64_PC32` (including a pointer table that
+becomes `DIR64` relocations), resolve imports, run the init hook, then unload
+and free the image. The demo's init calls
+`haku_module_register_device("hello", ...)`, so the test reads
+`HAKU64-MODULE-DEV-OK` from `/dev/hello`, confirms `module64_unload` is
+`-EBUSY` while that descriptor is open, closes it, and then unloads. The same
+run covers the library's strings, a heap round trip, the tick counter and a
+pointer table (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`,
 `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`); a duplicate load, a
 truncated file and a corrupted magic must all be refused before
 `HAKU64-MODULE-REJECT-OK` is printed.
 
-The user-library test drives each of the three: it opens the device and the
-files, checks that `delete_module` reports `-EBUSY` while a descriptor is open,
-closes it, unloads, and reloads to prove the slots are reusable
-(`USER-MODDEV-OK`, `USER-ROMFS-OK`).
+`ROMFS.HKM` is loaded next and stays mounted across the ring-3 program, which
+proves the capability chain end to end: the module registers a read-only
+`vfs64_fs_ops_t` and mounts it at `/rom` during init, the boot test stats,
+opens, reads and lists `README`/`VERSION` through the module, checks that a
+read-only mount refuses `O_WRONLY` and every path mutation with `-EROFS`, and
+observes `-EBUSY` from `delete_module` while the mount has open descriptions
+(`HAKU64-MODULE-FS-OK`). The ring-3 `INIT.ELF` repeats the namespace checks
+through the syscall layer (`HAKU64-USER-MODULE-OK`), and only after it exits
+does the kernel unload the module and confirm that `/rom` and its files are
+gone (`HAKU64-MODULE-FS-RELEASE-OK`).
+
+The user-library test drives each of the three 32-bit modules: it opens the
+device and the files, checks that `delete_module` reports `-EBUSY` while a
+descriptor is open, closes it, unloads, and reloads to prove the slots are
+reusable (`USER-MODDEV-OK`, `USER-ROMFS-OK`).
 
 Modules are trusted kernel code. The validation is a container check: it stops
 a truncated or corrupt file from making the loader read out of bounds, but it
 cannot sandbox code written maliciously, because the module runs in ring 0 with
 the kernel's privileges. Both kernels allocate images from a heap that is
 already executable — the 64-bit heap lives in the boot identity map and the
-32-bit heap in its direct map — so executability is not what gates the feature;
-the remaining gap is module filesystem registration and mounting on the 64-bit
-side, which still answer `-ENOSYS`.
+32-bit heap in its direct map — so executability is not what gates the feature.
 
 ### Physical frame allocator
 

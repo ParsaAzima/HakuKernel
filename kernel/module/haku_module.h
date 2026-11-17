@@ -78,10 +78,10 @@
  * filesystem, and mount that filesystem once at a non-root prefix. The exit
  * hook runs after the kernel detaches them and cannot register new ones.
  *
- * The x86-64 kernel has neither the VFS nor devfs yet, so its loader exports
- * only the logging, tick, heap and struct-fill helpers; the registration
- * calls exist and answer -ENOSYS. An x64 module can therefore compute and
- * log, but cannot add a namespace until the 64-bit filesystem stack exists.
+ * Both ports implement the whole set. The x86-64 loader exports the same
+ * logging, tick, heap, registration and struct-fill helpers, binds what a
+ * module registers to its slot, and refuses delete_module while a descriptor
+ * opened through that device or mount is still live.
  */
 #ifndef HAKU_MODULE_H
 #define HAKU_MODULE_H

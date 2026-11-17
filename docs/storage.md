@@ -94,9 +94,10 @@ The x86-64 kernel compiles the same `ata.c` and `fat12.c` against a small
 compatibility header and puts `kernel/arch/x86_64/kernel/fs64.c` in front of
 them: an eight-slot cache of 32 pages per path, walking one directory entry per
 lookup, with `fs64_lookup`, `fs64_read`, `fs64_write` and `fs64_*/stat`
-helpers. `kernel/arch/x86_64/kernel/vfs64.c` holds the namespace: a four-entry
+helpers. `kernel/arch/x86_64/kernel/vfs64.c` holds the namespace: a six-entry
 mount table with longest-prefix, case-insensitive resolution (the FAT12 volume
-at `/disk`, the RAM root at `/`, procfs at `/proc`, devfs at `/dev`), and
+at `/disk`, the RAM root at `/`, procfs at `/proc`, devfs at `/dev`, plus two
+slots for module filesystems), and
 descriptors that record which backend they came from. `/dev` offers `null`,
 `zero` and `console` as character files; a write to `/dev/null` is discarded, a
 read from `/dev/zero` is zeroes, and `/dev/console` is an alias of the implicit
@@ -105,7 +106,11 @@ table has four slots beyond the built-ins for devices a module registers with
 `haku_module_register_device`; each slot counts its open descriptors, so
 unloading that module reports `-EBUSY` until the last one closes. The device
 namespace is read-only: create, unlink, rename and rmdir below `/dev` fail with
-`-EACCES`, and truncating a device is `-EINVAL`.
+`-EACCES`, and truncating a device is `-EINVAL`. A filesystem a module
+registers with `haku_module_register_fs` and mounts with `haku_module_mount`
+takes one of the two remaining mount slots; its open descriptions are counted
+the same way, and its files are read and listed through `fs64.c`'s module
+branches without a page cache (`storage.md` describes the reference backend).
 
 `kernel/arch/x86_64/kernel/procfs64.c` mounts at `/proc` and generates
 `meminfo`, `uptime` and `self/cmdline` when the path is first opened, holding

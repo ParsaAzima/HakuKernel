@@ -9,8 +9,7 @@ The x86-64 kernel serves the ported subset under the x86-64 Linux numbers with
 `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` arguments and `rax` for the number and the
 result, entered by `SYSCALL` with an `INT 0x80` fallback. This page documents
 the 32-bit table in full because it is the complete one; the 64-bit image still
-lacks module-backed filesystem mounting (it has FAT12 at `/disk`, an initramfs
-root, procfs and devfs) and signal handlers.
+lacks signal handlers.
 
 ## Syscall ABI
 
@@ -391,9 +390,10 @@ already trusts the image should call `init_module`.
 The x86-64 kernel serves the same two operations under the x86-64 Linux
 numbers, `init_module` (175) and `delete_module` (176). The container must be
 version 2; the length bound and page-wise copies are the same, and the loader
-relocates the 64-bit forms. A 64-bit module can log, read ticks and use the
-kernel heap, but its capability calls answer `-ENOSYS` until there is a 64-bit
-VFS, so `delete_module` has nothing to detach.
+relocates the 64-bit forms. A 64-bit module can log, read ticks, use the kernel
+heap, register a character device and register and mount a filesystem; `mmap`
+of a module file answers `-ENODEV`, and `delete_module` detaches the mount and
+the device before it frees the image.
 
 The x86-64 kernel also serves `arch_prctl` (158), the thread-pointer call the
 i386 side spells `set_thread_area`/`get_thread_area`. `ARCH_SET_FS` (0x1002)
@@ -521,11 +521,10 @@ userland; conformance is not a goal. What exists, by area:
 Deliberately absent: job-control stop/continue states (the group and session
 calls are real, but stop signals still end a process), hard links, file-backed
 mappings, `socket`, a user-facing `mount` (users cannot reparent the boot
-namespace; loadable modules mount their own prefix during init), networking,
-the rest of the 64-bit namespace (FAT12 at `/disk`, the RAM
-initramfs at `/`, procfs at `/proc` and devfs at `/dev` exist; module
-filesystem registration and mounting do not), and the filesystem half of the
-x64 module API (it answers `-ENOSYS`; device registration is wired).
+namespace; loadable modules mount their own prefix during init), and
+networking. A module filesystem is read through `read`, `lseek`, `pread`,
+`stat`, `getdents64` and the `*at` calls at ring 3 on both ports; it has no
+page cache of its own and cannot be mapped.
 `clone`-created threads are present: a thread shares the caller's address
 space, descriptors and signal dispositions, reports the process id from
 `getpid` and its own id from `gettid`, can carry its own FS base through

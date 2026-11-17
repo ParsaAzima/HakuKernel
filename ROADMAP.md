@@ -29,9 +29,9 @@ that needs new kernel work is 2.
 | Ring 3 | `SYSCALL`/`SYSRET` + `INT 0x80`, page-by-page user copies, NX | `INT 0x80`, page-by-page user copies |
 | Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads and the pthread subset, `futex`, process groups and sessions | same, plus signal handlers, job control and wait queues |
 | Syscalls | ported subset on the x86-64 numbers, including pipes and a blocking `poll`; no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
-| Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
+| Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), read-only module filesystems (`/rom`), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
 | Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
-| Modules | version 2 loader: log, ticks, heap, device registration; filesystem registration/mount return `-ENOSYS` | version 1 loader with device and filesystem registration |
+| Modules | version 2 loader: log, ticks, heap, device and filesystem registration; a module filesystem is mounted at its own prefix and read through the VFS | version 1 loader with device and filesystem registration |
 | Userland | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device | freestanding user C library, `busybox ash`, the FAT12 rootfs image, probes |
 
 CI runs the two headless gates at one and four CPUs on every push; the shell
@@ -188,20 +188,24 @@ filesystems.
       unpacks it into the RAM root through the descriptor path, and the disk
       stays at `/disk` — the same namespace shape the 32-bit image uses. An
       image without the archive falls back to FAT12 as `/`.
-- [ ] Wire the remaining module capability exports:
+- [x] Wire the remaining module capability exports:
       `haku_module_register_fs`, `haku_module_mount` and the two struct
-      fillers. Keep the existing `-EBUSY` rule for devices.
-- [ ] Port `hello.c` and `romfs.c` to the 64-bit build and run them from the
+      fillers. Keep the existing `-EBUSY` rule for devices and apply it to a
+      filesystem whose mount still has open descriptions.
+- [x] Port `hello.c` and `romfs.c` to the 64-bit build and run them from the
       disk, so the capability path is exercised by real C modules rather than
-      stubs.
-- [ ] Keep the build-time size assertion between `haku_module_fs_ops_t` and
-      `vfs_fs_ops_t`, now for the 64-bit layouts too.
+      stubs. `X64MOD.HKM` covers the device half; `ROMFS.HKM` is the same
+      `romfs.c` compiled for amd64 and mounted at `/rom`.
+- [x] Keep the build-time size assertion between `haku_module_fs_ops_t` and
+      `vfs64_fs_ops_t` (`module64.c`).
 
 **Acceptance.** `HAKU64-VFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-PROCFS-OK`,
 `HAKU64-USER-DEV-OK`, `HAKU64-USER-PROCFS-OK`, `HAKU64-INITRAMFS-OK`,
-`HAKU64-USER-INITRAMFS-OK`, `HAKU64-MODULE-DEV-OK`; `/dev/hello` reads and
-`delete_module` reports `-EBUSY` until the last descriptor closes. The `/rom`
-mount and its `HAKU64-MODULE-CAP-OK` marker wait for the filesystem half.
+`HAKU64-USER-INITRAMFS-OK`, `HAKU64-MODULE-DEV-OK`, `HAKU64-MODULE-FS-OK`,
+`HAKU64-USER-MODULE-OK` and `HAKU64-MODULE-FS-RELEASE-OK`; `/dev/hello` reads,
+`/rom` is read and listed from ring 0 and ring 3 (including the `-EROFS`
+refusals), and `delete_module` reports `-EBUSY` for either resource until the
+last descriptor closes.
 
 ## 3. Pipes, signals and job control
 

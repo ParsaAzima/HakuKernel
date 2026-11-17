@@ -143,7 +143,7 @@ ported table: `stat`/`fstat`/`statx`, `chdir`/`getcwd` with a relative open,
 `ftruncate`/`truncate`/`renameat`/`unlinkat`, `uname`/`times`/`getrlimit`/
 `clock_getres`, `prctl` names, two different `getrandom` words,
 `brk`+`mprotect`, `poll`/`select`, `sched_yield` and `dup3`/`fcntl`). The boot
-log also carries `HAKU64-DISK-OK`, `HAKU64-VFS-OK` (four mounts),
+log also carries `HAKU64-DISK-OK`, `HAKU64-VFS-OK` (four boot mounts),
 `HAKU64-INITRAMFS-OK` (the kernel reads `/disk/INITRD`, unpacks the cpio
 archive into the RAM root, and reports the entry, file and byte counts while
 `/disk` stays the FAT12 volume), `HAKU64-DEVFS-OK` (devfs at `/dev` with the
@@ -153,7 +153,12 @@ root: the module logs, reads ticks, uses the heap and registers `/dev/hello`
 (`HAKU64-MODULE-OK`, `HAKU64-MODULE-LIB-OK`, `HAKU64-MODULE-LOAD-OK`,
 `HAKU64-MODULE-DEV-OK`, `HAKU64-MODULE-UNLOAD-OK`), while a duplicate load, a
 truncated file and a bad magic must be refused before
-`HAKU64-MODULE-REJECT-OK`. Finally `HAKU64-LIBC-OK`: the kernel loads
+`HAKU64-MODULE-REJECT-OK`. `ROMFS.HKM` then provides a read-only filesystem at
+`/rom` (fifth mount): stat, read, readdir and the `-EROFS` refusals are checked
+from the kernel (`HAKU64-MODULE-FS-OK`), the same namespace is read by
+`/INIT.ELF` at ring 3 (`HAKU64-USER-MODULE-OK`), and the module is unloaded only
+after that program exits (`HAKU64-MODULE-FS-RELEASE-OK`). Finally
+`HAKU64-LIBC-OK`: the kernel loads
 `/INIT.ELF` from the RAM root, and that program — written in ordinary C against
 `user/lib64` — prints, allocates, reads and writes files, forks a
 copy-on-write child, maps memory and reads the clock before exiting 0.
@@ -257,7 +262,9 @@ host side.
 `build/haku64_fs.img` is the x86-64 data disk. It is rebuilt on every x64 run
 because the self-test writes `/disk/NOTE.TXT` into it and no user data is
 expected to survive; its seed files are `HELLO.TXT`, `PATTERN.BIN`, `INITRD`,
-`USER.ELF`, `INIT.ELF` and `X64MOD.HKM`.
+`USER.ELF`, `INIT.ELF`, `X64MOD.HKM` and `ROMFS.HKM` (the same
+`kernel/module/demo/romfs.c` compiled for amd64), which also go into the cpio
+archive so `/ROMFS.HKM` is reachable from the RAM root.
 
 `python build.py inspect` (default: `build/haku_fs.img`) lists the root
 directory and FAT summary without touching the image; `--chains` also prints

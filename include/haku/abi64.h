@@ -204,6 +204,7 @@ typedef long long time_t;
 #define HAKU64_EMFILE  24
 #define HAKU64_ENOSPC  28
 #define HAKU64_ESPIPE  29
+#define HAKU64_EROFS   30
 #define HAKU64_EPIPE   32
 #define HAKU64_ERANGE  34
 #define HAKU64_EDEADLK 35

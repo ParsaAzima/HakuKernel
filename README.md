@@ -73,10 +73,10 @@ volume itself as `/`.
   first-class: `include/haku/module.h` declares the services and `libhakumod`
   supplies the string and 64-bit helpers the compiler calls, with the packer
   dropping whatever a module does not reach. Modules are trusted ring-0 code.
-  Both kernels load versioned containers; the x86-64 loader provides logging,
-  ticks and the kernel heap, while the device/filesystem registration calls
-  answer `-ENOSYS` until module registration reaches the 64-bit mount table and
-  devfs.
+  Both kernels load versioned containers and both wire the full capability
+  set: logging, ticks, the kernel heap, a `/dev` character device, and a
+  filesystem backend mounted at its own prefix. The x86-64 port runs
+  `romfs.c`, the same C source as the 32-bit `/rom`, as `ROMFS.HKM`.
 - **Storage** — ATA PIO on both legacy channels with reset/retry recovery, a
   writable FAT12 driver, a VFS with per-process descriptors, `ramfs` root,
   `initramfs` (cpio newc), `/dev`, and a generated `/proc`. The x86-64 kernel
@@ -113,8 +113,9 @@ volume itself as `/`.
   `/INIT.ELF`.
   The disk is `/disk`, a cpio initramfs is the RAM root, `/proc` generates
   `meminfo`/`uptime`/`self/cmdline`, and `/dev` provides `null`, `zero`,
-  `console` and devices a module registers; there is no shell, no module
-  filesystem yet, and no signal handlers, but `pipe`/`pipe2` and a blocking
+  `console` and devices a module registers; a module filesystem such as `/rom`
+  joins the same namespace and is read and listed at ring 3. There is no shell
+  and no signal handlers yet, but `pipe`/`pipe2` and a blocking
   `poll` connect a forked parent and child.
 
 ## Quick start
@@ -202,12 +203,11 @@ Tasks are pinned to the CPU that created them, there is no load balancing or
 migration, and the user-space concurrency tests still run on the bootstrap
 processor, so a ring-3 task running on an AP is not yet covered. The x86-64
 kernel also lacks signal handlers, a line discipline, the kernel-log
-latch and any namespace beyond a FAT12 root with `/dev` (`null`, `zero`,
-`console`), so its userland is a C library (`user/lib64`) plus the
+latch and any namespace beyond its boot mounts and the filesystems modules
+mount themselves, so its userland is a C library (`user/lib64`) plus the
 `/INIT.ELF` self-test rather than a shell; its console and PS/2 keyboard
-are there so a program can read a line's worth of keys, and module capability
-registration answers `ENOSYS` there because no path wires it to the mount
-table. FAT12 has 8.3 names, no timestamps, and no permission bits. Haku's
+are there so a program can read a line's worth of keys. FAT12 has 8.3 names,
+no timestamps, and no permission bits. Haku's
 filesystem cache holds eight paths of at most 128 KiB each. Everything
 beyond the implemented subset returns `ENOSYS` rather than pretending to work.
 
