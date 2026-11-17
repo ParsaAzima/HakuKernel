@@ -29,6 +29,9 @@
 %define HAKU64_SYS_MPROTECT      10
 %define HAKU64_SYS_MUNMAP        11
 %define HAKU64_SYS_BRK           12
+%define HAKU64_SYS_RT_SIGACTION  13
+%define HAKU64_SYS_RT_SIGPROCMASK 14
+%define HAKU64_SYS_RT_SIGRETURN  15
 %define HAKU64_SYS_IOCTL         16
 %define HAKU64_SYS_PREAD64       17
 %define HAKU64_SYS_PWRITE64      18
@@ -63,12 +66,14 @@
 %define HAKU64_SYS_SETSID        112
 %define HAKU64_SYS_GETPGID       121
 %define HAKU64_SYS_GETSID        124
+%define HAKU64_SYS_SIGALTSTACK   131
 %define HAKU64_SYS_ARCH_PRCTL    158
 %define HAKU64_SYS_GETTID        186
 %define HAKU64_SYS_GETDENTS64    217
 %define HAKU64_SYS_CLOCK_GETTIME 228
 %define HAKU64_SYS_CLOCK_GETRES  229
 %define HAKU64_SYS_EXIT_GROUP    231
+%define HAKU64_SYS_TGKILL        234
 %define HAKU64_SYS_OPENAT        257
 %define HAKU64_SYS_MKDIRAT       258
 %define HAKU64_SYS_NEWFSTATAT    262
@@ -110,6 +115,7 @@
 %define HAKU64_EPERM   1
 %define HAKU64_ENOENT  2
 %define HAKU64_ESRCH   3
+%define HAKU64_EINTR   4
 %define HAKU64_EIO     5
 %define HAKU64_ENOEXEC 8
 %define HAKU64_EBADF   9
@@ -137,7 +143,63 @@
 %define HAKU64_EOWNERDEAD 130
 %define HAKU64_ENOTRECOVERABLE 131
 
-%define HAKU64_SIGPIPE 13
+; Signals (Linux x86-64 numbering), dispositions and sigaltstack flags.
+%define HAKU64_SIGHUP   1
+%define HAKU64_SIGINT   2
+%define HAKU64_SIGQUIT  3
+%define HAKU64_SIGILL   4
+%define HAKU64_SIGTRAP  5
+%define HAKU64_SIGABRT  6
+%define HAKU64_SIGBUS   7
+%define HAKU64_SIGFPE   8
+%define HAKU64_SIGKILL  9
+%define HAKU64_SIGUSR1  10
+%define HAKU64_SIGSEGV  11
+%define HAKU64_SIGUSR2  12
+%define HAKU64_SIGPIPE  13
+%define HAKU64_SIGALRM  14
+%define HAKU64_SIGTERM  15
+%define HAKU64_SIGSTKFLT 16
+%define HAKU64_SIGCONT  18
+%define HAKU64_SIGSTOP  19
+%define HAKU64_SIGTSTP  20
+%define HAKU64_SIGTTIN  21
+%define HAKU64_SIGTTOU  22
+%define HAKU64_SIGURG   23
+%define HAKU64_SIGXCPU  24
+%define HAKU64_SIGXFSZ  25
+%define HAKU64_SIGVTALRM 26
+%define HAKU64_SIGPROF  27
+%define HAKU64_SIGWINCH 28
+%define HAKU64_SIGIO    29
+%define HAKU64_SIGPWR   30
+%define HAKU64_SIGSYS   31
+%define HAKU64_NSIG     31
+
+%define HAKU64_SIG_DFL    0
+%define HAKU64_SIG_IGN    1
+%define HAKU64_SIG_BLOCK  0
+%define HAKU64_SIG_UNBLOCK 1
+%define HAKU64_SIG_SETMASK 2
+
+%define HAKU64_SA_NOCLDSTOP 0x00000001
+%define HAKU64_SA_SIGINFO   0x00000004
+%define HAKU64_SA_RESTORER  0x04000000
+%define HAKU64_SA_ONSTACK   0x08000000
+%define HAKU64_SA_RESTART   0x10000000
+%define HAKU64_SA_NODEFER   0x40000000
+%define HAKU64_SA_RESETHAND 0x80000000
+
+%define HAKU64_SS_ONSTACK    1
+%define HAKU64_SS_DISABLE    2
+%define HAKU64_SS_AUTODISARM 0x80000000
+
+; Offset of the restorer return address in the frame the kernel builds: the
+; restorer finds the frame at RSP - 8 when rt_sigreturn runs. The siginfo and
+; ucontext blocks follow 32 bytes of Microsoft x64 shadow space, because a
+; handler spills its register arguments just above its return address.
+%define HAKU64_SIGFRAME_INFO     0x38
+%define HAKU64_SIGFRAME_UCONTEXT 0xB8
 
 ; *at flags and access modes.
 %define HAKU64_AT_FDCWD          -100

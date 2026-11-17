@@ -45,6 +45,7 @@ typedef struct {
     u64 clear_tid;   /* CLONE_CHILD_CLEARTID word, zeroed at exit */
     u32 pgrp;        /* process group id (user ids: index + 1) */
     u32 sid;         /* session id */
+    k64_sigstate_t signals; /* dispositions, blocked mask, pending bits */
     u64 robust_head; /* user struct robust_list_head, walked at exit */
     u32 detached;    /* a thread with no joiner: its slot is reaped at exit */
     u64 fs_base;     /* user FS base, arch_prctl(ARCH_SET_FS) */
@@ -55,6 +56,41 @@ typedef struct {
 
 static task64_t tasks[K64_TASK_MAX];
 static u32 enabled;
+
+/* A fresh slot starts with every disposition default, nothing blocked or
+ * pending and no alternate stack. Signal state is the one field a task can
+ * inherit instead: fork and clone copy the creator's table and clear the
+ * pending bits, so a signal raised for the parent before the fork is not
+ * also delivered to the child. */
+static void signals_reset(int id) {
+    memset(&tasks[id].signals, 0, sizeof(tasks[id].signals));
+}
+
+static void signals_inherit(int child, int parent) {
+    tasks[child].signals = tasks[parent].signals;
+    tasks[child].signals.pending = 0;
+    tasks[child].signals.alt_depth = 0;
+}
+
+/* execve keeps the blocked mask and the ignored dispositions, and resets a
+ * caught signal to its default action, exactly like Linux: a handler address
+ * from the old image would have no meaning in the new one. Pending signals
+ * survive an exec, so they are deliberately left alone. */
+static void signals_exec(int id) {
+    k64_sigstate_t *state = &tasks[id].signals;
+
+    for (u32 i = 0; i < K64_NSIG; i++) {
+        if (state->actions[i].handler == K64_SIG_IGN) continue;
+        state->actions[i].handler = K64_SIG_DFL;
+        state->actions[i].flags = 0;
+        state->actions[i].restorer = 0;
+        state->actions[i].mask = 0;
+    }
+    state->alt_sp = 0;
+    state->alt_size = 0;
+    state->alt_flags = K64_SS_DISABLE;
+    state->alt_depth = 0;
+}
 
 /* One lock for the task table. The slots, the mapping records and the
  * address-space reference counts are read by every CPU (a kill from the
@@ -220,6 +256,7 @@ void sched64_init(void) {
     tasks[0].cwd[0] = '/';
     tasks[0].cwd[1] = 0;
     comm_set(0, "kernel");
+    signals_reset(0);
     space_refs[0] = 1;
     memcpy(fxsave_areas[0], fxsave_default, sizeof(fxsave_default));
 
@@ -286,6 +323,7 @@ int task64_create_kernel_on(u32 cpu_affinity, void (*entry)(void)) {
     tasks[id].cwd[0] = '/';
     tasks[id].cwd[1] = 0;
     comm_set(id, "kthread");
+    signals_reset(id);
     space_owner[id] = id;
     space_refs[id] = 1;
     prepare_sse(id);
@@ -363,6 +401,7 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].cwd[0] = '/';
     tasks[id].cwd[1] = 0;
     comm_set(id, "user");
+    signals_reset(id);
     space_owner[id] = id;
     space_refs[id] = 1;
     prepare_sse(id);
@@ -1435,6 +1474,7 @@ regs64_t *sched64_fork(regs64_t *frame, u64 flags, u64 child_tid) {
         tasks[child].cwd[i] = 0;
         comm_set(child, tasks[owner].comm);
     }
+    signals_inherit(child, parent);
     space_owner[child] = child;
     space_refs[child] = 1;
 
@@ -1559,6 +1599,7 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
         tasks[child].cwd[i] = 0;
         comm_set(child, tasks[source].comm);
     }
+    signals_inherit(child, parent);
     /* The space, its mapping records and the bump pointer stay with the
      * owner; the new thread is one more user until it is reaped. */
     space_owner[child] = owner;
@@ -1781,6 +1822,10 @@ int task64_exec(int id, u64 space) {
     /* The robust list belongs to the old image; the new one registers its
      * own. The process group and session survive exec, as in Linux. */
     tasks[id].robust_head = 0;
+    /* A caught signal is reset to its default action, an ignored one stays
+     * ignored, and the blocked mask carries over; the handler address and the
+     * alternate stack belonged to the old image. */
+    signals_exec(id);
     /* The old image's thread pointer dies with it. Clearing the fields and
      * the live MSRs means the new program sees FS/GS base 0 until it calls
      * arch_prctl, exactly like a freshly exec'd Linux process. */
@@ -1823,74 +1868,86 @@ int task64_reap(int parent, int pid, u64 *status) {
     return match < 0 ? -10 : -11;          /* ECHILD / EAGAIN */
 }
 
-/* Deliver a signal. There are no handlers, so the only action is the
- * default one: terminate. Signal 0 is the usual "does this pid exist"
- * probe and only checks the target. A task cannot signal itself here
- * because the dispatcher has to know it must not resume the frame; kill()
- * of the caller goes through exit() instead. */
-int task64_signal(int id, u32 signal) {
-    tid_word64_t word;
-    u32 owner;
+/* Raise `signal` for one task. The kernel stores a pending bit; the action
+ * runs in sys64_signal_deliver() just before the task returns to ring 3, so a
+ * handler can end a syscall but never interrupt the middle of one. The target
+ * may be the caller: raise() is itself a syscall, and delivery happens on the
+ * way out of it. A parked task (futex or console read) is woken with EINTR so
+ * the signal is not stuck behind a wait that may never end; a blocked signal
+ * only sets the bit, and the wake happens when the mask opens. */
+int task64_raise(int id, u32 signal) {
+    u32 bit, owner;
     u64 flags;
 
     if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return -3;
-    if (id == cur_task()) return -22;      /* EINVAL: use exit() */
     if (signal > K64_NSIG) return -22;
     if (signal == 0) return 0;
 
+    bit = K64_SIG_BIT(signal);
     flags = spin64_lock(&sched_lock);
     if (tasks[id].state == K64_TASK_DONE) {
         spin64_unlock(&sched_lock, flags);
         return 0;
     }
     owner = tasks[id].cpu;
-    word = finish_locked(id, signal, 0);
+    tasks[id].signals.pending |= bit;
+    if ((bit & ~tasks[id].signals.blocked) != 0 &&
+        tasks[id].state == K64_TASK_WAIT) {
+        tasks[id].futex_addr = 0;
+        tasks[id].state = K64_TASK_READY;
+        if (tasks[id].frame) tasks[id].frame->rax = (u64)0 - K64_SIG_EINTR;
+    }
     spin64_unlock(&sched_lock, flags);
-    robust_release(&word);
-    clear_tid_word(&word);
     smp64_resched_cpu(owner);
     return 0;
 }
 
-/* kill(2) names a process, and a process is its thread group: the default
- * action of a fatal signal takes every thread, not just the one whose tid
- * happened to be named. `id` is the slot the caller named; the group it
- * belongs to is what ends. The caller never ends here — the dispatcher routes
- * a signal aimed at the caller's own group through sched64_signal_group(),
- * because that call must not resume its frame. */
+/* The one-task form of kill: a tid names a thread, so the signal stays with
+ * that task instead of going to its group. */
+int task64_signal(int id, u32 signal) {
+    return task64_raise(id, signal);
+}
+
+k64_sigstate_t *task64_signals(int id) {
+    if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return 0;
+    return &tasks[id].signals;
+}
+
+int task64_signal_pending(int id) {
+    k64_sigstate_t *state;
+
+    if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return 0;
+    state = &tasks[id].signals;
+    return (state->pending & ~state->blocked & K64_SIG_MASK_ALL) != 0;
+}
+
+/* kill(2) names a process, and a process is its thread group. A
+ * process-directed signal goes to the group leader, or to the first live
+ * thread when the leader is already gone; Linux makes the same choice among
+ * the threads that do not block it. A group whose only members are zombies
+ * accepts the signal and drops it. */
 int task64_signal_group(int id, u32 signal) {
-    k64_percpu_t *cpu = this_cpu();
-    tid_word64_t words[K64_TASK_MAX];
-    u32 tgid, cpus_mask = 0;
-    int count = 0, found = 0, me = cur_task();
+    int pick = -1;
+    u32 tgid;
     u64 flags;
 
     if (!valid_id(id) || tasks[id].state == K64_TASK_UNUSED) return -3;
     if (signal > K64_NSIG) return -22;
+    if (signal == 0) return 0;
     tgid = tasks[id].tgid;
 
     flags = spin64_lock(&sched_lock);
     for (int i = 1; i < (int)K64_TASK_MAX; i++) {
-        if (tasks[i].state == K64_TASK_UNUSED) continue;
-        if (tasks[i].tgid != tgid) continue;
-        found = 1;
-        if (signal == 0 || i == me) continue;
+        if (tasks[i].state == K64_TASK_UNUSED || tasks[i].tgid != tgid) continue;
         if (tasks[i].state == K64_TASK_DONE) continue;
-        words[count] = finish_locked(i, signal, 0);
-        count++;
-        if (cpu && tasks[i].cpu != cpu->index &&
-            tasks[i].cpu < K64_SMP_MAX_CPUS)
-            cpus_mask |= 1u << tasks[i].cpu;
+        if ((u32)i == tgid) {
+            pick = i;
+            break;
+        }
+        if (pick < 0) pick = i;
     }
     spin64_unlock(&sched_lock, flags);
-
-    for (int i = 0; i < count; i++) {
-        robust_release(&words[i]);
-        clear_tid_word(&words[i]);
-    }
-    for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
-        if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
-    return found ? 0 : -3;
+    return pick < 0 ? 0 : task64_raise(pick, signal);
 }
 
 int task64_parent(int id) {

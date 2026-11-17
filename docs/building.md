@@ -171,7 +171,11 @@ descriptors. The same program also runs the pthread subset —
 `HAKU64-USER-DETACH-OK` (a detached thread frees its own pages and its slot
 disappears), `HAKU64-USER-ROBUST-OK` (`EOWNERDEAD`, `pthread_mutex_consistent`
 and poisoning) and `HAKU64-USER-ERRNO-THREAD-OK` (per-thread `errno`) — on top
-of the raw `clone`/clear-tid tests.
+of the raw `clone`/clear-tid tests. `HAKU64-USER-SIGNAL-OK` covers signal
+delivery from the same program: a handler runs with the right number and its
+own signal blocked, the mask comes back afterwards, a blocked signal waits for
+`SIG_UNBLOCK`, `SIG_IGN` drops one, `SA_ONSTACK` puts the frame on the
+alternate stack, and a signal ends `nanosleep` with `EINTR` and the time left.
 The display stack is checked too: `HAKU64-FB-OK` names the VBE mode the shared
 renderer took over (`grid=128x48 font=terminus-8x16`), `HAKU64-TERMINAL-OK`
 names the backend, and `HAKU64-KBD-OK` proves the PS/2 set-1 decoder. The run

@@ -31,7 +31,7 @@ compiles the two independently, and neither build touches the other's files.
 
 | File | Contents |
 |---|---|
-| `crt64.asm` | `_start`: reads the initial stack image, finds the auxiliary vector, calls `haku64_tls_init`, calls `main(argc, argv, envp)`, exits with its return value. |
+| `crt64.asm` | `_start`: reads the initial stack image, finds the auxiliary vector, calls `haku64_tls_init`, calls `main(argc, argv, envp)`, exits with its return value; also holds `haku64_restore_rt`, the signal restorer that `sigaction` installs. |
 | `syscall64.asm` | `haku64_syscall0`..`haku64_syscall6`: the raw kernel entry, returning `-errno` unchanged. |
 | `haku_stdarg.h` | A freestanding `<stdarg.h>`: MSVC's `__va_start` intrinsic, or the clang builtins. |
 | `tls64.c` | `_tls_index` and `_tls_used`, the TLS template markers, `haku64_tls_init`: finds `PT_TLS` through `AT_PHDR`, maps the block and a TEB, and installs the user GS base; `haku64_tls_new`/`haku64_tls_free` do the same per thread. |
@@ -44,6 +44,7 @@ compiles the two independently, and neither build touches the other's files.
 | `memory64.c` | `malloc`, `calloc`, `realloc`, `free` (first fit over a `brk` heap with block splitting) and `atoi`. |
 | `unistd64.c` | `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `dup3`, `pipe`, `pipe2`, `poll`, `unlink`, `rename`, `mkdir`, `rmdir`, `chdir`, `getcwd`, `access`, `getpid`, `gettid`, `getppid`, `arch_prctl`, `fork`, `waitpid`, `execve`, `exit`, `_exit`, `brk`, `sbrk`, `stat`, `lstat`, `fstat`, `nanosleep`, `sleep`, `clock_gettime`, `uname`. |
 | `mman64.c` | `mmap`, `munmap`, `mprotect`. |
+| `signal64.c` | `sigaction`, `sigprocmask`, `sigaltstack`, `signal`, `raise`; `sigaction` sets `SA_RESTORER` and points it at `haku64_restore_rt`. |
 
 Everything returns `-1` and sets `errno` on failure, using the kernel's
 `-errno` return value; the raw `haku64_syscall*` wrappers do not translate it.
@@ -245,6 +246,33 @@ the library does not control.
 inherited robust-list head and marks the surviving handle as this process's
 main thread, so a forked child never joins or detaches the parent's thread.
 
+## Signals
+
+`signal64.c` exposes `sigaction`, `sigprocmask`, `sigaltstack`, `signal` and
+`raise` over the Haku calls. The kernel queues the signal and delivers it on
+the way back to ring 3, so `raise` returns normally and the handler starts with
+a clean syscall behind it. Because the user stack is `NX`, the kernel cannot
+write a trampoline there; `sigaction` therefore sets `SA_RESTORER` and points
+the record at `haku64_restore_rt` in `crt64.asm`, which runs `rt_sigreturn`.
+Passing a raw handler without that flag is refused with `EINVAL`.
+
+A handler is compiled with the same Microsoft x64 convention as the rest of the
+library, so the kernel passes the signal number in `RCX`; with `SA_SIGINFO` the
+`siginfo` pointer is in `RDX` and the `ucontext` in `R8`. The saved context has
+the kernel's register order (`r15`..`r8`, `rbp`, `rdi`, `rsi`, `rdx`, `rcx`,
+`rbx`, `rax`, `rip`, `cs`, `rflags`, `rsp`, `ss`). An interrupted `SYSCALL`
+leaves `RCX`/`R11` holding the entry RIP and flags, so those two fields of a
+syscall-interrupted context carry no pre-call value; the ABI already treats
+both as clobbered.
+
+Signals are per task, not per thread group: a signal sent to a process reaches
+one thread (the leader, or the first live thread when the leader is gone), and
+`tgkill`/`raise` name a thread. A pending unblocked signal ends a blocking
+`waitpid`, `nanosleep` or `poll` with `errno = EINTR`. There is no `sigqueue`,
+no real-time range, no hardware-fault delivery (a ring-3 fault still ends the
+group instead of entering a `SIGSEGV` handler), no job control and no
+`SA_RESTART` restart of the interrupted call.
+
 ## Build pipeline
 
 `python build.py` (x64) compiles `user/lib64/*.c` and `*.asm` and
@@ -283,6 +311,7 @@ regression says what broke instead of only changing an exit status:
 | `HAKU64-USER-PIPE-OK` | a 512-byte transfer through a 4 KiB ring arrived intact, `poll` saw data then an empty pipe, the last writer's close turned the next read into EOF, and `O_NONBLOCK` reported `EAGAIN` |
 | `HAKU64-USER-PIPE-SIGPIPE-OK` | a forked child's write to a pipe with no reader ended it with the default `SIGPIPE` action instead of returning `EPIPE` |
 | `HAKU64-USER-PIPE-BLOCK-OK` | a child's 8 KiB write to a 4 KiB ring blocked until the parent drained it, and every byte arrived intact |
+| `HAKU64-USER-SIGNAL-OK` | a handler ran with the right signal number and its own signal blocked, the mask was restored, a blocked signal stayed pending until `SIG_UNBLOCK`, `SIG_IGN` dropped one, `SA_ONSTACK` put the frame on the alternate stack, and a signal ended `nanosleep` with `EINTR` and the remaining time |
 | `HAKU64-USER-ERRNO-THREAD-OK` | a thread's `errno` write did not reach its creator's |
 | `HAKU64-USER-THREAD-EXEC-IMAGE-OK` | the image a thread `execve`d is running (printed by the new image) |
 | `HAKU64-USER-THREAD-EXEC-OK` | the exec ended the group leader, which was reaped, and the thread's image exited with 42 |
@@ -321,12 +350,13 @@ detached worker, the two robust-mutex outcomes, and per-thread `errno`.
 - **No floating point in `printf`.** `%f`, `%e` and `%g` are not implemented;
   the kernel has no FPU context switch for user tasks beyond FXSAVE/FXRSTOR of
   the SSE state.
-- **No signal handlers, but `SIGPIPE` exists as a default action.** There is no
-  `sigaction`, so a program cannot catch, block or ignore a signal, and a
-  thread cannot be cancelled through one. `pipe`/`pipe2` and `poll` do exist;
-  a write with no reader ends the process with the default `SIGPIPE` action
-  instead of returning `EPIPE`, and `fcntl` is reached through the raw
-  `haku64_syscall3` wrapper because the library does not wrap it yet.
+- **Signals have dispositions but no job control.** `sigaction`, `sigprocmask`,
+  `sigaltstack`, `signal` and `raise` work, and a handler needs the restorer
+  `sigaction` supplies. There is no `sigqueue`, no real-time range, no `SIGSTOP`
+  handling, and a hardware fault is never turned into a signal. `pipe`/`pipe2`
+  and `poll` exist; a write with no reader fails with `EPIPE` and raises
+  `SIGPIPE`, whose default action ends the process. `fcntl` is reached through
+  the raw `haku64_syscall3` wrapper because the library does not wrap it yet.
 - **`haku64_thread_create` is detached, not joinable.** Its thread frees its
   own stack and TLS block on return, so there is no status to collect; use
   `haku64_thread_spawn`/`haku64_thread_join` or `pthread_create` when the

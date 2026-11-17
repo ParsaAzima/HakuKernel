@@ -321,12 +321,12 @@ static regs64_t *handle_lapic(regs64_t *r) {
 regs64_t *isr64_dispatch(regs64_t *r) {
     u32 vector = (u32)r->vector;
     if (vector < 32) return handle_exception(r);
-    if (vector == K64_SYSCALL_VECTOR) return sys64_dispatch(r);
+    if (vector == K64_SYSCALL_VECTOR) return sys64_signal_deliver(sys64_dispatch(r));
     if (vector >= K64_IRQ_BASE && vector < K64_IRQ_BASE + K64_IRQ_COUNT)
-        return handle_irq(r);
+        return sys64_signal_deliver(handle_irq(r));
     if (vector == K64_VEC_LAPIC_TIMER || vector == K64_VEC_RESCHED ||
         vector == K64_VEC_TLB)
-        return handle_lapic(r);
+        return sys64_signal_deliver(handle_lapic(r));
 
     k64_puts("HAKU64-EXC-UNEXPECTED: vector=");
     k64_dec(vector);

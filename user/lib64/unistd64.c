@@ -3,9 +3,8 @@
  * Each function is a thin, typed shell over one Haku syscall. The numbers and
  * argument order are the Linux x86-64 ones, so the code reads the same as a
  * Linux libc and the kernel's dispatch table stays the single reference.
- * Anything the kernel does not implement is not declared here at all: there
- * is no signal() wrapper yet, because claiming it in a header would be worse
- * than leaving it out.
+ * Anything the kernel does not implement is not declared here at all; the
+ * signal wrappers live in signal64.c for the same reason.
  */
 #include <haku/abi64.h>
 

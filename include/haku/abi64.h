@@ -63,6 +63,9 @@ typedef long long time_t;
 #define HAKU64_SYS_MPROTECT      10
 #define HAKU64_SYS_MUNMAP        11
 #define HAKU64_SYS_BRK           12
+#define HAKU64_SYS_RT_SIGACTION  13
+#define HAKU64_SYS_RT_SIGPROCMASK 14
+#define HAKU64_SYS_RT_SIGRETURN  15
 #define HAKU64_SYS_IOCTL         16
 #define HAKU64_SYS_PREAD64       17
 #define HAKU64_SYS_PWRITE64      18
@@ -98,6 +101,7 @@ typedef long long time_t;
 #define HAKU64_SYS_SETSID        112
 #define HAKU64_SYS_GETPGID       121
 #define HAKU64_SYS_GETSID        124
+#define HAKU64_SYS_SIGALTSTACK   131
 #define HAKU64_SYS_ARCH_PRCTL    158
 #define HAKU64_SYS_GETTID        186
 #define HAKU64_SYS_FUTEX         202
@@ -105,6 +109,7 @@ typedef long long time_t;
 #define HAKU64_SYS_CLOCK_GETTIME 228
 #define HAKU64_SYS_CLOCK_GETRES  229
 #define HAKU64_SYS_EXIT_GROUP    231
+#define HAKU64_SYS_TGKILL        234
 #define HAKU64_SYS_OPENAT        257
 #define HAKU64_SYS_MKDIRAT       258
 #define HAKU64_SYS_NEWFSTATAT    262
@@ -187,6 +192,7 @@ typedef long long time_t;
 #define HAKU64_EPERM   1
 #define HAKU64_ENOENT  2
 #define HAKU64_ESRCH   3
+#define HAKU64_EINTR   4
 #define HAKU64_EIO     5
 #define HAKU64_ENOEXEC 8
 #define HAKU64_EBADF   9
@@ -214,9 +220,69 @@ typedef long long time_t;
 #define HAKU64_EOWNERDEAD 130
 #define HAKU64_ENOTRECOVERABLE 131
 
-/* Signals the library names. Only the default action exists, and it ends the
- * process: a write to a pipe with no reader raises SIGPIPE. */
-#define HAKU64_SIGPIPE 13
+/* Signals (Linux x86-64 numbering). Haku implements the standard range
+ * 1..31: real-time signals are rejected with EINVAL. A handler is a ring-3
+ * function and needs a restorer, because the kernel cannot place an
+ * executable stub on the user stack (it is mapped NX); sigaction() below
+ * fills one in, so only code that touches the raw structure has to care.
+ *
+ * Handler arguments follow the Microsoft x64 C ABI this toolchain compiles
+ * for, not Linux's System V one: the signal number arrives in RCX, and with
+ * SA_SIGINFO the siginfo pointer is in RDX and the ucontext pointer in R8. */
+#define HAKU64_SIGHUP   1
+#define HAKU64_SIGINT   2
+#define HAKU64_SIGQUIT  3
+#define HAKU64_SIGILL   4
+#define HAKU64_SIGTRAP  5
+#define HAKU64_SIGABRT  6
+#define HAKU64_SIGBUS   7
+#define HAKU64_SIGFPE   8
+#define HAKU64_SIGKILL  9
+#define HAKU64_SIGUSR1  10
+#define HAKU64_SIGSEGV  11
+#define HAKU64_SIGUSR2  12
+#define HAKU64_SIGPIPE  13
+#define HAKU64_SIGALRM  14
+#define HAKU64_SIGTERM  15
+#define HAKU64_SIGSTKFLT 16
+#define HAKU64_SIGCONT  18
+#define HAKU64_SIGSTOP  19
+#define HAKU64_SIGTSTP  20
+#define HAKU64_SIGTTIN  21
+#define HAKU64_SIGTTOU  22
+#define HAKU64_SIGURG   23
+#define HAKU64_SIGXCPU  24
+#define HAKU64_SIGXFSZ  25
+#define HAKU64_SIGVTALRM 26
+#define HAKU64_SIGPROF  27
+#define HAKU64_SIGWINCH 28
+#define HAKU64_SIGIO    29
+#define HAKU64_SIGPWR   30
+#define HAKU64_SIGSYS   31
+#define HAKU64_NSIG     31
+
+#define HAKU64_SIG_DFL    0
+#define HAKU64_SIG_IGN    1
+#define HAKU64_SIG_BLOCK  0
+#define HAKU64_SIG_UNBLOCK 1
+#define HAKU64_SIG_SETMASK 2
+
+/* sigaction flags. SIGINFO, ONSTACK, RESTORER and NODEFER are honoured; the
+ * others are stored unchanged and ignored (SA_RESETHAND does not reset the
+ * handler after it runs). */
+#define HAKU64_SA_NOCLDSTOP 0x00000001
+#define HAKU64_SA_SIGINFO   0x00000004
+#define HAKU64_SA_RESTORER  0x04000000
+#define HAKU64_SA_ONSTACK   0x08000000
+#define HAKU64_SA_RESTART   0x10000000
+#define HAKU64_SA_NODEFER   0x40000000
+#define HAKU64_SA_RESETHAND 0x80000000
+
+/* sigaltstack(2): only DISABLE is acted on; ONSTACK is reported when the
+ * running handler owns the alternate stack. */
+#define HAKU64_SS_ONSTACK    1
+#define HAKU64_SS_DISABLE    2
+#define HAKU64_SS_AUTODISARM 0x80000000
 
 /* --------------------------------------------------------- path and flags */
 #define HAKU64_AT_FDCWD -100
@@ -331,6 +397,50 @@ typedef struct {
     short revents;
 } haku64_pollfd_t;
 
+/* rt_sigaction(2) record: handler, flags, restorer, and the signals to block
+ * while the handler runs (one 32-bit word, signals 1..31). The kernel copies
+ * 32 bytes and rejects a sigset size other than 8, like Linux x86-64. */
+typedef struct {
+    unsigned long long handler;
+    unsigned long long flags;
+    unsigned long long restorer;
+    unsigned long long mask;
+} haku64_sigaction_t;
+
+typedef struct {
+    unsigned long long bits;
+} haku64_sigset_t;
+
+/* sigaltstack(2) record: stack pointer, flags, size. */
+typedef struct {
+    void *ss_sp;
+    unsigned int ss_flags;
+    unsigned int __pad;
+    unsigned long long ss_size;
+} haku64_stack_t;
+
+/* The saved context in a signal frame. uc_mcontext holds the interrupted
+ * register set in the kernel's order: r15..r8, rbp, rdi, rsi, rdx, rcx, rbx,
+ * rax, rip, cs, rflags, rsp, ss. */
+typedef struct {
+    unsigned long long uc_flags;
+    unsigned long long uc_link;
+    haku64_stack_t uc_stack;
+    unsigned long long uc_mcontext[20];
+    unsigned long long uc_sigmask;
+} haku64_ucontext_t;
+
+/* siginfo_t prefix. The kernel writes a 128-byte block: si_signo, si_errno
+ * and si_code in the first 12 bytes, the rest zero. This structure names the
+ * head of it, which is what a handler reads. */
+typedef struct {
+    int si_signo;
+    int si_errno;
+    int si_code;
+    int __pad;
+    long long si_value[2];
+} haku64_siginfo_t;
+
 #define HAKU64_POLLIN  0x0001
 #define HAKU64_POLLOUT 0x0004
 #define HAKU64_POLLERR 0x0008
@@ -414,8 +524,9 @@ int dup2(int old_fd, int new_fd);
 int dup3(int old_fd, int new_fd, int flags);
 /* pipe()/pipe2(): fds[0] reads and fds[1] writes the same ring. pipe2 also
  * takes O_NONBLOCK and O_CLOEXEC. A read of an empty pipe blocks until data
- * or the last writer closes (then it returns 0); a write with no reader ends
- * the process with the default SIGPIPE action. */
+ * or the last writer closes (then it returns 0); a write with no reader fails
+ * with EPIPE and raises SIGPIPE, whose default action still ends the
+ * process. */
 int pipe(int fds[2]);
 int pipe2(int fds[2], int flags);
 /* poll(2): `count` entries of haku64_pollfd_t, `timeout` in milliseconds and
@@ -441,8 +552,22 @@ int getsid(int pid);
 int setsid(void);
 /* kill(2) with the Linux pid selectors: > 0 one process, 0 the caller's
  * process group, -1 every other process, < -1 the group whose id is -pid.
- * Signal 0 only checks that the target exists. */
+ * Signal 0 only checks that the target exists. The signal is queued and
+ * acted on before the target returns to ring 3, so a handler runs with a
+ * clean stack. */
 int kill(int pid, int signal);
+
+/* Signals. sigaction() fills in the restorer trampoline the kernel needs for
+ * a real handler, keeps the previous disposition in `old` when it is not
+ * NULL, and returns 0 or -1 with errno. `signal()` is the historical
+ * one-argument form; raise() sends the caller's own signal. */
+typedef void (*haku64_sighandler_t)(int);
+int sigaction(int signal, const haku64_sigaction_t *action,
+              haku64_sigaction_t *old);
+int sigprocmask(int how, const haku64_sigset_t *set, haku64_sigset_t *old);
+int sigaltstack(const haku64_stack_t *stack, haku64_stack_t *old);
+haku64_sighandler_t signal(int signal, haku64_sighandler_t handler);
+int raise(int signal);
 
 /* The robust futex list a thread registers so its mutexes are handed on when
  * it exits. The layout matches Linux's struct robust_list_head: the first

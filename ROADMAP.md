@@ -27,8 +27,8 @@ that needs new kernel work is 2.
 | Boot and memory | long-mode entry, four-level paging, 2 MiB physmap, frame allocator, 8 MiB heap | 32-bit protected mode, two-level paging, direct map |
 | Interrupts | 64-bit IDT/TSS with IST, 8259 + PIT, RTC; SMP bring-up with per-CPU scheduling, LAPIC timers and TLB shootdown | same, including per-CPU scheduling on the APs (`--smp=1..4`) |
 | Ring 3 | `SYSCALL`/`SYSRET` + `INT 0x80`, page-by-page user copies, NX | `INT 0x80`, page-by-page user copies |
-| Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads and the pthread subset, `futex`, process groups and sessions | same, plus signal handlers, job control and wait queues |
-| Syscalls | ported subset on the x86-64 numbers, including pipes and a blocking `poll`; no signal handlers | the subset a static musl/busybox userland needs, including pipes and signals |
+| Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4`, threads and the pthread subset, `futex`, process groups and sessions, per-task signal dispositions with a handler frame and `sigaltstack` | same, plus job control and wait queues |
+| Syscalls | ported subset on the x86-64 numbers, including pipes, a blocking `poll` and signals 1..31 (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack`) | the subset a static musl/busybox userland needs, including pipes and signals |
 | Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), read-only module filesystems (`/rom`), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
 | Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
 | Modules | version 2 loader: log, ticks, heap, device and filesystem registration; a module filesystem is mounted at its own prefix and read through the VFS | version 1 loader with device and filesystem registration |
@@ -116,11 +116,12 @@ the work on its behalf.
       at exit. `haku64_thread_spawn`/`haku64_thread_join` keep the handle inside
       the thread's own stack, sleep on that word, then reap and unmap, so a
       joined thread costs no allocation and leaks nothing
-      (`HAKU64-USER-THREAD-JOIN-OK`). `kill` is process-directed, so a signal
-      reaches the whole group, while `tgkill` stays per task and validates the
-      group id. A thread can `execve`: the rest of the group ends and the caller
-      keeps the address space (`HAKU64-USER-THREAD-EXEC-OK`), and a ring-3
-      fault ends the group rather than leaving a sibling in a broken space.
+      (`HAKU64-USER-THREAD-JOIN-OK`). `kill` is process-directed, so the signal
+      goes to the group leader (or the first live thread when it is gone),
+      while `tgkill` stays per task and validates the group id. A thread can
+      `execve`: the rest of the group ends and the caller keeps the address
+      space (`HAKU64-USER-THREAD-EXEC-OK`), and a ring-3 fault ends the group
+      rather than leaving a sibling in a broken space.
 - [x] Detached threads that clean up after themselves: `clone` accepts
       `CLONE_DETACH` (a Haku flag, valid only with `CLONE_THREAD`), and the CPU
       that ran the task reclaims its slot at the next tick or switch instead of
@@ -223,10 +224,14 @@ continue, and a foreground process group tied to the console.
       child's write with no reader ends in the default `SIGPIPE` action) and
       `HAKU64-USER-PIPE-BLOCK-OK` (a write larger than the ring blocks until
       the reader drains it).
-- [ ] Real signal delivery: `rt_sigaction` (13), `rt_sigprocmask` (14) and
+- [x] Real signal delivery: `rt_sigaction` (13), `rt_sigprocmask` (14) and
       `rt_sigreturn` (15) on the x86-64 numbers, a user handler frame with a
       restorer, `sigaltstack` (131), and correct pending/masked state across
-      `fork` and `execve`.
+      `fork` and `execve`. Each task owns its dispositions and mask; a signal is
+      queued and delivered on the way back to ring 3, so a handler frame returns
+      through `IRETQ` (SYSRET would clobber `RCX`/`R11`). Handler arguments use
+      the Microsoft x64 convention (`RCX` = signal) because that is what the
+      toolchain compiles. Proven by `HAKU64-USER-SIGNAL-OK`.
 - [ ] Stop and continue: `SIGSTOP`/`SIGCONT`, `wait4` with `WUNTRACED`, and
       `setpgid`/`getpgrp`/`setsid` with the same rules the 32-bit side has.
 - [ ] A console TTY: `TIOCGPGRP`/`TIOCSPGRP`, `TCGETS`/`TCSETS`, `SIGHUP` when
@@ -240,9 +245,9 @@ continue, and a foreground process group tied to the console.
 **Acceptance.** `HAKU64-PIPE-OK`, `HAKU64-SIGNAL-OK`, `HAKU64-JOBCTL-OK`; a
 ring-3 test runs a two-stage pipeline, catches and returns from a handler,
 stops and resumes a child, and observes the foreground group change. The pipe
-half is done: `HAKU64-USER-PIPE-OK` and `HAKU64-USER-PIPE-SIGPIPE-OK` already
-run in `/INIT.ELF`, and the remaining markers wait for real signal delivery
-and a TTY.
+and handler halves are done: `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK`
+and `HAKU64-USER-SIGNAL-OK` already run in `/INIT.ELF`, and the remaining
+markers wait for stop/continue and a TTY.
 
 ## 4. Interactive x86-64 userland (console, TTY, busybox)
 

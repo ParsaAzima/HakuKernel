@@ -1061,6 +1061,146 @@ static void test_procfs(void) {
         printf("HAKU64-USER-PROCFS-OK: meminfo uptime self/cmdline\n");
 }
 
+/* Signal delivery: a handler installed with sigaction() runs on the way back
+ * from raise(), a blocked signal waits for SIG_UNBLOCK, SIG_IGN drops it, the
+ * alternate stack takes the frame when SA_ONSTACK asks for it, and a signal
+ * that arrives during nanosleep() turns it into EINTR. Each step is one
+ * observable fact, so a regression names the rule it broke. */
+
+static volatile int signal_hits;
+static volatile int signal_number;
+static volatile unsigned long long signal_mask_inside;
+static volatile unsigned long long signal_stack_pointer;
+
+static void handle_usr1(int sig) {
+    haku64_sigset_t inside;
+    char probe = 0;
+
+    /* The kernel runs the handler with the signal itself blocked unless
+     * SA_NODEFER is set, so the query below must show its bit. */
+    (void)sigprocmask(HAKU64_SIG_BLOCK, NULL, &inside);
+    signal_mask_inside = inside.bits;
+    signal_number = sig;
+    signal_stack_pointer = (unsigned long long)&probe;
+    signal_hits++;
+}
+
+static void test_signals(void) {
+    int before = failures;
+    haku64_sigaction_t action, old;
+    haku64_sigset_t set, previous;
+    static char altstack_area[16384];
+    haku64_stack_t stack, report;
+
+    signal_hits = 0;
+    signal_number = 0;
+    signal_mask_inside = 0;
+
+    memset(&action, 0, sizeof(action));
+    action.handler = (unsigned long long)handle_usr1;
+    check(sigaction(HAKU64_SIGUSR1, &action, &old) == 0,
+          "sigaction installs a handler");
+    check(old.handler == HAKU64_SIG_DFL, "the old disposition was SIG_DFL");
+
+    check(raise(HAKU64_SIGUSR1) == 0, "raise(SIGUSR1)");
+    check(signal_hits == 1 && signal_number == HAKU64_SIGUSR1,
+          "the handler ran with the signal number");
+    check((signal_mask_inside & (1ull << (HAKU64_SIGUSR1 - 1))) != 0,
+          "the signal is blocked inside its own handler");
+
+    set.bits = 0;
+    check(sigprocmask(HAKU64_SIG_BLOCK, NULL, &previous) == 0,
+          "query the signal mask");
+    check(previous.bits == 0, "the mask was restored after the handler");
+
+    /* A blocked signal is remembered, not delivered, and SIG_UNBLOCK hands
+     * it to the handler on the way out of the sigprocmask call. */
+    set.bits = 1ull << (HAKU64_SIGUSR1 - 1);
+    check(sigprocmask(HAKU64_SIG_BLOCK, &set, NULL) == 0, "block SIGUSR1");
+    check(raise(HAKU64_SIGUSR1) == 0, "raise a blocked signal");
+    check(signal_hits == 1, "a blocked signal stays pending");
+    check(sigprocmask(HAKU64_SIG_UNBLOCK, &set, NULL) == 0, "unblock SIGUSR1");
+    check(signal_hits == 2, "the pending signal is delivered on unblock");
+
+    /* SIG_IGN is a disposition, not a mask: the signal is thrown away. */
+    memset(&action, 0, sizeof(action));
+    action.handler = HAKU64_SIG_IGN;
+    check(sigaction(HAKU64_SIGUSR2, &action, NULL) == 0, "ignore SIGUSR2");
+    set.bits = 0;
+    (void)sigprocmask(HAKU64_SIG_SETMASK, &set, NULL);
+    check(raise(HAKU64_SIGUSR2) == 0, "raise an ignored signal");
+    check(signal_hits == 2, "SIG_IGN drops the signal");
+
+    /* An alternate stack takes the frame, so the handler's locals sit in
+     * altstack_area rather than below the interrupted stack pointer. */
+    stack.ss_sp = altstack_area;
+    stack.ss_flags = 0;
+    stack.ss_size = sizeof(altstack_area);
+    check(sigaltstack(&stack, NULL) == 0, "install an alternate stack");
+
+    signal_hits = 0;
+    signal_stack_pointer = 0;
+    memset(&action, 0, sizeof(action));
+    action.handler = (unsigned long long)handle_usr1;
+    action.flags = HAKU64_SA_ONSTACK;
+    check(sigaction(HAKU64_SIGUSR1, &action, NULL) == 0,
+          "install a SA_ONSTACK handler");
+    check(raise(HAKU64_SIGUSR1) == 0, "raise with an alternate stack");
+    check(signal_hits == 1, "the alternate-stack handler ran");
+    check(signal_stack_pointer >= (unsigned long long)altstack_area &&
+              signal_stack_pointer <
+                  (unsigned long long)(altstack_area + sizeof(altstack_area)),
+          "the handler frame is on the alternate stack");
+
+    stack.ss_flags = HAKU64_SS_DISABLE;
+    check(sigaltstack(&stack, NULL) == 0, "disable the alternate stack");
+    check(sigaltstack(NULL, &report) == 0, "query the alternate stack");
+    check((report.ss_flags & HAKU64_SS_DISABLE) != 0,
+          "the alternate stack reads back as disabled");
+
+    /* A signal that arrives during a sleep ends it with EINTR and reports the
+     * time still to sleep, so a caller can restart the call. */
+    memset(&action, 0, sizeof(action));
+    action.handler = (unsigned long long)handle_usr1;
+    check(sigaction(HAKU64_SIGUSR1, &action, NULL) == 0,
+          "reinstall the normal handler");
+
+    signal_hits = 0;
+    {
+        haku64_timespec_t nap, left;
+        int status = 0;
+        int child;
+
+        child = fork();
+        check(child >= 0, "fork for the EINTR test");
+        if (child == 0) {
+            nap.tv_sec = 0;
+            nap.tv_nsec = 30 * 1000 * 1000;      /* 30 ms */
+            (void)nanosleep(&nap, NULL);
+            (void)kill(getppid(), HAKU64_SIGUSR1);
+            _exit(0);
+        }
+        if (child > 0) {
+            nap.tv_sec = 5;
+            nap.tv_nsec = 0;
+            left.tv_sec = 0;
+            left.tv_nsec = 0;
+            errno = 0;
+            check(nanosleep(&nap, &left) == -1 && errno == HAKU64_EINTR,
+                  "a signal ends nanosleep with EINTR");
+            check(signal_hits == 1, "the interrupting handler ran");
+            check(left.tv_sec >= 0 && left.tv_sec < 5,
+                  "nanosleep reports the time still left");
+            check(waitpid(child, &status, 0) == child,
+                  "wait for the signalling child");
+            check(status == 0, "the signalling child exited cleanly");
+        }
+    }
+
+    if (failures == before)
+        printf("HAKU64-USER-SIGNAL-OK: handler, mask, SIG_IGN, altstack and EINTR\n");
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)envp;
 
@@ -1095,6 +1235,7 @@ int main(int argc, char **argv, char **envp) {
     test_thread_errno();
     test_thread_exec();
     test_processes();
+    test_signals();
     test_mappings_and_time();
     test_pipes();
     test_pipe_sigpipe();

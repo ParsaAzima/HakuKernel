@@ -8,8 +8,8 @@ POSIX surface, and the self-test markers that cover them.
 The x86-64 kernel serves the ported subset under the x86-64 Linux numbers with
 `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` arguments and `rax` for the number and the
 result, entered by `SYSCALL` with an `INT 0x80` fallback. This page documents
-the 32-bit table in full because it is the complete one; the 64-bit image still
-lacks signal handlers.
+the 32-bit table in full because it is the complete one; the 64-bit image
+implements a subset of it, including signal dispositions and delivery.
 
 ## Syscall ABI
 
@@ -428,12 +428,36 @@ bounded by 64 nodes and, for every futex word the exiting task still owns, sets
 `-EINVAL` rather than ignored.
 `exit` (60) ends only the calling task, while `exit_group` (231) ends every
 task of the caller's thread group. `kill` (62) is process-directed — the id
-names a thread group, so the default action reaches every thread, including
-when the caller signals its own group — while `tgkill` (234) can single out one
-task and refuses a tid that does not belong to the given tgid. `execve` from a
-thread ends the other members of its group and keeps the address space for the
-new image; it is refused only when a live task outside the group shares that
-space.
+names a thread group, so a process-directed signal goes to the leader, or to
+the first live thread when the leader is gone — while `tgkill` (234) can single
+out one task and refuses a tid that does not belong to the given tgid.
+`execve` from a thread ends the other members of its group and keeps the
+address space for the new image; it is refused only when a live task outside
+the group shares that space.
+
+Signals 1..31 are implemented: `rt_sigaction` (13), `rt_sigprocmask` (14),
+`rt_sigreturn` (15) and `sigaltstack` (131). Each task owns its dispositions,
+blocked mask and pending bits, so threads of one process do not share them
+(unlike Linux's `CLONE_SIGHAND`); `fork` and `clone` copy the table and clear
+the pending bits, and `execve` keeps the blocked mask and the ignored
+dispositions while resetting a caught signal to its default. A signal is queued
+and delivered on the way back to ring 3, so `kill` and `raise` return normally
+and a fatal default action ends the whole thread group instead. The frame on
+the user stack holds the `siginfo`, the saved `ucontext` and 32 bytes of
+Microsoft x64 shadow space, and the handler is called the way this toolchain
+compiles C: `rcx` = signal number, and with `SA_SIGINFO` `rdx` = `siginfo`,
+`r8` = `ucontext`. `SA_RESTORER` is mandatory for a real handler because the
+user stack is `NX`; `sigaction` in `user/lib64` fills in the restorer from
+`crt64.asm`. A handler frame and an `rt_sigreturn` frame return through `IRETQ`
+rather than `SYSRET`, which would overwrite `rcx` and `r11` with the return RIP
+and flags. `SIGKILL` and `SIGSTOP` cannot be caught; `SIGCHLD`, `SIGURG`,
+`SIGWINCH` and `SIGCONT` default to ignore, every other signal to terminate.
+A pending unblocked signal ends a blocking `wait4`, `nanosleep` or `poll` with
+`-EINTR` (`nanosleep` reports the time still left), and a matched futex or a
+console byte is delivered before the `EINTR`. Hardware faults are not turned
+into signals, so a protection fault still ends the group. `HAKU64-USER-SIGNAL-OK`
+covers the handler, the mask, `SIG_IGN`, the alternate stack and the `EINTR`
+wake-up at ring 3.
 
 `futex` (202) implements `FUTEX_WAIT` and `FUTEX_WAKE`, and accepts
 `FUTEX_PRIVATE_FLAG` because the op is the low seven bits. `WAIT` compares the

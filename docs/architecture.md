@@ -77,7 +77,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
 | threads | `clone(CLONE_VM)` shares one space and, with `CLONE_FILES`, one descriptor table; a futex hands the flag over | `HAKU64-THREAD-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, pipes, process, time, limits, `poll`/`select` | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK`, `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, pipes, process, time, limits, `poll`/`select`, and signal dispositions with a handler frame | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK`, `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK`, `HAKU64-USER-SIGNAL-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | modules | `X64MOD.HKM` and `ROMFS.HKM` are read from the disk, relocated and run; duplicate, truncated and bad-magic images refused; the second registers a read-only filesystem mounted at `/rom` and cannot unload while it has open files | `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK`, `HAKU64-MODULE-FS-OK`, `HAKU64-MODULE-FS-RELEASE-OK`, `HAKU64-USER-MODULE-OK` |
@@ -144,11 +144,12 @@ is what the CPU loads when a ring-3 trap enters the kernel.
 installs carries the matching bit: executable segments clear bit 63 while
 data, BSS, stack and non-`PROT_EXEC` mappings set it, so code pages cannot be
 written and writable pages cannot be fetched. A ring-3 `#PF` used to halt the
-machine; `idt64.c` now ends the task instead, because there is no signal
-model yet: `sched64_fault` records the vector and `CR2` and switches to the
-next runnable task, while a kernel fault stays fatal. The NX self-test jumps
-into a writable page and asserts vector 14 with `CR2` at that page. Frame
-extraction in the paging code uses `K64_PHYS_MASK` rather than
+machine; `idt64.c` now ends the task instead: `sched64_fault` records the
+vector and `CR2` and switches to the next runnable task, while a kernel fault
+stays fatal. Signals are queued software events, so a hardware fault is not
+turned into one; only `kill`, `raise` and `SIGPIPE` deliver. The NX self-test
+jumps into a writable page and asserts vector 14 with `CR2` at that page.
+Frame extraction in the paging code uses `K64_PHYS_MASK` rather than
 `K64_PAGE_MASK`, so the NX bit can never leak into a physical address.
 
 Ring-3 entry is an ordinary `IRETQ` from a frame whose `CS` is `0x23` and
@@ -158,10 +159,14 @@ programs `STAR` (kernel segments from `0x08`, `SYSRET` base `0x10`), `LSTAR`
 and `FMASK`, and sets `EFER.SCE`. `syscall64_entry` saves the user `RSP`,
 switches to the task's kernel stack (the `TSS.RSP0` mirror
 `gdt64_rsp0_value`), builds the same `regs64_t` frame the interrupt stubs
-build, and calls `sys64_dispatch`. It returns with `SYSRET` when the
-dispatcher hands back a ring-3 frame and through the shared `IRETQ` tail when
-the scheduler hands back a kernel frame. `INT 0x80` at vector `0x80` remains
-as a DPL-3 fallback, and the test program exercises both entry points.
+build, and calls `sys64_dispatch`; `sys64_signal_deliver` then runs on the
+frame the dispatcher returns, so queued signals are acted on once per return
+to ring 3. An ordinary return uses `SYSRET` when the dispatcher hands back a
+ring-3 frame and the shared `IRETQ` tail for a kernel frame; a signal-handler
+or `rt_sigreturn` frame is marked and also takes the `IRETQ` tail, because
+`SYSRET` takes the return RIP from `RCX` and would destroy the handler's first
+argument. `INT 0x80` at vector `0x80` remains as a DPL-3 fallback, and the test
+program exercises both entry points.
 
 `sys64_dispatch` implements the x86-64 Linux convention — number in `RAX`,
 arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, result in `RAX` or a negative
@@ -315,16 +320,26 @@ console descriptor that was never duplicated is a no-op; there is no
 `O_CLOEXEC` and no `dup3`. `wait4` blocks until a child is `DONE`, writes
 `(status & 0xFF) << 8` or the terminating signal, and reaps it; a task's
 space, frames and kernel stack are released only at that point, which is also
-what lets the boot test inspect a task after it stopped. Signals have no
-handlers: a fatal signal performs the default action, terminate, and `wait4`
-reports the signal number. `SIGCHLD` is not delivered and there are no signal
-masks. `kill` names a process, and a process is its thread group, so the
-default action reaches every thread; a signal aimed at the caller's own group
-ends it through `sched64_signal_group` instead of returning. `tgkill` is the
+what lets the boot test inspect a task after it stopped. A task carries one
+disposition per signal, a blocked mask and the pending bits, and those live in
+the task slot, so two threads of one process do not share them the way Linux's
+`CLONE_SIGHAND` would. A signal is queued and acted on at the last moment
+before the task returns to ring 3, so it can end a syscall but never the middle
+of one; a fatal default action ends the whole thread group, and `wait4` reports
+the signal number. A caught signal gets a frame on the user stack with the
+interrupted register set underneath it, and `rt_sigreturn` restores that set.
+The frame carries a restorer, which is mandatory: the user stack is `NX`, so
+the kernel cannot plant the trampoline the 32-bit port writes. Handler
+arguments follow the Microsoft x64 C ABI the toolchain compiles for (`RCX` =
+signal), not Linux's System V order, and a handler frame returns through
+`IRETQ` because `SYSRET` would overwrite `RCX` and `R11`. `kill` names a
+process, and a process is its thread group, so a process-directed signal goes
+to the group leader (or the first live thread when it is gone); `tgkill` is the
 only call that can name a single thread, and it refuses a tgid/tid pair that
-does not belong together. A ring-3 fault is fatal for the same reason: it
-ends the whole group, because a sibling must not keep running in a space its
-peer just faulted in.
+does not belong together. `SIGCHLD` is accepted and ignored but never raised by
+the kernel. A ring-3 fault is still fatal: it ends the whole group, because a
+sibling must not keep running in a space its peer just faulted in, and there is
+no hardware-fault signal model.
 
 `execve` reads the whole file into a heap buffer (32 pages is the cache limit),
 runs `elf64_load`, and `task64_exec` releases the caller's old space — aliased
@@ -446,15 +461,15 @@ elapsed since that sample; when the RTC cannot be read it falls back to
 monotonic time. `nanosleep` rounds the request up to whole timer ticks and
 then waits with interrupts enabled, the same way `wait4` does, so other
 READY tasks run during the sleep; there is no sleep queue, the waiter stays
-the current task and is simply resumed, and `remaining` is never written
-because nothing interrupts the sleep. `poll` and `select` answer from the
+the current task and is simply resumed. A pending signal that is not blocked
+ends the sleep with `-EINTR` and writes the time still left, so a caller can
+restart the call. `poll` and `select` answer from the
 descriptor table instead of wait queues: the console is always readable and
 writable, a file is readable while its position is below the size, and a
 positive timeout is spent in tick slices; a `poll` on a pipe waits for the peer
 to move data (or for the timeout), while an infinite `select` with nothing
-ready returns 0 rather than blocking. Symlinks and real signal handlers are
-still missing; the syscall port that is there covers what the tests and a
-static libc probe need.
+ready returns 0 rather than blocking. `wait4`, `nanosleep` and `poll` also
+return `-EINTR` for a pending signal; symlinks are still missing.
 
 The 64-bit path now has an ELF64 loader, a FAT12 data disk at `/disk`, a RAM
 initramfs root at `/`, procfs at `/proc`, a `/dev` with `null`, `zero`,
@@ -464,7 +479,7 @@ user C library (`user/lib64`) with `/INIT.ELF` as the first real ring-3
 program. A shell therefore still requires the 32-bit
 side, which is where the full userland lives. [The roadmap](../ROADMAP.md)
 (milestones 1 to 4) lists the remaining stages: the musl probe for milestone 1,
-then signals and job control, and the interactive shell. The 64-bit sources are
+then job control and the interactive shell. The 64-bit sources are
 excluded from the 32-bit link line, so both targets build from one tree.
 
 `kernel/arch/x86_64/elf/elf64.c` follows the 32-bit loader's rules — validate

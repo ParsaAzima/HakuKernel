@@ -837,6 +837,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-USER-PIPE-OK",
                 "HAKU64-USER-PIPE-SIGPIPE-OK",
                 "HAKU64-USER-PIPE-BLOCK-OK",
+                "HAKU64-USER-SIGNAL-OK",
                 "HAKU64-USER-ERRNO-THREAD-OK",
                 "HAKU64-USER-THREAD-EXEC-OK",
                 "HAKU64-USER-THREAD-EXEC-IMAGE-OK",

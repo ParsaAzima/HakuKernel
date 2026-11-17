@@ -34,15 +34,17 @@ static u64 sys64_random_next(void);
 #define SYS64_IOV_SIZE    16ull
 #define SYS64_TIMESPEC    16ull
 
-/* A pipe write that found no reader has to end the process with SIGPIPE, and
- * only the dispatcher may do that (it must not resume this frame). The write
- * path returns this value instead of an errno; every errno is -1..-4095, so
- * bit 63 plus a zero low half cannot collide with one. */
+/* A pipe write that found no reader has to raise SIGPIPE as well as fail with
+ * EPIPE. The write path is shared by write() and writev(), so it reports this
+ * sentinel and the dispatcher turns it into the queued signal plus -EPIPE;
+ * every errno is -1..-4095, so bit 63 plus a zero low half cannot collide with
+ * one. */
 #define SYS64_PIPE_SIGPIPE 0x8000000000000000ull
 
 #define SYS64_EPERM  1ull
 #define SYS64_ENOENT 2ull
 #define SYS64_ESRCH  3ull
+#define SYS64_EINTR  4ull
 #define SYS64_EIO    5ull
 #define SYS64_E2BIG  7ull
 #define SYS64_ENOEXEC 8ull
@@ -1998,6 +2000,9 @@ static u64 sys64_wait4(u64 pid, u64 status, u64 options) {
         if (result >= 0) break;
         if (result == -(int)SYS64_ECHILD) return (u64)0 - SYS64_ECHILD;
         if (options & K64_WNOHANG) return 0;
+        /* A signal that will run a handler ends the wait with EINTR, as on
+         * Linux; the handler runs in sys64_signal_deliver on the way out. */
+        if (task64_signal_pending(id)) return (u64)0 - SYS64_EINTR;
         sti64();
         cpu_halt64();
         cli64();
@@ -2013,11 +2018,11 @@ static u64 sys64_wait4(u64 pid, u64 status, u64 options) {
 }
 
 /* kill(pid, signal): pid 1 and up names a process, and a process is its
- * thread group, so the default action reaches every thread. Linux's pid 0
- * (own process group) and negative pids (process groups) are not implemented
- * because there is no pgrp table here, and are refused. The caller's own group
- * is
- * handled in the dispatcher because it must not resume its frame. */
+ * thread group, so a process-directed signal goes to the leader (or the first
+ * live thread when it is gone). Delivery happens on the way back to ring 3,
+ * so this call always returns normally; a fatal default action ends the group
+ * in sys64_signal_deliver. The dispatcher handles pid 0 and negative pids
+ * itself because those name groups rather than one process. */
 static u64 sys64_kill(u64 pid, u64 signal) {
     s64 want = (s64)pid;
 
@@ -2055,12 +2060,12 @@ static u64 sys64_clock_gettime(u64 clock_id, u64 tp) {
  * The interval is rounded up to whole timer ticks and the task waits with
  * interrupts enabled, exactly like wait4's loop, so other READY tasks run
  * while it waits; there is no sleep queue yet, so the waiter stays the
- * current task and is simply resumed. `remaining` is never written because
- * no signal can interrupt the sleep. */
+ * current task and is simply resumed. A signal that will run a handler ends
+ * the sleep with EINTR and reports the time still left, which is the Linux
+ * contract a caller uses to restart the call. */
 static u64 sys64_nanosleep(u64 request, u64 remaining) {
     u64 ts[2], hz, ticks, wait, deadline;
-
-    (void)remaining;
+    int id = sched64_current();
 
     if (!copy_from_user64(current_space(), ts, request, SYS64_TIMESPEC))
         return (u64)0 - SYS64_EFAULT;
@@ -2075,6 +2080,19 @@ static u64 sys64_nanosleep(u64 request, u64 remaining) {
     ticks = timer64_ticks();
     deadline = ticks + wait;
     while (timer64_ticks() < deadline) {
+        if (task64_signal_pending(id)) {
+            u64 left = deadline - timer64_ticks();
+            u64 out[2];
+
+            if (remaining) {
+                out[0] = left / hz;
+                out[1] = (left % hz) * (1000000000ull / hz);
+                if (!copy_to_user64(current_space(), remaining, out,
+                                    SYS64_TIMESPEC))
+                    return (u64)0 - SYS64_EFAULT;
+            }
+            return (u64)0 - SYS64_EINTR;
+        }
         sti64();
         cpu_halt64();
         cli64();
@@ -2682,6 +2700,8 @@ static u64 sys64_poll(u64 fds, u64 nfds, u64 timeout_ms) {
             if (revents) ready++;
         }
         if (ready || timeout_ms == 0) return ready;
+        /* Bytes are ready before a signal ends the wait: readiness wins. */
+        if (task64_signal_pending(id)) return (u64)0 - SYS64_EINTR;
         if (timeout_ms != ~0ull) {
             /* Spend one 10 ms slice per pass; the timer runs at 100 Hz, so
              * this is a real wait rather than a busy loop. */
@@ -2824,6 +2844,313 @@ static u64 sys64_delete_module(u64 name, u64 flags) {
     return (u64)(s64)module64_unload(buffer);
 }
 
+/* ---------------------------------------------------------------- signals
+ *
+ * The user-side layouts are in include/haku/abi64.h and must stay in step
+ * with the kernel's k64_sigaction_t, k64_sigframe_t and k64_ucontext_t. The
+ * frame carries a restorer, which this port requires: the user stack is
+ * mapped NX, so the kernel cannot place its own "mov rax, 15; syscall" stub
+ * there the way the 32-bit port does. Linux's x86-64 ABI has the same rule,
+ * and libc always passes one.
+ */
+#define SYS64_SIGACTION_SIZE 32ull
+#define SYS64_STACK_SIZE     24ull
+#define SYS64_SIGSET_SIZE    8ull
+
+/* Signals whose default action is to do nothing. The stop signals keep their
+ * fatal default until job control exists. */
+static int signal_default_ignored(u32 sig) {
+    return sig == K64_SIGCHLD || sig == K64_SIGURG || sig == K64_SIGWINCH ||
+           sig == K64_SIGCONT;
+}
+
+static u64 sys64_rt_sigaction(u64 sig, u64 act, u64 old, u64 setsize) {
+    k64_sigstate_t *state = task64_signals(sched64_current());
+    u64 space = current_space();
+    u64 raw[4];
+
+    if (!state) return (u64)0 - SYS64_ESRCH;
+    if (sig < 1u || sig > K64_NSIG) return (u64)0 - SYS64_EINVAL;
+    /* x86-64 Linux requires the sigset size to be the 8 bytes of its kernel
+     * sigset_t, and so does this port. */
+    if (setsize != SYS64_SIGSET_SIZE) return (u64)0 - SYS64_EINVAL;
+
+    if (old) {
+        k64_sigaction_t *cur = &state->actions[sig - 1u];
+
+        raw[0] = cur->handler;
+        raw[1] = cur->flags;
+        raw[2] = cur->restorer;
+        raw[3] = cur->mask;
+        if (!copy_to_user64(space, old, raw, sizeof(raw)))
+            return (u64)0 - SYS64_EFAULT;
+    }
+    if (!act) return 0;
+    if (!copy_from_user64(space, raw, act, sizeof(raw)))
+        return (u64)0 - SYS64_EFAULT;
+    /* SIGKILL and SIGSTOP cannot be caught or ignored. */
+    if (sig == K64_SIGKILL || sig == K64_SIGSTOP) return (u64)0 - SYS64_EINVAL;
+    /* A handler without a restorer could never return: the user stack is not
+     * executable, so the frame cannot carry a kernel-provided trampoline. */
+    if (raw[0] > K64_SIG_IGN && (raw[1] & K64_SA_RESTORER) == 0)
+        return (u64)0 - SYS64_EINVAL;
+
+    state->actions[sig - 1u].handler = raw[0];
+    state->actions[sig - 1u].flags = raw[1];
+    state->actions[sig - 1u].restorer = raw[2];
+    state->actions[sig - 1u].mask =
+        raw[3] & K64_SIG_MASK_ALL & ~(K64_SIGKILL_BIT | K64_SIGSTOP_BIT);
+    return 0;
+}
+
+static u64 sys64_rt_sigprocmask(u64 how, u64 set, u64 old, u64 setsize) {
+    k64_sigstate_t *state = task64_signals(sched64_current());
+    u64 space = current_space();
+    u64 mask = 0, previous;
+
+    if (!state) return (u64)0 - SYS64_ESRCH;
+    if (setsize != SYS64_SIGSET_SIZE) return (u64)0 - SYS64_EINVAL;
+    if (how > K64_SIG_SETMASK) return (u64)0 - SYS64_EINVAL;
+
+    if (old) {
+        previous = state->blocked;
+        if (!copy_to_user64(space, old, &previous, sizeof(previous)))
+            return (u64)0 - SYS64_EFAULT;
+    }
+    if (!set) return 0;
+    if (!copy_from_user64(space, &mask, set, sizeof(mask)))
+        return (u64)0 - SYS64_EFAULT;
+    mask &= K64_SIG_MASK_ALL & ~(K64_SIGKILL_BIT | K64_SIGSTOP_BIT);
+    if (how == K64_SIG_BLOCK) state->blocked |= (u32)mask;
+    else if (how == K64_SIG_UNBLOCK) state->blocked &= ~(u32)mask;
+    else state->blocked = (u32)mask;
+    return 0;
+}
+
+/* sigaltstack(ss, old_ss). The record on the user side is
+ *   { u64 ss_sp; u32 ss_flags; u32 padding; u64 ss_size; }
+ * which is 24 bytes, the same shape the kernel copies below. */
+static u64 sys64_sigaltstack(u64 ss, u64 old) {
+    k64_sigstate_t *state = task64_signals(sched64_current());
+    u64 space = current_space();
+    u64 raw[3], report[3];
+    u32 flags;
+
+    if (!state) return (u64)0 - SYS64_ESRCH;
+    if (old) {
+        report[0] = state->alt_sp;
+        report[1] = state->alt_sp ? (state->alt_depth ? K64_SS_ONSTACK : 0u)
+                                  : (u64)K64_SS_DISABLE;
+        report[2] = state->alt_size;
+        if (!copy_to_user64(space, old, report, sizeof(report)))
+            return (u64)0 - SYS64_EFAULT;
+    }
+    if (!ss) return 0;
+    if (!copy_from_user64(space, raw, ss, sizeof(raw)))
+        return (u64)0 - SYS64_EFAULT;
+    flags = (u32)raw[1];
+    if (flags & ~(K64_SS_DISABLE | K64_SS_AUTODISARM))
+        return (u64)0 - SYS64_EINVAL;
+    if (flags & K64_SS_DISABLE) {
+        state->alt_sp = 0;
+        state->alt_size = 0;
+        state->alt_flags = K64_SS_DISABLE;
+        return 0;
+    }
+    /* The range must sit in the user half, be large enough for a frame plus
+     * the handler's own call frame, and not wrap. */
+    if (raw[0] < K64_USER_BASE || raw[2] < K64_SIGSTKSZ_MIN ||
+        raw[0] + raw[2] < raw[0] || raw[0] + raw[2] > K64_USER_END)
+        return (u64)0 - SYS64_ENOMEM;
+    state->alt_sp = raw[0];
+    state->alt_size = raw[2];
+    state->alt_flags = flags;
+    return 0;
+}
+
+/* rt_sigreturn(2): the restorer ran, so RSP points just past the frame's
+ * return address. Restore the interrupted register set and the mask. A frame
+ * that is missing or malformed is how a program that corrupted its own stack
+ * is caught: the task dies with SIGSEGV, as on Linux. */
+regs64_t *sys64_sigreturn(regs64_t *frame) {
+    k64_sigstate_t *state = task64_signals(sched64_current());
+    k64_sigframe_t saved;
+    u64 base;
+
+    if (!state) return frame;
+    base = frame->rsp - 8ull;
+    if (base < K64_USER_BASE || base > K64_USER_END - sizeof(saved) ||
+        !copy_from_user64(current_space(), &saved, base, sizeof(saved)) ||
+        saved.magic != K64_SIGFRAME_MAGIC) {
+        return sched64_signal_group(frame, K64_SIGSEGV);
+    }
+
+    state->blocked = (u32)saved.blocked & K64_SIG_MASK_ALL;
+    if (state->alt_depth) state->alt_depth--;
+
+    frame->r15 = saved.uc.r15;
+    frame->r14 = saved.uc.r14;
+    frame->r13 = saved.uc.r13;
+    frame->r12 = saved.uc.r12;
+    frame->r11 = saved.uc.r11;
+    frame->r10 = saved.uc.r10;
+    frame->r9 = saved.uc.r9;
+    frame->r8 = saved.uc.r8;
+    frame->rbp = saved.uc.rbp;
+    frame->rdi = saved.uc.rdi;
+    frame->rsi = saved.uc.rsi;
+    frame->rdx = saved.uc.rdx;
+    frame->rcx = saved.uc.rcx;
+    frame->rbx = saved.uc.rbx;
+    frame->rax = saved.uc.rax;
+    frame->rip = saved.uc.rip;
+    frame->cs = saved.uc.cs;
+    frame->rflags = saved.uc.rflags;
+    frame->rsp = saved.uc.rsp;
+    frame->ss = saved.uc.ss;
+    /* SYSRET would overwrite RCX and R11 from the return RIP and flags, and
+     * the whole point here is to hand the interrupted values back. Mark the
+     * frame so the SYSCALL stub takes the IRETQ tail instead. */
+    frame->vector = K64_VEC_SIGRET;
+    frame->error = 0;
+    return frame;
+}
+
+/* Deliver the first unblocked pending signal, on the way back to ring 3.
+ * This is the only place a disposition is acted on, so the rules are in one
+ * function: an ignored signal is dropped, a default action either does
+ * nothing or ends the thread group, and a handler gets a frame on the user
+ * stack with the interrupted context underneath it. */
+regs64_t *sys64_signal_deliver(regs64_t *frame) {
+    int id = sched64_current();
+    k64_sigstate_t *state;
+    k64_sigaction_t *action;
+    k64_sigframe_t built;
+    u32 pending, sig = 0, bit = 0;
+    u64 space, base, flags, handler;
+    int on_alt = 0;
+
+    if (!frame || ((u32)frame->cs & 3u) != 3u) return frame;
+    if (id <= 0) return frame;
+    state = task64_signals(id);
+    if (!state) return frame;
+
+    pending = state->pending & ~state->blocked & K64_SIG_MASK_ALL;
+    if (!pending) return frame;
+    /* The lowest signal wins, which is the order the masks are defined in. */
+    for (sig = 1u; sig <= K64_NSIG; sig++) {
+        bit = K64_SIG_BIT(sig);
+        if (pending & bit) break;
+    }
+
+    action = &state->actions[sig - 1u];
+    handler = action->handler;
+    flags = action->flags;
+    state->pending &= ~bit;
+
+    if (handler == K64_SIG_IGN) return frame;
+    if (handler == K64_SIG_DFL) {
+        if (signal_default_ignored(sig)) return frame;
+        return sched64_signal_group(frame, sig);
+    }
+
+    memset(&built, 0, sizeof(built));
+    built.magic = K64_SIGFRAME_MAGIC;
+    built.blocked = state->blocked & K64_SIG_MASK_ALL;
+    built.restorer = action->restorer;
+    built.info_block[0] = (u8)(sig & 0xFFu);   /* si_signo */
+    built.info_block[8] = 0u;                  /* si_code: SI_USER */
+    built.uc.flags = 0;
+    built.uc.link = 0;
+    built.uc.ss_sp = state->alt_sp;
+    built.uc.ss_flags = state->alt_sp ? 0u : K64_SS_DISABLE;
+    built.uc.ss_size = state->alt_size;
+    built.uc.r15 = frame->r15;
+    built.uc.r14 = frame->r14;
+    built.uc.r13 = frame->r13;
+    built.uc.r12 = frame->r12;
+    built.uc.r11 = frame->r11;
+    built.uc.r10 = frame->r10;
+    built.uc.r9 = frame->r9;
+    built.uc.r8 = frame->r8;
+    built.uc.rbp = frame->rbp;
+    built.uc.rdi = frame->rdi;
+    built.uc.rsi = frame->rsi;
+    built.uc.rdx = frame->rdx;
+    built.uc.rcx = frame->rcx;
+    built.uc.rbx = frame->rbx;
+    built.uc.rax = frame->rax;
+    built.uc.rip = frame->rip;
+    built.uc.cs = frame->cs;
+    built.uc.rflags = frame->rflags;
+    built.uc.rsp = frame->rsp;
+    built.uc.ss = frame->ss;
+    built.uc.sigmask = built.blocked;
+
+    /* The alternate stack, when the disposition asked for it and one is
+     * installed, takes the frame; otherwise it goes below the interrupted
+     * stack pointer so the handler's own calls cannot reach it. Entry RSP
+     * keeps the ABI's 16-byte convention: RSP % 16 == 8, as if a call had
+     * just pushed the return address. */
+    if ((flags & K64_SA_ONSTACK) && state->alt_sp) {
+        base = (state->alt_sp + state->alt_size - sizeof(built) - 8ull) &
+               ~15ull;
+        base += 8ull;
+        if (base < state->alt_sp || base > state->alt_sp + state->alt_size)
+            return sched64_signal_group(frame, K64_SIGSEGV);
+        on_alt = 1;
+    } else {
+        base = (frame->rsp - sizeof(built) - 8ull) & ~15ull;
+        base += 8ull;
+        if (base >= frame->rsp || base < K64_USER_BASE)
+            return sched64_signal_group(frame, K64_SIGSEGV);
+    }
+
+    space = current_space();
+    if (!copy_to_user64(space, base, &built, sizeof(built)))
+        return sched64_signal_group(frame, K64_SIGSEGV);
+
+    /* The handler runs with its own signal blocked unless SA_NODEFER, plus
+     * whatever extra mask the disposition asked for. */
+    if ((flags & K64_SA_NODEFER) == 0) state->blocked |= bit;
+    state->blocked |= (u32)(action->mask & K64_SIG_MASK_ALL);
+    if (on_alt) state->alt_depth++;
+
+    frame->r15 = 0;
+    frame->r14 = 0;
+    frame->r13 = 0;
+    frame->r12 = 0;
+    frame->r11 = 0;
+    frame->r10 = 0;
+    frame->r9 = 0;
+    frame->r8 = 0;
+    frame->rbp = 0;
+    frame->rbx = 0;
+    frame->rcx = 0;
+    frame->rax = 0;
+    frame->rdi = 0;
+    frame->rsi = 0;
+    /* Microsoft x64 C ABI, which is what this toolchain compiles for: the
+     * signal number goes in RCX, the siginfo pointer in RDX and the
+     * ucontext pointer in R8. (Linux's System V entry convention would use
+     * RDI/RSI/RDX; a handler built here would read the wrong registers.) */
+    frame->rcx = sig;
+    frame->rdx = (flags & K64_SA_SIGINFO) ? base + K64_SIGFRAME_SIGINFO : 0;
+    frame->r8 = (flags & K64_SA_SIGINFO) ? base + K64_SIGFRAME_UCONTEXT : 0;
+    frame->rip = handler;
+    frame->rsp = base;
+    frame->cs = K64_USER_CS | 3u;
+    frame->ss = K64_USER_DS | 3u;
+    /* Interrupts on in the handler, direction flag clear, trap flag off. */
+    frame->rflags = (frame->rflags & ~0x500ull) | 0x202ull;
+    /* RCX carries the signal number, so this frame cannot return through
+     * SYSRET: the marker makes the SYSCALL stub use IRETQ, which restores
+     * RCX from the frame instead of loading it with the return RIP. */
+    frame->vector = K64_VEC_SIGRET;
+    frame->error = 0;
+    return frame;
+}
+
 regs64_t *sys64_dispatch(regs64_t *frame) {
     u32 in_user = ((u32)frame->cs & 3u) == 3u;
     u32 wrote = 0;
@@ -2846,6 +3173,23 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
     }
 
     switch (frame->rax) {
+    case K64_SYS_RT_SIGACTION:
+        result = sys64_rt_sigaction(frame->rdi, frame->rsi, frame->rdx,
+                                    frame->r10);
+        break;
+
+    case K64_SYS_RT_SIGPROCMASK:
+        result = sys64_rt_sigprocmask(frame->rdi, frame->rsi, frame->rdx,
+                                      frame->r10);
+        break;
+
+    case K64_SYS_RT_SIGRETURN:
+        return sys64_sigreturn(frame);
+
+    case K64_SYS_SIGALTSTACK:
+        result = sys64_sigaltstack(frame->rdi, frame->rsi);
+        break;
+
     case K64_SYS_READ:
         if (fs64_fd_console(sched64_current(), (int)frame->rdi))
             return sys64_console_read(frame);
@@ -3264,15 +3608,22 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     case K64_SYS_WRITE:
         result = sys64_write(frame->rdi, frame->rsi, frame->rdx);
-        if (result == SYS64_PIPE_SIGPIPE)
-            return sched64_signal_group(frame, K64_SIGPIPE);
+        if (result == SYS64_PIPE_SIGPIPE) {
+            /* A pipe with no reader is EPIPE plus SIGPIPE, not an immediate
+             * kill: the queued signal lets a handler run, and the default
+             * action still ends the process on the way out. */
+            (void)task64_raise(sched64_current(), K64_SIGPIPE);
+            result = (u64)0 - SYS64_EPIPE;
+        }
         wrote = 1;
         break;
 
     case K64_SYS_WRITEV:
         result = sys64_writev(frame->rdi, frame->rsi, frame->rdx);
-        if (result == SYS64_PIPE_SIGPIPE)
-            return sched64_signal_group(frame, K64_SIGPIPE);
+        if (result == SYS64_PIPE_SIGPIPE) {
+            (void)task64_raise(sched64_current(), K64_SIGPIPE);
+            result = (u64)0 - SYS64_EPIPE;
+        }
         wrote = 1;
         break;
 
@@ -3315,21 +3666,15 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
             break;
         }
 
-        /* kill() aimed at the caller's own thread group (its pid or any
-         * sibling tid) ends the process and must never resume this frame. */
-        if (want > 0 && want <= (s64)K64_TASK_MAX && signal != 0 &&
-            task64_state((int)want - 1) != (int)K64_TASK_UNUSED &&
-            sched64_tgid((int)want - 1) == sched64_tgid(me))
-            return sched64_signal_group(frame, signal);
-
+        /* Every branch only queues a signal: the action runs in
+         * sys64_signal_deliver on the way back to ring 3, which is also why a
+         * signal aimed at the caller's own group no longer has to abandon
+         * this frame. */
         if (want == 0) {
-            /* pid 0: the caller's process group, which contains the caller.
-             * Peers are marked finished here and the caller's own thread
-             * group then goes down the fatal path. */
-            u32 group = sched64_pgrp(me);
-            int peers = sched64_signal_pgrp(group, signal);
+            /* pid 0: the caller's process group, which usually contains the
+             * caller. */
+            int peers = sched64_signal_pgrp(sched64_pgrp(me), signal);
 
-            if (signal != 0) return sched64_signal_group(frame, signal);
             result = peers < 0 ? (u64)peers : 0;
             break;
         }
@@ -3350,16 +3695,9 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
         if (want < -1) {
             /* -pgid: every task in that process group. */
-            u32 group = (u32)(-want);
-            int peers = sched64_signal_pgrp(group, signal);
+            int peers = sched64_signal_pgrp((u32)(-want), signal);
 
-            if (peers < 0) {
-                result = (u64)peers;
-                break;
-            }
-            if (signal != 0 && group == sched64_pgrp(me))
-                return sched64_signal_group(frame, signal);
-            result = 0;
+            result = peers < 0 ? (u64)peers : 0;
             break;
         }
 

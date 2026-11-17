@@ -28,12 +28,26 @@
 [bits 64]
 default rel
 
+%include "haku/abi64.inc"
+
 section .text
 
 global _start
+global haku64_restore_rt
 extern main
 extern exit
 extern haku64_tls_init
+
+; The signal restorer. sys64_signal_deliver puts this address at [rsp] of a
+; handler frame, so a plain `ret` in the handler lands here and asks the
+; kernel to restore the interrupted context. It lives in .text because the
+; user stack is mapped NX: a stub the kernel wrote there would fault on its
+; first instruction. rt_sigreturn() never returns when the frame is intact
+; (a corrupt frame ends the task with SIGSEGV), so the HLT is unreachable.
+haku64_restore_rt:
+    mov rax, HAKU64_SYS_RT_SIGRETURN
+    syscall
+    hlt
 
 _start:
     xor ebp, ebp                ; the outermost frame, so debuggers stop here

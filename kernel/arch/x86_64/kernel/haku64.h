@@ -150,6 +150,14 @@ typedef signed long long s64;
 #define K64_VEC_RESCHED     0x41u
 #define K64_VEC_TLB         0x42u
 
+/* Not a vector: a marker the SYSCALL stub looks for after signal delivery.
+ * SYSRET takes the return RIP from RCX and the flags from R11, which would
+ * destroy the handler's first argument (RCX, per the Microsoft x64 ABI) and
+ * the restored R11 of an rt_sigreturn frame. A frame carrying this value goes
+ * back through IRETQ, which restores every register from the frame itself.
+ * Real vectors are 0..66 and 0xFF, so 0x1FF cannot be mistaken for one. */
+#define K64_VEC_SIGRET      0x1FFu
+
 /* Model-specific registers reached through read_msr64/write_msr64. GS.base
  * holds the per-CPU block while the kernel runs and the task's user GS base
  * in ring 3, so a SWAPGS on every privilege transition is what makes
@@ -217,6 +225,7 @@ typedef signed long long s64;
 #define K64_SYS_BRK           12u
 #define K64_SYS_RT_SIGACTION  13u
 #define K64_SYS_RT_SIGPROCMASK 14u
+#define K64_SYS_RT_SIGRETURN  15u
 #define K64_SYS_IOCTL         16u
 #define K64_SYS_PREAD64       17u
 #define K64_SYS_PWRITE64      18u
@@ -258,6 +267,7 @@ typedef signed long long s64;
 #define K64_SYS_SETSID        112u
 #define K64_SYS_GETPGID       121u
 #define K64_SYS_GETSID        124u
+#define K64_SYS_SIGALTSTACK   131u
 #define K64_SYS_SETPGID       109u
 #define K64_SYS_SET_ROBUST_LIST 273u
 #define K64_SYS_GET_ROBUST_LIST 274u
@@ -421,15 +431,62 @@ typedef signed long long s64;
 #define K64_WNOHANG 1u
 #define K64_WSTATUS_CODE(status) (((status) >> 8) & 0xFFu)
 
-/* Signals: only the default action is implemented, which is termination.
- * There are no user handlers and no signal masks yet. */
-#define K64_SIGINT  2u
-#define K64_SIGKILL 9u
-#define K64_SIGSEGV 11u
-#define K64_SIGPIPE 13u
-#define K64_SIGTERM 15u
-#define K64_SIGCHLD 17u
-#define K64_NSIG    31u
+/* Signals, Linux numbering, 1..31. Real-time signals are not implemented and
+ * are rejected with -EINVAL, so the pending and blocked masks fit one u32. */
+#define K64_SIGHUP   1u
+#define K64_SIGINT   2u
+#define K64_SIGQUIT  3u
+#define K64_SIGILL   4u
+#define K64_SIGTRAP  5u
+#define K64_SIGABRT  6u
+#define K64_SIGBUS   7u
+#define K64_SIGFPE   8u
+#define K64_SIGKILL  9u
+#define K64_SIGUSR1  10u
+#define K64_SIGSEGV  11u
+#define K64_SIGUSR2  12u
+#define K64_SIGPIPE  13u
+#define K64_SIGALRM  14u
+#define K64_SIGTERM  15u
+#define K64_SIGCHLD  17u
+#define K64_SIGCONT  18u
+#define K64_SIGSTOP  19u
+#define K64_SIGTSTP  20u
+#define K64_SIGTTIN  21u
+#define K64_SIGTTOU  22u
+#define K64_SIGURG   23u
+#define K64_SIGWINCH 28u
+#define K64_NSIG     31u
+/* Every bit a mask may carry: signals 1..31. */
+#define K64_SIG_MASK_ALL ((u32)((1ull << K64_NSIG) - 1ull))
+/* Signal 1 maps to bit 0, so a mask bit is 1 << (sig - 1). */
+#define K64_SIG_BIT(sig) ((u32)1u << ((sig) - 1u))
+#define K64_SIGKILL_BIT  K64_SIG_BIT(K64_SIGKILL)
+#define K64_SIGSTOP_BIT  K64_SIG_BIT(K64_SIGSTOP)
+
+/* rt_sigaction(2) handler values, flags and rt_sigprocmask(2) operations,
+ * with the Linux numbering. The kernel only honours these four flags; the
+ * rest are accepted and ignored. */
+#define K64_SIG_DFL 0ull
+#define K64_SIG_IGN 1ull
+#define K64_SIG_BLOCK   0u
+#define K64_SIG_UNBLOCK 1u
+#define K64_SIG_SETMASK 2u
+#define K64_SA_SIGINFO   0x00000004ull
+#define K64_SA_ONSTACK   0x08000000ull
+#define K64_SA_RESTORER  0x04000000ull
+#define K64_SA_RESTART   0x10000000ull
+#define K64_SA_NODEFER   0x40000000ull
+#define K64_SA_RESETHAND 0x80000000ull
+
+/* sigaltstack(2) flags. SS_ONSTACK is reported while a handler frame is on
+ * the alternate stack; SS_AUTODISARM is accepted and ignored. */
+#define K64_SS_ONSTACK    1u
+#define K64_SS_DISABLE    2u
+#define K64_SS_AUTODISARM 0x80000000u
+#define K64_SIGSTKSZ_MIN  2048ull
+/* errno a blocked syscall reports when a signal it will act on arrives. */
+#define K64_SIG_EINTR     4u
 
 /* lseek() whence values, with the Linux numbering. */
 #define K64_SEEK_SET 0u
@@ -446,6 +503,77 @@ typedef struct {
     u64 vector, error;
     u64 rip, cs, rflags, rsp, ss;
 } regs64_t;
+
+/* --------------------------------------------------------------- signals
+ *
+ * A task carries one disposition per signal, a blocked mask and the pending
+ * bits. A signal is raised into `pending` and acted on at the last moment
+ * before the task returns to ring 3, which is why a handler can interrupt a
+ * syscall but never the middle of one.
+ *
+ * The frames the kernel builds on the user stack are part of the ABI between
+ * the kernel and the restorer that comes back with rt_sigreturn(2); the
+ * matching user-side layout is in include/haku/abi64.h.
+ *
+ *   +0x000  restorer     the handler's return address
+ *   +0x008  shadow       Microsoft x64 shadow space: a handler spills its
+ *                        register arguments here, so the frame stays clear
+ *   +0x028  magic        identifies the frame for rt_sigreturn
+ *   +0x030  blocked      the mask in effect when the signal was raised
+ *   +0x038  siginfo      128 bytes
+ *   +0x0B8  ucontext     the interrupted register set
+ *
+ * The handler arguments follow the Microsoft x64 C ABI this toolchain uses,
+ * not the Linux System V one: RCX is the signal number, RDX the siginfo
+ * pointer (SA_SIGINFO only) and R8 the ucontext pointer (SA_SIGINFO only).
+ */
+#define K64_SIGFRAME_MAGIC   0x48414B5536345349ull   /* "HAKU64SI" */
+#define K64_SIGFRAME_SHADOW  32u
+#define K64_SIGFRAME_SIGINFO 0x38u
+#define K64_SIGFRAME_INFO_SIZE 128u
+#define K64_SIGFRAME_UCONTEXT (K64_SIGFRAME_SIGINFO + K64_SIGFRAME_INFO_SIZE)
+
+typedef struct {
+    u64 handler;   /* K64_SIG_DFL, K64_SIG_IGN, or a ring-3 address */
+    u64 flags;     /* K64_SA_* */
+    u64 restorer;  /* SA_RESTORER trampoline, required for a handler */
+    u64 mask;      /* extra signals blocked inside the handler */
+} k64_sigaction_t;
+
+typedef struct {
+    u64 flags;
+    u64 link;
+    u64 ss_sp;     /* alternate stack, or 0 when disabled */
+    u32 ss_flags;
+    u32 pad0;
+    u64 ss_size;
+    u64 r15, r14, r13, r12, r11, r10, r9, r8;
+    u64 rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    u64 rip, cs, rflags, rsp, ss;
+    u64 sigmask;   /* the blocked mask to restore */
+} k64_ucontext_t;
+
+typedef struct {
+    u64 restorer;
+    u64 shadow[K64_SIGFRAME_SHADOW / 8u];
+    u64 magic;
+    u64 blocked;
+    u8 info_block[K64_SIGFRAME_INFO_SIZE];
+    k64_ucontext_t uc;
+} k64_sigframe_t;
+
+/* Per-task signal state. The pending and blocked words cover signals 1..31,
+ * so a task table of K64_TASK_MAX slots costs about 16 KiB of dispositions;
+ * that is the price of a handler table per task and is paid once at boot. */
+typedef struct {
+    u32 pending;
+    u32 blocked;
+    u64 alt_sp;
+    u64 alt_size;
+    u32 alt_flags;
+    u32 alt_depth;  /* handler frames currently running on the alt stack */
+    k64_sigaction_t actions[K64_NSIG];
+} k64_sigstate_t;
 
 /* ------------------------------------------------------------- per-CPU block
  * One of these per processor, reached through GS after a SWAPGS. The first
@@ -865,6 +993,18 @@ regs64_t *sched64_exit_group(regs64_t *frame);
 /* kill() of the caller's own thread group: a fatal signal ends every peer,
  * then the caller, and never resumes its frame. */
 regs64_t *sched64_signal_group(regs64_t *frame, u32 signal);
+/* The signal state of `id`, or 0 when the slot is unused. syscall64.c owns
+ * the copy-in/copy-out and frame building; task64.c owns the table. */
+k64_sigstate_t *task64_signals(int id);
+/* 1 when `id` has a signal that is pending and not blocked. The blocking
+ * syscalls poll this in their halt loops so a signal ends them with EINTR. */
+int task64_signal_pending(int id);
+/* Raise `signal` for `id` (self allowed): set the bit, wake a parked task
+ * with EINTR, and reschedule its CPU. */
+int task64_raise(int id, u32 signal);
+/* Called on the way back to ring 3: act on the first unblocked pending
+ * signal (ignore, default action, or run the handler). */
+regs64_t *sys64_signal_deliver(regs64_t *frame);
 /* A ring-3 exception is not resumable: mark the task done, record why, and
  * switch to the next runnable task. */
 regs64_t *sched64_fault(regs64_t *frame, u32 vector, u64 address);

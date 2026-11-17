@@ -60,11 +60,16 @@ global isr64_percpu_offsets
 
 extern isr64_dispatch
 extern sys64_dispatch
+extern sys64_signal_deliver
 
 ; User selectors the SYSCALL stub writes into the frame it builds. They
 ; must match K64_USER_CS/K64_USER_DS in haku64.h, including RPL 3.
 %define USER_CS 0x23
 %define USER_SS 0x1B
+
+; Must match K64_VEC_SIGRET in haku64.h: a frame carrying this value is a
+; signal frame or an rt_sigreturn frame and goes back through IRETQ.
+%define VEC_SIGRET 0x1FF
 
 ; Offsets inside k64_percpu_t that this file reads through GS. haku64.h
 ; documents the layout and percpu64_offsets_ok() cross-checks these two
@@ -286,9 +291,11 @@ syscall64_setup:
 ; The handler wants the same regs64_t frame every interrupt builds, so the
 ; stub manufactures one on the task's kernel stack (RSP0). The frame
 ; records vector 0x80 and the user selectors, which is what the C dispatcher
-; already tests with `cs & 3`. Returning to ring 3 uses SYSRET: RCX/R11 are
-; overwritten anyway by the SYSCALL ABI, so the values SYSRET needs are
-; already where it wants them after the frame is popped.
+; already tests with `cs & 3`. An ordinary return uses SYSRET: RCX/R11 are
+; clobbered by the SYSCALL ABI anyway, so a caller cannot expect them to
+; survive the call. A frame the dispatcher marks with VEC_SIGRET (a signal
+; handler or an rt_sigreturn) has to preserve RCX/R11, and takes the IRETQ
+; tail instead.
 global syscall64_entry
 syscall64_entry:
     swapgs
@@ -325,10 +332,23 @@ syscall64_entry:
     and rsp, ~0xF
     sub rsp, 32                  ; shadow space
     call sys64_dispatch
+    ; Signal delivery is the last step before ring 3, so a handler runs with a
+    ; clean syscall behind it. Every dispatcher return goes through here,
+    ; including the early ones (fork, clone, exec, futex, exit).
+    mov rcx, rax
+    and rsp, ~0xF
+    sub rsp, 32
+    call sys64_signal_deliver
     mov rsp, rax                 ; frame to resume
 
-    ; SYSRET can only return to ring 3. A kernel frame (the scheduler fell
-    ; back to the boot context) goes through the IRETQ tail instead.
+    ; SYSRET can only return to ring 3, and it forces RCX to the return RIP
+    ; and R11 to the flags. A signal handler's first argument is in RCX, and
+    ; an rt_sigreturn frame has to hand back the interrupted RCX/R11, so
+    ; those frames take the IRETQ tail, which loads every register from the
+    ; frame. A kernel frame (the scheduler fell back to the boot context)
+    ; goes through the same tail.
+    cmp qword [rsp + 120], VEC_SIGRET      ; frame->vector
+    je isr64_restore
     test byte [rsp + 144], 3     ; frame->cs
     jz isr64_restore
 
