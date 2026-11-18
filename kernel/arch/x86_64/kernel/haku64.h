@@ -1106,6 +1106,13 @@ int sched64_set_pgrp(int id, u32 pgid);
 int sched64_pgrp_exists(u32 pgid);
 int sched64_setsid(int id);
 int sched64_signal_pgrp(u32 pgid, u32 signal);
+/* The console's foreground process group. Zero means "not set", and every
+ * caller is then foreground. The setter answers 0, -EINVAL for group 0 and
+ * -EPERM for a group with no live member. It lives beside the process groups
+ * because the exit path hangs up the foreground group when a session leader
+ * ends, not only the ioctl path. */
+u32 sched64_console_fg(void);
+int sched64_console_set_fg(u32 pgrp);
 /* Robust futex list (set_robust_list 273 / get_robust_list 274). `head` is
  * the user address of a struct robust_list_head; the scheduler walks it when
  * the registering task exits and marks every futex it finds still owned by

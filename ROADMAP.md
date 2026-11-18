@@ -27,7 +27,7 @@ that needs new kernel work is 2.
 | Boot and memory | long-mode entry, four-level paging, 2 MiB physmap, frame allocator, 8 MiB heap | 32-bit protected mode, two-level paging, direct map |
 | Interrupts | 64-bit IDT/TSS with IST, 8259 + PIT, RTC; SMP bring-up with per-CPU scheduling, LAPIC timers and TLB shootdown | same, including per-CPU scheduling on the APs (`--smp=1..4`) |
 | Ring 3 | `SYSCALL`/`SYSRET` + `INT 0x80`, page-by-page user copies, NX | `INT 0x80`, page-by-page user copies |
-| Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4` with `WUNTRACED`/`WCONTINUED`, threads and the pthread subset, `futex`, process groups and sessions, per-task signal dispositions with a handler frame and `sigaltstack`, `SIGSTOP`/`SIGCONT` with a stopped task state | same, plus job control and wait queues |
+| Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4` with `WUNTRACED`/`WCONTINUED`, threads and the pthread subset, `futex`, process groups and sessions, per-task signal dispositions with a handler frame and `sigaltstack`, `SIGSTOP`/`SIGCONT` with a stopped task state, `SIGTTIN` on a background console read and `SIGHUP` from a session leader's exit | same, plus job control and wait queues |
 | Syscalls | ported subset on the x86-64 numbers, including pipes, a blocking `poll`, signals 1..31 (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack`) and the console `ioctl` surface | the subset a static musl/busybox userland needs, including pipes and signals |
 | Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), read-only module filesystems (`/rom`), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
 | Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
@@ -241,8 +241,13 @@ continue, and a foreground process group tied to the console.
       foreground group, `TCGETS`/`TCSETS*`, `TCSBRK`/`TCFLSH`, `TIOCGWINSZ`,
       `FIONREAD` and `ENOTTY` everywhere else, with an `ioctl` wrapper in
       `user/lib64`. Proven by `HAKU64-USER-TTY-OK`.
-- [ ] Terminal-generated signals: `SIGHUP` when the session leader exits, and
-      `SIGTTOU`/`SIGTTIN` for a background write or read.
+- [x] Terminal-generated signals: a console read from a process group that is
+      not the foreground one raises `SIGTTIN` for the group and fails with
+      `-EINTR` (or `-EIO` when the signal is blocked or ignored), and a ring-3
+      session leader's exit raises `SIGHUP` for the console's foreground
+      group. `SIGTTOU` has no trigger because the console does not set
+      `TOSTOP`, so a background write runs. Proven by
+      `HAKU64-USER-TTY-SIGNAL-OK`.
 - [x] Exit semantics: a thread group exits only when its last thread does (a
       leader that exits hands the address space, heap and mappings to a
       survivor), and `set_robust_list`/`get_robust_list` let the kernel walk a
@@ -252,10 +257,11 @@ continue, and a foreground process group tied to the console.
 **Acceptance.** `HAKU64-PIPE-OK`, `HAKU64-SIGNAL-OK`, `HAKU64-JOBCTL-OK`; a
 ring-3 test runs a two-stage pipeline, catches and returns from a handler,
 stops and resumes a child, and observes the foreground group change. The pipe,
-handler, stop/continue and TTY quarters are done: `HAKU64-USER-PIPE-OK`,
-`HAKU64-USER-PIPE-SIGPIPE-OK`, `HAKU64-USER-SIGNAL-OK`, `HAKU64-USER-STOP-OK`
-and `HAKU64-USER-TTY-OK` run in `/INIT.ELF`; the remaining work is the job
-control a real shell drives (terminal-generated signals and wait queues).
+handler, stop/continue, TTY and terminal-signal quarters are done:
+`HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK`,
+`HAKU64-USER-SIGNAL-OK`, `HAKU64-USER-STOP-OK`, `HAKU64-USER-TTY-OK` and
+`HAKU64-USER-TTY-SIGNAL-OK` run in `/INIT.ELF`; the remaining work is the line
+discipline and wait queues a real shell drives.
 
 ## 4. Interactive x86-64 userland (console, TTY, busybox)
 

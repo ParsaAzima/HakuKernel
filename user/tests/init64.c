@@ -1276,6 +1276,8 @@ static void test_console_tty(void) {
               (unsigned)(HAKU64_ISIG | HAKU64_ICANON | HAKU64_ECHO),
           "the console reports ISIG, ICANON and ECHO");
     check(termios.c_cc[2] == 0x7F, "VERASE is the console's");
+    check((termios.c_lflag & HAKU64_TOSTOP) == 0,
+          "the console does not set TOSTOP, so a background write runs");
     check(ioctl(1, HAKU64_TIOCGWINSZ, &winsize) == 0, "TIOCGWINSZ");
     check(winsize.ws_row == 25 && winsize.ws_col == 80, "the console size");
 
@@ -1308,6 +1310,146 @@ static void test_console_tty(void) {
     if (failures == before)
         printf("HAKU64-USER-TTY-OK: console termios, window size and"
                " foreground group\n");
+}
+
+/* The two signals the terminal raises on its own. SIGTTIN parks a process
+ * group that reads while it is not the foreground group; SIGHUP goes to the
+ * foreground group when a session leader exits. Both are exercised on
+ * forked children, because this process has to stay foreground to keep
+ * running. */
+static void hangup_handler(int signal) {
+    (void)signal;
+    _exit(42);
+}
+
+static void test_tty_signals(void) {
+    int before = failures;
+    int status = 0, pgrp, child;
+
+    /* test_console_tty() left this process as the foreground group, which is
+     * what makes the children below background groups. */
+    pgrp = getpgrp();
+
+    /* A blocked SIGTTIN cannot stop the reader, so POSIX fails the read with
+     * EIO and leaves the task running. */
+    child = fork();
+    check(child >= 0, "fork the blocked-SIGTTIN reader");
+    if (child == 0) {
+        haku64_sigset_t set;
+        char byte;
+
+        set.bits = 1ull << (HAKU64_SIGTTIN - 1);
+        if (sigprocmask(HAKU64_SIG_BLOCK, &set, NULL) != 0) _exit(11);
+        if (setpgid(0, 0) != 0) _exit(12);
+        errno = 0;
+        if (read(0, &byte, 1) != -1 || errno != HAKU64_EIO) _exit(13);
+        _exit(0);
+    } else if (child > 0) {
+        check(waitpid(child, &status, 0) == child,
+              "reap the blocked background reader");
+        check(HAKU64_WIFEXITED(status) && HAKU64_WEXITSTATUS(status) == 0,
+              "a blocked SIGTTIN fails the read with EIO");
+    }
+
+    /* With the default disposition the read stops the whole group, and only
+     * SIGCONT brings it back: the read then returns EINTR. */
+    child = fork();
+    check(child >= 0, "fork the background reader");
+    if (child == 0) {
+        char byte;
+
+        if (setpgid(0, 0) != 0) _exit(11);
+        errno = 0;
+        if (read(0, &byte, 1) != -1 || errno != HAKU64_EINTR) _exit(12);
+        _exit(0);
+    } else if (child > 0) {
+        check(waitpid(child, &status, HAKU64_WUNTRACED) == child,
+              "wait4(WUNTRACED) sees the SIGTTIN stop");
+        check(HAKU64_WIFSTOPPED(status) &&
+                  HAKU64_WSTOPSIG(status) == HAKU64_SIGTTIN,
+              "a background console read stops on SIGTTIN");
+        check(kill(child, HAKU64_SIGCONT) == 0,
+              "SIGCONT the background reader");
+        check(waitpid(child, &status, HAKU64_WCONTINUED) == child,
+              "wait4(WCONTINUED) sees the resume");
+        check(waitpid(child, &status, 0) == child &&
+                  HAKU64_WIFEXITED(status) &&
+                  HAKU64_WEXITSTATUS(status) == 0,
+              "the resumed reader returns EINTR and exits cleanly");
+    }
+
+    /* A session leader that exits hangs up the console's foreground group.
+     * The watcher catches SIGHUP and reports it through its exit status; the
+     * leader waits for the parent's byte and then exits as a session
+     * leader. */
+    {
+        int ready[2] = { -1, -1 }, go[2] = { -1, -1 };
+
+        if (pipe(ready) != 0 || pipe(go) != 0) {
+            check(0, "pipes for the hangup test");
+            return;
+        }
+        child = fork();
+        check(child >= 0, "fork the SIGHUP watcher");
+        if (child == 0) {
+            haku64_sigaction_t action;
+            haku64_timespec_t nap;
+
+            close(ready[0]);
+            close(go[0]);
+            close(go[1]);
+            memset(&action, 0, sizeof(action));
+            action.handler = (unsigned long long)hangup_handler;
+            if (sigaction(HAKU64_SIGHUP, &action, NULL) != 0) _exit(11);
+            if (setpgid(0, 0) != 0) _exit(12);
+            if (write(ready[1], "r", 1) != 1) _exit(13);
+            nap.tv_sec = 2;
+            nap.tv_nsec = 0;
+            (void)nanosleep(&nap, NULL);   /* SIGHUP ends this with EINTR */
+            _exit(9);                      /* no hangup arrived */
+        }
+        close(ready[1]);
+        if (child > 0) {
+            char byte;
+            int watcher = child, leader, group;
+
+            check(read(ready[0], &byte, 1) == 1, "the watcher is ready");
+            close(ready[0]);
+            group = getpgid(watcher);
+            check(group > 0 && ioctl(1, HAKU64_TIOCSPGRP, &group) == 0,
+                  "the watcher's group becomes the foreground");
+
+            leader = fork();
+            check(leader >= 0, "fork the session leader");
+            if (leader == 0) {
+                close(go[1]);
+                if (setsid() < 0) _exit(11);
+                if (read(go[0], &byte, 1) != 1) _exit(12);
+                _exit(0);                  /* the exit hangs the group up */
+            }
+            if (leader > 0)
+                check(write(go[1], "x", 1) == 1, "release the session leader");
+            if (leader > 0) {
+                check(waitpid(leader, &status, 0) == leader &&
+                          HAKU64_WIFEXITED(status) &&
+                          HAKU64_WEXITSTATUS(status) == 0,
+                      "the session leader exits");
+                check(waitpid(watcher, &status, 0) == watcher &&
+                          HAKU64_WIFEXITED(status) &&
+                          HAKU64_WEXITSTATUS(status) == 42,
+                      "SIGHUP reached the foreground group");
+            }
+        }
+        close(go[0]);
+        close(go[1]);
+    }
+
+    /* Leave the console as this process found it. */
+    (void)ioctl(1, HAKU64_TIOCSPGRP, &pgrp);
+
+    if (failures == before)
+        printf("HAKU64-USER-TTY-SIGNAL-OK: SIGTTIN stops a background read"
+               " and SIGHUP hangs up the foreground group\n");
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -1347,6 +1489,7 @@ int main(int argc, char **argv, char **envp) {
     test_signals();
     test_stop_continue();
     test_console_tty();
+    test_tty_signals();
     test_mappings_and_time();
     test_pipes();
     test_pipe_sigpipe();

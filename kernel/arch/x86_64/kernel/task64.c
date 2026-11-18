@@ -605,6 +605,57 @@ static regs64_t *switch_away(const char *halt_message) {
     return result;
 }
 
+/* ---------------------------------------------- console foreground group
+ *
+ * The console's foreground process group lives here rather than in the ioctl
+ * path because the exit path needs it too: a session leader that exits hangs
+ * up the terminal's foreground group. Haku has one console, so one stored id
+ * is the whole state. Zero means "not set yet", and then every group counts
+ * as foreground, which is what a boot without a job-control shell needs.
+ */
+static u32 console_fg_pgrp;
+
+/* The group a terminal read is allowed from. A group whose last member is
+ * already DONE no longer counts, so a shell that exits does not leave a stale
+ * answer behind. */
+u32 sched64_console_fg(void) {
+    u32 fg = console_fg_pgrp;
+
+    return (fg && task64_pgrp_valid(fg)) ? fg : 0;
+}
+
+/* tcsetpgrp: the caller names a group with a live member. The two errors are
+ * the ioctl contract's: EINVAL for zero and EPERM for a group that does not
+ * exist. The check-then-store is not atomic across CPUs, which is harmless:
+ * a group that dies in between is caught by the next query. */
+int sched64_console_set_fg(u32 pgrp) {
+    if (!pgrp) return -22;                /* EINVAL */
+    if (!task64_pgrp_valid(pgrp)) return -1;  /* EPERM */
+    console_fg_pgrp = pgrp;
+    return 0;
+}
+
+/* A ring-3 task returns through a user CS; a kernel thread's frame carries
+ * the kernel selector. Both get a session id at creation, so the frame is how
+ * this port tells a user process from a kernel thread. */
+static int user_frame(const regs64_t *frame) {
+    return frame && (frame->cs & 3u) == 3u;
+}
+
+/* POSIX hangs up the terminal's foreground group when the session that owns
+ * it ends. This port has one console and no controlling-terminal
+ * association, so the rule is the simple one: a session leader that exits
+ * raises SIGHUP for the foreground group, whatever session it led. Called
+ * after sched_lock is dropped, because raising a signal takes it. */
+static void console_hangup(int leader) {
+    u32 fg;
+
+    if (!leader) return;
+    fg = sched64_console_fg();
+    if (!fg) return;
+    (void)sched64_signal_pgrp(fg, K64_SIGHUP);
+}
+
 /* ------------------------------------------------------------- task exit
  *
  * Three things have to happen atomically when a task stops: its state becomes
@@ -778,7 +829,7 @@ static void robust_release(const tid_word64_t *word) {
 regs64_t *sched64_exit(regs64_t *frame) {
     k64_percpu_t *cpu = this_cpu();
     tid_word64_t word;
-    int me;
+    int me, leader;
     u64 flags;
 
     if (!enabled || !cpu || (int)cpu->current < 0) return frame;
@@ -787,11 +838,13 @@ regs64_t *sched64_exit(regs64_t *frame) {
     flags = spin64_lock(&sched_lock);
     /* exit() passes the status in RDI; the frame is not saved because the
      * task never resumes, but the value is what a parent would read back. */
+    leader = user_frame(frame) && tasks[me].sid == (u32)me + 1u;
     word = finish_locked(me, 0, frame->rdi);
     spin64_unlock(&sched_lock, flags);
 
     robust_release(&word);
     clear_tid_word(&word);
+    console_hangup(leader);
     return switch_away("HAKU64-TASK-HALT: no runnable task after exit\r\n");
 }
 
@@ -811,7 +864,7 @@ static regs64_t *end_group(regs64_t *frame, u32 signal, u64 status,
     tid_word64_t words[K64_TASK_MAX];
     tid_word64_t own;
     u32 tgid, cpus_mask = 0;
-    int count = 0, me;
+    int count = 0, me, leader = 0;
     u64 flags;
 
     if (!enabled || !cpu || (int)cpu->current < 0) return frame;
@@ -826,10 +879,12 @@ static regs64_t *end_group(regs64_t *frame, u32 signal, u64 status,
         if (tasks[i].state == K64_TASK_DONE) continue;
         words[count] = finish_locked(i, signal, status);
         count++;
+        if (tasks[i].sid == (u32)i + 1u) leader = 1;
         if (tasks[i].cpu != cpu->index && tasks[i].cpu < K64_SMP_MAX_CPUS)
             cpus_mask |= 1u << tasks[i].cpu;
     }
     own = finish_locked(me, signal, frame->rdi);
+    if (tasks[me].sid == (u32)me + 1u) leader = 1;
     spin64_unlock(&sched_lock, flags);
 
     /* The peers' words are cleared first: each belongs to a thread that is
@@ -848,6 +903,7 @@ static regs64_t *end_group(regs64_t *frame, u32 signal, u64 status,
     for (u32 c = 0; c < K64_SMP_MAX_CPUS; c++)
         if (cpus_mask & (1u << c)) smp64_resched_cpu(c);
 
+    console_hangup(leader && user_frame(frame));
     return switch_away(halt_message);
 }
 
@@ -995,9 +1051,10 @@ int sched64_pgrp_exists(u32 pgid) {
 }
 
 /* setpgid(2): move the thread group `id` belongs to into `pgid`. A group must
- * exist and must belong to the caller's session, and a session leader cannot
- * change group (it would leave its own session without a leader). Called with
- * no lock: it takes the table lock itself because it rewrites several tasks.
+ * exist and must belong to the caller's session, except the process's own id,
+ * which creates a new group. A session leader cannot change group (it would
+ * leave its own session without a leader). Called with no lock: it takes the
+ * table lock itself because it rewrites several tasks.
  */
 int sched64_set_pgrp(int id, u32 pgid) {
     int tgid;
@@ -1012,8 +1069,11 @@ int sched64_set_pgrp(int id, u32 pgid) {
 
     flags = spin64_lock(&sched_lock);
     /* A session leader owns the group it leads; moving it would leave the
-     * session without one, so Linux refuses with EPERM. */
-    if (tasks[tgid].pgrp == tasks[tgid].sid) {
+     * session without one, so Linux refuses with EPERM. The test is against
+     * the leader's own id, not "group equals session": every process in a
+     * fresh session starts in the leader's group, and a child must be able
+     * to split off its own job group. */
+    if ((u32)tgid + 1u == tasks[tgid].sid) {
         spin64_unlock(&sched_lock, flags);
         return -1;
     }
@@ -1026,6 +1086,10 @@ int sched64_set_pgrp(int id, u32 pgid) {
         }
         found = 1;
     }
+    /* Naming the caller's own id creates a group that has no member yet:
+     * that is exactly what setpgid(0, 0) does, and it is how a shell gives a
+     * job its own group. */
+    if (!found && pgid == (u32)tgid + 1u) found = 1;
     if (!found) {
         spin64_unlock(&sched_lock, flags);
         return -3;                       /* ESRCH */

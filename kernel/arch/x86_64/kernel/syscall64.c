@@ -766,14 +766,11 @@ static u64 sys64_fcntl(int id, u64 fd, u64 command, u64 argument) {
     }
 }
 
-/* The console's foreground process group. Zero means "not set yet", and a
- * query then reports the caller's own group, which is what a shell checks at
- * start-up. Haku has one console, so one variable is the whole story. */
-static u32 console_fg_pgrp;
-
 /* ioctl(2): the console answers the termios and window-size requests a
  * program probes for. A 36-byte kernel termios is what the x86-64 ABI
- * passes to the driver; glibc translates it into its own layout. */
+ * passes to the driver; glibc translates it into its own layout. The
+ * foreground process group itself lives beside the process-group table, in
+ * task64.c, because the exit path hangs it up too. */
 static u64 sys64_ioctl(int id, u64 fd, u64 request, u64 argument) {
     u8 termios[36];
     u16 winsize[4];
@@ -831,12 +828,11 @@ static u64 sys64_ioctl(int id, u64 fd, u64 request, u64 argument) {
     }
 
     case 0x540Fu: {                       /* TIOCGPGRP */
-        u32 fg = console_fg_pgrp;
+        u32 fg = sched64_console_fg();
 
-        /* The stored group is only meaningful while it is alive: a shell that
-         * exits without cleaning up must not leave a stale answer that the
-         * next process reads as "I am in the background". */
-        if (!fg || !task64_pgrp_valid(fg)) fg = sched64_pgrp(sched64_current());
+        /* A console with no foreground group yet reports the caller's own,
+         * which is what a shell checks at start-up. */
+        if (!fg) fg = sched64_pgrp(sched64_current());
         if (!copy_to_user64(current_space(), argument, &fg, 4))
             return (u64)0 - SYS64_EFAULT;
         return 0;
@@ -846,12 +842,8 @@ static u64 sys64_ioctl(int id, u64 fd, u64 request, u64 argument) {
 
         if (!copy_from_user64(current_space(), &pgrp, argument, 4))
             return (u64)0 - SYS64_EFAULT;
-        /* A job-control shell names a group it created; a group with no live
-         * member would make every later tcgetpgrp lie, so it is refused. */
-        if (pgrp <= 0) return (u64)0 - SYS64_EINVAL;
-        if (!task64_pgrp_valid((u32)pgrp)) return (u64)0 - SYS64_EPERM;
-        console_fg_pgrp = (u32)pgrp;
-        return 0;
+        /* EINVAL for zero, EPERM for a group with no live member. */
+        return (u64)sched64_console_set_fg((u32)pgrp);
     }
     case 0x5409u:                         /* TCSBRK */
     case 0x540Bu:                         /* TCFLSH */
@@ -1315,18 +1307,41 @@ static int console_data_ready(void) {
 
 /* read(0, buf, n) on the console. There is no line discipline: the queue
  * hands out decoded characters as they are typed, and the bytes are echoed so
- * typing is visible on the framebuffer console. An empty queue parks the task
- * with -EAGAIN; IRQ1 wakes it and the caller retries, which is the same
- * contract the 32-bit console uses for its blocking read. */
+ * typing is visible on the framebuffer console. A process group that is not
+ * the console's foreground group gets SIGTTIN instead of a read, which is the
+ * read half of job control; POSIX's rule that a blocked or ignored SIGTTIN
+ * turns the stop into a plain EIO failure is kept. An empty
+ * queue parks the task with -EAGAIN; IRQ1 wakes it and the caller retries,
+ * which is the same contract the 32-bit console uses for its blocking read. */
 static regs64_t *sys64_console_read(regs64_t *frame) {
     u8 chunk[64];
     u64 count = frame->rdx, done = 0;
+    int id = sched64_current();
 
     if (count == 0) {
         frame->rax = 0;
         return frame;
     }
     if (count > sizeof(chunk)) count = sizeof(chunk);
+
+    {
+        u32 pgrp = sched64_pgrp(id), fg = sched64_console_fg();
+        k64_sigstate_t *state = task64_signals(id);
+
+        if (fg && pgrp && fg != pgrp) {
+            /* A stop signal that cannot act must not be queued either: the
+             * caller keeps running, and the read is what fails. */
+            if (state && ((state->blocked & K64_SIG_BIT(K64_SIGTTIN)) ||
+                          state->actions[K64_SIGTTIN - 1u].handler ==
+                              K64_SIG_IGN)) {
+                frame->rax = (u64)0 - SYS64_EIO;
+                return frame;
+            }
+            (void)sched64_signal_pgrp(pgrp, K64_SIGTTIN);
+            frame->rax = (u64)0 - SYS64_EINTR;
+            return frame;
+        }
+    }
 
     while (done < count) {
         int ch = kbd64_read();

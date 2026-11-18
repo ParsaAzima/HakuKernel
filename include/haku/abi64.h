@@ -378,12 +378,14 @@ typedef struct {
 #define HAKU64_FIONREAD   0x541B
 #define HAKU64_TIOCNOTTY  0x5422
 
-/* termios flag bits the console reports. */
+/* termios flag bits the console reports. TOSTOP is deliberately absent: a
+ * background write is never stopped, so SIGTTOU cannot arise here. */
 #define HAKU64_ISIG   0x0001
 #define HAKU64_ICANON 0x0002
 #define HAKU64_ECHO   0x0008
 #define HAKU64_ECHOE  0x0010
 #define HAKU64_ECHOK  0x0020
+#define HAKU64_TOSTOP 0x0100
 
 #define HAKU64_S_IFMT  0xF000
 #define HAKU64_S_IFREG 0x8000

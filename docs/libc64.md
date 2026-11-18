@@ -271,12 +271,16 @@ one thread (the leader, or the first live thread when the leader is gone), and
 `waitpid`, `nanosleep` or `poll` with `errno = EINTR`. `raise(SIGSTOP)` parks
 the calling task and `kill(pid, SIGCONT)` resumes it; `waitpid` reports the
 stop with `WUNTRACED` and the resume with `WCONTINUED`, reaping only on exit.
-There is no `sigqueue`,
+The terminal raises two signals itself: a console read from a background
+process group stops that group with `SIGTTIN` (and the read fails with `EINTR`
+after the resume, or with `EIO` if `SIGTTIN` is blocked or ignored), and a
+session leader's exit sends `SIGHUP` to the console's foreground group. There
+is no `sigqueue`,
 no real-time range, no hardware-fault delivery (a ring-3 fault still ends the
 group instead of entering a `SIGSEGV` handler), no `SA_RESTART` restart of the
-interrupted call, and no terminal-generated `SIGHUP`/`SIGTTIN`/`SIGTTOU`; the
-console's foreground group is only bookkeeping that `tcsetpgrp`/`tcgetpgrp`
-read and write.
+interrupted call, and no `SIGTTOU` because the console never sets `TOSTOP`.
+The foreground group itself is real state: a group with no live member is
+refused by `tcsetpgrp` and never reported by `tcgetpgrp`.
 
 ## Console ioctls
 
@@ -286,7 +290,9 @@ mode (`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`), `TCSETS`,
 `TCSETSW`, `TCSETSF`, `TCSBRK` and `TCFLSH` succeed without changing it,
 `TIOCGWINSZ` reports 80x25, and `TIOCGPGRP`/`TIOCSPGRP` read and write the
 console's foreground process group (one console, so one stored group; the
-session is not checked). A group with no live member
+session is not checked). The same stored group is what decides whether a
+console read is a foreground one, and what a session leader's exit hangs up.
+A group with no live member
 is refused with `EPERM`, and a descriptor whose description is not the console
 — including `/dev/null` and a pipe — fails with `ENOTTY`. A program that only
 wants to know whether it is on a terminal can therefore rely on that error.
@@ -332,6 +338,7 @@ regression says what broke instead of only changing an exit status:
 | `HAKU64-USER-SIGNAL-OK` | a handler ran with the right signal number and its own signal blocked, the mask was restored, a blocked signal stayed pending until `SIG_UNBLOCK`, `SIG_IGN` dropped one, `SA_ONSTACK` put the frame on the alternate stack, and a signal ended `nanosleep` with `EINTR` and the remaining time |
 | `HAKU64-USER-STOP-OK` | a child stopped itself with `SIGSTOP`, `wait4(WUNTRACED)` reported `(SIGSTOP << 8) | 0x7F` without reaping it, `kill(pid, 0)` still found it, `SIGCONT` resumed it, `wait4(WCONTINUED)` reported `0xFFFF` once, and the child then exited cleanly |
 | `HAKU64-USER-TTY-OK` | `TCGETS` reported canonical mode, `TIOCGWINSZ` 80x25, `TIOCGPGRP`/`TIOCSPGRP` round-tripped the caller's group, an unknown group was refused with `EPERM`, and `TCGETS` on `/dev/null` failed with `ENOTTY` |
+| `HAKU64-USER-TTY-SIGNAL-OK` | a background read with `SIGTTIN` blocked failed with `EIO`, the same read with the default disposition stopped on `SIGTTIN` and returned `EINTR` after `SIGCONT`, and a session leader's exit sent `SIGHUP` to the console's foreground group |
 | `HAKU64-USER-ERRNO-THREAD-OK` | a thread's `errno` write did not reach its creator's |
 | `HAKU64-USER-THREAD-EXEC-IMAGE-OK` | the image a thread `execve`d is running (printed by the new image) |
 | `HAKU64-USER-THREAD-EXEC-OK` | the exec ended the group leader, which was reaped, and the thread's image exited with 42 |

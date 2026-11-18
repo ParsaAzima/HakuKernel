@@ -272,6 +272,7 @@
 %define HAKU64_ECHO   0x0008
 %define HAKU64_ECHOE  0x0010
 %define HAKU64_ECHOK  0x0020
+%define HAKU64_TOSTOP 0x0100
 
 ; File type and directory-entry types as the kernel reports them.
 %define HAKU64_S_IFMT  0xF000

@@ -335,9 +335,13 @@ foreground process group after checking that the group is alive, and
 `TIOCGPGRP` reports it (falling back to the caller's group when the stored
 group has exited); `TIOCNOTTY` is accepted. The group and session calls are
 real: `getpgrp`/`getpgid` report the recorded group, `setpgid` moves the
-caller or a child, and `setsid`/`getsid` track the session, which is what an
+caller or a child and can create a new group led by that process, and
+`setsid`/`getsid` track the session, which is what an
 interactive `ash` needs to turn job control on and run a foreground pipeline
-instead of dying with "can't set tty process group". `poll` reports readiness per descriptor (a
+instead of dying with "can't set tty process group". A terminal also acts on
+its own: a background read is stopped with `SIGTTIN`, and a session leader's
+exit sends `SIGHUP` to the foreground group (see the signal section). `poll`
+reports readiness per descriptor (a
 pipe with data is `POLLIN`, a closed write end adds `POLLHUP`, a closed read
 end makes the write side `POLLERR`), and it blocks: a zero timeout scans once,
 a negative one waits indefinitely, and a positive one is a millisecond
@@ -473,13 +477,28 @@ task, like the dispositions: a stopped thread's siblings keep running, so a
 job-control shell should signal a single-threaded job. `HAKU64-USER-STOP-OK`
 covers a child that stops itself, the `WUNTRACED` status, `kill(pid, 0)` on the
 parked child, `SIGCONT`, the `WCONTINUED` status and its one-shot nature.
+
+Two of those signals also come from the terminal. A console read from a
+process group that is not the console's foreground group raises `SIGTTIN` for
+that group and fails with `-EINTR`; the default action then parks the group,
+so a background reader is stopped until `SIGCONT`. If `SIGTTIN` is blocked or
+ignored it cannot stop anything, and the read is the call that fails, with
+`-EIO`, while the task keeps running. A background write is never stopped
+because the reported `termios` does not set `TOSTOP`, so `SIGTTOU` cannot
+arise. When a ring-3 session leader exits, the console's foreground group is
+hung up with `SIGHUP`; Haku has one console and does not tie sessions to it,
+so that is the rule for every session leader, not only the one that owns the
+terminal.
+
 `ioctl` (16) answers the console: `TCGETS`, `TCSETS`/`TCSETSW`/`TCSETSF`,
 `TCSBRK`/`TCFLSH`, `TIOCGWINSZ`, `FIONREAD`, `TIOCNOTTY`, and
 `TIOCGPGRP`/`TIOCSPGRP` against a foreground process group that must still
 have a live member; anything else, or any descriptor that is not the console,
 is `-ENOTTY`. `HAKU64-USER-TTY-OK` checks the reported mode and window size,
 the group round-trip, the refusal of an unknown group, and `ENOTTY` on
-`/dev/null`.
+`/dev/null`. `HAKU64-USER-TTY-SIGNAL-OK` covers the background read (both the
+`EIO` failure with `SIGTTIN` blocked and the stop/resume with it defaulted)
+and the `SIGHUP` a session leader's exit sends to the foreground group.
 
 `futex` (202) implements `FUTEX_WAIT` and `FUTEX_WAKE`, and accepts
 `FUTEX_PRIVATE_FLAG` because the op is the low seven bits. `WAIT` compares the

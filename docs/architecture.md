@@ -77,7 +77,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
 | threads | `clone(CLONE_VM)` shares one space and, with `CLONE_FILES`, one descriptor table; a futex hands the flag over | `HAKU64-THREAD-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, pipes, process, time, limits, `poll`/`select`, and signal dispositions with a handler frame | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK`, `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK`, `HAKU64-USER-SIGNAL-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, pipes, process, time, limits, `poll`/`select`, and signal dispositions with a handler frame | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK`, `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK`, `HAKU64-USER-SIGNAL-OK`, `HAKU64-USER-STOP-OK`, `HAKU64-USER-TTY-OK`, `HAKU64-USER-TTY-SIGNAL-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | modules | `X64MOD.HKM` and `ROMFS.HKM` are read from the disk, relocated and run; duplicate, truncated and bad-magic images refused; the second registers a read-only filesystem mounted at `/rom` and cannot unload while it has open files | `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK`, `HAKU64-MODULE-FS-OK`, `HAKU64-MODULE-FS-RELEASE-OK`, `HAKU64-USER-MODULE-OK` |
@@ -359,6 +359,27 @@ than Linux's queue of `SIGCHLD` reasons. Like the dispositions, the stop is
 per task, not per thread group: this port has no shared signal state, so a
 multi-threaded process parked by `SIGSTOP` stops the thread that received it
 and its siblings keep running.
+
+The terminal supplies two of those signals itself. Its foreground process
+group is one stored id, kept beside the process-group table rather than in the
+ioctl path because two unrelated callers need it: `TIOCSPGRP` writes it (and
+refuses a group with no live member, so a dead shell cannot leave a stale
+answer), and a console read compares the caller's group with it. A read from
+any other group queues `SIGTTIN` for that group and returns `-EINTR`, so the
+default action parks the reader until `SIGCONT`; a group that blocked or
+ignored `SIGTTIN` cannot be stopped, and then the read itself fails with
+`-EIO` while the task keeps running. A zero foreground group means "not set"
+and makes every group foreground, which is what a boot without a
+job-control shell needs. Writes are never stopped: the reported `termios`
+does not set `TOSTOP`, so `SIGTTOU` has no trigger on this port. The second
+caller is `sched64_exit`/`end_group`: when the task that ends is a ring-3
+session leader, they raise `SIGHUP` for the foreground group after the exit
+transaction and its user-word writes are done, because raising a signal takes
+the scheduler lock. The frame's `CS` tells a user process from a kernel
+thread, since both carry a session id. There is one console and no
+controlling-terminal association, so every session leader's exit hangs the
+console up, not only the session that owns it — the honest simplification
+this port can support.
 
 `execve` reads the whole file into a heap buffer (32 pages is the cache limit),
 runs `elf64_load`, and `task64_exec` releases the caller's old space — aliased
