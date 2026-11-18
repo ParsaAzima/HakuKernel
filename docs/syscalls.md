@@ -327,6 +327,7 @@ not take effect yet because `execve` does not close descriptors on this port.
 `ioctl` on the console answers `TCGETS` with the terminal's fixed mode
 (`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`, erase `0x7F`,
 EOF `^D`), accepts `TCSETS`/`TCSETSW`/`TCSETSF` without changing that mode,
+accepts `TCSBRK`/`TCFLSH`,
 reports an 80x25 window for `TIOCGWINSZ`, and returns `ENOTTY` for a
 descriptor that is not the console. A terminal opened by path (`/dev/tty`,
 `/dev/console`) answers the same requests. `TIOCSPGRP` records the
@@ -458,6 +459,27 @@ console byte is delivered before the `EINTR`. Hardware faults are not turned
 into signals, so a protection fault still ends the group. `HAKU64-USER-SIGNAL-OK`
 covers the handler, the mask, `SIG_IGN`, the alternate stack and the `EINTR`
 wake-up at ring 3.
+
+`SIGSTOP`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU` default to parking the task in a
+`K64_TASK_STOP` state instead of ending it. The stopped frame is the one that
+was returning to ring 3, so `SIGCONT` continues the interrupted call; `SIGKILL`
+also wakes a stopped task (to die), and any other signal stays pending until
+the process is continued, which is the POSIX rule. `wait4` reports a stop as
+`(signal << 8) | 0x7F` when the caller passed `WUNTRACED`, and a resume as
+`0xFFFF` when it passed `WCONTINUED`; neither reaps the child, and each event
+is reported once. A continue clears a stop event the parent never read, which
+is the simple version of Linux's `SIGCHLD` reason queue. The stop state is per
+task, like the dispositions: a stopped thread's siblings keep running, so a
+job-control shell should signal a single-threaded job. `HAKU64-USER-STOP-OK`
+covers a child that stops itself, the `WUNTRACED` status, `kill(pid, 0)` on the
+parked child, `SIGCONT`, the `WCONTINUED` status and its one-shot nature.
+`ioctl` (16) answers the console: `TCGETS`, `TCSETS`/`TCSETSW`/`TCSETSF`,
+`TCSBRK`/`TCFLSH`, `TIOCGWINSZ`, `FIONREAD`, `TIOCNOTTY`, and
+`TIOCGPGRP`/`TIOCSPGRP` against a foreground process group that must still
+have a live member; anything else, or any descriptor that is not the console,
+is `-ENOTTY`. `HAKU64-USER-TTY-OK` checks the reported mode and window size,
+the group round-trip, the refusal of an unknown group, and `ENOTTY` on
+`/dev/null`.
 
 `futex` (202) implements `FUTEX_WAIT` and `FUTEX_WAKE`, and accepts
 `FUTEX_PRIVATE_FLAG` because the op is the low seven bits. `WAIT` compares the

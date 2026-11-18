@@ -1201,6 +1201,115 @@ static void test_signals(void) {
         printf("HAKU64-USER-SIGNAL-OK: handler, mask, SIG_IGN, altstack and EINTR\n");
 }
 
+/* A stopped child is reported by wait4(WUNTRACED) without being reaped, and
+ * SIGCONT makes it runnable again and reports a continue to a parent that
+ * asked for one. The child waits on a pipe after the resume, so the continue
+ * event cannot race its exit. */
+static void test_stop_continue(void) {
+    int before = failures;
+    int command[2] = { -1, -1 };
+    int status = 0;
+    int child;
+
+    errno = 0;
+    check(waitpid(-1, &status, 0x40) == -1 && errno == HAKU64_EINVAL,
+          "waitpid rejects an unknown option");
+
+    check(pipe(command) == 0, "pipe for the stop child");
+    if (command[0] < 0) return;
+
+    child = fork();
+    check(child >= 0, "fork for the stop child");
+    if (child == 0) {
+        char byte;
+
+        close(command[1]);
+        /* The default action of SIGSTOP parks this task: nothing below runs
+         * until the parent sends SIGCONT. */
+        (void)raise(HAKU64_SIGSTOP);
+        /* The parent's byte is the proof that the resume happened. */
+        if (read(command[0], &byte, 1) != 1) _exit(3);
+        _exit(0);
+    }
+    close(command[0]);
+    if (child > 0) {
+        check(waitpid(child, &status, HAKU64_WUNTRACED) == child,
+              "wait4(WUNTRACED) reports the stop");
+        check(HAKU64_WIFSTOPPED(status), "the status is a stop");
+        check(HAKU64_WSTOPSIG(status) == HAKU64_SIGSTOP,
+              "the stop signal is SIGSTOP");
+        check(kill(child, 0) == 0, "a stopped child still exists");
+        check(waitpid(child, &status, HAKU64_WNOHANG) == 0,
+              "a stopped child is not an exit");
+        check(kill(child, HAKU64_SIGCONT) == 0, "SIGCONT resumes the child");
+        check(waitpid(child, &status, HAKU64_WCONTINUED) == child,
+              "wait4(WCONTINUED) reports the resume");
+        check(HAKU64_WIFCONTINUED(status), "the status is a continue");
+        check(waitpid(child, &status, HAKU64_WNOHANG | HAKU64_WCONTINUED) == 0,
+              "a continue is reported once");
+        check(write(command[1], "x", 1) == 1, "release the stopped child");
+        close(command[1]);
+        check(waitpid(child, &status, 0) == child,
+              "wait for the resumed child");
+        check(HAKU64_WIFEXITED(status) && HAKU64_WEXITSTATUS(status) == 0,
+              "the resumed child exited cleanly");
+    } else {
+        close(command[1]);
+    }
+
+    if (failures == before)
+        printf("HAKU64-USER-STOP-OK: SIGSTOP parks, wait4 reports it and"
+               " SIGCONT resumes\n");
+}
+
+/* The console's terminal surface: fixed termios and window size, an ioctl
+ * that is refused everywhere else, and the foreground process group a
+ * job-control shell round-trips through tcsetpgrp/tcgetpgrp. */
+static void test_console_tty(void) {
+    int before = failures;
+    int pgrp = 0, named = 0, fd;
+    haku64_termios_t termios;
+    haku64_winsize_t winsize;
+
+    check(ioctl(1, HAKU64_TCGETS, &termios) == 0, "TCGETS on the console");
+    check((termios.c_lflag & (HAKU64_ISIG | HAKU64_ICANON | HAKU64_ECHO)) ==
+              (unsigned)(HAKU64_ISIG | HAKU64_ICANON | HAKU64_ECHO),
+          "the console reports ISIG, ICANON and ECHO");
+    check(termios.c_cc[2] == 0x7F, "VERASE is the console's");
+    check(ioctl(1, HAKU64_TIOCGWINSZ, &winsize) == 0, "TIOCGWINSZ");
+    check(winsize.ws_row == 25 && winsize.ws_col == 80, "the console size");
+
+    check(ioctl(1, HAKU64_TIOCGPGRP, &pgrp) == 0 && pgrp == getpgrp(),
+          "TIOCGPGRP reports the caller's group");
+    named = getpgrp();
+    check(ioctl(1, HAKU64_TIOCSPGRP, &named) == 0, "TIOCSPGRP sets the group");
+    pgrp = 0;
+    check(ioctl(1, HAKU64_TIOCGPGRP, &pgrp) == 0 && pgrp == getpgrp(),
+          "the foreground group round-trips");
+    named = 0x7FFF;
+    errno = 0;
+    check(ioctl(1, HAKU64_TIOCSPGRP, &named) == -1 && errno == HAKU64_EPERM,
+          "TIOCSPGRP refuses a group that does not exist");
+    named = 0;
+    errno = 0;
+    check(ioctl(1, HAKU64_TIOCSPGRP, &named) == -1 && errno == HAKU64_EINVAL,
+          "TIOCSPGRP refuses group 0");
+
+    fd = open("/dev/null", HAKU64_O_RDWR);
+    check(fd >= 0, "open /dev/null for the ENOTTY check");
+    if (fd >= 0) {
+        errno = 0;
+        check(ioctl(fd, HAKU64_TCGETS, &termios) == -1 &&
+                  errno == HAKU64_ENOTTY,
+              "ioctl on a non-console fails with ENOTTY");
+        close(fd);
+    }
+
+    if (failures == before)
+        printf("HAKU64-USER-TTY-OK: console termios, window size and"
+               " foreground group\n");
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)envp;
 
@@ -1236,6 +1345,8 @@ int main(int argc, char **argv, char **envp) {
     test_thread_exec();
     test_processes();
     test_signals();
+    test_stop_continue();
+    test_console_tty();
     test_mappings_and_time();
     test_pipes();
     test_pipe_sigpipe();

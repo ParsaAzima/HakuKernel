@@ -427,9 +427,18 @@ typedef signed long long s64;
 #define K64_AT_FDCWD (-100)
 #define K64_PATH_MAX  K64_FS_PATH_MAX
 
-/* wait4() options and the status encoding. */
-#define K64_WNOHANG 1u
+/* wait4() options and the status encoding. A stopped child reports
+ * (signal << 8) | 0x7F, which is the wait-status "stopped" pattern a libc
+ * tests with WIFSTOPPED, and a resumed one reports 0xFFFF, its WIFCONTINUED
+ * pattern. The low byte of an exit status is 0 and of a signal death is the
+ * signal, so the three cannot be confused. */
+#define K64_WNOHANG    1u
+#define K64_WUNTRACED  2u
+#define K64_WCONTINUED 8u
 #define K64_WSTATUS_CODE(status) (((status) >> 8) & 0xFFu)
+#define K64_WSTATUS_STOP(status) (((status) & 0xFFu) == 0x7Fu)
+#define K64_WSTATUS_CONTINUED(status) ((status) == 0xFFFFull)
+#define K64_WSTATUS_STOPPED(sig) ((((u64)(sig)) << 8) | 0x7Full)
 
 /* Signals, Linux numbering, 1..31. Real-time signals are not implemented and
  * are rejected with -EINVAL, so the pending and blocked masks fit one u32. */
@@ -971,6 +980,12 @@ enum {
     /* Blocked in futex(FUTEX_WAIT). The saved frame is the syscall frame
      * with RAX=0, so a wake resumes the task as if the call had returned. */
     K64_TASK_WAIT,
+    /* Parked by a stop signal (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU). The
+     * saved frame is the return-to-ring-3 frame the signal interrupted, so
+     * SIGCONT resumes the task exactly where it left off. A stopped task is
+     * not runnable and not reapable: only SIGCONT, SIGKILL or exit_group
+     * moves it again. */
+    K64_TASK_STOP,
     K64_TASK_DONE
 };
 
@@ -993,6 +1008,11 @@ regs64_t *sched64_exit_group(regs64_t *frame);
 /* kill() of the caller's own thread group: a fatal signal ends every peer,
  * then the caller, and never resumes its frame. */
 regs64_t *sched64_signal_group(regs64_t *frame, u32 signal);
+/* The default action of a stop signal: save `frame`, mark the caller
+ * K64_TASK_STOP with `signal`, and switch away. SIGCONT resumes it through
+ * that same frame. A SIGCONT or SIGKILL that is already pending wins, and
+ * the frame is returned so the signal is delivered on the next entry. */
+regs64_t *sched64_stop(regs64_t *frame, u32 signal);
 /* The signal state of `id`, or 0 when the slot is unused. syscall64.c owns
  * the copy-in/copy-out and frame building; task64.c owns the table. */
 k64_sigstate_t *task64_signals(int id);
@@ -1111,7 +1131,12 @@ regs64_t *sched64_park_until(regs64_t *frame, u64 address, u64 result,
                              int (*ready)(void), int *parked);
 /* reap a DONE child of `parent`; returns the child id or a negative errno */
 int task64_exec(int id, u64 space);
-int task64_reap(int parent, int pid, u64 *status);
+/* Reap or report one child of `parent`. `options` is a mask of K64_WNOHANG,
+ * K64_WUNTRACED and K64_WCONTINUED. A stop is reported once under WUNTRACED
+ * and leaves the child in place; a resume is reported once under WCONTINUED.
+ * Returns the child's pid, -ECHILD when there is no such child, or -EAGAIN
+ * when a matching child exists but has nothing to report. */
+int task64_reap(int parent, int pid, u32 options, u64 *status);
 /* terminate a task as if by a signal; returns 0 or a negative errno */
 int task64_signal(int id, u32 signal);
 /* kill(2): end the whole thread group `id` leads. A process with threads
@@ -1120,6 +1145,10 @@ int task64_signal(int id, u32 signal);
  * signal-0 existence answer. */
 int task64_signal_group(int id, u32 signal);
 int task64_parent(int id);
+/* 1 when `pgrp` names a process group that still has a live member. The
+ * console's foreground group is checked with this so a shell that exits
+ * without cleaning up cannot leave a stale answer behind. */
+int task64_pgrp_valid(u32 pgrp);
 
 /* fs64.c: a page cache in front of every mounted filesystem. A cached file
  * is at most FS64_PAGE_MAX pages (128 KiB) and eight paths are cached at

@@ -72,6 +72,14 @@ int poll(haku64_pollfd_t *fds, unsigned int count, int timeout) {
                         timeout));
 }
 
+/* ioctl(2): only the console answers. The request is the Linux number, which
+ * is what the kernel's table is keyed on. */
+int ioctl(int fd, unsigned long long request, void *argument) {
+    return (int)haku64_errno_check(
+        haku64_syscall3(HAKU64_SYS_IOCTL, fd, (long long)request,
+                        (long long)argument));
+}
+
 int unlink(const char *path) {
     return (int)haku64_errno_check(
         haku64_syscall1(HAKU64_SYS_UNLINK, (long long)path));

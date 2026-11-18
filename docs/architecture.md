@@ -320,7 +320,10 @@ console descriptor that was never duplicated is a no-op; there is no
 `O_CLOEXEC` and no `dup3`. `wait4` blocks until a child is `DONE`, writes
 `(status & 0xFF) << 8` or the terminating signal, and reaps it; a task's
 space, frames and kernel stack are released only at that point, which is also
-what lets the boot test inspect a task after it stopped. A task carries one
+what lets the boot test inspect a task after it stopped. `WUNTRACED` and
+`WCONTINUED` ask for the other two state changes a shell cares about and
+report them without reaping: a stop as `(signal << 8) | 0x7F` and a resume as
+`0xFFFF`, each once. A task carries one
 disposition per signal, a blocked mask and the pending bits, and those live in
 the task slot, so two threads of one process do not share them the way Linux's
 `CLONE_SIGHAND` would. A signal is queued and acted on at the last moment
@@ -340,6 +343,22 @@ does not belong together. `SIGCHLD` is accepted and ignored but never raised by
 the kernel. A ring-3 fault is still fatal: it ends the whole group, because a
 sibling must not keep running in a space its peer just faulted in, and there is
 no hardware-fault signal model.
+
+A stop signal's default action is the fourth task state, `K64_TASK_STOP`.
+`SIGSTOP`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU` park the task with the frame
+that was about to return to ring 3, so a resume continues the interrupted
+syscall's return rather than restarting it; `SIGCONT` and `SIGKILL` are the
+only signals that take it out of that state (`SIGCONT` through
+`task64_raise`, `SIGKILL` so it can die), and every other signal stays
+pending until then. The round-robin scan only picks `READY`, so a stopped task
+costs nothing while it waits. Both events are recorded on the task for
+`wait4`: a stop sets `stop_reported` and a continue sets `continued`, and each
+is cleared when a waiting parent reads it; a continue that follows an
+unreported stop supersedes it, which is the one place this port is simpler
+than Linux's queue of `SIGCHLD` reasons. Like the dispositions, the stop is
+per task, not per thread group: this port has no shared signal state, so a
+multi-threaded process parked by `SIGSTOP` stops the thread that received it
+and its siblings keep running.
 
 `execve` reads the whole file into a heap buffer (32 pages is the cache limit),
 runs `elf64_load`, and `task64_exec` releases the caller's old space — aliased

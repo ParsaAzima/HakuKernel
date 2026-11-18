@@ -208,6 +208,7 @@ typedef long long time_t;
 #define HAKU64_EINVAL  22
 #define HAKU64_ENFILE  23
 #define HAKU64_EMFILE  24
+#define HAKU64_ENOTTY  25
 #define HAKU64_ENOSPC  28
 #define HAKU64_ESPIPE  29
 #define HAKU64_EROFS   30
@@ -331,6 +332,58 @@ typedef long long time_t;
 #define HAKU64_CLOCK_MONOTONIC 1
 
 #define HAKU64_WNOHANG 1
+
+/* wait4 options and the status encodings its results use. A stopped child
+ * reports (signal << 8) | 0x7F; a resumed one reports 0xFFFF. */
+#define HAKU64_WUNTRACED  2
+#define HAKU64_WCONTINUED 8
+#define HAKU64_WIFEXITED(status)    (((status) & 0x7F) == 0)
+#define HAKU64_WEXITSTATUS(status)  (((status) >> 8) & 0xFF)
+#define HAKU64_WIFSIGNALED(status)  (((status) & 0x7F) != 0 && \
+                                     ((status) & 0x7F) != 0x7F)
+#define HAKU64_WTERMSIG(status)     ((status) & 0x7F)
+#define HAKU64_WIFSTOPPED(status)   (((status) & 0xFF) == 0x7F)
+#define HAKU64_WSTOPSIG(status)     (((status) >> 8) & 0xFF)
+#define HAKU64_WIFCONTINUED(status) ((status) == 0xFFFF)
+
+/* The console's termios and winsize records: the Linux i386 layouts, which
+ * are also what the x86-64 kernel writes. TCGETS/TCSETS*, TIOCGWINSZ and the
+ * foreground-group requests are answered on the console only; every other
+ * descriptor fails with ENOTTY. */
+typedef struct {
+    unsigned int c_iflag;
+    unsigned int c_oflag;
+    unsigned int c_cflag;
+    unsigned int c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[19];
+} haku64_termios_t;
+
+typedef struct {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+} haku64_winsize_t;
+
+#define HAKU64_TCGETS     0x5401
+#define HAKU64_TCSETS     0x5402
+#define HAKU64_TCSETSW    0x5403
+#define HAKU64_TCSETSF    0x5404
+#define HAKU64_TCSBRK     0x5409
+#define HAKU64_TCFLSH     0x540B
+#define HAKU64_TIOCGPGRP  0x540F
+#define HAKU64_TIOCSPGRP  0x5410
+#define HAKU64_TIOCGWINSZ 0x5413
+#define HAKU64_FIONREAD   0x541B
+#define HAKU64_TIOCNOTTY  0x5422
+
+/* termios flag bits the console reports. */
+#define HAKU64_ISIG   0x0001
+#define HAKU64_ICANON 0x0002
+#define HAKU64_ECHO   0x0008
+#define HAKU64_ECHOE  0x0010
+#define HAKU64_ECHOK  0x0020
 
 #define HAKU64_S_IFMT  0xF000
 #define HAKU64_S_IFREG 0x8000
@@ -533,6 +586,10 @@ int pipe2(int fds[2], int flags);
  * -1 to wait for a pipe to change. Returns the number of entries with events
  * or 0 on timeout. */
 int poll(haku64_pollfd_t *fds, unsigned int count, int timeout);
+/* ioctl(2) on the console: termios and window-size queries, and the
+ * foreground process group (TCGETPGRP/TCSETPGRP in libc terms). A
+ * descriptor that is not the console fails with ENOTTY. */
+int ioctl(int fd, unsigned long long request, void *argument);
 int unlink(const char *path);
 int rename(const char *old_path, const char *new_path);
 int mkdir(const char *path, ...);

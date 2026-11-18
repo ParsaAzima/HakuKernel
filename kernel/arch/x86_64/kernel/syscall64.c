@@ -766,6 +766,11 @@ static u64 sys64_fcntl(int id, u64 fd, u64 command, u64 argument) {
     }
 }
 
+/* The console's foreground process group. Zero means "not set yet", and a
+ * query then reports the caller's own group, which is what a shell checks at
+ * start-up. Haku has one console, so one variable is the whole story. */
+static u32 console_fg_pgrp;
+
 /* ioctl(2): the console answers the termios and window-size requests a
  * program probes for. A 36-byte kernel termios is what the x86-64 ABI
  * passes to the driver; glibc translates it into its own layout. */
@@ -826,9 +831,13 @@ static u64 sys64_ioctl(int id, u64 fd, u64 request, u64 argument) {
     }
 
     case 0x540Fu: {                       /* TIOCGPGRP */
-        int pgrp = sched64_current() + 1;
+        u32 fg = console_fg_pgrp;
 
-        if (!copy_to_user64(current_space(), argument, &pgrp, 4))
+        /* The stored group is only meaningful while it is alive: a shell that
+         * exits without cleaning up must not leave a stale answer that the
+         * next process reads as "I am in the background". */
+        if (!fg || !task64_pgrp_valid(fg)) fg = sched64_pgrp(sched64_current());
+        if (!copy_to_user64(current_space(), argument, &fg, 4))
             return (u64)0 - SYS64_EFAULT;
         return 0;
     }
@@ -837,9 +846,16 @@ static u64 sys64_ioctl(int id, u64 fd, u64 request, u64 argument) {
 
         if (!copy_from_user64(current_space(), &pgrp, argument, 4))
             return (u64)0 - SYS64_EFAULT;
+        /* A job-control shell names a group it created; a group with no live
+         * member would make every later tcgetpgrp lie, so it is refused. */
         if (pgrp <= 0) return (u64)0 - SYS64_EINVAL;
+        if (!task64_pgrp_valid((u32)pgrp)) return (u64)0 - SYS64_EPERM;
+        console_fg_pgrp = (u32)pgrp;
         return 0;
     }
+    case 0x5409u:                         /* TCSBRK */
+    case 0x540Bu:                         /* TCFLSH */
+        return 0;
     case 0x540Eu:                         /* TIOCNOTTY */
         return 0;
     default:
@@ -1982,7 +1998,8 @@ static regs64_t *sys64_futex(regs64_t *frame) {
 /* wait4(pid, status, options): block until one child is DONE, write its
  * status, and reap it. Waiters sleep with interrupts enabled: the timer
  * preempts them, the child runs to completion, and the loop sees DONE on
- * the way back in. WNOHANG makes it a poll instead. */
+ * the way back in. WNOHANG makes it a poll instead. WUNTRACED and WCONTINUED
+ * report a stop or a resume of a live child without reaping it. */
 static u64 sys64_wait4(u64 pid, u64 status, u64 options) {
     int id = sched64_current();
     u64 space = current_space();
@@ -1990,13 +2007,14 @@ static u64 sys64_wait4(u64 pid, u64 status, u64 options) {
     s64 want = (s64)pid;
     int result;
 
-    if (options & ~(u64)K64_WNOHANG) return (u64)0 - SYS64_EINVAL;
+    if (options & ~(u64)(K64_WNOHANG | K64_WUNTRACED | K64_WCONTINUED))
+        return (u64)0 - SYS64_EINVAL;
     if (want < -1 || want == 0) return (u64)0 - SYS64_EINVAL;
     if (status != 0 && !user_page64(space, status, 0, 1))
         return (u64)0 - SYS64_EFAULT;
 
     for (;;) {
-        result = task64_reap(id, (int)want, &code);
+        result = task64_reap(id, (int)want, (u32)options, &code);
         if (result >= 0) break;
         if (result == -(int)SYS64_ECHILD) return (u64)0 - SYS64_ECHILD;
         if (options & K64_WNOHANG) return 0;
@@ -2857,11 +2875,20 @@ static u64 sys64_delete_module(u64 name, u64 flags) {
 #define SYS64_STACK_SIZE     24ull
 #define SYS64_SIGSET_SIZE    8ull
 
-/* Signals whose default action is to do nothing. The stop signals keep their
- * fatal default until job control exists. */
+/* Signals whose default action is to do nothing. SIGCONT belongs here only
+ * while the target is running: its real work (making a stopped task runnable)
+ * happens in task64_raise. */
 static int signal_default_ignored(u32 sig) {
     return sig == K64_SIGCHLD || sig == K64_SIGURG || sig == K64_SIGWINCH ||
            sig == K64_SIGCONT;
+}
+
+/* Signals whose default action is to stop the task, the counterpart of the
+ * fatal group action. SIGSTOP cannot be caught or ignored; the terminal stop
+ * signals can, and a handler then decides what to do. */
+static int signal_default_stops(u32 sig) {
+    return sig == K64_SIGSTOP || sig == K64_SIGTSTP || sig == K64_SIGTTIN ||
+           sig == K64_SIGTTOU;
 }
 
 static u64 sys64_rt_sigaction(u64 sig, u64 act, u64 old, u64 setsize) {
@@ -3051,6 +3078,7 @@ regs64_t *sys64_signal_deliver(regs64_t *frame) {
     if (handler == K64_SIG_IGN) return frame;
     if (handler == K64_SIG_DFL) {
         if (signal_default_ignored(sig)) return frame;
+        if (signal_default_stops(sig)) return sched64_stop(frame, sig);
         return sched64_signal_group(frame, sig);
     }
 

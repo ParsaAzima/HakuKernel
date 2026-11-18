@@ -37,6 +37,9 @@ typedef struct {
     regs64_t *frame;
     u64 exit_status; /* exit/exit_group argument, readable after DONE */
     u32 term_signal; /* non-zero when a signal (or a fault) ended the task */
+    u32 stop_signal; /* non-zero while a stop signal parks the task */
+    u32 stop_reported; /* a stop event a wait4(WUNTRACED) has not returned */
+    u32 continued;   /* a resume a wait4(WCONTINUED) has not returned */
     u64 fault_vector; /* non-zero when the task stopped on a ring-3 fault */
     u64 fault_address;
     u64 mmap_next;   /* per-task bump pointer for anonymous mappings */
@@ -70,6 +73,15 @@ static void signals_inherit(int child, int parent) {
     tasks[child].signals = tasks[parent].signals;
     tasks[child].signals.pending = 0;
     tasks[child].signals.alt_depth = 0;
+}
+
+/* A fresh slot is neither stopped nor carrying a stop/continue event for a
+ * parent. A fork or clone must clear these too: the parent's event belongs to
+ * the parent's parent, not to the new child. */
+static void stop_state_reset(int id) {
+    tasks[id].stop_signal = 0;
+    tasks[id].stop_reported = 0;
+    tasks[id].continued = 0;
 }
 
 /* execve keeps the blocked mask and the ignored dispositions, and resets a
@@ -242,6 +254,7 @@ void sched64_init(void) {
     tasks[0].frame = 0;
     tasks[0].exit_status = 0;
     tasks[0].term_signal = 0;
+    stop_state_reset(0);
     tasks[0].fault_vector = 0;
     tasks[0].fault_address = 0;
     tasks[0].mmap_next = 0;
@@ -309,6 +322,7 @@ int task64_create_kernel_on(u32 cpu_affinity, void (*entry)(void)) {
     tasks[id].frame = frame_on_stack(top, (u64)entry);
     tasks[id].exit_status = 0;
     tasks[id].term_signal = 0;
+    stop_state_reset(id);
     tasks[id].fault_vector = 0;
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = 0;
@@ -385,6 +399,7 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].frame = frame;
     tasks[id].exit_status = 0;
     tasks[id].term_signal = 0;
+    stop_state_reset(id);
     tasks[id].fault_vector = 0;
     tasks[id].fault_address = 0;
     tasks[id].mmap_next = K64_USER_MMAP_BASE;
@@ -847,6 +862,42 @@ regs64_t *sched64_exit_group(regs64_t *frame) {
 regs64_t *sched64_signal_group(regs64_t *frame, u32 signal) {
     return end_group(frame, signal, 0,
                      "HAKU64-TASK-HALT: no runnable task after a signal\r\n");
+}
+
+/* A stop signal's default action. The task parks itself with the frame that
+ * was about to return to ring 3, so a resume continues the interrupted
+ * syscall instead of restarting it. Only SIGCONT, SIGKILL or exit_group moves
+ * a stopped task. A SIGCONT or SIGKILL that is already queued makes the stop
+ * pointless (nothing would wake the task), so the frame is returned and the
+ * queued signal is delivered on the next entry.
+ *
+ * The stop is per task, not per thread group: this port gives every thread
+ * its own signal state, so a stop signal parks the task that receives it and
+ * its siblings keep running. A job-control shell signals the group leader,
+ * which is the single-threaded case this milestone needs. */
+regs64_t *sched64_stop(regs64_t *frame, u32 signal) {
+    k64_percpu_t *cpu = this_cpu();
+    u32 queued;
+    int me;
+    u64 flags;
+
+    if (!enabled || !cpu || (int)cpu->current < 0) return frame;
+    me = (int)cpu->current;
+
+    fxsave64(fxsave_areas[me]);
+    flags = spin64_lock(&sched_lock);
+    queued = tasks[me].signals.pending & ~tasks[me].signals.blocked;
+    if (queued & (K64_SIG_BIT(K64_SIGCONT) | K64_SIGKILL_BIT)) {
+        spin64_unlock(&sched_lock, flags);
+        return frame;
+    }
+    tasks[me].frame = frame;
+    tasks[me].stop_signal = signal;
+    tasks[me].stop_reported = 1;
+    tasks[me].continued = 0;
+    tasks[me].state = K64_TASK_STOP;
+    spin64_unlock(&sched_lock, flags);
+    return switch_away("HAKU64-TASK-HALT: no runnable task after a stop\r\n");
 }
 
 /* A ring-3 exception ends the whole process: the fault info is recorded on
@@ -1445,6 +1496,7 @@ regs64_t *sched64_fork(regs64_t *frame, u64 flags, u64 child_tid) {
     tasks[child].frame = child_frame;
     tasks[child].exit_status = 0;
     tasks[child].term_signal = 0;
+    stop_state_reset(child);
     tasks[child].fault_vector = 0;
     tasks[child].fault_address = 0;
     tasks[child].mmap_next = tasks[parent].mmap_next;
@@ -1569,6 +1621,7 @@ regs64_t *sched64_clone(regs64_t *frame, u64 flags, u64 child_stack,
     tasks[child].frame = child_frame;
     tasks[child].exit_status = 0;
     tasks[child].term_signal = 0;
+    stop_state_reset(child);
     tasks[child].fault_vector = 0;
     tasks[child].fault_address = 0;
     tasks[child].futex_addr = 0;
@@ -1836,14 +1889,21 @@ int task64_exec(int id, u64 space) {
     return 1;
 }
 
-/* Reap one child of `parent`. `pid` < 0 means any child, otherwise it must
- * match the child's pid. Returns the child's pid, -ECHILD when there is no
- * such child, or -EAGAIN when a matching child is still running. */
-int task64_reap(int parent, int pid, u64 *status) {
-    int match = -1;
+/* Reap or report one child of `parent`. `pid` < 0 means any child, otherwise
+ * it must match the child's pid. `options` is the subset of wait4's flags the
+ * kernel honours: WUNTRACED asks for a stop event and WCONTINUED for a
+ * continue event, neither of which reaps the child. An exited child always
+ * wins, because its status is the one a parent must not lose.
+ *
+ * Returns the child's pid, -ECHILD when there is no such child, or -EAGAIN
+ * when a matching child exists but has no event the caller asked for. */
+int task64_reap(int parent, int pid, u32 options, u64 *status) {
+    int match = -1, found = -1, reap = 0;
+    u64 code = 0, flags;
 
     if (!valid_id(parent)) return -3;      /* ESRCH */
 
+    flags = spin64_lock(&sched_lock);
     for (int i = 1; i < (int)K64_TASK_MAX; i++) {
         if (tasks[i].state == K64_TASK_UNUSED) continue;
         if (tasks[i].parent != parent) continue;
@@ -1853,19 +1913,36 @@ int task64_reap(int parent, int pid, u64 *status) {
         /* `pid` is the user-visible id (index + 1), not the slot index. */
         if (pid >= 0 && (int)tasks[i].id + 1 != pid) continue;
         if (tasks[i].state == K64_TASK_DONE) {
-            u64 code = tasks[i].term_signal
-                           ? (u64)tasks[i].term_signal
-                           : (tasks[i].exit_status & 0xFFu) << 8;
-            int id = i;
-            int result = id + 1;
-
-            if (status) *status = code;
-            finalize_task(id);
-            return result;
+            code = tasks[i].term_signal
+                       ? (u64)tasks[i].term_signal
+                       : (tasks[i].exit_status & 0xFFu) << 8;
+            found = i;
+            reap = 1;
+            break;
+        }
+        /* A stop is one event: it is reported once and the child stays put,
+         * so the next wait4 without WUNTRACED still blocks on its exit. */
+        if (tasks[i].state == K64_TASK_STOP && tasks[i].stop_reported &&
+            (options & K64_WUNTRACED)) {
+            code = K64_WSTATUS_STOPPED(tasks[i].stop_signal);
+            tasks[i].stop_reported = 0;
+            found = i;
+            break;
+        }
+        if (tasks[i].continued && (options & K64_WCONTINUED)) {
+            code = 0xFFFFull;
+            tasks[i].continued = 0;
+            found = i;
+            break;
         }
         match = i;
     }
-    return match < 0 ? -10 : -11;          /* ECHILD / EAGAIN */
+    spin64_unlock(&sched_lock, flags);
+
+    if (found < 0) return match < 0 ? -10 : -11;   /* ECHILD / EAGAIN */
+    if (status) *status = code;
+    if (reap) finalize_task(found);
+    return found + 1;
 }
 
 /* Raise `signal` for one task. The kernel stores a pending bit; the action
@@ -1874,7 +1951,12 @@ int task64_reap(int parent, int pid, u64 *status) {
  * may be the caller: raise() is itself a syscall, and delivery happens on the
  * way out of it. A parked task (futex or console read) is woken with EINTR so
  * the signal is not stuck behind a wait that may never end; a blocked signal
- * only sets the bit, and the wake happens when the mask opens. */
+ * only sets the bit, and the wake happens when the mask opens.
+ *
+ * A stopped task needs the same treatment from the other side: SIGCONT (and
+ * SIGKILL, which no mask hides) makes it runnable again and records the
+ * resume for wait4(WCONTINUED). Every other signal stays pending until the
+ * task is continued, which is what POSIX says a stopped process does. */
 int task64_raise(int id, u32 signal) {
     u32 bit, owner;
     u64 flags;
@@ -1891,11 +1973,22 @@ int task64_raise(int id, u32 signal) {
     }
     owner = tasks[id].cpu;
     tasks[id].signals.pending |= bit;
-    if ((bit & ~tasks[id].signals.blocked) != 0 &&
-        tasks[id].state == K64_TASK_WAIT) {
-        tasks[id].futex_addr = 0;
-        tasks[id].state = K64_TASK_READY;
-        if (tasks[id].frame) tasks[id].frame->rax = (u64)0 - K64_SIG_EINTR;
+    if ((bit & ~tasks[id].signals.blocked) != 0) {
+        if (tasks[id].state == K64_TASK_WAIT) {
+            tasks[id].futex_addr = 0;
+            tasks[id].state = K64_TASK_READY;
+            if (tasks[id].frame) tasks[id].frame->rax = (u64)0 - K64_SIG_EINTR;
+        } else if (tasks[id].state == K64_TASK_STOP &&
+                   (signal == K64_SIGCONT || signal == K64_SIGKILL)) {
+            /* A continue is one event: a second SIGCONT, or a continue of a
+             * task that was never stopped, reports nothing. */
+            if (signal == K64_SIGCONT) {
+                tasks[id].stop_signal = 0;
+                tasks[id].stop_reported = 0;
+                tasks[id].continued = 1;
+            }
+            tasks[id].state = K64_TASK_READY;
+        }
     }
     spin64_unlock(&sched_lock, flags);
     smp64_resched_cpu(owner);
@@ -1953,6 +2046,26 @@ int task64_signal_group(int id, u32 signal) {
 int task64_parent(int id) {
     if (!valid_id(id) || tasks[id].parent < 0) return -1;
     return tasks[id].parent;
+}
+
+/* One bounded scan of the task table (K64_TASK_MAX entries, with the lock
+ * held): a process group is alive while any non-zombie member exists. */
+int task64_pgrp_valid(u32 pgrp) {
+    u64 flags;
+    int valid = 0;
+
+    if (pgrp == 0) return 0;
+    flags = spin64_lock(&sched_lock);
+    for (int i = 1; i < (int)K64_TASK_MAX; i++) {
+        if (tasks[i].state == K64_TASK_UNUSED ||
+            tasks[i].state == K64_TASK_DONE)
+            continue;
+        if (tasks[i].pgrp != pgrp) continue;
+        valid = 1;
+        break;
+    }
+    spin64_unlock(&sched_lock, flags);
+    return valid;
 }
 
 /* Total across CPUs: the self-test asserts that switching happened, and with

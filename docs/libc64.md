@@ -42,7 +42,7 @@ compiles the two independently, and neither build touches the other's files.
 | `string64.c` | `mem*` and `str*`: `memcpy`, `memmove`, `memset`, `memcmp`, `memchr`, `strlen`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strcmp`, `strncmp`, `strchr`, `strrchr`, `strstr`. |
 | `stdio64.c` | `printf`, `snprintf`, `puts`, `putchar`; the formatter builds each line in a 1 KiB buffer on the caller's stack. |
 | `memory64.c` | `malloc`, `calloc`, `realloc`, `free` (first fit over a `brk` heap with block splitting) and `atoi`. |
-| `unistd64.c` | `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `dup3`, `pipe`, `pipe2`, `poll`, `unlink`, `rename`, `mkdir`, `rmdir`, `chdir`, `getcwd`, `access`, `getpid`, `gettid`, `getppid`, `arch_prctl`, `fork`, `waitpid`, `execve`, `exit`, `_exit`, `brk`, `sbrk`, `stat`, `lstat`, `fstat`, `nanosleep`, `sleep`, `clock_gettime`, `uname`. |
+| `unistd64.c` | `read`, `write`, `open`, `close`, `lseek`, `dup`, `dup2`, `dup3`, `pipe`, `pipe2`, `poll`, `ioctl`, `unlink`, `rename`, `mkdir`, `rmdir`, `chdir`, `getcwd`, `access`, `getpid`, `gettid`, `getppid`, `arch_prctl`, `fork`, `waitpid`, `execve`, `exit`, `_exit`, `brk`, `sbrk`, `stat`, `lstat`, `fstat`, `nanosleep`, `sleep`, `clock_gettime`, `uname`. |
 | `mman64.c` | `mmap`, `munmap`, `mprotect`. |
 | `signal64.c` | `sigaction`, `sigprocmask`, `sigaltstack`, `signal`, `raise`; `sigaction` sets `SA_RESTORER` and points it at `haku64_restore_rt`. |
 
@@ -268,10 +268,28 @@ both as clobbered.
 Signals are per task, not per thread group: a signal sent to a process reaches
 one thread (the leader, or the first live thread when the leader is gone), and
 `tgkill`/`raise` name a thread. A pending unblocked signal ends a blocking
-`waitpid`, `nanosleep` or `poll` with `errno = EINTR`. There is no `sigqueue`,
+`waitpid`, `nanosleep` or `poll` with `errno = EINTR`. `raise(SIGSTOP)` parks
+the calling task and `kill(pid, SIGCONT)` resumes it; `waitpid` reports the
+stop with `WUNTRACED` and the resume with `WCONTINUED`, reaping only on exit.
+There is no `sigqueue`,
 no real-time range, no hardware-fault delivery (a ring-3 fault still ends the
-group instead of entering a `SIGSEGV` handler), no job control and no
-`SA_RESTART` restart of the interrupted call.
+group instead of entering a `SIGSEGV` handler), no `SA_RESTART` restart of the
+interrupted call, and no terminal-generated `SIGHUP`/`SIGTTIN`/`SIGTTOU`; the
+console's foreground group is only bookkeeping that `tcsetpgrp`/`tcgetpgrp`
+read and write.
+
+## Console ioctls
+
+`ioctl` in `unistd64.c` hands the request number to the kernel unchanged, and
+the console is the only descriptor that answers. `TCGETS` reports the fixed
+mode (`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`), `TCSETS`,
+`TCSETSW`, `TCSETSF`, `TCSBRK` and `TCFLSH` succeed without changing it,
+`TIOCGWINSZ` reports 80x25, and `TIOCGPGRP`/`TIOCSPGRP` read and write the
+console's foreground process group (one console, so one stored group; the
+session is not checked). A group with no live member
+is refused with `EPERM`, and a descriptor whose description is not the console
+— including `/dev/null` and a pipe — fails with `ENOTTY`. A program that only
+wants to know whether it is on a terminal can therefore rely on that error.
 
 ## Build pipeline
 
@@ -312,6 +330,8 @@ regression says what broke instead of only changing an exit status:
 | `HAKU64-USER-PIPE-SIGPIPE-OK` | a forked child's write to a pipe with no reader ended it with the default `SIGPIPE` action instead of returning `EPIPE` |
 | `HAKU64-USER-PIPE-BLOCK-OK` | a child's 8 KiB write to a 4 KiB ring blocked until the parent drained it, and every byte arrived intact |
 | `HAKU64-USER-SIGNAL-OK` | a handler ran with the right signal number and its own signal blocked, the mask was restored, a blocked signal stayed pending until `SIG_UNBLOCK`, `SIG_IGN` dropped one, `SA_ONSTACK` put the frame on the alternate stack, and a signal ended `nanosleep` with `EINTR` and the remaining time |
+| `HAKU64-USER-STOP-OK` | a child stopped itself with `SIGSTOP`, `wait4(WUNTRACED)` reported `(SIGSTOP << 8) | 0x7F` without reaping it, `kill(pid, 0)` still found it, `SIGCONT` resumed it, `wait4(WCONTINUED)` reported `0xFFFF` once, and the child then exited cleanly |
+| `HAKU64-USER-TTY-OK` | `TCGETS` reported canonical mode, `TIOCGWINSZ` 80x25, `TIOCGPGRP`/`TIOCSPGRP` round-tripped the caller's group, an unknown group was refused with `EPERM`, and `TCGETS` on `/dev/null` failed with `ENOTTY` |
 | `HAKU64-USER-ERRNO-THREAD-OK` | a thread's `errno` write did not reach its creator's |
 | `HAKU64-USER-THREAD-EXEC-IMAGE-OK` | the image a thread `execve`d is running (printed by the new image) |
 | `HAKU64-USER-THREAD-EXEC-OK` | the exec ended the group leader, which was reaped, and the thread's image exited with 42 |
@@ -350,10 +370,12 @@ detached worker, the two robust-mutex outcomes, and per-thread `errno`.
 - **No floating point in `printf`.** `%f`, `%e` and `%g` are not implemented;
   the kernel has no FPU context switch for user tasks beyond FXSAVE/FXRSTOR of
   the SSE state.
-- **Signals have dispositions but no job control.** `sigaction`, `sigprocmask`,
-  `sigaltstack`, `signal` and `raise` work, and a handler needs the restorer
-  `sigaction` supplies. There is no `sigqueue`, no real-time range, no `SIGSTOP`
-  handling, and a hardware fault is never turned into a signal. `pipe`/`pipe2`
+- **Signals have dispositions and a stop state, but no terminal-generated job
+  control.** `sigaction`, `sigprocmask`, `sigaltstack`, `signal` and `raise`
+  work, a handler needs the restorer `sigaction` supplies, and `SIGSTOP`/
+  `SIGCONT` park and resume a task with `wait4` reporting both events. There is
+  no `sigqueue`, no real-time range, no `SIGHUP`/`SIGTTIN`/`SIGTTOU` from the
+  keyboard, and a hardware fault is never turned into a signal. `pipe`/`pipe2`
   and `poll` exist; a write with no reader fails with `EPIPE` and raises
   `SIGPIPE`, whose default action ends the process. `fcntl` is reached through
   the raw `haku64_syscall3` wrapper because the library does not wrap it yet.

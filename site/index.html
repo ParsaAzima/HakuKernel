@@ -192,7 +192,7 @@
   </p>
   <ul class="plain">
     <li>Two-stage boot loader: A20, GDT, protected mode, E820, then PAE and long mode on x86-64.</li>
-    <li>Frame allocator, kernel heap, copy-on-write <code>fork</code>, <code>execve</code>, <code>wait4</code>, process groups and sessions.</li>
+    <li>Frame allocator, kernel heap, copy-on-write <code>fork</code>, <code>execve</code>, <code>wait4</code> with <code>WUNTRACED</code>/<code>WCONTINUED</code>, process groups and sessions.</li>
     <li><code>clone</code> threads with <code>futex</code>, a pthread subset, robust mutexes and condition variables, per-thread <code>errno</code>.</li>
     <li>ATA PIO, a writable FAT12 driver behind a VFS, ramfs, devfs, procfs and a cpio initramfs.</li>
     <li>A ring-3 ELF loader with validated user pointers, <code>-errno</code> results and NX enforcement.</li>
@@ -242,7 +242,10 @@
     <code>execve</code> replaces the image and rebuilds the initial stack with
     <code>argc</code>, <code>argv</code> and <code>envp</code>, and
     <code>wait4</code> reaps the exit status. Process groups and sessions carry
-    <code>kill(-pgid)</code> and the console's foreground group.
+    <code>kill(-pgid)</code> and the console's foreground group, which
+    <code>TIOCGPGRP</code>/<code>TIOCSPGRP</code> report and set.
+    <code>SIGSTOP</code> parks a task in its own state and <code>SIGCONT</code>
+    resumes it; <code>wait4</code> reports both events without reaping.
   </p>
   <p>
     Threads come from <code>clone</code>: the address space and descriptor
@@ -345,7 +348,7 @@
         <tr><th scope="row">Paging</th><td>four levels, 1&nbsp;GiB physmap with 2&nbsp;MiB pages</td><td>two levels, sized direct map, no PAE</td></tr>
         <tr><th scope="row">Syscalls</th><td><code>SYSCALL</code>/<code>SYSRET</code> plus <code>INT 0x80</code></td><td><code>INT 0x80</code></td></tr>
         <tr><th scope="row">Scheduling</th><td>per-CPU LAPIC timers, every CPU dispatches</td><td>PIT wall clock, APs dispatch from the shared table</td></tr>
-        <tr><th scope="row">Signals</th><td>handlers, dispositions and <code>sigaltstack</code>; no job control</td><td>handlers, dispositions and job control</td></tr>
+        <tr><th scope="row">Signals</th><td>handlers, dispositions, <code>sigaltstack</code> and stop/continue; no terminal-generated signals</td><td>handlers, dispositions and job control</td></tr>
         <tr><th scope="row">Pipes</th><td class="yes">yes</td><td class="yes">yes</td></tr>
         <tr><th scope="row">Userland</th><td><code>user/lib64</code> and <code>/INIT.ELF</code> from disk</td><td>user C library, <code>busybox ash</code> as PID&nbsp;1, and a FAT12 rootfs whose <code>/INIT</code> starts the shell</td></tr>
         <tr><th scope="row">Modules</th><td>v2: log, ticks, heap, device registration</td><td>v1: device and filesystem registration</td></tr>
@@ -366,7 +369,7 @@
   <ul class="plain">
     <li>No networking, no demand paging, no swap, no load balancing, no CPU migration.</li>
     <li>No SMP-tested ring-3 task: the user-space concurrency tests still run on the bootstrap processor.</li>
-    <li>The x86-64 side has no shell and no line discipline, and no job control; signals 1..31 are handled, but a hardware fault is not turned into one.</li>
+    <li>The x86-64 side has no shell and no line discipline; signals 1..31 are handled, including stop/continue and a console foreground group, but nothing generates <code>SIGHUP</code>/<code>SIGTTIN</code>/<code>SIGTTOU</code> from the keyboard, and a hardware fault is not turned into a signal.</li>
     <li>FAT12 only: 8.3 names, no timestamps, no permission bits, eight cached paths of 128&nbsp;KiB.</li>
     <li>The rootfs is a 1.44&nbsp;MB FAT12 volume: one busybox binary, no symlinks and no <code>/etc/fstab</code>, so applets run as <code>/bin/busybox APP</code>.</li>
     <li>A module filesystem has no page cache and cannot be mapped; <code>mmap</code> answers <code>-ENODEV</code> and <code>execve</code> does not search module mounts.</li>

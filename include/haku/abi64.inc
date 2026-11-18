@@ -131,6 +131,7 @@
 %define HAKU64_EINVAL  22
 %define HAKU64_ENFILE  23
 %define HAKU64_EMFILE  24
+%define HAKU64_ENOTTY  25
 %define HAKU64_ENOSPC  28
 %define HAKU64_ESPIPE  29
 %define HAKU64_EROFS   30
@@ -249,6 +250,28 @@
 %define HAKU64_CLOCK_MONOTONIC 1
 
 %define HAKU64_WNOHANG 1
+
+; wait4 state reports and console ioctl requests.
+%define HAKU64_WUNTRACED  2
+%define HAKU64_WCONTINUED 8
+
+%define HAKU64_TCGETS     0x5401
+%define HAKU64_TCSETS     0x5402
+%define HAKU64_TCSETSW    0x5403
+%define HAKU64_TCSETSF    0x5404
+%define HAKU64_TCSBRK     0x5409
+%define HAKU64_TCFLSH     0x540B
+%define HAKU64_TIOCGPGRP  0x540F
+%define HAKU64_TIOCSPGRP  0x5410
+%define HAKU64_TIOCGWINSZ 0x5413
+%define HAKU64_FIONREAD   0x541B
+%define HAKU64_TIOCNOTTY  0x5422
+
+%define HAKU64_ISIG   0x0001
+%define HAKU64_ICANON 0x0002
+%define HAKU64_ECHO   0x0008
+%define HAKU64_ECHOE  0x0010
+%define HAKU64_ECHOK  0x0020
 
 ; File type and directory-entry types as the kernel reports them.
 %define HAKU64_S_IFMT  0xF000
