@@ -768,6 +768,15 @@ void k64_fail(const char *what);
 void console64_init(void);
 /* 1 when the screen is being painted (a backend was selected). */
 int console64_ready(void);
+/* Hand the screen to userland: from here k64_putc writes COM1 only, so a
+ * kernel marker cannot draw over a running program. console64_reclaim() is
+ * the fatal-path exception (the screen has to show why the kernel stopped). */
+void console64_handover(void);
+void console64_reclaim(void);
+/* Output that belongs to the program rather than the kernel log. It always
+ * paints the screen, latched or not; the console write path and the line
+ * discipline's echo use it. */
+void console64_user_putc(char c);
 /* Answers the screen size the console writer can use: the framebuffer's text
  * grid, or the VGA text grid. Both are always valid after console64_init. */
 u32 console64_columns(void);
@@ -796,6 +805,26 @@ int kbd64_read(void);
 u32 kbd64_pending(void);
 /* IRQ1: read the controller and queue what it produced. */
 void kbd64_irq(void);
+
+/* tty64.c: the console's canonical line discipline. The keyboard queue holds
+ * raw keys; this layer turns them into one echoed line at a time. The
+ * reported termios is the contract it implements: Enter commits, 0x08 and
+ * VERASE 0x7F erase, ^D ends the line (an empty line is EOF), and ^C
+ * discards the line and raises SIGINT for the foreground group. Control
+ * characters reach it because kbd64.c tracks Ctrl and maps Ctrl+letter to
+ * 0x01..0x1A, which is what makes ^D and ^C typeable on a PC keyboard. */
+void tty64_reset(void);
+/* 1 when a finished line (or an EOF result) is waiting for the reader. */
+int tty64_pending_line(void);
+/* Drain queued keys into the line, echoing them. Stops at a finished line, so
+ * the work is bounded by the keyboard ring. Returns keys consumed; sets
+ * `interrupted` when ^C discarded the line and queued SIGINT. */
+u32 tty64_pump(int id, int *interrupted);
+/* Copy up to `count` bytes of the finished line; 1 when a read result was
+ * produced (a ^D on an empty line produces a zero-byte result). */
+int tty64_take_line(void *dst, u32 count, u32 *copied);
+/* TCFLSH: drop queued keys and the line being edited. */
+void tty64_flush(void);
 
 /* bootmem64.c: bump allocator for the structures that must exist before
  * the frame allocator and heap do (page tables, frame bitmaps). */

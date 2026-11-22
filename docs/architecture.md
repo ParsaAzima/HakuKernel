@@ -68,7 +68,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | IDT/PIC | 256 gates, 8259 remapped to `0x20`/`0x28`, IRQ0 unmasked | `HAKU64-IDT-OK` |
 | exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
-| keyboard | PC/8042 in set-1 mode: IRQ1 unmasked after a decode-only self-test | `HAKU64-KBD-OK` |
+| keyboard | PC/8042 in set-1 mode: IRQ1 feeds `kbd64.c`, and `tty64.c` turns the queue into canonical echoed lines (Enter, erase, `^D` EOF, `^C` to `SIGINT`) | `HAKU64-KBD-OK`, `HAKU64-USER-TTY-LINE-OK`, `HAKU64-USER-TTY-EOF-OK`, `HAKU64-USER-TTY-INTR-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
 | files | FAT12 on an ATA disk at `/disk` plus a RAM initramfs root, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
 | namespace | a six-entry mount table with longest-prefix resolution; FAT12 at `/disk`, `ramfs64` at `/`, `procfs64` at `/proc` with generated `meminfo`/`uptime`/`self/cmdline`, devfs at `/dev` with `null`, `zero`, `console` and module-registered devices, and module filesystems such as `/rom`, filled at boot from the `INITRD` cpio archive | `HAKU64-VFS-OK`, `HAKU64-PROCFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-INITRAMFS-OK`, `HAKU64-USER-DEV-OK`, `HAKU64-USER-PROCFS-OK`, `HAKU64-USER-INITRAMFS-OK` |
@@ -77,7 +77,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | fork | a child gets a copied address space, two observers of one `MAP_SHARED` page | `HAKU64-FORK-OK` |
 | threads | `clone(CLONE_VM)` shares one space and, with `CLONE_FILES`, one descriptor table; a futex hands the flag over | `HAKU64-THREAD-OK` |
 | ring 3 | an `IRETQ` frame with `CS=0x23`/`SS=0x1B` enters user mode | `HAKU64-USER-OK` |
-| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, pipes, process, time, limits, `poll`/`select`, and signal dispositions with a handler frame | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK`, `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK`, `HAKU64-USER-SIGNAL-OK`, `HAKU64-USER-STOP-OK`, `HAKU64-USER-TTY-OK`, `HAKU64-USER-TTY-SIGNAL-OK` |
+| syscall | `SYSCALL`/`SYSRET` plus the DPL-3 `INT 0x80` fallback: the ported i386 table on the x86-64 ABI — I/O and metadata, paths and directories, `mmap`/`brk`/`mprotect`, pipes, process, time, limits, `poll`/`select`, and signal dispositions with a handler frame | `HAKU64-SYSCALL-OK`, `HAKU64-SYSCALL64-OK`, `HAKU64-ABI-OK`, `HAKU64-PORT-OK`, `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK`, `HAKU64-USER-SIGNAL-OK`, `HAKU64-USER-STOP-OK`, `HAKU64-USER-TTY-OK`, `HAKU64-USER-TTY-SIGNAL-OK`, `HAKU64-USER-TTY-LINE-OK`, `HAKU64-USER-TTY-EOF-OK`, `HAKU64-USER-TTY-INTR-OK` |
 | NX | a ring-3 fetch from a mapped non-executable page faults and ends the task | `HAKU64-NX-OK` |
 | ELF64 | malformed images refused, then an embedded static executable runs | `HAKU64-ELF-REJECT-OK`, `HAKU64-ELF-OK`, `HAKU64-ELF-RUN-OK` |
 | modules | `X64MOD.HKM` and `ROMFS.HKM` are read from the disk, relocated and run; duplicate, truncated and bad-magic images refused; the second registers a read-only filesystem mounted at `/rom` and cannot unload while it has open files | `HAKU64-MODULE-LOAD-OK`, `HAKU64-MODULE-UNLOAD-OK`, `HAKU64-MODULE-REJECT-OK`, `HAKU64-MODULE-FS-OK`, `HAKU64-MODULE-FS-RELEASE-OK`, `HAKU64-USER-MODULE-OK` |
@@ -516,8 +516,9 @@ initramfs root at `/`, procfs at `/proc`, a `/dev` with `null`, `zero`,
 `console` and module-registered devices, a module filesystem at `/rom`, the
 syscall table, a module loader with device and filesystem registration, and a
 user C library (`user/lib64`) with `/INIT.ELF` as the first real ring-3
-program. A shell therefore still requires the 32-bit
-side, which is where the full userland lives. [The roadmap](../ROADMAP.md)
+program. Its console now has a canonical line discipline and the kernel-log
+latch, but there is no x86-64 shell yet, so the interactive side still runs on
+the 32-bit image. [The roadmap](../ROADMAP.md)
 (milestones 1 to 4) lists the remaining stages: the musl probe for milestone 1,
 then job control and the interactive shell. The 64-bit sources are
 excluded from the 32-bit link line, so both targets build from one tree.

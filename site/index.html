@@ -304,9 +304,12 @@
   </p>
   <p>
     A PS/2 keyboard decoder fills an interrupt-driven queue. The i386 port adds
-    the line discipline and CSI handling; the x86-64 port lets a blocking
-    <code>read()</code> on the console wake on IRQ1, which is what the
-    <code>HAKU64-KEY-OK</code> test proves.
+    CSI handling; the x86-64 port adds a canonical line discipline on top of
+    the queue — Enter commits an echoed line, Backspace erases, <code>^D</code>
+    is EOF, and <code>^C</code> raises <code>SIGINT</code> for the foreground
+    group. A console <code>read()</code> parks until a line is finished, which
+    is what <code>HAKU64-USER-TTY-LINE-OK</code> and
+    <code>HAKU64-USER-TTY-EOF-OK</code> prove.
   </p>
 </section>
 
@@ -372,7 +375,7 @@
   <ul class="plain">
     <li>No networking, no demand paging, no swap, no load balancing, no CPU migration.</li>
     <li>No SMP-tested ring-3 task: the user-space concurrency tests still run on the bootstrap processor.</li>
-    <li>The x86-64 side has no shell and no line discipline; signals 1..31 are handled, including stop/continue, a console foreground group, <code>SIGTTIN</code> for a background read and <code>SIGHUP</code> from a session leader's exit, but the console never sets <code>TOSTOP</code> so <code>SIGTTOU</code> cannot arise, and a hardware fault is not turned into a signal.</li>
+    <li>The x86-64 side has no shell and no scrollback: the console keeps only the visible grid and the arrow keys are ignored, while <code>^\</code> and <code>^Z</code> are still plain bytes. Signals 1..31 are handled, including stop/continue, a console foreground group, <code>SIGTTIN</code> for a background read and <code>SIGHUP</code> from a session leader's exit, but the console never sets <code>TOSTOP</code> so <code>SIGTTOU</code> cannot arise, and a hardware fault is not turned into a signal.</li>
     <li>FAT12 only: 8.3 names, no timestamps, no permission bits, eight cached paths of 128&nbsp;KiB.</li>
     <li>The rootfs is a 1.44&nbsp;MB FAT12 volume: one busybox binary, no symlinks and no <code>/etc/fstab</code>, so applets run as <code>/bin/busybox APP</code>.</li>
     <li>A module filesystem has no page cache and cannot be mapped; <code>mmap</code> answers <code>-ENODEV</code> and <code>execve</code> does not search module mounts.</li>

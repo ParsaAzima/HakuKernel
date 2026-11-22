@@ -846,7 +846,12 @@ static u64 sys64_ioctl(int id, u64 fd, u64 request, u64 argument) {
         return (u64)sched64_console_set_fg((u32)pgrp);
     }
     case 0x5409u:                         /* TCSBRK */
+        return 0;
     case 0x540Bu:                         /* TCFLSH */
+        /* 0 TCIFLUSH and 2 TCIOFLUSH drop input; the output side is the
+         * shared console and has nothing queued to drop. Bounded by the
+         * keyboard ring, which is what tty64_flush() drains. */
+        if (argument == 0 || argument == 2) tty64_flush();
         return 0;
     case 0x540Eu:                         /* TIOCNOTTY */
         return 0;
@@ -1050,7 +1055,8 @@ static u64 sys64_write(u64 fd, u64 buffer, u64 count) {
         chunk = K64_PAGE_SIZE - offset;
         if (chunk > count - written) chunk = count - written;
         for (u64 i = 0; i < chunk; i++)
-            k64_putc(*(const volatile char *)phys_to_virt64(phys + i));
+            console64_user_putc(
+                *(const volatile char *)phys_to_virt64(phys + i));
         written += chunk;
     }
     return written;
@@ -1298,31 +1304,36 @@ static u64 sys64_mkdirat(int id, int dirfd, u64 path) {
     return (u64)fs64_create_dir(name);
 }
 
-/* console64: is a byte waiting? Called by sched64_park_until() with the task
- * lock held, which is how a keystroke that lands between the empty check and
- * the park is still seen. */
+/* console64: is input worth waking a parked reader for? Called by
+ * sched64_park_until() with the task lock held, which is how a keystroke that
+ * lands between the empty check and the park is still seen. A queued key that
+ * does not complete a line counts too: the retry consumes it, and the wake
+ * that followed its push may already have raced with the park. */
 static int console_data_ready(void) {
-    return kbd64_pending() != 0;
+    return tty64_pending_line() || kbd64_pending() != 0;
 }
 
-/* read(0, buf, n) on the console. There is no line discipline: the queue
- * hands out decoded characters as they are typed, and the bytes are echoed so
- * typing is visible on the framebuffer console. A process group that is not
- * the console's foreground group gets SIGTTIN instead of a read, which is the
- * read half of job control; POSIX's rule that a blocked or ignored SIGTTIN
- * turns the stop into a plain EIO failure is kept. An empty
- * queue parks the task with -EAGAIN; IRQ1 wakes it and the caller retries,
+/* read(0, buf, n) on the console. The keyboard queue holds raw keys; tty64.c
+ * turns them into canonical lines, so a read returns when Enter (or ^D)
+ * completes a line rather than handing out bytes as they are typed. Erase,
+ * echo and EOF are the line discipline's, not this dispatcher's. A process
+ * group that is not the console's foreground group gets SIGTTIN instead of a
+ * read, which is the read half of job control; POSIX's rule that a blocked or
+ * ignored SIGTTIN turns the stop into a plain EIO failure is kept. No line
+ * yet parks the task with -EAGAIN; IRQ1 wakes it and the caller retries,
  * which is the same contract the 32-bit console uses for its blocking read. */
 static regs64_t *sys64_console_read(regs64_t *frame) {
-    u8 chunk[64];
-    u64 count = frame->rdx, done = 0;
+    u8 line[64];
+    u64 count = frame->rdx;
+    u32 copied = 0;
+    int interrupted = 0;
     int id = sched64_current();
 
     if (count == 0) {
         frame->rax = 0;
         return frame;
     }
-    if (count > sizeof(chunk)) count = sizeof(chunk);
+    if (count > sizeof(line)) count = sizeof(line);
 
     {
         u32 pgrp = sched64_pgrp(id), fg = sched64_console_fg();
@@ -1343,28 +1354,28 @@ static regs64_t *sys64_console_read(regs64_t *frame) {
         }
     }
 
-    while (done < count) {
-        int ch = kbd64_read();
-        if (ch < 0) break;
-        chunk[done++] = (u8)ch;
+    (void)tty64_pump(id, &interrupted);
+    /* ^C must not park: the task would sleep with SIGINT pending, and a
+     * parked task is not on the run queue to receive it. Failing with EINTR
+     * returns to user mode, where the signal frame is built. */
+    if (interrupted) {
+        frame->rax = (u64)0 - SYS64_EINTR;
+        return frame;
     }
-
-    if (!done) {
+    if (!tty64_take_line(line, (u32)count, &copied)) {
         int parked = 0;
         return sched64_park_until(frame, K64_CONSOLE_WAIT_ADDR,
                                   (u64)0 - SYS64_EAGAIN,
                                   console_data_ready, &parked);
     }
 
-    if (!copy_to_user64(current_space(), frame->rsi, chunk, done)) {
+    /* copied can be zero: ^D on an empty line is end-of-file, and the read
+     * then returns 0 without touching the user buffer. */
+    if (copied && !copy_to_user64(current_space(), frame->rsi, line, copied)) {
         frame->rax = (u64)0 - SYS64_EFAULT;
         return frame;
     }
-    for (u64 i = 0; i < done; i++) {
-        if (chunk[i] == '\n') k64_putc('\r');
-        k64_putc((char)chunk[i]);
-    }
-    frame->rax = done;
+    frame->rax = copied;
     return frame;
 }
 

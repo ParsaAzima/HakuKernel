@@ -1483,8 +1483,15 @@ static int test_libc64(void) {
         elf64_unload(&loaded);
         return 0;
     }
+    /* The first user task owns the screen from here: kernel markers keep
+     * going to COM1 but no longer draw over the program. This is the 64-bit
+     * counterpart of the 32-bit klog_mirror_display(0) handover. */
+    console64_handover();
 
-    deadline = timer64_ticks() + 400;
+    /* The headless handshake types one line, then ^D and ^C, and the QEMU
+     * monitor sleeps between commands; 15 s leaves room for a slow CI runner
+     * while still failing a program that never exits. */
+    deadline = timer64_ticks() + 1500;
     while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
         cpu_pause64();
     if (task64_state(id) != K64_TASK_DONE) {

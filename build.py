@@ -799,7 +799,22 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     if not wait_for_serial(serial, "HAKU64-KEY-READY", boot_timeout):
         log("warning: the ring-3 program never asked for a keystroke")
     else:
-        monitor_cmd(mon_port, ["sendkey x"])
+        # Erase, then commit: the line discipline must deliver "x\n" only
+        # after Enter and only after Backspace removed the 'a'.
+        monitor_cmd(mon_port, ["sendkey a", "sendkey backspace",
+                               "sendkey x", "sendkey ret"])
+        if not wait_for_serial(serial, "HAKU64-KEY-EOF-READY", boot_timeout):
+            log("warning: the ring-3 program never asked for ^D")
+        else:
+            # Ctrl+D on the empty next line is the zero-length EOF read.
+            monitor_cmd(mon_port, ["sendkey ctrl-d"])
+            if not wait_for_serial(serial, "HAKU64-KEY-INTR-READY",
+                                   boot_timeout):
+                log("warning: the ring-3 program never asked for ^C")
+            else:
+                # Ctrl+C is a signal, not a byte: the read fails with EINTR
+                # and the handler runs on the way back to user mode.
+                monitor_cmd(mon_port, ["sendkey ctrl-c"])
     reached = wait_for_serial(serial, "HAKU64-SELFTEST-OK", boot_timeout)
     monitor_cmd(mon_port, [f"screendump {ppm}"])
     proc.kill()
@@ -841,6 +856,9 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-USER-STOP-OK",
                 "HAKU64-USER-TTY-OK",
                 "HAKU64-USER-TTY-SIGNAL-OK",
+                "HAKU64-USER-TTY-LINE-OK",
+                "HAKU64-USER-TTY-EOF-OK",
+                "HAKU64-USER-TTY-INTR-OK",
                 "HAKU64-USER-ERRNO-THREAD-OK",
                 "HAKU64-USER-THREAD-EXEC-OK",
                 "HAKU64-USER-THREAD-EXEC-IMAGE-OK",

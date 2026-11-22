@@ -42,8 +42,11 @@ void k64_dec(u64 value) {
 }
 
 /* A failure the headless check can grep for, then stop: a broken memory
- * subsystem cannot be recovered from here. */
+ * subsystem cannot be recovered from here. The screen is reclaimed first,
+ * because the latch that hands it to userland would otherwise hide the
+ * reason from the only person who can see the machine. */
 void k64_fail(const char *what) {
+    console64_reclaim();
     k64_puts("HAKU64-FAIL: ");
     k64_puts(what);
     k64_puts("\r\n");

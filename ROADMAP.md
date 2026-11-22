@@ -30,7 +30,7 @@ that needs new kernel work is 2.
 | Processes | round-robin scheduler, `fork`/COW, `execve`, `wait4` with `WUNTRACED`/`WCONTINUED`, threads and the pthread subset, `futex`, process groups and sessions, per-task signal dispositions with a handler frame and `sigaltstack`, `SIGSTOP`/`SIGCONT` with a stopped task state, `SIGTTIN` on a background console read and `SIGHUP` from a session leader's exit | same, plus job control and wait queues |
 | Syscalls | ported subset on the x86-64 numbers, including pipes, a blocking `poll`, signals 1..31 (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack`) and the console `ioctl` surface | the subset a static musl/busybox userland needs, including pipes and signals |
 | Storage | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), read-only module filesystems (`/rom`), file writes | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs |
-| Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard | the same renderer and font, plus the terminal line discipline and CSI handling |
+| Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text, VGA text fallback, PS/2 keyboard, canonical line discipline (`tty64.c`), kernel-log display latch | the same renderer and font, plus the terminal line discipline and CSI handling |
 | Modules | version 2 loader: log, ticks, heap, device and filesystem registration; a module filesystem is mounted at its own prefix and read through the VFS | version 1 loader with device and filesystem registration |
 | Userland | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device | freestanding user C library, `busybox ash`, the FAT12 rootfs image, probes |
 
@@ -260,8 +260,9 @@ stops and resumes a child, and observes the foreground group change. The pipe,
 handler, stop/continue, TTY and terminal-signal quarters are done:
 `HAKU64-USER-PIPE-OK`, `HAKU64-USER-PIPE-SIGPIPE-OK`,
 `HAKU64-USER-SIGNAL-OK`, `HAKU64-USER-STOP-OK`, `HAKU64-USER-TTY-OK` and
-`HAKU64-USER-TTY-SIGNAL-OK` run in `/INIT.ELF`; the remaining work is the line
-discipline and wait queues a real shell drives.
+`HAKU64-USER-TTY-SIGNAL-OK` run in `/INIT.ELF`; the line discipline landed in
+milestone 4 (`tty64.c`), and the remaining work is the wait queues a real
+shell drives.
 
 ## 4. Interactive x86-64 userland (console, TTY, busybox)
 
@@ -278,10 +279,17 @@ with the 32-bit image available as a fallback.
       translation (`kbd64.c`, IRQ1) feeding a queue that console `read()`
       drains; an empty queue parks the task with `-EAGAIN` and IRQ1 wakes it
       (`HAKU64-KBD-OK`, `HAKU64-KEY-OK`).
-- [ ] Line discipline and scrollback on the x86-64 console: erase, line
-      buffering and history belong to a terminal layer rather than `read()`
-      (which today only echoes), and the kernel log latch the 32-bit terminal
-      has must exist here too.
+- [x] A canonical line discipline on the x86-64 console (`tty64.c`): Enter
+      commits an echoed line, Backspace/`VERASE` erase the last character,
+      `^D` is EOF on an empty line, `^C` raises `SIGINT` for the foreground
+      group, and `TCFLSH` drops queued input
+      (`HAKU64-USER-TTY-LINE-OK`, `HAKU64-USER-TTY-EOF-OK`,
+      `HAKU64-USER-TTY-INTR-OK`). The kernel log
+      latch exists too: `console64_handover()` sends later kernel markers to
+      COM1 only, while `k64_fail` reclaims the screen.
+- [ ] Scrollback and history on the x86-64 console: the framebuffer keeps
+      only the visible grid, and the `0xE0`-prefixed arrow keys do not reach
+      it yet.
 - [ ] Build a static x86-64 musl busybox in CI (`tools/getbusybox.py` or a
       prebuilt artifact) and place it in the initramfs with `/init` reading
       `INIT.CMD` when present.

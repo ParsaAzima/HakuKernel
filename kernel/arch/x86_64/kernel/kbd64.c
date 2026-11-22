@@ -6,10 +6,15 @@
  * that console read() drains.
  *
  * The 32-bit port hands each character straight to the terminal layer because
- * it owns a line editor. The 64-bit console has no terminal layer yet, so the
- * queue is the interface: read() pops, and when it is empty the caller parks
+ * it owns a line editor. The 64-bit console has the same separation now: this
+ * driver decodes keys into a queue and tty64.c turns them into canonical lines
+ * (see tty64.c). read() pops the queue, and when it is empty the caller parks
  * on K64_CONSOLE_WAIT_ADDR with -EAGAIN. IRQ1 then pushes and wakes, so an
  * idle console costs no CPU.
+ *
+ * Ctrl is tracked like shift because the line discipline needs the control
+ * characters a PC keyboard cannot otherwise produce: Ctrl+A..Z become
+ * 0x01..0x1A, which is how ^D (end-of-line/EOF) and ^C (SIGINT) are typed.
  *
  * Everything that touches the ring or the modifier state takes the same
  * interrupt-safe lock, because IRQ1 and a system call both reach it. The ring
@@ -50,6 +55,7 @@ static u32 queue_head;                 /* next byte to hand out */
 static u32 queue_tail;                 /* next free slot */
 static volatile int shift_down;
 static volatile int caps_lock;
+static volatile int ctrl_down;
 static spinlock_t kbd_lock = SPINLOCK_INIT;
 
 /* Translate one scancode. Only the caller's lock makes this safe: it touches
@@ -70,6 +76,9 @@ static int kbd_decode(u8 sc, char *out) {
     case 0x36: /* right shift */
         shift_down = !break_code;
         return 0;
+    case 0x1D: /* left ctrl; 0xE0-prefixed right ctrl lands here too */
+        ctrl_down = !break_code;
+        return 0;
     case 0x3A: /* caps lock toggles on the make code only */
         if (!break_code) caps_lock = !caps_lock;
         return 0;
@@ -81,6 +90,17 @@ static int kbd_decode(u8 sc, char *out) {
      * no US-layout character; bound the index rather than reading past the
      * table. */
     if (index >= 0x40) return 0;
+
+    /* Ctrl names control characters, not the letter with a different case:
+     * Shift and Caps Lock are ignored for this mapping. */
+    if (ctrl_down) {
+        char base = scancode_map[index];
+
+        if (base >= 'a' && base <= 'z') {
+            *out = (char)(base - 'a' + 1);
+            return 1;
+        }
+    }
 
     *out = (shift_down ^ caps_lock) ? scancode_map_shift[index]
                                     : scancode_map[index];
@@ -150,13 +170,15 @@ void kbd64_init(void) {
 
 /* Decode-only self-test with synthesised scancodes, so the check does not
  * depend on the headless run typing anything: shift+a gives 'A', shift up
- * gives 'a', Enter and Backspace are queued, the 0xE0 prefix and a keypad
- * scancode produce nothing, and the queue drains in order. */
+ * gives 'a', Enter and Backspace are queued, Ctrl+d gives 0x04 and releasing
+ * Ctrl restores 'd', the 0xE0 prefix and a keypad scancode produce nothing,
+ * and the queue drains in order. */
 int kbd64_self_test(void) {
     static const u8 scancodes[] = {
-        0x2A, 0x1E, 0xAA, 0x1E, 0x1C, 0x0E, 0xE0, 0x47, 0x3B
+        0x2A, 0x1E, 0xAA, 0x1E, 0x1C, 0x0E, 0xE0, 0x47, 0x3B,
+        0x1D, 0x20, 0x9D, 0x20
     };
-    static const char expected[] = { 'A', 'a', '\n', '\b' };
+    static const char expected[] = { 'A', 'a', '\n', '\b', 0x04, 'd' };
     int produced = 0;
     int ok = 1;
     char ch;
@@ -175,6 +197,7 @@ int kbd64_self_test(void) {
     /* A fresh scan starts with neither modifier held. */
     shift_down = 0;
     caps_lock = 0;
+    ctrl_down = 0;
 
     if (!ok) return 0;
     k64_puts("HAKU64-KBD-OK: PS/2 set-1 decode and queue, irq1=");

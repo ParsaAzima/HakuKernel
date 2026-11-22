@@ -64,8 +64,9 @@ than executed: there is no cursor addressing, colour, or scrolling region.
 
 ## The 64-bit console
 
-The x86-64 port has no terminal layer yet, so its console is two drivers and a
-queue rather than a line discipline.
+The x86-64 port uses the same split as the 32-bit terminal, with less in one
+file: `console64.c` owns the output tee, `kbd64.c` decodes keys into a queue,
+and `tty64.c` is the canonical line discipline on top of that queue.
 
 `kernel/arch/x86_64/kernel/console64.c` owns the output tee. `k64_putc` writes
 COM1 first and the display second, once `console64_init` has selected a
@@ -82,24 +83,52 @@ page table: `write()` paints from a system call, which runs on the caller's
 `CR3`. The frames the aperture covers are reserved out of the frame allocator
 first, because firmware may place the framebuffer inside RAM.
 
+Kernel log lines are a boot channel on the screen here too.
+`test_libc64` calls `console64_handover()` as soon as the first user task
+exists: from then on `k64_putc` keeps writing COM1 but stops painting, so a
+kernel marker cannot draw over a running program, while
+`console64_user_putc` -- the console write path and the line discipline's echo
+-- always paints. The latch is one-way, like the 32-bit
+`klog_mirror_display(0)`, and `k64_fail` reclaims the screen so a stopped
+kernel still shows its reason on the machine.
+
 `kernel/arch/x86_64/kernel/kbd64.c` decodes set-1 scancodes from IRQ1 with the
 same US-layout tables and shift/caps handling as `kernel/drivers/kbd.c`, and
 pushes the character into a 128-byte ring. The ring drops the newest byte when
 it is full (losing a keystroke beats overwriting one the reader has not seen),
 and the `0xE0` prefix is ignored, so the arrow keys and the keypad do nothing
-yet -- exactly as on the 32-bit side. IRQ1 is unmasked only after a decode-only
-self-test proves the tables (`HAKU64-KBD-OK`), which keeps the check
-independent of whether the headless run types anything.
+yet -- exactly as on the 32-bit side. Ctrl is tracked like Shift, because the
+terminal's special characters are otherwise unreachable: Ctrl+A..Z decode to
+`0x01..0x1A`, which is how `^D` and `^C` are typed. IRQ1 is unmasked only after
+a decode-only self-test proves the tables (`HAKU64-KBD-OK`), which keeps the
+check independent of whether the headless run types anything.
 
-Console `read()` pops the queue and echoes what it took, so typing is visible;
-there is no erase key and no line buffering. When the queue is empty the task
-parks with `-EAGAIN` on `K64_CONSOLE_WAIT_ADDR` instead of spinning, and IRQ1
-wakes it. The park goes through `sched64_park_until`, which re-runs the
-"is there a byte?" test with the task lock held: a keystroke that arrives
-between the empty check and the state change is therefore never lost. A caller
-sees `-EAGAIN` after a real switch away and retries, which is what
-`user/tests/init64.c` does while it waits for the `x` the headless run types
-(`HAKU64-KEY-READY` then `HAKU64-KEY-OK`).
+`kernel/arch/x86_64/kernel/tty64.c` is the line discipline. A console `read()`
+returns one line at a time instead of the bytes as they are typed: Enter
+commits the line (including its newline), erase -- both the `0x08` a PC
+Backspace sends and the reported `VERASE` `0x7F` -- removes the last character
+and echoes the usual backspace-space-backspace, and `^D` ends the line, with an
+empty line reported as a zero-length read (EOF) and a partial line delivered
+without a newline. Each accepted byte is echoed as it is consumed. `^C`
+discards the line and queues `SIGINT` for the console's foreground group
+instead of becoming text; `^\` and `^Z` still do not act. One finished line is
+buffered at a time, so type-ahead stays in the keyboard ring rather than
+overwriting a line the reader has not taken, and the pump stops at that line:
+its work is bounded by the 128-byte ring. `TCFLSH` with `TCIFLUSH`/`TCIOFLUSH`
+drops the ring and the line being edited.
+
+When no line is finished the task parks with `-EAGAIN` on
+`K64_CONSOLE_WAIT_ADDR` instead of spinning, and IRQ1 wakes it. The park goes
+through `sched64_park_until`, which re-runs the readiness test with the task
+lock held -- a finished line, or a queued key the retry still has to consume,
+so a keystroke that arrives between the check and the state change is never
+lost. A caller sees `-EAGAIN` after a real switch away and retries, which is
+what `user/tests/init64.c` does while it waits for the line the headless run
+types. The test types `a`, Backspace, `x`, Enter and then `^D` after
+`HAKU64-KEY-READY`, so `HAKU64-USER-TTY-LINE-OK` proves both erase and
+line buffering, `HAKU64-USER-TTY-EOF-OK` proves the empty-line `^D`, and a
+final `^C` with a handler installed proves `HAKU64-USER-TTY-INTR-OK`: the
+read fails with `EINTR`, the line is discarded, and the handler runs.
 
 ## Logging, panic, and crash reports
 

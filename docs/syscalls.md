@@ -327,7 +327,8 @@ not take effect yet because `execve` does not close descriptors on this port.
 `ioctl` on the console answers `TCGETS` with the terminal's fixed mode
 (`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`, erase `0x7F`,
 EOF `^D`), accepts `TCSETS`/`TCSETSW`/`TCSETSF` without changing that mode,
-accepts `TCSBRK`/`TCFLSH`,
+accepts `TCSBRK`, and on x86-64 makes `TCFLSH` with `TCIFLUSH`/`TCIOFLUSH` drop
+queued input and the line being edited,
 reports an 80x25 window for `TIOCGWINSZ`, and returns `ENOTTY` for a
 descriptor that is not the console. A terminal opened by path (`/dev/tty`,
 `/dev/console`) answers the same requests. `TIOCSPGRP` records the
@@ -499,6 +500,21 @@ the group round-trip, the refusal of an unknown group, and `ENOTTY` on
 `/dev/null`. `HAKU64-USER-TTY-SIGNAL-OK` covers the background read (both the
 `EIO` failure with `SIGTTIN` blocked and the stop/resume with it defaulted)
 and the `SIGHUP` a session leader's exit sends to the foreground group.
+
+The x86-64 console implements the mode it reports. `tty64.c` keeps one
+canonical line: Enter commits it, Backspace/`VERASE` erase the last character,
+`^D` ends the line (an empty line is a zero-length EOF read, a partial line is
+delivered without its newline), and every accepted byte is echoed. `^C`
+discards the line and queues `SIGINT` for the foreground group instead of
+becoming text; `^\` and `^Z` are still ordinary bytes, so `SIGQUIT` and
+`SIGTSTP` have no terminal trigger yet. A read that has no finished line parks
+with `-EAGAIN` and IRQ1 wakes it, the same retry contract as before. The
+headless run types `a`, Backspace, `x`, Enter and then `^D`, so
+`HAKU64-USER-TTY-LINE-OK` proves erase plus line buffering,
+`HAKU64-USER-TTY-EOF-OK` proves the empty-line EOF, and
+`HAKU64-USER-TTY-INTR-OK` proves that `^C` ran the installed `SIGINT`
+handler with the read failing with `EINTR` and the line discarded. The
+32-bit terminal still returns queued bytes without line editing.
 
 `futex` (202) implements `FUTEX_WAIT` and `FUTEX_WAKE`, and accepts
 `FUTEX_PRIVATE_FLAG` because the op is the low seven bits. `WAIT` compares the

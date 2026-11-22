@@ -15,6 +15,12 @@
 #include "vga_text.h"
 
 static int console_up;
+/* The screen belongs to userland from console64_handover() onward. Kernel
+ * markers then go to COM1 only, which keeps a log line from drawing over a
+ * running program; the headless check reads COM1, so nothing is lost. The
+ * latch is one-way by design and console64_reclaim() is the fatal-path
+ * exception (k64_fail), because a stopped kernel has to say why on screen. */
+static int screen_owned;
 
 /* Print the selected backend and its geometry, the way the 32-bit port does,
  * so the serial log names what the screen is showing. */
@@ -60,7 +66,24 @@ void console64_init(void) {
  * COM1 before the screen sees the byte. */
 void k64_putc(char c) {
     serial_putc64(c);
+    if (console_up && !screen_owned) display_putc(c);
+}
+
+/* Program output: the latch does not apply, because the bytes a user program
+ * writes are the reason the screen is owned. */
+void console64_user_putc(char c) {
+    serial_putc64(c);
     if (console_up) display_putc(c);
+}
+
+/* Called as soon as the first user task exists, matching the 32-bit port's
+ * klog_mirror_display(0) handover. */
+void console64_handover(void) {
+    screen_owned = 1;
+}
+
+void console64_reclaim(void) {
+    screen_owned = 0;
 }
 
 void k64_puts(const char *text) {

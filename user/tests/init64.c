@@ -878,32 +878,92 @@ static void test_pipe_blocking(void) {
         printf("HAKU64-USER-PIPE-BLOCK-OK: a full ring blocks the writer\n");
 }
 
-/* The console read blocks: when the keyboard queue is empty the kernel parks
- * the task with -EAGAIN and IRQ1 wakes it, so this loop retries until a byte
- * arrives. build.py types 'x' only after it reads the marker below, which is
- * what makes the handshake deterministic instead of a race with boot time. */
+static volatile int console_intr_seen;
+
+static void console_intr_handler(int signal) {
+    (void)signal;
+    console_intr_seen = 1;
+}
+
+/* The console read blocks: when no line is finished the kernel parks the task
+ * with -EAGAIN and IRQ1 wakes it, so this loop retries until Enter commits the
+ * line. build.py types 'a', Backspace, 'x' and Enter only after it reads the
+ * marker below, which is what makes the handshake deterministic instead of a
+ * race with boot time; the 'a' proves erase, and the fact that no byte arrives
+ * before Enter proves canonical buffering. The newline is part of the line, so
+ * a second one-byte read returns it. Then a ^D on an empty line is EOF. */
 static void test_console(void) {
-    char ch = 0;
+    char byte = 0;
+    ssize_t n = -1;
     int tries;
 
-    printf("HAKU64-KEY-READY: waiting for one keystroke\n");
+    printf("HAKU64-KEY-READY: waiting for one keystroke line\n");
     for (tries = 0; tries < 200000; tries++) {
-        ssize_t n = read(0, &ch, 1);
+        n = read(0, &byte, 1);
+        if (n != -1) break;
+    }
+    if (n != 1 || byte != 'x') {
+        printf("HAKU64-KEY-FAIL: canonical line began with 0x%02x\n",
+               (unsigned char)byte);
+        failures++;
+        return;
+    }
+    n = read(0, &byte, 1);
+    if (n != 1 || byte != '\n') {
+        printf("HAKU64-KEY-FAIL: the committed line did not end with a"
+               " newline\n");
+        failures++;
+        return;
+    }
+    printf("HAKU64-USER-TTY-LINE-OK: erase and line buffering deliver the"
+           " line on Enter\n");
+    printf("HAKU64-KEY-OK: console read got 'x' after erase\n");
 
-        if (n == 1) {
-            if (ch == 'x')
-                printf("HAKU64-KEY-OK: console read got '%c'\n", ch);
-            else {
-                printf("HAKU64-KEY-FAIL: console read got 0x%02x\n",
-                       (unsigned char)ch);
-                failures++;
-            }
+    printf("HAKU64-KEY-EOF-READY: waiting for ^D on an empty line\n");
+    for (tries = 0; tries < 200000; tries++) {
+        n = read(0, &byte, 1);
+        if (n != -1) break;
+    }
+    if (n == 0) {
+        printf("HAKU64-USER-TTY-EOF-OK: ^D on an empty line reads EOF\n");
+    } else {
+        printf("HAKU64-KEY-FAIL: ^D returned %d instead of EOF\n", (int)n);
+        failures++;
+        return;
+    }
+
+    /* ^C is not text: the line discipline discards the line and raises
+     * SIGINT for the foreground group. The kernel fails the call with EINTR
+     * rather than parking, so the pending signal is delivered on the way back
+     * to user mode and the handler has run by the time read() returns. */
+    {
+        haku64_sigaction_t action;
+        int tries2;
+
+        memset(&action, 0, sizeof(action));
+        action.handler = (unsigned long long)console_intr_handler;
+        if (sigaction(HAKU64_SIGINT, &action, NULL) != 0) {
+            printf("HAKU64-KEY-FAIL: could not install the SIGINT handler\n");
+            failures++;
             return;
         }
-        if (n != -1) break;        /* 0 or a positive short count: not ours */
+        console_intr_seen = 0;
+        printf("HAKU64-KEY-INTR-READY: waiting for ^C\n");
+        for (tries2 = 0; tries2 < 200000; tries2++) {
+            errno = 0;
+            n = read(0, &byte, 1);
+            if (console_intr_seen) break;
+            if (n != -1) break;
+        }
+        if (console_intr_seen && n == -1 && errno == HAKU64_EINTR) {
+            printf("HAKU64-USER-TTY-INTR-OK: ^C raised SIGINT and discarded"
+                   " the line\n");
+            return;
+        }
+        printf("HAKU64-KEY-FAIL: ^C gave seen=%d n=%d errno=%d\n",
+               console_intr_seen, (int)n, errno);
+        failures++;
     }
-    printf("HAKU64-KEY-FAIL: console read never returned a byte\n");
-    failures++;
 }
 
 /* The kernel unpacks a cpio archive from /disk/INITRD into RAM and mounts it

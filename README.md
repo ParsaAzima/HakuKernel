@@ -202,12 +202,12 @@ its own current task, idle task and timer, and wakes other CPUs with an IPI.
 Tasks are pinned to the CPU that created them, there is no load balancing or
 migration, and the user-space concurrency tests still run on the bootstrap
 processor, so a ring-3 task running on an AP is not yet covered. The x86-64
-kernel also lacks signal handlers, a line discipline, the kernel-log
-latch and any namespace beyond its boot mounts and the filesystems modules
-mount themselves, so its userland is a C library (`user/lib64`) plus the
-`/INIT.ELF` self-test rather than a shell; its console and PS/2 keyboard
-are there so a program can read a line's worth of keys. FAT12 has 8.3 names,
-no timestamps, and no permission bits. Haku's
+kernel also has no shell or scrollback and no namespace beyond its boot mounts
+and the filesystems modules mount themselves, so its userland is a C library
+(`user/lib64`) plus the `/INIT.ELF` self-test rather than a shell; its console
+has a canonical line discipline and PS/2 keyboard so a program can read a
+whole line of keys. FAT12 has 8.3 names, no timestamps, and no permission
+bits. Haku's
 filesystem cache holds eight paths of at most 128 KiB each. Everything
 beyond the implemented subset returns `ENOSYS` rather than pretending to work.
 

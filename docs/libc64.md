@@ -271,10 +271,12 @@ one thread (the leader, or the first live thread when the leader is gone), and
 `waitpid`, `nanosleep` or `poll` with `errno = EINTR`. `raise(SIGSTOP)` parks
 the calling task and `kill(pid, SIGCONT)` resumes it; `waitpid` reports the
 stop with `WUNTRACED` and the resume with `WCONTINUED`, reaping only on exit.
-The terminal raises two signals itself: a console read from a background
+The terminal raises signals itself. A console read from a background
 process group stops that group with `SIGTTIN` (and the read fails with `EINTR`
-after the resume, or with `EIO` if `SIGTTIN` is blocked or ignored), and a
-session leader's exit sends `SIGHUP` to the console's foreground group. There
+after the resume, or with `EIO` if `SIGTTIN` is blocked or ignored), a session
+leader's exit sends `SIGHUP` to the console's foreground group, and on x86-64
+`^C` at the keyboard queues `SIGINT` for that same foreground group instead of
+joining the line. There
 is no `sigqueue`,
 no real-time range, no hardware-fault delivery (a ring-3 fault still ends the
 group instead of entering a `SIGSEGV` handler), no `SA_RESTART` restart of the
@@ -287,7 +289,8 @@ refused by `tcsetpgrp` and never reported by `tcgetpgrp`.
 `ioctl` in `unistd64.c` hands the request number to the kernel unchanged, and
 the console is the only descriptor that answers. `TCGETS` reports the fixed
 mode (`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`), `TCSETS`,
-`TCSETSW`, `TCSETSF`, `TCSBRK` and `TCFLSH` succeed without changing it,
+`TCSETSW`, `TCSETSF` and `TCSBRK` succeed without changing it, `TCFLSH` with
+`TCIFLUSH` or `TCIOFLUSH` drops queued keys and the line being edited,
 `TIOCGWINSZ` reports 80x25, and `TIOCGPGRP`/`TIOCSPGRP` read and write the
 console's foreground process group (one console, so one stored group; the
 session is not checked). The same stored group is what decides whether a
@@ -296,6 +299,20 @@ A group with no live member
 is refused with `EPERM`, and a descriptor whose description is not the console
 — including `/dev/null` and a pipe — fails with `ENOTTY`. A program that only
 wants to know whether it is on a terminal can therefore rely on that error.
+
+`read` on the console implements the canonical mode `TCGETS` reports. One
+finished line is buffered at a time: Enter commits it and echoes `\r\n`, the
+`0x08` a PC Backspace sends and `VERASE` `0x7F` remove the last character and
+echo backspace-space-backspace, and `^D` ends the line — an empty line is a
+zero-length EOF read, while a partial line is delivered without its newline.
+Every accepted byte is echoed. `^C` discards the line, sends `SIGINT` to the
+foreground group, and fails the read with `EINTR`; `^\` and `^Z` are ordinary
+bytes for now. A call with no
+finished line parks the task and returns `EAGAIN`, so a program that wants a
+normal blocking read retries on that error, which is what the x86-64 test
+does. A short buffer takes the front of the line and leaves the rest for the
+next read. Type-ahead beyond the current line stays in the 128-byte keyboard
+ring rather than growing kernel state.
 
 ## Build pipeline
 
@@ -339,6 +356,9 @@ regression says what broke instead of only changing an exit status:
 | `HAKU64-USER-STOP-OK` | a child stopped itself with `SIGSTOP`, `wait4(WUNTRACED)` reported `(SIGSTOP << 8) | 0x7F` without reaping it, `kill(pid, 0)` still found it, `SIGCONT` resumed it, `wait4(WCONTINUED)` reported `0xFFFF` once, and the child then exited cleanly |
 | `HAKU64-USER-TTY-OK` | `TCGETS` reported canonical mode, `TIOCGWINSZ` 80x25, `TIOCGPGRP`/`TIOCSPGRP` round-tripped the caller's group, an unknown group was refused with `EPERM`, and `TCGETS` on `/dev/null` failed with `ENOTTY` |
 | `HAKU64-USER-TTY-SIGNAL-OK` | a background read with `SIGTTIN` blocked failed with `EIO`, the same read with the default disposition stopped on `SIGTTIN` and returned `EINTR` after `SIGCONT`, and a session leader's exit sent `SIGHUP` to the console's foreground group |
+| `HAKU64-USER-TTY-LINE-OK` | typing `a`, Backspace, `x`, Enter produced the single line `x\n`: erase removed the `a` and no byte arrived before Enter |
+| `HAKU64-USER-TTY-EOF-OK` | `^D` on the next, empty line returned a zero-length read instead of blocking |
+| `HAKU64-USER-TTY-INTR-OK` | `^C` ran the installed `SIGINT` handler, the read failed with `EINTR`, and the typed line was discarded |
 | `HAKU64-USER-ERRNO-THREAD-OK` | a thread's `errno` write did not reach its creator's |
 | `HAKU64-USER-THREAD-EXEC-IMAGE-OK` | the image a thread `execve`d is running (printed by the new image) |
 | `HAKU64-USER-THREAD-EXEC-OK` | the exec ended the group leader, which was reaped, and the thread's image exited with 42 |
