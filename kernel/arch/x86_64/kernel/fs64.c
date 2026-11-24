@@ -24,7 +24,10 @@
  *
  * Limits, stated rather than hidden: a cached file is at most 32 pages
  * (128 KiB), at most 8 paths are cached at once, and the cache is shared by
- * every descriptor of the same path (opened read-write internally). FAT12
+ * every descriptor of the same path (opened read-write internally). execve()
+ * is the one reader that does not go through the cache: it streams an image
+ * into one heap buffer (fs64_load_image), because an executable is read once
+ * and mapped, and a 128 KiB ceiling is not an executable ceiling. FAT12
  * still stores 8.3 names; a RAM file may use up to 48 bytes of name. The
  * FAT12 cache is written back, not write-through: after a crash, the last
  * dirty pages can be lost. A mapping also does not hold a cache reference of
@@ -109,6 +112,8 @@ static char dir_paths[FS64_DESC_MAX][K64_FS_PATH_MAX + 1];
 #define FS64_EPERM    1
 #define FS64_ENOENT   2
 #define FS64_EIO      5
+#define FS64_ENOEXEC  8
+#define FS64_ENOMEM   12
 #define FS64_EBADF    9
 #define FS64_EACCES   13
 #define FS64_EFAULT   14
@@ -568,6 +573,104 @@ u64 fs64_read(int file, u64 offset, void *dst, u64 count) {
         done += chunk;
     }
     return done;
+}
+
+/* Load a whole file for execve into a fresh heap buffer. read() goes
+ * through the page cache, whose per-file bound (128 KiB) is the wrong bound
+ * for an image: an executable is read once and mapped, never read again, so
+ * streaming it costs one buffer and leaves the cache to files that are
+ * actually read. A FAT12 file is streamed from its own handle in 64 KiB
+ * chunks; a RAM file is copied from its node's pages and therefore stays
+ * bounded by the ramfs file limit. Returns the size and sets *image, or
+ * returns a negative errno and leaves *image alone. */
+s64 fs64_load_image(const char *path, u8 **image, u64 cap) {
+    char rel[VFS64_REL_MAX];
+    u32 backend, mount = 0;
+    u8 *buffer;
+    u64 size;
+
+    if (!path || !*path || !image) return -FS64_EINVAL;
+    *image = 0;
+    if (vfs64_resolve_mount(path, &backend, rel, &mount) != 0)
+        return -FS64_ENOENT;
+
+    if (backend == VFS64_MOUNT_RAM) {
+        u32 node, ino;
+        int kind;
+        int result = ramfs64_lookup(rel, &node, &kind, &size, &ino);
+
+        if (result < 0) return (s64)result;
+        if (kind != FS64_KIND_FILE) return -FS64_EISDIR;
+        if (size == 0) return -FS64_ENOEXEC;
+        if (size > cap) return -FS64_ENOMEM;
+        buffer = (u8 *)kmalloc64(size);
+        if (!buffer) return -FS64_ENOMEM;
+        for (u64 page = 0, at = 0; at < size;
+             page++, at += K64_PAGE_SIZE) {
+            u64 frame = ramfs64_page(node, page);
+            u64 chunk = K64_PAGE_SIZE;
+
+            if (!frame) {
+                kfree64(buffer);
+                return -FS64_EIO;
+            }
+            if (chunk > size - at) chunk = size - at;
+            memcpy(buffer + at, phys_to_virt64(frame), (usize)chunk);
+        }
+        *image = buffer;
+        return (s64)size;
+    }
+
+    /* devfs and module mounts were never executable (the old lookup skipped
+     * them); a procfs file is synthetic and cannot be an ELF image. */
+    if (backend == VFS64_MOUNT_DEV || backend == VFS64_MOUNT_MODULE)
+        return -FS64_ENOENT;
+    if (backend != VFS64_MOUNT_FAT) return -FS64_ENOEXEC;
+    {
+        fat12_file_t handle;
+        fat12_stat_t stat;
+        uint32_t got, pos;
+        u64 done = 0;
+
+        if (fat12_file_open(rel, FAT12_OPEN_READ, &handle) != 1)
+            return -FS64_ENOENT;
+        if (fat12_file_fstat(&handle, &stat) != 1) {
+            (void)fat12_file_close(&handle);
+            return -FS64_EIO;
+        }
+        size = stat.size;
+        if (size == 0) {
+            (void)fat12_file_close(&handle);
+            return -FS64_ENOEXEC;
+        }
+        if (size > cap) {
+            (void)fat12_file_close(&handle);
+            return -FS64_ENOMEM;
+        }
+        buffer = (u8 *)kmalloc64(size);
+        if (!buffer) {
+            (void)fat12_file_close(&handle);
+            return -FS64_ENOMEM;
+        }
+        while (done < size) {
+            u64 chunk = size - done;
+
+            if (chunk > 64u * 1024u) chunk = 64u * 1024u;
+            if (fat12_file_seek(&handle, (int32_t)done, FAT12_SEEK_SET,
+                                &pos) != 1 ||
+                fat12_file_read(&handle, buffer + done, (uint32_t)chunk,
+                                &got) != 1 ||
+                got != chunk) {
+                (void)fat12_file_close(&handle);
+                kfree64(buffer);
+                return -FS64_EIO;
+            }
+            done += chunk;
+        }
+        (void)fat12_file_close(&handle);
+        *image = buffer;
+        return (s64)size;
+    }
 }
 
 /* Write into the cache, extending the file up to FS64_PAGE_MAX pages.

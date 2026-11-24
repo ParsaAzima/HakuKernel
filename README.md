@@ -96,8 +96,9 @@ volume itself as `/`.
   file writes behind a page cache that file-backed `mmap` maps from,
   `fork`/`wait4` with copy-on-write pages and default-action signals,
   `dup`/`dup2` over a shared file
-  description, `nanosleep`, `execve` of an ELF64 file from the disk with
-  `argc`/`argv`/`envp` on the new stack, threads: `clone` with
+  description, `nanosleep`, `execve` of an ELF64 file streamed from the disk
+  (up to 1.5 MiB) with `argc`/`argv`/`envp` on the new stack, threads:
+  `clone` with
   `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`, `gettid`, `futex` wait/wake, a
   detached `CLONE_DETACH` form, the pthread subset and robust mutexes,
   the ported i386 syscall table on the x86-64 ABI (`stat`/`statx`,
@@ -208,7 +209,8 @@ and the filesystems modules mount themselves, so its userland is a C library
 has a canonical line discipline and PS/2 keyboard so a program can read a
 whole line of keys. FAT12 has 8.3 names, no timestamps, and no permission
 bits. Haku's
-filesystem cache holds eight paths of at most 128 KiB each. Everything
+filesystem cache holds eight paths of at most 128 KiB each; `execve` streams an
+image of up to 1.5 MiB instead of caching it. Everything
 beyond the implemented subset returns `ENOSYS` rather than pretending to work.
 
 ## Policies

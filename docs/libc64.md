@@ -312,7 +312,10 @@ finished line parks the task and returns `EAGAIN`, so a program that wants a
 normal blocking read retries on that error, which is what the x86-64 test
 does. A short buffer takes the front of the line and leaves the rest for the
 next read. Type-ahead beyond the current line stays in the 128-byte keyboard
-ring rather than growing kernel state.
+ring rather than growing kernel state. The `0xE0` extended keys are consumed
+by the kernel, not delivered as bytes: Up/Down recall committed lines,
+Left/Right/Home/End move the insertion point, and Page Up/Down review the
+framebuffer's scrollback ring.
 
 ## Build pipeline
 

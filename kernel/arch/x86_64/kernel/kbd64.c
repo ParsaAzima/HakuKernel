@@ -16,6 +16,11 @@
  * characters a PC keyboard cannot otherwise produce: Ctrl+A..Z become
  * 0x01..0x1A, which is how ^D (end-of-line/EOF) and ^C (SIGINT) are typed.
  *
+ * The 0xE0 prefix is state, not a discarded byte: the following scancode is
+ * one of the extended keys. Arrows and Page Up/Down become K64_KEY_* markers
+ * above 0x7F, which tty64.c consumes for line editing, history recall and
+ * scrollback review; extended Enter and keypad '/' remain ordinary text.
+ *
  * Everything that touches the ring or the modifier state takes the same
  * interrupt-safe lock, because IRQ1 and a system call both reach it. The ring
  * drops the newest byte when full: losing one keystroke is better than
@@ -56,17 +61,46 @@ static u32 queue_tail;                 /* next free slot */
 static volatile int shift_down;
 static volatile int caps_lock;
 static volatile int ctrl_down;
+static volatile int extended;            /* last byte was 0xE0 */
 static spinlock_t kbd_lock = SPINLOCK_INIT;
 
 /* Translate one scancode. Only the caller's lock makes this safe: it touches
- * the modifier state. Returns 1 when a byte was produced. */
+ * the modifier and prefix state. Returns 1 when a byte was produced. */
 static int kbd_decode(u8 sc, char *out) {
     int break_code;
     u8 index;
 
-    /* Extended prefix (arrows, keypad, right ctrl/alt). The 32-bit driver
-     * ignores it too; the four arrow keys therefore do nothing yet. */
-    if (sc == 0xE0) return 0;
+    if (sc == 0xE0) {
+        extended = 1;
+        return 0;
+    }
+    if (extended) {
+        extended = 0;
+        break_code = (sc & 0x80) != 0;
+        index = (u8)(sc & 0x7F);
+        if (!break_code) {
+            switch (index) {
+            case 0x48: *out = (char)K64_KEY_UP;    return 1;
+            case 0x50: *out = (char)K64_KEY_DOWN;  return 1;
+            case 0x4B: *out = (char)K64_KEY_LEFT;  return 1;
+            case 0x4D: *out = (char)K64_KEY_RIGHT; return 1;
+            case 0x49: *out = (char)K64_KEY_PGUP;  return 1;
+            case 0x51: *out = (char)K64_KEY_PGDN;  return 1;
+            case 0x47: *out = (char)K64_KEY_HOME;  return 1;
+            case 0x4F: *out = (char)K64_KEY_END;   return 1;
+            case 0x1C: *out = '\n'; return 1;      /* keypad Enter */
+            case 0x35: *out = '/';  return 1;      /* keypad divide */
+            case 0x1D: ctrl_down = 1; return 0;    /* right Ctrl */
+            case 0x2A:                             /* right Shift on some 8042s */
+            case 0x36: shift_down = 1; return 0;
+            default: return 0;
+            }
+        }
+        /* Releasing the extended modifiers must not leave them stuck. */
+        if (index == 0x1D) ctrl_down = 0;
+        if (index == 0x2A || index == 0x36) shift_down = 0;
+        return 0;
+    }
 
     break_code = (sc & 0x80) != 0;
     index = (u8)(sc & 0x7F);
@@ -121,6 +155,12 @@ static void kbd_push(char c) {
     spin_unlock_irqrestore(&kbd_lock, flags);
 }
 
+/* Push an already-decoded byte. Only the boot-time line-discipline self-test
+ * uses this, while IRQ1 is still masked and no reader can race the ring. */
+void kbd64_inject(char c) {
+    kbd_push(c);
+}
+
 int kbd64_read(void) {
     irqflags_t flags = spin_lock_irqsave(&kbd_lock);
     int ch = -1;
@@ -170,15 +210,24 @@ void kbd64_init(void) {
 
 /* Decode-only self-test with synthesised scancodes, so the check does not
  * depend on the headless run typing anything: shift+a gives 'A', shift up
- * gives 'a', Enter and Backspace are queued, Ctrl+d gives 0x04 and releasing
- * Ctrl restores 'd', the 0xE0 prefix and a keypad scancode produce nothing,
- * and the queue drains in order. */
+ * gives 'a', Enter and Backspace are queued, the 0xE0 prefix followed by each
+ * arrow and paging key produces its marker (the extended break and F1 produce
+ * nothing), Ctrl+d gives 0x04 and releasing Ctrl restores 'd', and the queue
+ * drains in order. */
 int kbd64_self_test(void) {
     static const u8 scancodes[] = {
-        0x2A, 0x1E, 0xAA, 0x1E, 0x1C, 0x0E, 0xE0, 0x47, 0x3B,
+        0x2A, 0x1E, 0xAA, 0x1E, 0x1C, 0x0E,
+        0xE0, 0x48, 0xE0, 0xC8, 0xE0, 0x50, 0xE0, 0x4B, 0xE0, 0x4D,
+        0xE0, 0x49, 0xE0, 0x51, 0xE0, 0x47, 0xE0, 0x4F, 0x3B,
         0x1D, 0x20, 0x9D, 0x20
     };
-    static const char expected[] = { 'A', 'a', '\n', '\b', 0x04, 'd' };
+    static const char expected[] = {
+        'A', 'a', '\n', '\b',
+        (char)K64_KEY_UP, (char)K64_KEY_DOWN, (char)K64_KEY_LEFT,
+        (char)K64_KEY_RIGHT, (char)K64_KEY_PGUP, (char)K64_KEY_PGDN,
+        (char)K64_KEY_HOME, (char)K64_KEY_END,
+        0x04, 'd'
+    };
     int produced = 0;
     int ok = 1;
     char ch;
@@ -198,6 +247,7 @@ int kbd64_self_test(void) {
     shift_down = 0;
     caps_lock = 0;
     ctrl_down = 0;
+    extended = 0;
 
     if (!ok) return 0;
     k64_puts("HAKU64-KBD-OK: PS/2 set-1 decode and queue, irq1=");

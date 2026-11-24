@@ -36,6 +36,18 @@ uint32_t fbcon_columns(void);
 uint32_t fbcon_rows(void);
 const char *fbcon_font_name(void);
 
+/* Scrollback. Every row that leaves the top of the visible grid is copied
+ * into a bounded ring before the pixels are moved up. `fbcon_scroll_view`
+ * moves the viewing window by `delta` rows (positive = older) and repaints
+ * the whole grid synchronously; calling it with 0 returns to the live
+ * screen. Any normal putc also returns to the live screen, so output can
+ * never be painted into a stale view. The functions return the current
+ * offset and the number of retained rows; both are 0 without a framebuffer
+ * or when the mode is too large for the character shadow. */
+int fbcon_scroll_view(int delta);
+uint32_t fbcon_scroll_offset(void);
+uint32_t fbcon_scrollback_rows(void);
+
 /* display.h backend table; select it with display_use() once fbcon_init()
  * succeeded. */
 extern const display_ops_t fbcon_display;

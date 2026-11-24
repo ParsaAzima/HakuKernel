@@ -40,3 +40,11 @@ int display_cursor(uint32_t *row, uint32_t *col) {
     active->cursor(row, col);
     return 1;
 }
+
+void display_cursor_up(uint32_t rows) {
+    if (active && active->cursor_up) active->cursor_up(rows);
+}
+
+void display_cursor_col(uint32_t col) {
+    if (active && active->cursor_col) active->cursor_col(col);
+}

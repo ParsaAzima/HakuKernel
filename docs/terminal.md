@@ -34,7 +34,14 @@ come from task and interrupt context.
 
 `kernel/drivers/fbcon.c` owns the framebuffer console: a 256x72 shadow of the
 character grid (so the cursor underline can be erased by repainting the cell
-underneath it), glyph blitting through the font descriptor, and scrolling. The
+underneath it), glyph blitting through the font descriptor, and scrolling.
+Before pixels are moved up, the departing row is copied into a 128-row ring;
+`fbcon_scroll_view(±n)` repaints the whole grid from that ring plus the live
+shadow, with offset 0 exactly reproducing the live screen. Any normal putc
+returns to offset 0 first, so output can never be painted into a snapshot, and
+clearing the screen stops a review without discarding history. The ring and
+the character shadow are both static, bounded by `256 x 72` and
+`128 x 256`, so the renderer never allocates from interrupt context. The
 screen is plain text, all of it -- no status line, no reserved row and no
 overlay -- so the grid is exactly the mode divided by the cell: 128x48 at
 1024x768. The font is Terminus 8x16 bold, embedded as
@@ -96,8 +103,11 @@ kernel still shows its reason on the machine.
 same US-layout tables and shift/caps handling as `kernel/drivers/kbd.c`, and
 pushes the character into a 128-byte ring. The ring drops the newest byte when
 it is full (losing a keystroke beats overwriting one the reader has not seen),
-and the `0xE0` prefix is ignored, so the arrow keys and the keypad do nothing
-yet -- exactly as on the 32-bit side. Ctrl is tracked like Shift, because the
+and the `0xE0` prefix is now state: the following scancode becomes a
+`K64_KEY_*` marker above `0x7F` for Up, Down, Left, Right, Page Up/Down, Home
+and End, while extended Enter and keypad `/` stay ordinary text. Those markers
+never reach a reader -- `tty64.c` consumes them (the 32-bit driver still
+ignores the prefix). Ctrl is tracked like Shift, because the
 terminal's special characters are otherwise unreachable: Ctrl+A..Z decode to
 `0x01..0x1A`, which is how `^D` and `^C` are typed. IRQ1 is unmasked only after
 a decode-only self-test proves the tables (`HAKU64-KBD-OK`), which keeps the
@@ -129,6 +139,27 @@ types. The test types `a`, Backspace, `x`, Enter and then `^D` after
 line buffering, `HAKU64-USER-TTY-EOF-OK` proves the empty-line `^D`, and a
 final `^C` with a handler installed proves `HAKU64-USER-TTY-INTR-OK`: the
 read fails with `EINTR`, the line is discarded, and the handler runs.
+
+The same line discipline owns the extended keys. Up/Down walk a 32-entry ring
+of committed lines with the in-progress line staged so Down restores it;
+Left/Right/Home/End move an insertion point that backspace deletes before and
+ordinary typing inserts at; Page Up/Down move the framebuffer scrollback view
+and report `HAKU64-SCROLL-UP`/`HAKU64-SCROLL-DOWN` on COM1. The headless run
+prints a READY marker before each key batch, so `user/tests/init64.c` can
+assert that Up recalled `re`, that Up-Up-Down walked back and forward, and
+that Page keys were consumed while ordinary text still reached the reader
+(`HAKU64-HIST-OK`, `HAKU64-HIST-RECALL-OK`, `HAKU64-HIST-CYCLE-OK`,
+`HAKU64-SCROLL-OK`).
+
+A line that wrapped over several rows is redrawn in full: `display_ops_t`
+gained relative cursor moves (`cursor_up`, `cursor_col`), implemented by both
+backends, and `tty64.c` captures the start cell on the first key of a line.
+A refresh walks back by `floor((start_col + drawn_chars) / columns)` rows,
+paints the line and its erase tail, then walks back again to place the cursor
+at the insertion point. The row count is relative, so a scroll that moved
+both the anchor and the cursor cancels out. A boot-time self-test types a
+line longer than the 128-column grid, edits it in the middle and checks both
+the cursor cell and the delivered text (`HAKU64-TTY-REDRAW-OK`).
 
 ## Logging, panic, and crash reports
 

@@ -16,6 +16,11 @@ typedef struct display_ops {
     void (*putc)(char c);
     /* 1-based text cursor position, for the terminal's cursor report. */
     void (*cursor)(uint32_t *row, uint32_t *col);
+    /* Relative cursor movement for a line editor that redraws a line which
+     * wrapped over several rows. Both are no-ops on a backend that does not
+     * track a cursor. */
+    void (*cursor_up)(uint32_t rows);
+    void (*cursor_col)(uint32_t col); /* 0-based column in the current row */
 } display_ops_t;
 
 /* Select the VGA text backend and clear the screen. */
@@ -30,5 +35,8 @@ void display_clear(uint8_t color);
 /* Text cursor as a 1-based (row, column) pair. Returns 0 when the active
  * backend does not track one. */
 int display_cursor(uint32_t *row, uint32_t *col);
+/* Relative cursor moves for a line editor redrawing wrapped text. */
+void display_cursor_up(uint32_t rows);
+void display_cursor_col(uint32_t col);
 
 #endif

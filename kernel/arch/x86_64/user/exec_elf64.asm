@@ -64,6 +64,14 @@ _start:
     mov edx, msg_args_end - msg_args
     syscall
 
+    ; The tail of this image sits past the old 128 KiB budget: exec must
+    ; have read and mapped the whole file for this string to print.
+    mov eax, HAKU64_SYS_WRITE
+    mov edi, 1
+    lea rsi, [msg_large]
+    mov edx, msg_large_end - msg_large
+    syscall
+
     mov eax, HAKU64_SYS_EXIT
     mov edi, 42
     syscall
@@ -151,7 +159,7 @@ msg_bad_env:
 msg_bad_env_end:
 
 arg_path:
-    db '/USER.ELF', 0
+    db '/disk/USER.ELF', 0
 
 arg_alpha:
     db 'alpha', 0
@@ -161,3 +169,12 @@ arg_beta:
 
 env_one:
     db 'A=1', 0
+
+; Deliberate filler: this program is the large-image test. Filling 320 KiB
+; with zeros makes /disk/USER.ELF bigger than the page cache's 128 KiB bound,
+; and the marker after it lives in the last page, so printing it proves
+; execve streamed and mapped the whole file.
+times 327680 db 0
+msg_large:
+    db 'HAKU64-EXEC-LARGE', 13, 10
+msg_large_end:

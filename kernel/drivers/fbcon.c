@@ -13,6 +13,11 @@
  * is the only state that is not derivable from pixels, and it is bounded by
  * FBCON_MAX_COLS x FBCON_MAX_ROWS; a mode larger than that still renders, it
  * just keeps the cursor as a plain overlay.
+ *
+ * The shadow is also the source for scrollback: before a scroll discards the
+ * top row, its characters are copied into a bounded ring. A viewer offsets
+ * which part of (scrollback + live shadow) is painted; normal output cancels
+ * the offset first, so no kernel or user write can disappear into history.
  */
 #include "fbcon.h"
 #include "sync.h"
@@ -22,8 +27,16 @@
  * from interrupt context and must never allocate. */
 #define FBCON_MAX_COLS 256u
 #define FBCON_MAX_ROWS 72u
+/* 128 rows of history at the widest supported grid is 32 KiB of static
+ * storage. The renderer runs in interrupt context and must not allocate, and
+ * a fixed ring also bounds the work a runaway producer can cause. */
+#define FBCON_SCROLL_MAX_ROWS 128u
 
 static uint8_t fbcon_shadow[FBCON_MAX_COLS * FBCON_MAX_ROWS];
+static uint8_t scroll_rows[FBCON_SCROLL_MAX_ROWS][FBCON_MAX_COLS];
+static uint32_t scroll_head;              /* oldest retained row */
+static uint32_t scroll_count;
+static uint32_t scroll_view;              /* 0 = the live grid */
 
 static int fb_ready;
 static int fb_shadowed;
@@ -168,6 +181,20 @@ static void fb_erase_cursor(void) {
 
 /* --- scrolling --------------------------------------------------------- */
 
+/* Preserve the row about to leave the screen. One bounded copy per scroll,
+ * from the shadow row that fb_scroll() is about to overwrite. */
+static void scroll_push(void) {
+    uint32_t slot;
+
+    if (!fb_shadowed || !fb_cols) return;
+    if (scroll_count == FBCON_SCROLL_MAX_ROWS)
+        scroll_head = (scroll_head + 1u) % FBCON_SCROLL_MAX_ROWS;
+    else
+        scroll_count++;
+    slot = (scroll_head + scroll_count - 1u) % FBCON_SCROLL_MAX_ROWS;
+    memcpy(scroll_rows[slot], fbcon_shadow, fb_cols);
+}
+
 static void fb_scroll(void) {
     uint32_t row_bytes = fb_pitch * fb_cell_h;
     /* Move the whole screen up by one row and blank the last one. */
@@ -175,6 +202,7 @@ static void fb_scroll(void) {
     uint8_t *dst = fb_base;
     uint8_t *src = dst + row_bytes;
 
+    scroll_push();
     memmove(dst, src, total);
     /* Blank the new last row with the scanline filler, not a per-pixel
      * put: it is the same clamped rectangle and a fraction of the calls. */
@@ -188,6 +216,48 @@ static void fb_scroll(void) {
     fb_cursor_y = fb_rows - 1u;
     fb_cursor_x = 0;
 }
+
+/* Repaint every visible row from the logical screen: the retained history
+ * followed by the live shadow. Row 0 of the view is `scroll_view` rows before
+ * the first live row, so offset 0 reproduces the live grid exactly. Caller
+ * holds fb_lock. */
+static void fb_repaint(void) {
+    for (uint32_t row = 0; row < fb_rows; row++) {
+        uint32_t logical = scroll_count - scroll_view + row;
+
+        fb_fill(0, row * fb_cell_h, fb_width, fb_cell_h, fb_bg);
+        for (uint32_t col = 0; col < fb_cols; col++) {
+            char ch;
+
+            if (logical < scroll_count)
+                ch = (char)scroll_rows[(scroll_head + logical) %
+                                       FBCON_SCROLL_MAX_ROWS][col];
+            else
+                ch = fb_shadow_get(col, logical - scroll_count);
+            if (ch && ch != ' ')
+                fb_draw_glyph(col, row, ch, fb_fg, fb_bg);
+        }
+    }
+    /* The underline belongs to the live grid, not to a snapshot. */
+    if (!scroll_view) fb_draw_cursor();
+}
+
+int fbcon_scroll_view(int delta) {
+    irqflags_t flags;
+
+    if (!fb_ready || !fb_shadowed) return 0;
+    flags = spin_lock_irqsave(&fb_lock);
+    /* Clamp before negating so even INT_MIN is harmless. */
+    if (delta > (int)scroll_count) delta = (int)scroll_count;
+    if (delta < -(int)scroll_count) delta = -(int)scroll_count;
+    scroll_view = (uint32_t)((int)scroll_view + delta);
+    fb_repaint();
+    spin_unlock_irqrestore(&fb_lock, flags);
+    return (int)scroll_view;
+}
+
+uint32_t fbcon_scroll_offset(void) { return scroll_view; }
+uint32_t fbcon_scrollback_rows(void) { return scroll_count; }
 
 /* --- output ------------------------------------------------------------ */
 
@@ -234,6 +304,9 @@ static void fbcon_clear(uint8_t color) {
     (void)color;
     if (!fb_ready) return;
     flags = spin_lock_irqsave(&fb_lock);
+    /* Clearing the screen does not erase history, but it does stop any
+     * review of it: there is nothing on screen to review any more. */
+    scroll_view = 0;
     fb_fill(0, 0, fb_width, fb_height, fb_bg);
     if (fb_shadowed)
         memset(fbcon_shadow, ' ', fb_cols * fb_rows);
@@ -249,6 +322,12 @@ static void fbcon_putc(char c) {
     if (!fb_ready) return;
     if (c == '\0') return;
     flags = spin_lock_irqsave(&fb_lock);
+    /* Writing while reviewing history returns to the live grid first, so a
+     * later write lands where its cursor says it will. */
+    if (scroll_view) {
+        scroll_view = 0;
+        fb_repaint();
+    }
     fb_putc_locked(c);
     spin_unlock_irqrestore(&fb_lock, flags);
 }
@@ -264,11 +343,51 @@ static void fbcon_cursor(uint32_t *row, uint32_t *col) {
     spin_unlock_irqrestore(&fb_lock, flags);
 }
 
+/* A line editor redrawing text that wrapped over several rows moves back to
+ * the line's first cell before repainting. The underline is repainted from
+ * the shadow at both ends so no pixels from the old position survive, and a
+ * pending scrollback review is cancelled just like a putc would cancel it. */
+static void fbcon_cursor_up(uint32_t rows) {
+    irqflags_t flags;
+
+    if (!fb_ready || !rows) return;
+    flags = spin_lock_irqsave(&fb_lock);
+    if (scroll_view) {
+        scroll_view = 0;
+        fb_repaint();
+    }
+    if (rows > fb_cursor_y) rows = fb_cursor_y;
+    fb_erase_cursor();
+    fb_cursor_y -= rows;
+    fb_draw_cursor();
+    spin_unlock_irqrestore(&fb_lock, flags);
+}
+
+static void fbcon_cursor_col(uint32_t col) {
+    irqflags_t flags;
+
+    if (!fb_ready) return;
+    flags = spin_lock_irqsave(&fb_lock);
+    if (scroll_view) {
+        scroll_view = 0;
+        fb_repaint();
+    }
+    if (fb_cols && col >= fb_cols) col = fb_cols - 1u;
+    if (col != fb_cursor_x) {
+        fb_erase_cursor();
+        fb_cursor_x = col;
+        fb_draw_cursor();
+    }
+    spin_unlock_irqrestore(&fb_lock, flags);
+}
+
 const display_ops_t fbcon_display = {
     "framebuffer",
     fbcon_clear,
     fbcon_putc,
     fbcon_cursor,
+    fbcon_cursor_up,
+    fbcon_cursor_col,
 };
 
 /* --- queries ----------------------------------------------------------- */
@@ -320,6 +439,9 @@ int fbcon_init(const fbcon_mode_t *mode) {
     fb_cursor_fg = compose(0x40u, 0xC0u, 0xFFu);
 
     fb_shadowed = fb_cols <= FBCON_MAX_COLS && fb_rows <= FBCON_MAX_ROWS;
+    scroll_head = 0;
+    scroll_count = 0;
+    scroll_view = 0;
 
     fb_cursor_x = 0;
     fb_cursor_y = 0;

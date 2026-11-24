@@ -777,6 +777,12 @@ void console64_reclaim(void);
  * paints the screen, latched or not; the console write path and the line
  * discipline's echo use it. */
 void console64_user_putc(char c);
+/* Text cursor of the active backend, 1-based row and column. */
+void console64_user_cursor(u32 *row, u32 *col);
+/* Move that cursor up `rows` rows, or set its 0-based column. Used by the
+ * line discipline to redraw an edited line that wrapped over rows. */
+void console64_user_cursor_up(u32 rows);
+void console64_user_cursor_col(u32 col);
 /* Answers the screen size the console writer can use: the framebuffer's text
  * grid, or the VGA text grid. Both are always valid after console64_init. */
 u32 console64_columns(void);
@@ -792,6 +798,18 @@ int fb64_init(void);
  * queued; console read() pops from that queue and parks on
  * K64_CONSOLE_WAIT_ADDR when it is empty, so IRQ1 is the wakeup. */
 #define K64_KBD_QUEUE 128u
+/* Extended (0xE0-prefixed) keys are carried through the same byte ring as
+ * ASCII. They live above 0x7F so no printable character or Ctrl code can be
+ * confused with them, and only the line discipline consumes them: userland
+ * never sees one in a console read. */
+#define K64_KEY_UP      0x80u
+#define K64_KEY_DOWN    0x81u
+#define K64_KEY_LEFT    0x82u
+#define K64_KEY_RIGHT   0x83u
+#define K64_KEY_PGUP    0x84u
+#define K64_KEY_PGDN    0x85u
+#define K64_KEY_HOME    0x86u
+#define K64_KEY_END     0x87u
 /* A kernel pseudo-address, far above any user mapping: the scheduler only
  * compares it for equality when it matches waiters. */
 #define K64_CONSOLE_WAIT_ADDR 0xFFFFFFFFFFFFF000ull
@@ -805,6 +823,9 @@ int kbd64_read(void);
 u32 kbd64_pending(void);
 /* IRQ1: read the controller and queue what it produced. */
 void kbd64_irq(void);
+/* Push one already-decoded byte, for the boot-time tty self-test while IRQ1
+ * is still masked. Real keys always arrive through kbd64_irq. */
+void kbd64_inject(char c);
 
 /* tty64.c: the console's canonical line discipline. The keyboard queue holds
  * raw keys; this layer turns them into one echoed line at a time. The
@@ -812,7 +833,11 @@ void kbd64_irq(void);
  * VERASE 0x7F erase, ^D ends the line (an empty line is EOF), and ^C
  * discards the line and raises SIGINT for the foreground group. Control
  * characters reach it because kbd64.c tracks Ctrl and maps Ctrl+letter to
- * 0x01..0x1A, which is what makes ^D and ^C typeable on a PC keyboard. */
+ * 0x01..0x1A, which is what makes ^D and ^C typeable on a PC keyboard.
+ * K64_KEY_* markers from 0xE0-prefixed keys are line-discipline policy:
+ * Up/Down walk the bounded history of committed lines, Left/Right/Home/End
+ * move the insertion point, and Page Up/Down move the framebuffer console's
+ * scrollback view. */
 void tty64_reset(void);
 /* 1 when a finished line (or an EOF result) is waiting for the reader. */
 int tty64_pending_line(void);
@@ -825,6 +850,10 @@ u32 tty64_pump(int id, int *interrupted);
 int tty64_take_line(void *dst, u32 count, u32 *copied);
 /* TCFLSH: drop queued keys and the line being edited. */
 void tty64_flush(void);
+/* Boot-time self-test: a line longer than the grid width is edited in its
+ * middle, and the cursor is checked at the insertion point. Prints
+ * HAKU64-TTY-REDRAW-OK. */
+int tty64_self_test(void);
 
 /* bootmem64.c: bump allocator for the structures that must exist before
  * the frame allocator and heap do (page tables, frame bitmaps). */
@@ -885,9 +914,12 @@ void paging64_switch_space(u64 space);
 /* ------------------------------------------------------------- ELF64 loader
  * On-disk layout (the loader validates it before touching memory). The
  * supported subset is static ET_EXEC: no PT_INTERP, no PT_DYNAMIC, readable
- * PT_LOAD segments that are not both writable and executable. */
+ * PT_LOAD segments that are not both writable and executable. An image is at
+ * most 384 pages (1.5 MiB) including its stack, which is the size a static
+ * musl binary needs; the frame vector in elf64_load() is 3 KiB of that. */
 #define K64_ELF64_MAX_PHDRS 16u
-#define K64_ELF64_MAX_PAGES 64u
+#define K64_ELF64_MAX_PAGES 384u
+#define K64_ELF64_MAX_BYTES ((u64)K64_ELF64_MAX_PAGES * K64_PAGE_SIZE)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -1188,7 +1220,9 @@ int task64_pgrp_valid(u32 pgrp);
 
 /* fs64.c: a page cache in front of every mounted filesystem. A cached file
  * is at most FS64_PAGE_MAX pages (128 KiB) and eight paths are cached at
- * once. The FAT12 volume is mounted at /disk and the RAM initramfs at /. */
+ * once. The FAT12 volume is mounted at /disk and the RAM initramfs at /.
+ * execve() is the one reader that does not go through this bound: it streams
+ * an image into the heap instead of caching it (fs64_load_image). */
 #define K64_FS_FDS      16u
 #define K64_FS_PATH_MAX 64u
 #define FS64_PAGE_MAX   32u
@@ -1204,6 +1238,9 @@ u64 fs64_size(int file);
 u64 fs64_pages(int file);
 u64 fs64_page(int file, u64 index);
 u64 fs64_read(int file, u64 offset, void *dst, u64 count);
+/* Read a whole executable image into a fresh heap buffer, bypassing the page
+ * cache's per-file bound. Returns the size, or a negative errno. */
+s64 fs64_load_image(const char *path, u8 **image, u64 cap);
 u64 fs64_write(int file, u64 offset, const void *src, u64 count);
 int fs64_truncate(int file, u64 size);
 int fs64_open_fd(int task, const char *path, u64 flags, int *error);

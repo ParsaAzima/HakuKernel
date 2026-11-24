@@ -936,9 +936,11 @@ cow_done:
     jne fail
 
     ; ---- fork + execve: run a program that lives on the disk ----------
-    ; USER.ELF is not linked into the kernel, so the only way this line can
-    ; print is if execve read it from the FAT12 volume, validated it and
-    ; replaced the child's address space with it.
+    ; USER.ELF is not linked into the kernel and not in the initramfs, so
+    ; the only way this line can print is if execve streamed it from the
+    ; FAT12 volume, validated it and replaced the child's address space. The
+    ; file is deliberately larger than one page-cache slot, which is what
+    ; proves the image path does not inherit the cache's 128 KiB bound.
     mov r15d, 51
     mov eax, HAKU64_SYS_FORK
     syscall
@@ -984,9 +986,10 @@ exec_child:
     cmp rax, -HAKU64_ENOENT
     jne exec_bad
 
-    ; Now the real thing: argv = {"/USER.ELF", "alpha", "beta", NULL} and
-    ; envp = {"A=1", NULL}. The stack the child gets built by execve is what
-    ; USER.ELF reads, so status 42 proves argc/argv/envp landed correctly.
+    ; Now the real thing: argv = {"/disk/USER.ELF", "alpha", "beta", NULL}
+    ; and envp = {"A=1", NULL}. The stack the child gets built by execve is
+    ; what USER.ELF reads, so status 42 proves argc/argv/envp landed
+    ; correctly.
     mov rbx, EXEC_ARGV
     lea rax, [path_user]
     mov [rbx], rax
@@ -1865,7 +1868,7 @@ path_dot:
     db '/./HELLO.TXT', 0
 
 path_user:
-    db '/USER.ELF', 0
+    db '/disk/USER.ELF', 0
 
 exec_arg1:
     db 'alpha', 0

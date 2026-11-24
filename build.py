@@ -504,12 +504,14 @@ def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf):
     The kernel mounts FAT12 at /disk, reads /disk/INITRD, and unpacks it into
     the RAM filesystem that becomes /. The archive therefore carries what the
     boot tests open by absolute path: HELLO.TXT with the 16-byte marker,
-    PATTERN.BIN with three pages of a byte pattern, USER.ELF (the program the
-    ring-3 test execs, so the kernel image does not contain it), INIT.ELF (the
-    C program built against user/lib64 that the kernel starts first),
-    X64MOD.HKM (the packed module the loader reads and relocates), ROMFS.HKM
-    (the read-only filesystem module the capability test mounts at /rom), and
-    etc/banner.txt for the ring-3 initramfs check. The pattern is the same
+    PATTERN.BIN with three pages of a byte pattern, INIT.ELF (the C program
+    built against user/lib64 that the kernel starts first), X64MOD.HKM (the
+    packed module the loader reads and relocates), ROMFS.HKM (the read-only
+    filesystem module the capability test mounts at /rom), and
+    etc/banner.txt for the ring-3 initramfs check. USER.ELF stays on the
+    FAT12 volume only: it is the program execve() runs, it is deliberately
+    larger than one page-cache slot, and execve() streams it from the disk
+    rather than through the initramfs. The pattern is the same
     (offset*37+11) & 0xFF formula boot64.c uses to verify it.
 
     The FAT12 volume keeps its own copies of HELLO.TXT and PATTERN.BIN so the
@@ -536,7 +538,7 @@ def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf):
     run([py, os.path.join(ROOT, "tools", "mkcpio.py"), archive,
          "--dir=tmp", "--dir=dev", "--dir=disk",
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
-         f"USER.ELF={exec_elf}", f"INIT.ELF={init_elf}",
+         f"INIT.ELF={init_elf}",
          f"X64MOD.HKM={module_image}", f"ROMFS.HKM={romfs_image}",
          f"etc/banner.txt={banner_path}"])
     if os.path.getsize(archive) > 32 * 4096:
@@ -690,11 +692,16 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
 
     # 2b. the program stored on the disk and run by execve(). Same layout,
     #     same base: it never coexists with the image above because it runs
-    #     in a space of its own.
+    #     in a space of its own. Its flat image carries 320 KiB of filler so
+    #     the file is larger than one old page-cache slot; the BSS segment
+    #     goes just past the code, computed here so the tool and the linker
+    #     agree on where the code ends.
     run([nasm, "-I" + os.path.join(ROOT, "include"), "-f", "bin",
          exec_src, "-o", exec_flat])
+    exec_bss_offset = (os.path.getsize(exec_flat) + 0xFFF) & ~0xFFF
     run([py, os.path.join(ROOT, "tools", "mkelf64.py"),
-         exec_flat, exec_elf, f"--base={user_base:#x}"])
+         exec_flat, exec_elf, f"--base={user_base:#x}",
+         f"--data-offset={exec_bss_offset:#x}"])
 
     # 1c. the x86-64 user C library and /INIT.ELF, the first ring-3 program
     #     built with it. Same pipeline as the 32-bit userland: compile C and
@@ -728,12 +735,15 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
          init64_pe, init64_elf])
     log("x86-64 user libc built, /INIT.ELF packed as ELF64")
 
+    # The kernel links libhakumod's runtime half too: elf64_load() keeps its
+    # frame vector on the stack (384 pages = 3 KiB), so the compiler emits a
+    # __chkstk call the freestanding link has to satisfy.
     run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:NATIVE",
                   "/ENTRY:entry64", "/BASE:0x10000", "/ALIGN:16", "/FIXED",
                   "/MAP:" + os.path.join(BUILD, "kernel64.map"),
                   "/NODEFAULTLIB", "/OUT:" + kernel_pe,
                   entry_obj, isr_obj, ap_trampoline64_obj,
-                  user_image_obj] + objects)
+                  user_image_obj, x64_modruntime] + objects)
     pe = subprocess.run([py, os.path.join(ROOT, "tools", "pe2bin.py"),
                          kernel_pe, kernel_bin],
                         capture_output=True, text=True)
@@ -796,25 +806,41 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                                     "-monitor",
                                     f"tcp:127.0.0.1:{mon_port},"
                                     "server=on,wait=off"])
-    if not wait_for_serial(serial, "HAKU64-KEY-READY", boot_timeout):
-        log("warning: the ring-3 program never asked for a keystroke")
-    else:
-        # Erase, then commit: the line discipline must deliver "x\n" only
-        # after Enter and only after Backspace removed the 'a'.
-        monitor_cmd(mon_port, ["sendkey a", "sendkey backspace",
-                               "sendkey x", "sendkey ret"])
-        if not wait_for_serial(serial, "HAKU64-KEY-EOF-READY", boot_timeout):
-            log("warning: the ring-3 program never asked for ^D")
-        else:
-            # Ctrl+D on the empty next line is the zero-length EOF read.
-            monitor_cmd(mon_port, ["sendkey ctrl-d"])
-            if not wait_for_serial(serial, "HAKU64-KEY-INTR-READY",
-                                   boot_timeout):
-                log("warning: the ring-3 program never asked for ^C")
-            else:
-                # Ctrl+C is a signal, not a byte: the read fails with EINTR
-                # and the handler runs on the way back to user mode.
-                monitor_cmd(mon_port, ["sendkey ctrl-c"])
+    def type_after(marker, keys, what):
+        """Wait for the guest's READY marker, then inject the keys."""
+        if not wait_for_serial(serial, marker, boot_timeout):
+            log(f"warning: the ring-3 program never asked for {what}")
+            return False
+        monitor_cmd(mon_port, keys)
+        return True
+
+    # Erase, then commit: the line discipline must deliver "x\n" only after
+    # Enter and only after Backspace removed the 'a'.
+    type_after("HAKU64-KEY-READY",
+               ["sendkey a", "sendkey backspace", "sendkey x", "sendkey ret"],
+               "a keystroke line")
+    # Ctrl+D on the empty next line is the zero-length EOF read; Ctrl+C is a
+    # signal, not a byte, so the read fails with EINTR and the handler runs on
+    # the way back to user mode.
+    type_after("HAKU64-KEY-EOF-READY", ["sendkey ctrl-d"], "^D")
+    type_after("HAKU64-KEY-INTR-READY", ["sendkey ctrl-c"], "^C")
+    # Extended keys: seed history, recall it, walk back and forward, then
+    # review the scrollback the 80 printed rows pushed out of the grid. The
+    # trailing 's' commits a line so the guest's blocked read returns after
+    # the PageUp/PageDown keys have been pumped.
+    type_after("HAKU64-HIST-READY",
+               ["sendkey r", "sendkey e", "sendkey ret"], "history seed")
+    type_after("HAKU64-HIST-RECALL-READY",
+               ["sendkey up", "sendkey ret"], "history recall")
+    type_after("HAKU64-HIST-CYCLE-READY",
+               ["sendkey up", "sendkey up", "sendkey down", "sendkey ret"],
+               "history cycle")
+    if type_after("HAKU64-SCROLL-READY",
+                  ["sendkey pgup", "sendkey pgup",
+                   "sendkey pgdn", "sendkey pgdn",
+                   "sendkey s", "sendkey ret"], "scroll keys"):
+        wait_for_serial(serial, "HAKU64-SCROLL-UP: offset=2", boot_timeout)
+        wait_for_serial(serial, "HAKU64-SCROLL-DOWN: offset=0", boot_timeout)
     reached = wait_for_serial(serial, "HAKU64-SELFTEST-OK", boot_timeout)
     monitor_cmd(mon_port, [f"screendump {ppm}"])
     proc.kill()
@@ -826,7 +852,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     required = ["HAKU64-BOOT-OK", "HAKU64-E820-OK", "HAKU64-PAGING-OK",
                 "HAKU64-PERCPU-OK", "HAKU64-FRAME-OK", "HAKU64-HEAP-OK",
                 "HAKU64-TERMINAL-OK: console=",
-                "HAKU64-KBD-OK", "HAKU64-KEY-OK",
+                "HAKU64-KBD-OK", "HAKU64-TTY-REDRAW-OK", "HAKU64-KEY-OK",
                 "HAKU64-GDT-OK",
                 "HAKU64-IDT-OK", "HAKU64-EXC-OK", "HAKU64-TIMER-OK",
                 f"HAKU64-SMP-OK: cpus={smp_cpus}",
@@ -859,12 +885,17 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-USER-TTY-LINE-OK",
                 "HAKU64-USER-TTY-EOF-OK",
                 "HAKU64-USER-TTY-INTR-OK",
+                "HAKU64-HIST-OK", "HAKU64-HIST-RECALL-OK",
+                "HAKU64-HIST-CYCLE-OK", "HAKU64-SCROLL-OK",
+                "HAKU64-SCROLL-UP: offset=2",
+                "HAKU64-SCROLL-DOWN: offset=0",
                 "HAKU64-USER-ERRNO-THREAD-OK",
                 "HAKU64-USER-THREAD-EXEC-OK",
                 "HAKU64-USER-THREAD-EXEC-IMAGE-OK",
                 "HAKU64-FILE-OK", "HAKU64-DISK-OK", "HAKU64-FORK-OK",
                 "HAKU64-COW-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",
+                "HAKU64-EXEC-LARGE",
                 "HAKU64-THREAD-OK", "HAKU64-PORT-OK",
                 "HAKU64-MODULE-OK", "HAKU64-MODULE-LIB-OK",
                 "HAKU64-MODULE-LOAD-OK", "HAKU64-MODULE-REJECT-OK",

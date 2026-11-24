@@ -117,9 +117,11 @@ run starts a fresh FAT12 data disk (`build/haku64_fs.img`) seeded with
 `HELLO.TXT`, `PATTERN.BIN`, `INITRD` (the cpio archive unpacked into the RAM
 root), the `USER.ELF` program the test execs, `INIT.ELF`
 (the C program built against `user/lib64`) and `X64MOD.HKM`, the packed
-x86-64 module. The archive carries the same files plus `etc/banner.txt` and the
-`tmp`, `dev` and `disk` directories, so `/` is the RAM root and `/disk` is the
-FAT12 volume. It ends with
+x86-64 module. The archive carries the files the RAM root serves plus
+`etc/banner.txt` and the `tmp`, `dev` and `disk` directories, so `/` is the RAM
+root and `/disk` is the FAT12 volume; `USER.ELF` deliberately stays only on the
+volume, because it is the oversized image whose exec proves the streaming
+loader. It ends with
 `HAKU64-ELF-REJECT-OK` (six malformed ELF64 images refused with a reason),
 `HAKU64-ELF-OK` (the embedded static executable mapped into a fresh address
 space), `HAKU64-ELF-RUN-OK` (the program ran in ring 3, stored its BSS word
@@ -131,9 +133,10 @@ child and its parent observed the same `MAP_SHARED` page), `HAKU64-COW-OK` (a
 private page forked read-only and each writer got its own copy),
 `HAKU64-DUP-OK` (a duplicated descriptor shared one file offset, `dup2`
 redirected it, and `nanosleep` advanced the monotonic clock),
-`HAKU64-EXEC-OK` (a child `execve`d `USER.ELF` off the volume with two
+`HAKU64-EXEC-OK` (a child `execve`d `/disk/USER.ELF` off the volume with two
 arguments and one environment variable, the program checked the stack image
-and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS`, and it exited 42),
+and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS` plus `HAKU64-EXEC-LARGE`
+from the 320 KiB image's last page, and it exited 42),
 `HAKU64-THREAD-OK` (a `clone`d thread shared the address space and the
 descriptor table, bumped a shared word, woke the parent through a futex, and
 the parent's write through the thread's `dup2` target printed the marker
@@ -271,8 +274,10 @@ host side.
 because the self-test writes `/disk/NOTE.TXT` into it and no user data is
 expected to survive; its seed files are `HELLO.TXT`, `PATTERN.BIN`, `INITRD`,
 `USER.ELF`, `INIT.ELF`, `X64MOD.HKM` and `ROMFS.HKM` (the same
-`kernel/module/demo/romfs.c` compiled for amd64), which also go into the cpio
-archive so `/ROMFS.HKM` is reachable from the RAM root.
+`kernel/module/demo/romfs.c` compiled for amd64). Everything but `USER.ELF`
+also goes into the cpio archive so it is reachable from the RAM root;
+`USER.ELF` exists only on the volume, so only `execve` (not `open`) can find
+it, and its size is the large-image test.
 
 `python build.py inspect` (default: `build/haku_fs.img`) lists the root
 directory and FAT summary without touching the image; `--chains` also prints

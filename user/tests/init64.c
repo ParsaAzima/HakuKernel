@@ -966,6 +966,73 @@ static void test_console(void) {
     }
 }
 
+/* Read a whole canonical line from the console. A read parks until Enter
+ * commits, so the retry loop is only here for a spurious EINTR/timeout in an
+ * unusually slow boot; the keys themselves are injected by build.py after it
+ * sees the matching READY marker on the serial log. */
+static int read_console_line(char *buffer, int size) {
+    int tries;
+    ssize_t n;
+    int off = 0;
+
+    for (tries = 0; tries < 200000; tries++) {
+        n = read(0, buffer + off, (unsigned)(size - off));
+        if (n <= 0) continue;
+        off += (int)n;
+        if (buffer[off - 1] == '\n' || off >= size) return off;
+    }
+    return -1;
+}
+
+/* Extended keys are line-discipline policy, so they need a reader pumping the
+ * keyboard ring. Each stage prints a READY marker, build.py injects the keys,
+ * and the resulting committed line comes back through the same console read
+ * the earlier erase/EOF/INTR checks use. */
+static void test_console_history_scroll(void) {
+    char line[32];
+    int n;
+    int i;
+
+    printf("HAKU64-HIST-READY: type 're' then Enter\n");
+    n = read_console_line(line, sizeof(line));
+    if (n != 3 || memcmp(line, "re\n", 3) != 0) {
+        printf("HAKU64-HIST-FAIL: first line was %d bytes\n", n);
+        failures++;
+        return;
+    }
+    printf("HAKU64-HIST-OK: a committed line entered history\n");
+
+    printf("HAKU64-HIST-RECALL-READY: press Up then Enter\n");
+    n = read_console_line(line, sizeof(line));
+    if (n != 3 || memcmp(line, "re\n", 3) != 0) {
+        printf("HAKU64-HIST-RECALL-FAIL: Up gave %d bytes\n", n);
+        failures++;
+        return;
+    }
+    printf("HAKU64-HIST-RECALL-OK: Up recalled the last line\n");
+
+    printf("HAKU64-HIST-CYCLE-READY: Up, Up, Down then Enter\n");
+    n = read_console_line(line, sizeof(line));
+    if (n != 3 || memcmp(line, "re\n", 3) != 0) {
+        printf("HAKU64-HIST-CYCLE-FAIL: cycle gave %d bytes\n", n);
+        failures++;
+        return;
+    }
+    printf("HAKU64-HIST-CYCLE-OK: history walked back and forward\n");
+
+    /* More lines than the 1024x768 grid has rows (48 at 8x16), so the
+     * renderer must have pushed rows into scrollback to draw them all. */
+    for (i = 0; i < 80; i++) printf("HAKU64-SCROLL-FILL %02d\n", i);
+    printf("HAKU64-SCROLL-READY: PageUp twice, PageDown twice, then 's'\n");
+    n = read_console_line(line, sizeof(line));
+    if (n != 2 || memcmp(line, "s\n", 2) != 0) {
+        printf("HAKU64-SCROLL-FAIL: trailing line was %d bytes\n", n);
+        failures++;
+        return;
+    }
+    printf("HAKU64-SCROLL-OK: scroll keys were consumed, text still read\n");
+}
+
 /* The kernel unpacks a cpio archive from /disk/INITRD into RAM and mounts it
  * at /. Reading a file that exists only in the archive proves the userland
  * path reaches the RAM root, not the FAT12 volume: /etc/banner.txt is not
@@ -1555,6 +1622,7 @@ int main(int argc, char **argv, char **envp) {
     test_pipe_sigpipe();
     test_pipe_blocking();
     test_console();
+    test_console_history_scroll();
 
     if (failures) {
         printf("HAKU64-LIBC-FAIL: %d check(s)\n", failures);

@@ -1735,11 +1735,12 @@ int sys64_build_init_stack(loaded_elf64_t *loaded, const char *path) {
 /* execve(path, argv, envp): replace the caller's image with an ELF64 file
  * from the FAT12 volume. argv/envp strings are copied into kernel buffers
  * first, because the old address space is gone once the new one is current;
- * then the whole file is read into the heap (the page cache caps a file at
- * 32 pages), elf64_load validates and maps it, its stack gets argc/argv/
- * envp and a three-entry auxiliary vector, and task64_exec releases the old
- * space. Descriptors survive execve because there is no O_CLOEXEC. On
- * failure nothing has changed and the caller continues normally. */
+ * then fs64_load_image() streams the whole file into the heap without going
+ * through the 128 KiB page cache, elf64_load validates and maps it, its stack
+ * gets argc/argv/envp and a three-entry auxiliary vector, and task64_exec
+ * releases the old space. Descriptors survive execve because there is no
+ * O_CLOEXEC. On failure nothing has changed and the caller continues
+ * normally. */
 static regs64_t *sys64_execve(regs64_t *frame) {
     char name[K64_PATH_MAX + 1];
     exec_vector64_t argv, envp;
@@ -1747,7 +1748,8 @@ static regs64_t *sys64_execve(regs64_t *frame) {
     u64 space = current_space();
     u64 size;
     u8 *buffer;
-    int error, id = sched64_current(), file;
+    s64 image_size;
+    int error, id = sched64_current();
 
     error = resolve64_path(id, K64_AT_FDCWD, space, frame->rdi, name);
     if (error < 0) {
@@ -1762,31 +1764,12 @@ static regs64_t *sys64_execve(regs64_t *frame) {
         return frame;
     }
 
-    file = fs64_lookup(name);
-    if (file < 0) {
-        frame->rax = (u64)0 - SYS64_ENOENT;
+    image_size = fs64_load_image(name, &buffer, K64_ELF64_MAX_BYTES);
+    if (image_size < 0) {
+        frame->rax = (u64)0 - (u64)(-image_size);
         return frame;
     }
-    size = fs64_size(file);
-    if (size == 0 || size > (u64)0x20000) {
-        fs64_release(file);
-        frame->rax = (u64)0 - (size == 0 ? SYS64_ENOEXEC : SYS64_ENOMEM);
-        return frame;
-    }
-
-    buffer = (u8 *)kmalloc64(size);
-    if (!buffer) {
-        fs64_release(file);
-        frame->rax = (u64)0 - SYS64_ENOMEM;
-        return frame;
-    }
-    if (fs64_read(file, 0, buffer, size) != size) {
-        kfree64(buffer);
-        fs64_release(file);
-        frame->rax = (u64)0 - SYS64_EIO;
-        return frame;
-    }
-    fs64_release(file);
+    size = (u64)image_size;
 
     if (!elf64_load(buffer, size, &loaded)) {
         kfree64(buffer);

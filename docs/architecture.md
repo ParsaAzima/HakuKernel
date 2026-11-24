@@ -68,7 +68,7 @@ From `kernel64_main` the 64-bit kernel brings up, in order:
 | IDT/PIC | 256 gates, 8259 remapped to `0x20`/`0x28`, IRQ0 unmasked | `HAKU64-IDT-OK` |
 | exceptions | `INT3`, `#PF` and `#DE` provoked and resumed | `HAKU64-EXC-OK` |
 | timer | 100 Hz PIT, plus a bounded wait and an `HLT` wake-up | `HAKU64-TIMER-OK` |
-| keyboard | PC/8042 in set-1 mode: IRQ1 feeds `kbd64.c`, and `tty64.c` turns the queue into canonical echoed lines (Enter, erase, `^D` EOF, `^C` to `SIGINT`) | `HAKU64-KBD-OK`, `HAKU64-USER-TTY-LINE-OK`, `HAKU64-USER-TTY-EOF-OK`, `HAKU64-USER-TTY-INTR-OK` |
+| keyboard | PC/8042 in set-1 mode: IRQ1 feeds `kbd64.c`, and `tty64.c` turns the queue into canonical echoed lines (Enter, erase, `^D` EOF, `^C` to `SIGINT`); `0xE0` arrows recall history and Page Up/Down review the 128-row framebuffer scrollback | `HAKU64-KBD-OK`, `HAKU64-USER-TTY-LINE-OK`, `HAKU64-USER-TTY-EOF-OK`, `HAKU64-USER-TTY-INTR-OK`, `HAKU64-HIST-OK`, `HAKU64-HIST-CYCLE-OK`, `HAKU64-SCROLL-OK` |
 | RTC | CMOS wall clock sampled at boot, Unix epoch for `CLOCK_REALTIME` | `HAKU64-RTC-OK` |
 | files | FAT12 on an ATA disk at `/disk` plus a RAM initramfs root, behind an eight-slot page cache; `open`, `read`, `write`, `lseek`, `close`, `mkdir`, plus `stat`/`statx`, `getdents64`, `rename`, `unlink`, `truncate`, `chdir`/`getcwd`, `fsync` | `HAKU64-FS-OK`, `HAKU64-FILE-OK`, `HAKU64-DISK-OK` |
 | namespace | a six-entry mount table with longest-prefix resolution; FAT12 at `/disk`, `ramfs64` at `/`, `procfs64` at `/proc` with generated `meminfo`/`uptime`/`self/cmdline`, devfs at `/dev` with `null`, `zero`, `console` and module-registered devices, and module filesystems such as `/rom`, filled at boot from the `INITRD` cpio archive | `HAKU64-VFS-OK`, `HAKU64-PROCFS-OK`, `HAKU64-DEVFS-OK`, `HAKU64-INITRAMFS-OK`, `HAKU64-USER-DEV-OK`, `HAKU64-USER-PROCFS-OK`, `HAKU64-USER-INITRAMFS-OK` |
@@ -229,7 +229,10 @@ the seams they expect (`kernel/arch/x86_64/compat`): port I/O, the `klog_*`
 surface over `k64_*`, and a single-CPU spin mutex. `fs64.c` is the page cache
 in front of both: each path gets a slot holding up to 32 frames (128 KiB) and
 eight paths are cached at once, which is what lets `mmap` alias a file's
-frames and keeps every descriptor of one path looking at the same bytes. On
+frames and keeps every descriptor of one path looking at the same bytes.
+`execve` is the one reader that skips the cache: an image is streamed into one
+heap buffer and mapped once, never read again, so an executable is not limited
+to a cache slot. On
 FAT12 the cached frames are copies, written back when the last descriptor on
 a path closes or the owning task exits, so the cache is write-back, not
 write-through: a crash can lose the last pages. On the RAM backend
@@ -239,7 +242,8 @@ write-through: a crash can lose the last pages. On the RAM backend
 `O_TRUNC` and `O_APPEND`; `mkdir` creates one directory, and paths may contain
 `.` and `..` because both backends resolve them. The limits are explicit:
 FAT12 stores 8.3 names, the RAM root stores 48-byte components, both cap a
-cached file at 32 pages, and a writable `MAP_SHARED` mapping requires a
+cached file at 32 pages (an `execve` image is streamed, not cached), and a
+writable `MAP_SHARED` mapping requires a
 writable descriptor that stays open, because only descriptors pin a cache
 slot.
 
@@ -381,8 +385,9 @@ controlling-terminal association, so every session leader's exit hangs the
 console up, not only the session that owns it — the honest simplification
 this port can support.
 
-`execve` reads the whole file into a heap buffer (32 pages is the cache limit),
-runs `elf64_load`, and `task64_exec` releases the caller's old space — aliased
+`execve` streams the whole file into a heap buffer (`fs64_load_image`, so the
+page cache's 32-page bound does not apply), runs `elf64_load`, and
+`task64_exec` releases the caller's old space — aliased
 shared frames survive, as they do at exit — clears the mapping table and
 resets the anonymous window before switching CR3. `argv` and `envp` are
 captured first, while the old space is still current: each string is copied
@@ -532,7 +537,10 @@ reason a file was rejected. It maps each segment into a fresh
 then allocates a four-page stack ending one page below the top of PML4 slot
 1; the gap between the stack and the image is unmapped, so a runaway stack
 faults instead of overwriting code. Images must load above
-`0x0000008000010000`, which keeps the first 64 KiB of the slot unmapped.
+`0x0000008000010000`, which keeps the first 64 KiB of the slot unmapped. The
+loader accepts at most 384 pages (1.5 MiB) per image including the four-page
+stack, which is enough for a static musl binary; its frame list lives on the
+kernel stack (3 KiB), so the freestanding link also supplies `__chkstk`.
 There is no `AT_PHDR` because nothing walks it — only the `execve` hand-off
 builds an auxiliary vector, with `AT_PAGESZ`, `AT_ENTRY` and `AT_NULL` — and
 the loader records the page-aligned start of the first writable segment so the
@@ -558,13 +566,17 @@ past a `close`, and writes `HAKU64-DUP-OK` through a `dup` of the console
 (`HAKU64-DUP-OK`); `nanosleep` must move `CLOCK_MONOTONIC` forward by at
 least the 10 ms requested, and a nanosecond field of 1e9 is `-EINVAL`. It then
 forks again and the child first `execve`s a missing path, which must return
-`-ENOENT` with the child still running, and then `/USER.ELF` with
-`argv = {"/USER.ELF", "alpha", "beta"}` and `envp = {"A=1"}`. The exec'd
+`-ENOENT` with the child still running, and then `/disk/USER.ELF` with
+`argv = {"/disk/USER.ELF", "alpha", "beta"}` and `envp = {"A=1"}`. The exec'd
 program, `kernel/arch/x86_64/user/exec_elf64.asm`, walks that stack image
 ([rsp] argc, then argv, NULL, envp, NULL, auxv), prints
 `HAKU64-EXEC-PROG` and `HAKU64-EXEC-ARGS`, and exits 42; the parent requires
-status 42 and then prints `HAKU64-EXEC-OK`. `USER.ELF` is seeded on the FAT12
-volume by `build.py` and is not part of the kernel image, so the three markers
+status 42 and then prints `HAKU64-EXEC-OK`. The image carries 320 KiB of
+filler and a marker after it, so the program also prints `HAKU64-EXEC-LARGE`
+from its last page: the file is larger than a page-cache slot, which proves
+the streaming loader read and mapped all of it. `USER.ELF` is seeded on the
+FAT12 volume by `build.py` and is not part of the kernel image or the
+initramfs, so the four markers
 prove the program came off the disk, that `execve` replaced the child's
 address space, and that the argument vector landed where a startup stub reads
 it. It next maps a two-page thread stack, `clone`s a thread with

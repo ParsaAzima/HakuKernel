@@ -68,9 +68,25 @@ static void vga_cursor(uint32_t *row, uint32_t *col) {
     spin_unlock_irqrestore(&vga_lock, flags);
 }
 
+static void vga_cursor_up(uint32_t rows) {
+    irqflags_t flags = spin_lock_irqsave(&vga_lock);
+    if (rows > vga_row) rows = vga_row;
+    vga_row = (uint8_t)(vga_row - (uint8_t)rows);
+    spin_unlock_irqrestore(&vga_lock, flags);
+}
+
+static void vga_cursor_col(uint32_t col) {
+    irqflags_t flags = spin_lock_irqsave(&vga_lock);
+    if (col >= VGA_COLS) col = VGA_COLS - 1u;
+    vga_col = (uint8_t)col;
+    spin_unlock_irqrestore(&vga_lock, flags);
+}
+
 const display_ops_t vga_text_display = {
     "vga-text",
     vga_clear,
     vga_putc,
     vga_cursor,
+    vga_cursor_up,
+    vga_cursor_col,
 };

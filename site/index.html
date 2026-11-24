@@ -239,7 +239,8 @@
   <p>
     Every process owns an address space built from validated ELF segments and
     an 8&nbsp;KiB kernel stack. <code>fork</code> copies pages on write,
-    <code>execve</code> replaces the image and rebuilds the initial stack with
+    <code>execve</code> streams an image of up to 1.5&nbsp;MiB off the disk,
+    replaces the image and rebuilds the initial stack with
     <code>argc</code>, <code>argv</code> and <code>envp</code>, and
     <code>wait4</code> reaps the exit status. Process groups and sessions carry
     <code>kill(-pgid)</code> and the console's foreground group, which
@@ -288,7 +289,7 @@
     <dt>Writes</dt>
     <dd>Files are written back through the page cache; file-backed <code>mmap</code> maps those pages directly.</dd>
     <dt>Ceiling</dt>
-    <dd>Eight cached paths of at most 128&nbsp;KiB each, 8.3 names, no timestamps and no permission bits.</dd>
+    <dd>Eight cached paths of at most 128&nbsp;KiB each, 8.3 names, no timestamps and no permission bits. An <code>execve</code> image is streamed into one buffer, not cached, so it may reach 1.5&nbsp;MiB.</dd>
   </dl>
 </section>
 

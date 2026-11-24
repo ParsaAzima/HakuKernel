@@ -1453,7 +1453,9 @@ static int test_libc64(void) {
     file = fs64_lookup(path);
     if (file < 0) return 0;
     size = fs64_size(file);
-    if (size == 0 || size > 0x20000u) return 0;
+    /* This path goes through the page cache, so the cache's per-file bound
+     * applies even though elf64_load() would accept a larger image. */
+    if (size == 0 || size > (u64)FS64_PAGE_MAX * K64_PAGE_SIZE) return 0;
     image = (u8 *)kmalloc64(size);
     if (!image) return 0;
     if (fs64_read(file, 0, image, size) != size) {
@@ -1488,10 +1490,11 @@ static int test_libc64(void) {
      * counterpart of the 32-bit klog_mirror_display(0) handover. */
     console64_handover();
 
-    /* The headless handshake types one line, then ^D and ^C, and the QEMU
-     * monitor sleeps between commands; 15 s leaves room for a slow CI runner
-     * while still failing a program that never exits. */
-    deadline = timer64_ticks() + 1500;
+    /* The headless handshake types the erase/EOF/INTR lines, then seeds and
+     * walks history and reviews scrollback -- about twenty monitor commands,
+     * each with its own delay. 50 s leaves room for a slow CI runner while
+     * still failing a program that never exits. */
+    deadline = timer64_ticks() + 5000;
     while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
         cpu_pause64();
     if (task64_state(id) != K64_TASK_DONE) {
@@ -1697,6 +1700,9 @@ void kernel64_main(void) {
      * the self-test's queue cannot race a real key. */
     kbd64_init();
     if (!kbd64_self_test()) k64_fail("PS/2 keyboard decode self-test");
+    /* The console and keyboard are both live, but IRQ1 is still masked, so
+     * the line-discipline test can inject keys without racing a real one. */
+    if (!tty64_self_test()) k64_fail("wrapped-line redraw self-test");
     k64_puts("HAKU64-IDT-OK: gates=256 ist=df/nmi irq0=");
     k64_dec(K64_IRQ_BASE);
     k64_puts(" hz=");

@@ -76,6 +76,22 @@ void console64_user_putc(char c) {
     if (console_up) display_putc(c);
 }
 
+/* Cursor state for the line editor. Like user output, these ignore the
+ * screen-ownership latch: they belong to the program's own edit row. */
+void console64_user_cursor(u32 *row, u32 *col) {
+    if (console_up && display_cursor(row, col)) return;
+    *row = 1;
+    *col = 1;
+}
+
+void console64_user_cursor_up(u32 rows) {
+    if (console_up) display_cursor_up(rows);
+}
+
+void console64_user_cursor_col(u32 col) {
+    if (console_up) display_cursor_col(col);
+}
+
 /* Called as soon as the first user task exists, matching the 32-bit port's
  * klog_mirror_display(0) handover. */
 void console64_handover(void) {
