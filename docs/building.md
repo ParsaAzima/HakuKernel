@@ -106,11 +106,12 @@ at once. It must still report `HAKU64-PERCPU-OK`,
 CPUs had to dispatch from the shared task table) and
 `HAKU64-SMP-TLB-OK: targets=3 flushes=3 timeouts=0`; the 32-bit run asserts
 `SMP-SCHED-OK: cpus=4 workers=3` and `SMP-TLB-OK: targets=3 flushes=3`.
-Four is the 32-bit ceiling because its process table has exactly four slots
-and the boot test needs one per AP; `build.py` rejects a larger value instead
-of silently clamping it. With `--smp=1` there are no APs to schedule, so the
-run prints `HAKU64-SMP-SCHED-SKIP: uniprocessor` (or `SMP-SCHED-SKIP`) and
-`…-TLB-SKIP: uniprocessor`, and the marker list drops the `SMP*` entries.
+Four is the 32-bit ceiling because the boot test needs one task slot per AP
+and the process table is fixed-size (eight entries); `build.py` rejects a
+larger value instead of silently clamping it. With `--smp=1` there are no APs
+to schedule, so the run prints `HAKU64-SMP-SCHED-SKIP: uniprocessor` (or
+`SMP-SCHED-SKIP`), `…-TLB-SKIP: uniprocessor` and `…AP-SKIP: one CPU online`,
+and the marker list drops the `SMP*` and AP-run entries.
 
 `python build.py headless` builds and boots `haku64.img`, the default run. That
 run starts a fresh FAT12 data disk (`build/haku64_fs.img`) seeded with
@@ -136,7 +137,7 @@ redirected it, and `nanosleep` advanced the monotonic clock),
 `HAKU64-EXEC-OK` (a child `execve`d `/disk/USER.ELF` off the volume with two
 arguments and one environment variable, the program checked the stack image
 and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS` plus `HAKU64-EXEC-LARGE`
-from the 192 KiB image's last page, and it exited 42), `HAKU64-BUSYBOX-OK`
+from the 188 KiB image's last page, and it exited 42), `HAKU64-BUSYBOX-OK`
 (a second child exec'd static musl busybox from `/disk/BUSYBOX` and ran its
 `echo` applet, printing the marker from ring 3),
 `HAKU64-THREAD-OK` (a `clone`d thread shared the address space and the

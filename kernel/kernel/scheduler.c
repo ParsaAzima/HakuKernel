@@ -286,7 +286,7 @@ static int initialize_stack(task_t *task, int user_mode) {
 /* Round-robin over this CPU's own slots. A task pinned to another processor
  * is invisible here, which is what lets two CPUs pick two tasks at the same
  * instant without a lock: the slot index each one walks is disjoint. The scan
- * is bounded by SCHEDULER_MAX_PROCESSES (four). */
+ * is bounded by SCHEDULER_MAX_PROCESSES (eight). */
 static int find_next_task(void) {
     uint32_t me = percpu_self_index();
 

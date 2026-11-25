@@ -201,9 +201,10 @@ statically linked Linux binaries, without demand paging, swap, or networking.
 Both images have `clone`/`futex` threads and bring the application processors
 online with their own TSS and the shared IDT. Every CPU schedules: each has
 its own current task, idle task and timer, and wakes other CPUs with an IPI.
-Tasks are pinned to the CPU that created them, there is no load balancing or
-migration, and the user-space concurrency tests still run on the bootstrap
-processor, so a ring-3 task running on an AP is not yet covered. The x86-64
+Tasks are pinned to the CPU that created them, and there is no load balancing
+or migration. A libc-linked ring-3 probe now runs on an application processor
+on both ports: it prints its getcpu, TLS, signal, syscall, sleep and exit
+markers there, while the bootstrap processor collects its status. The x86-64
 kernel has scrollback and runs a static musl busybox applet via `execve`, but
 has no shell and no namespace beyond its boot mounts and the filesystems
 modules mount themselves: its userland is a C library (`user/lib64`), the

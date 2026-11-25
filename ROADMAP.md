@@ -306,7 +306,7 @@ with the 32-bit image available as a fallback.
   (`fs64_load_image`) instead of going through the 128 KiB page cache, and  
   `elf64_load` accepts up to 384 pages (1.5 MiB) per image including the  
   four-page stack, so a static musl binary fits. `/disk/USER.ELF` carries  
-  192 KiB of filler and prints `HAKU64-EXEC-LARGE` from its last page,  
+  188 KiB of filler and prints `HAKU64-EXEC-LARGE` from its last page,  
   which proves the FAT12 read, the loader and the mapping of an image  
   bigger than a cache slot.
 - [x] The x86-64 musl probe: `tools/getbusybox64.py` fetches Alpine's static  
@@ -343,7 +343,8 @@ atomic locks, per-CPU descriptor tables) are described in
 - [x] Scheduling on APs: each CPU picks, switches and idles (`HLT`)  
   independently, and each AP owns an idle task. On 32-bit a kernel worker  
   hands its slot back (`scheduler_kernel_exit`/`scheduler_join_kernel`)  
-  because the process table only has four entries.
+  because the process table is fixed-size; it now has eight entries so the
+  AP user probes and the user tests can coexist.
 - [x] Lock audit: one interrupt-owning spin lock, documented as such; the  
   scheduler, frame allocator, heap, TLB round and disk mutex use it and  
   nothing blocking happens under it. The 32-bit scheduler adds  
@@ -352,11 +353,15 @@ atomic locks, per-CPU descriptor tables) are described in
   CPU's address space, targeting only CPUs whose CR3 names the space.
 - [x] A one-CPU mode that still passes (`--smp=1`) so the scheduler can be  
   bisected, on both architectures.
-- [ ] User tasks on APs: pin a ring-3 task to an AP and prove it survives  
-  preemption, syscalls and exit there, so the syscall layer's bookkeeping  
-  (current task, `FS`-relative TLS, signal delivery) is exercised on more  
-  than the bootstrap processor. On 32-bit this also needs per-AP user  
-  address-space switching and a wider process table.
+- [x] User tasks on APs: a libc-linked probe is pinned to CPU 1 before the  
+  boot task enters ring 3 and prints its getcpu, TLS, signal, syscall, sleep  
+  and exit markers from that AP; the bootstrap processor only collects the  
+  status. This exercises the syscall layer's current-task, `FS`-relative TLS  
+  and signal bookkeeping beyond the BSP. On 32-bit the probe gets its own  
+  user page directory, sleepers expire on whichever CPU's timer fires, and  
+  the handshake frees the probe slot before PID 1 starts waiting for  
+  children. `--smp=1` reports `…AP-SKIP`, and the shell/rootfs disks skip a  
+  probe they do not seed.
 - [ ] Run queues instead of a pinned scan, with wake-up placement and  
   migration, once tasks may move between CPUs.
 - [ ] PCID/ASID tagging, so a shootdown can flush a single address space  
@@ -366,8 +371,10 @@ atomic locks, per-CPU descriptor tables) are described in
 **Acceptance.** `HAKU64-SMP-SCHED-OK`/`SMP-SCHED-OK` (a pinned worker per AP  
 proves every CPU dispatches from the shared task table) and  
 `HAKU64-SMP-TLB-OK`/`SMP-TLB-OK` (`targets=` equals the number of other CPUs,  
-`flushes=` matches, `timeouts=0`), with the whole suite green at `--smp=1`  
-(`…-SKIP` markers), `--smp=2` and `--smp=4` on both architectures. Met.
+`flushes=` matches, `timeouts=0`) and `HAKU64-AP-RUN-OK: cpu=1`/`AP-RUN-OK:  
+cpu=1` with the AP's TLS, signal, sleep and exit markers, with the whole suite  
+green at `--smp=1` (`…-SKIP` markers), `--smp=2` and `--smp=4` on both  
+architectures. Met.
 
 ## 6. Networking
 

@@ -577,7 +577,7 @@ forks again and the child first `execve`s a missing path, which must return
 program, `kernel/arch/x86_64/user/exec_elf64.asm`, walks that stack image
 ([rsp] argc, then argv, NULL, envp, NULL, auxv), prints
 `HAKU64-EXEC-PROG` and `HAKU64-EXEC-ARGS`, and exits 42; the parent requires
-status 42 and then prints `HAKU64-EXEC-OK`. The image carries 192 KiB of
+status 42 and then prints `HAKU64-EXEC-OK`. The image carries 188 KiB of
 filler and a marker after it, so the program also prints `HAKU64-EXEC-LARGE`
 from its last page: the file is larger than a page-cache slot, which proves
 the streaming loader read and mapped all of it. `USER.ELF` is seeded on the
@@ -806,10 +806,13 @@ is what differs.
   any other task) that `scheduler_prepare_ap` builds before the release; the
   AP's `scheduler_start_ap` sets its own `current` to the idle index, points
   the TSS at that stack, starts its LAPIC timer and `iret`s into the loop.
-  Because the 32-bit process table has only four slots, the boot test's kernel
-  workers do not stay resident: `scheduler_kernel_exit` marks the slot
-  `TASK_REAP_PENDING`, the AP's next tick switches it to idle, and the BSP's
-  `scheduler_join_kernel` frees the slot once no CPU is standing on it.
+  The 32-bit process table is a fixed-size array (eight slots), so the boot
+  test's kernel workers do not stay resident: `scheduler_kernel_exit` marks
+  the slot `TASK_REAP_PENDING`, the AP's next tick switches it to idle, and the
+  BSP's `scheduler_join_kernel` frees the slot once no CPU is standing on it.
+  The boot AP probe is the one exception: it keeps its exit status for the
+  bootstrap processor to read, then the handshake frees the whole slot before
+  PID 1 starts waiting for children.
 - **A timer per CPU.** IRQ0 on the BSP stays the wall clock, but an AP does
   not receive it, so each CPU programs its own local APIC timer. The divisor
   is calibrated once on the BSP against the PIT (mask the LAPIC timer, wait
@@ -835,12 +838,13 @@ is what differs.
   shoot down: it runs after the last task using that space has been reaped, so
   no CR3 names it, and a shootdown could not help because the frames about to
   be freed are the page tables a stale entry would point at.
-- **Housekeeping stays on one CPU.** On 32-bit, reaping a slot, waking
-  sleepers and re-scanning wait queues all run from CPU 0's tick, and the
-  post-user FS check (`fs_error_self_test`) only runs on CPU 0's idle loop:
-  the console writer has no lock of its own and only the BSP edits user page
-  tables, so doing that work in one place keeps the diagnostics and the
-  address-space teardown single-threaded.
+- **Housekeeping stays on one CPU.** On 32-bit, reaping a slot, re-scanning
+  wait queues and the post-user FS check (`fs_error_self_test`) run from CPU
+  0's tick and idle loop: the console writer has no lock of its own and only
+  the BSP edits user page tables, so doing that work in one place keeps the
+  diagnostics and the address-space teardown single-threaded. Sleepers are
+  the exception — a task pinned to an AP can park in `nanosleep`, so every
+  CPU's timer calls `wake_expired_sleepers()` for its own deadline scan.
 
 Both builds are checked with the same three shapes. `python build.py headless`
 boots two CPUs by default and asserts `HAKU64-PERCPU-OK`,
@@ -851,18 +855,27 @@ boots two CPUs by default and asserts `HAKU64-PERCPU-OK`,
 `SMP-TLB-OK: targets=1 flushes=1 timeouts=0`. `--smp=4` moves the markers to
 `cpus=4 workers=3 targets=3` on both (the 32-bit table is why its ceiling is
 four CPUs), and `--smp=1` skips the two scheduling tests with an explicit
-`…-SKIP: uniprocessor`. The scheduling test pins one worker per AP and waits
-for every worker's counter, which can only advance if that AP dispatched from
-the shared task table.
+`…-SKIP: uniprocessor` plus `…AP-SKIP` from the user probe. The scheduling
+test pins one worker per AP and waits for every worker's counter, which can
+only advance if that AP dispatched from the shared task table; the AP probe
+adds `HAKU64-AP-RUN-OK: cpu=1` and `AP-RUN-OK: cpu=1` with its TLS, signal,
+sleep and exit markers.
 
-What stage D does *not* do: there is no load balancing or migration (affinity
-is fixed at creation), no PCID/ASID tagging, and user-space concurrency is
-still exercised on the BSP — the fork/exec tests drive ring-3 tasks that are
-pinned there, so a user task preempted on one CPU and resumed on another is
-not yet a supported pattern. On 32-bit, APs only run kernel-mode tasks: there
-is no per-AP user address space switching yet. The per-CPU state it would need
-is in place; the syscall layer's own bookkeeping is the next piece of work
-(see `ROADMAP.md`).
+Stage D also covers ring 3: one libc-linked probe is placed on CPU 1 before
+PID 1 starts, so every syscall it makes goes through that AP's current task,
+TSS, FS base and APIC timer. On x86-64 the AP gets its own private copy of the
+kernel's slot-0 page tables, which is what lets a non-PIE `ET_EXEC` such as
+musl busybox keep its absolute addresses; the same path loads `AP64.ELF`. On
+32-bit the probe is a separate ELF with its own user page directory — the
+kernel activates the pinned task's CR3 and FS base on every switch, on either
+CPU — and the AP's syscall entry, signal frame and sleeper wake-up all work
+without the BSP.
+
+What it does *not* do: there is no load balancing or migration (affinity is
+fixed at creation), no PCID/ASID tagging, and a task preempted on one CPU and
+resumed on another is not a supported pattern. The fork/exec concurrency tests
+still drive the bootstrap processor; the AP probe is a single pinned task that
+exits before PID 1 begins.
 
 ### Haku modules
 

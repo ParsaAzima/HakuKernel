@@ -79,12 +79,16 @@ futex wake that makes a task runnable on another CPU sends it a reschedule
 IPI, and every page-table change that another CPU could have cached is
 followed by a TLB shootdown (see
 [architecture](architecture.md#stage-d-per-cpu-scheduling)). The 32-bit task
-table has four slots, so an AP's kernel worker leaves its slot through
-`scheduler_kernel_exit()` and the bootstrap processor frees it again; ring-3
-tasks still run on the bootstrap processor, which is also where reaping,
-sleeper wake-ups and the wait-queue rescan happen (the console writer has no
-lock of its own). The scheduling stages, the `--smp=N` flag and the markers
-the headless run asserts are described there too.
+table has eight slots, so an AP's kernel worker still leaves its slot through
+`scheduler_kernel_exit()` and the bootstrap processor frees it again. A
+libc-linked ring-3 probe is pinned to CPU 1 as well: it makes syscalls, takes
+a signal, sleeps and exits on the AP, with its own user page directory and FS
+base, and the bootstrap processor collects its status before PID 1 waits for
+any children. Reaping and the wait-queue rescan stay on the bootstrap
+processor (the console writer has no lock of its own), but sleepers expire on
+whichever CPU's timer reaches their deadline. The scheduling stages, the
+`--smp=N` flag and the markers the headless run asserts are described in the
+architecture document.
 
 `kernel/arch/x86/kernel/gdt.c` installs flat ring-0/ring-3 code and data descriptors plus a
 32-bit TSS. `kernel/arch/x86/mm/paging.c` gives each process supervisor-only kernel
