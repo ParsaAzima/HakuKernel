@@ -1017,6 +1017,66 @@ exec_bad:
 
 exec_done:
 
+    ; ---- musl probe: exec a real static x86-64 busybox ----------------
+    ; Steps 118-122, numbered past the ported table so each failure still
+    ; has its own tag. USER.ELF is a hand-written assembly program; this is
+    ; what proves a real static Linux userland starts here. musl's startup
+    ; syscall sweep (brk, arch_prctl, set_tid_address, rt_sigaction, ...)
+    ; has to work against this kernel. argv[0] is the multiplexer itself,
+    ; so `busybox echo` needs no $PATH; busybox prints the marker from ring 3.
+    mov r15d, 118
+    mov eax, HAKU64_SYS_FORK
+    syscall
+    test rax, rax
+    js fail
+    jz busy_child
+
+    mov r13, rax
+    mov r15d, 119
+    mov eax, HAKU64_SYS_WAIT4
+    mov rdi, r13
+    mov rsi, STATUS_BUF
+    xor edx, edx
+    syscall
+    cmp rax, r13
+    jne fail
+    mov r15d, 120
+    mov rbx, STATUS_BUF
+    mov rax, [rbx]
+    shr rax, 8
+    and eax, 0xFF
+    test eax, eax
+    jnz fail
+    jmp busy_done
+
+busy_child:
+    ; argv[0] is a string, not the path: FAT12 uppercases names, so pass
+    ; the lowercase applet name busybox expects even though the file is
+    ; /disk/BUSYBOX on the volume.
+    mov rbx, EXEC_ARGV
+    lea rax, [busybox_name]
+    mov [rbx], rax
+    lea rax, [busy_arg1]
+    mov [rbx + 8], rax
+    lea rax, [busy_arg2]
+    mov [rbx + 16], rax
+    mov qword [rbx + 24], 0
+    mov rdx, EXEC_ENVP
+    mov qword [rdx], 0
+    mov r15d, 121
+    mov rsi, rbx
+    mov eax, HAKU64_SYS_EXECVE
+    lea rdi, [path_busybox]
+    syscall
+    ; execve only returns on failure; 99 is a status the parent rejects.
+    mov r15d, 122
+    mov eax, HAKU64_SYS_EXIT
+    mov edi, 99
+    syscall
+    jmp $
+
+busy_done:
+
     ; ---- threads: clone(CLONE_VM|FILES|THREAD|SIGHAND) ----------------
     ; The child gets its own stack but the same address space, so the words
     ; it stores below are the words the parent reads: that is what separates
@@ -1869,6 +1929,18 @@ path_dot:
 
 path_user:
     db '/disk/USER.ELF', 0
+
+path_busybox:
+    db '/disk/BUSYBOX', 0
+
+busybox_name:
+    db 'busybox', 0
+
+busy_arg1:
+    db 'echo', 0
+
+busy_arg2:
+    db 'HAKU64-BUSYBOX-OK', 0
 
 exec_arg1:
     db 'alpha', 0

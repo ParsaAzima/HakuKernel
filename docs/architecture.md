@@ -522,11 +522,12 @@ initramfs root at `/`, procfs at `/proc`, a `/dev` with `null`, `zero`,
 syscall table, a module loader with device and filesystem registration, and a
 user C library (`user/lib64`) with `/INIT.ELF` as the first real ring-3
 program. Its console now has a canonical line discipline and the kernel-log
-latch, but there is no x86-64 shell yet, so the interactive side still runs on
-the 32-bit image. [The roadmap](../ROADMAP.md)
-(milestones 1 to 4) lists the remaining stages: the musl probe for milestone 1,
-then job control and the interactive shell. The 64-bit sources are
-excluded from the 32-bit link line, so both targets build from one tree.
+latch, and it now runs a static x86-64 musl busybox applet, but there is no
+x86-64 shell yet, so the interactive side still runs on the 32-bit image.
+[The roadmap](../ROADMAP.md)
+(milestones 1 to 4) lists the remaining stages: job control and the interactive
+shell. The 64-bit sources are excluded from the 32-bit link line, so both
+targets build from one tree.
 
 `kernel/arch/x86_64/elf/elf64.c` follows the 32-bit loader's rules — validate
 the whole image before mapping, accept only static `ET_EXEC`, require
@@ -541,7 +542,12 @@ faults instead of overwriting code. Images must load above
 loader accepts at most 384 pages (1.5 MiB) per image including the four-page
 stack, which is enough for a static musl binary; its frame list lives on the
 kernel stack (3 KiB), so the freestanding link also supplies `__chkstk`.
-There is no `AT_PHDR` because nothing walks it — only the `execve` hand-off
+Alpine's static busybox is a non-PIE `ET_EXEC` linked at 0x400000 and has no
+relocation records, so moving it would break its absolute immediates. Each
+new space therefore owns a private copy of the kernel's slot-0 page tables and
+the loader accepts a second, 4-8 MiB legacy image window: a 2 MiB identity
+leaf there is split into 4 KiB user pages, with `U/S=1` at every level while
+the kernel's own leaves stay supervisor-only. There is no `AT_PHDR` because nothing walks it — only the `execve` hand-off
 builds an auxiliary vector, with `AT_PAGESZ`, `AT_ENTRY` and `AT_NULL` — and
 the loader records the page-aligned start of the first writable segment so the
 self-test can read it back.
@@ -571,7 +577,7 @@ forks again and the child first `execve`s a missing path, which must return
 program, `kernel/arch/x86_64/user/exec_elf64.asm`, walks that stack image
 ([rsp] argc, then argv, NULL, envp, NULL, auxv), prints
 `HAKU64-EXEC-PROG` and `HAKU64-EXEC-ARGS`, and exits 42; the parent requires
-status 42 and then prints `HAKU64-EXEC-OK`. The image carries 320 KiB of
+status 42 and then prints `HAKU64-EXEC-OK`. The image carries 192 KiB of
 filler and a marker after it, so the program also prints `HAKU64-EXEC-LARGE`
 from its last page: the file is larger than a page-cache slot, which proves
 the streaming loader read and mapped all of it. `USER.ELF` is seeded on the
@@ -579,7 +585,13 @@ FAT12 volume by `build.py` and is not part of the kernel image or the
 initramfs, so the four markers
 prove the program came off the disk, that `execve` replaced the child's
 address space, and that the argument vector landed where a startup stub reads
-it. It next maps a two-page thread stack, `clone`s a thread with
+it. The test forks once more and execs `/disk/BUSYBOX` with
+`argv = {"busybox", "echo", "HAKU64-BUSYBOX-OK"}`. `argv[0]` is lowercase
+even though FAT12 uppercases the file name, because busybox dispatches
+applets from the basename of `argv[0]`. The marker is printed by the real
+musl runtime from ring 3, which proves the startup syscall sweep, the legacy
+image window and the 1 MiB FAT12 read all work together. It next maps a
+two-page thread stack, `clone`s a thread with
 `CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD`, sleeps in
 `futex(FUTEX_WAIT)` on a word in the shared BSS, and requires the thread to
 have bumped that word with `lock inc`, stored its `gettid` and `getpid`

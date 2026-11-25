@@ -136,7 +136,9 @@ redirected it, and `nanosleep` advanced the monotonic clock),
 `HAKU64-EXEC-OK` (a child `execve`d `/disk/USER.ELF` off the volume with two
 arguments and one environment variable, the program checked the stack image
 and printed `HAKU64-EXEC-PROG`/`HAKU64-EXEC-ARGS` plus `HAKU64-EXEC-LARGE`
-from the 320 KiB image's last page, and it exited 42),
+from the 192 KiB image's last page, and it exited 42), `HAKU64-BUSYBOX-OK`
+(a second child exec'd static musl busybox from `/disk/BUSYBOX` and ran its
+`echo` applet, printing the marker from ring 3),
 `HAKU64-THREAD-OK` (a `clone`d thread shared the address space and the
 descriptor table, bumped a shared word, woke the parent through a futex, and
 the parent's write through the thread's `dup2` target printed the marker
@@ -273,11 +275,14 @@ host side.
 `build/haku64_fs.img` is the x86-64 data disk. It is rebuilt on every x64 run
 because the self-test writes `/disk/NOTE.TXT` into it and no user data is
 expected to survive; its seed files are `HELLO.TXT`, `PATTERN.BIN`, `INITRD`,
-`USER.ELF`, `INIT.ELF`, `X64MOD.HKM` and `ROMFS.HKM` (the same
+`USER.ELF`, `INIT.ELF`, `X64MOD.HKM`, `BUSYBOX` and `ROMFS.HKM` (the same
 `kernel/module/demo/romfs.c` compiled for amd64). Everything but `USER.ELF`
-also goes into the cpio archive so it is reachable from the RAM root;
-`USER.ELF` exists only on the volume, so only `execve` (not `open`) can find
-it, and its size is the large-image test.
+and `BUSYBOX` also goes into the cpio archive so it is reachable from the RAM
+root; both stay only on the volume because neither fits the 128 KiB cache and
+RAM file limit. `BUSYBOX` is fetched by `tools/getbusybox64.py` on first use
+and cached under `build/busybox64`; `--busybox64=PATH` points at a local copy
+for offline runs. `USER.ELF` is the large-image test, `BUSYBOX` is the musl
+probe.
 
 `python build.py inspect` (default: `build/haku_fs.img`) lists the root
 directory and FAT summary without touching the image; `--chains` also prints

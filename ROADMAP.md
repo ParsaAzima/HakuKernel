@@ -15,9 +15,9 @@ Detailed history of everything that is already done lives in
 [the roadmap history](docs/roadmap-history.md). This file only tracks open  
 work.
 
-Milestone 1 is mostly landed: the x86-64 side has its own C library  
-(`user/lib64`) and `/INIT.ELF` runs from the FAT12 volume as a real ring-3  
-program. What is left in it is the third-party musl probe; the next milestone  
+Milestone 1 is landed: the x86-64 side has its own C library  
+(`user/lib64`), `/INIT.ELF` runs from the FAT12 volume as a real ring-3  
+program, and a static musl busybox applet runs there too. The next milestone  
 that needs new kernel work is 2.
 
 ## Where the project stands
@@ -306,12 +306,16 @@ with the 32-bit image available as a fallback.
   (`fs64_load_image`) instead of going through the 128 KiB page cache, and  
   `elf64_load` accepts up to 384 pages (1.5 MiB) per image including the  
   four-page stack, so a static musl binary fits. `/disk/USER.ELF` carries  
-  320 KiB of filler and prints `HAKU64-EXEC-LARGE` from its last page,  
+  192 KiB of filler and prints `HAKU64-EXEC-LARGE` from its last page,  
   which proves the FAT12 read, the loader and the mapping of an image  
   bigger than a cache slot.
-- [ ] Build a static x86-64 musl busybox in CI (`tools/getbusybox.py` or a  
-  prebuilt artifact) and place it in the initramfs with `/init` reading  
-  `INIT.CMD` when present.
+- [x] The x86-64 musl probe: `tools/getbusybox64.py` fetches Alpine's static  
+  x86-64 busybox on first use, `build.py` seeds it on the FAT12 volume as  
+  `BUSYBOX` (`--busybox64=PATH` for offline runs), and the ring-3 test execs  
+  `/disk/BUSYBOX echo HAKU64-BUSYBOX-OK`. Because Alpine's build is a non-PIE  
+  `ET_EXEC` at 0x400000 with no relocations, each user space now owns a copy  
+  of slot 0's page tables and the loader accepts a 4-8 MiB legacy window, so  
+  the absolute immediates stay valid (`HAKU64-BUSYBOX-OK`).
 - [ ] Make `shell`, `shell --check` and `probe` default to x86-64; `--arch=i386`  
   keeps the old image for comparison. Delete the "these modes force i386"  
   special case from `build.py`.

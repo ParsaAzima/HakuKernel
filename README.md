@@ -189,7 +189,8 @@ user/lib/            freestanding user C library and CRT (32-bit ABI)
 user/lib64/          x86-64 user C library and CRT (Microsoft x64 ABI)
 user/tests/          C library self-tests (LIB.ELF, INIT.ELF) and the musl probe
 include/haku/        shared ABI (abi.h/abi.inc, abi64.h/abi64.inc), user headers
-tools/               pe2bin, pe2elf, pe2elf64, mkimg, mkfat12, mkcpio, mkhakumod
+tools/               pe2bin, pe2elf, pe2elf64, mkimg, mkfat12, mkcpio,
+                     mkhakumod, getbusybox, getbusybox64
 build.py             the whole build, test, and QEMU orchestration
 ```
 
@@ -203,9 +204,10 @@ its own current task, idle task and timer, and wakes other CPUs with an IPI.
 Tasks are pinned to the CPU that created them, there is no load balancing or
 migration, and the user-space concurrency tests still run on the bootstrap
 processor, so a ring-3 task running on an AP is not yet covered. The x86-64
-kernel also has no shell or scrollback and no namespace beyond its boot mounts
-and the filesystems modules mount themselves, so its userland is a C library
-(`user/lib64`) plus the `/INIT.ELF` self-test rather than a shell; its console
+kernel has scrollback and runs a static musl busybox applet via `execve`, but
+has no shell and no namespace beyond its boot mounts and the filesystems
+modules mount themselves: its userland is a C library (`user/lib64`), the
+`/INIT.ELF` self-test and the busybox probe rather than a shell; its console
 has a canonical line discipline and PS/2 keyboard so a program can read a
 whole line of keys. FAT12 has 8.3 names, no timestamps, and no permission
 bits. Haku's

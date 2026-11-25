@@ -170,11 +170,12 @@ arg_beta:
 env_one:
     db 'A=1', 0
 
-; Deliberate filler: this program is the large-image test. Filling 320 KiB
+; Deliberate filler: this program is the large-image test. Filling 192 KiB
 ; with zeros makes /disk/USER.ELF bigger than the page cache's 128 KiB bound,
 ; and the marker after it lives in the last page, so printing it proves
-; execve streamed and mapped the whole file.
-times 327680 db 0
+; execve streamed and mapped the whole file. It is also small enough to leave
+; room for /disk/BUSYBOX on the same 1.44 MB FAT12 volume.
+times 196608 db 0
 msg_large:
     db 'HAKU64-EXEC-LARGE', 13, 10
 msg_large_end:

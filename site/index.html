@@ -107,7 +107,7 @@
           "name": "Can Haku run Linux binaries?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Only statically linked programs that stay inside the implemented syscall subset. The 32-bit image boots a static musl busybox, either directly as PID 1 or from a Linux-style rootfs where /etc/rc and /bin/busybox are paths on the disk, and a musl probe can be run manually; the x86-64 side runs its own C library and /INIT.ELF."
+            "text": "Only statically linked programs that stay inside the implemented syscall subset. The 32-bit image boots a static musl busybox, either directly as PID 1 or from a Linux-style rootfs where /etc/rc and /bin/busybox are paths on the disk. The x86-64 side runs its own C library and /INIT.ELF, and execs a static musl busybox applet from the FAT12 volume to prove a real Linux userland starts there."
           }
         }
       ]
@@ -421,9 +421,9 @@
       Only statically linked programs that stay inside the implemented syscall
       subset. The 32-bit image boots a static musl busybox, either directly as
       PID&nbsp;1 or from a Linux-style rootfs where <code>/etc/rc</code> and
-      <code>/bin/busybox</code> are paths on the disk, and a musl probe can be
-      run manually; the x86-64 side runs its own C library and
-      <code>/INIT.ELF</code>.
+      <code>/bin/busybox</code> are paths on the disk. The x86-64 side runs its
+      own C library and <code>/INIT.ELF</code>, and execs a static musl busybox
+      applet from the FAT12 volume to prove a real Linux userland starts there.
     </p>
   </div>
 </section>

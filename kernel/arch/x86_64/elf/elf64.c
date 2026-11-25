@@ -62,12 +62,22 @@ static const char *segment_error(const elf64_phdr_t *phdr, u64 image_size,
         return "loadable segment is both writable and executable";
     if (phdr->memsz == 0 || phdr->filesz > phdr->memsz)
         return "loadable segment has an impossible size";
-    if (phdr->vaddr < K64_USER_IMAGE_MIN || phdr->vaddr >= K64_USER_END ||
-        phdr->memsz > K64_USER_END - phdr->vaddr)
-        return "loadable segment is outside the user address window";
     end = phdr->vaddr + phdr->memsz;
-    if (end > K64_USER_STACK_BOTTOM || end <= phdr->vaddr)
-        return "loadable segment reaches into the user stack window";
+    if (phdr->vaddr >= K64_LEGACY_IMAGE_MIN &&
+        phdr->vaddr < K64_LEGACY_IMAGE_MAX) {
+        /* A static Linux ET_EXEC linked at 0x400000 has absolute addresses
+         * baked into its code, so it must load exactly there. The image has
+         * to stay inside the legacy window, which is private to this space. */
+        if (end > K64_LEGACY_IMAGE_MAX || end <= phdr->vaddr)
+            return "loadable segment is outside the legacy image window";
+    } else {
+        if (phdr->vaddr < K64_USER_IMAGE_MIN ||
+            phdr->vaddr >= K64_USER_END ||
+            phdr->memsz > K64_USER_END - phdr->vaddr)
+            return "loadable segment is outside the user address window";
+        if (end > K64_USER_STACK_BOTTOM || end <= phdr->vaddr)
+            return "loadable segment reaches into the user stack window";
+    }
     *page_start = phdr->vaddr & K64_PAGE_MASK;
     *page_end = (end + K64_PAGE_SIZE - 1) & K64_PAGE_MASK;
     if (*page_end <= *page_start)

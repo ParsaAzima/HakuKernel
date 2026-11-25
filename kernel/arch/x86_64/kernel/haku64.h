@@ -72,6 +72,16 @@ typedef signed long long s64;
 #define K64_USER_BRK_LIMIT      K64_USER_MMAP_BASE
 #define K64_USER_BRK_PAGES_MAX  4096u
 
+/* A second image window for static Linux binaries linked at conventional
+ * addresses: Alpine's ET_EXEC busybox loads at 0x400000 and has no dynamic
+ * relocations, so its absolute immediates and pointers must stay at their
+ * linked addresses. Every user space gets its own copy of the kernel's slot-0
+ * page tables, which lets the loader map these pages without touching the
+ * identity map shared by the kernel and every other CR3. The 4-8 MiB window
+ * is above the boot stages and kernel image and below the kernel heap. */
+#define K64_LEGACY_IMAGE_MIN 0x00400000ull
+#define K64_LEGACY_IMAGE_MAX 0x00800000ull
+
 /* Physical layout this stage reserves (all identity mapped, so a plain
  * pointer works):
  *   0x000000-0x200000  firmware, stage1/stage2, E820 and VBE handover,

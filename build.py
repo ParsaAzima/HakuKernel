@@ -391,6 +391,29 @@ def shell_busybox(explicit):
     return cached
 
 
+def shell_busybox64(explicit):
+    """Path to a static x86-64 busybox, fetching one on first use.
+
+    The x86-64 image has no musl toolchain in this build, so the binary comes
+    from Alpine's x86_64 repository. It is cached under build/ and never
+    committed; `--busybox64=PATH` points at a local copy for offline runs.
+    """
+    if explicit:
+        if not os.path.isfile(explicit):
+            sys.exit(f"no such busybox64: {explicit}")
+        return explicit
+    cached = os.path.join(BUILD, "busybox64")
+    if os.path.isfile(cached) and os.path.getsize(cached) > 0:
+        return cached
+    log("no x64 busybox cached; fetching a static musl build (Alpine x86_64)")
+    rc = subprocess.run([sys.executable,
+                         os.path.join(ROOT, "tools", "getbusybox64.py"),
+                         cached]).returncode
+    if rc != 0:
+        sys.exit("could not obtain x64 busybox; pass --busybox64=PATH")
+    return cached
+
+
 def build_shell_image(py, user_elf, busybox, command):
     """FAT12 image holding busybox and, optionally, the boot command line.
 
@@ -498,7 +521,8 @@ def build_rootfs_image(py, init_elf, busybox, command):
     return image
 
 
-def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf):
+def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf,
+                 busybox64):
     """Seed the x86-64 disk: a FAT12 volume with the boot archive on it.
 
     The kernel mounts FAT12 at /disk, reads /disk/INITRD, and unpacks it into
@@ -511,7 +535,10 @@ def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf):
     etc/banner.txt for the ring-3 initramfs check. USER.ELF stays on the
     FAT12 volume only: it is the program execve() runs, it is deliberately
     larger than one page-cache slot, and execve() streams it from the disk
-    rather than through the initramfs. The pattern is the same
+    rather than through the initramfs. BUSYBOX is there for the same reason —
+    a 1 MiB musl binary does not fit the 128 KiB initramfs or RAM root — and is
+    the x64 musl probe: the ring-3 test execs `/disk/BUSYBOX echo` to prove a
+    real static Linux userland can start on this port. The pattern is the same
     (offset*37+11) & 0xFF formula boot64.c uses to verify it.
 
     The FAT12 volume keeps its own copies of HELLO.TXT and PATTERN.BIN so the
@@ -548,12 +575,12 @@ def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf):
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
          f"INITRD={archive}", f"USER.ELF={exec_elf}",
          f"INIT.ELF={init_elf}", f"X64MOD.HKM={module_image}",
-         f"ROMFS.HKM={romfs_image}"])
+         f"BUSYBOX={busybox64}", f"ROMFS.HKM={romfs_image}"])
     log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes, "
         f"initramfs {os.path.getsize(archive)} bytes)")
 
 
-def build_x64(nasm, py, memory_mb, smp_cpus, mode):
+def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
     """Build haku64.img, then boot it when `mode` asks for a run.
 
     The entry path, memory subsystem, interrupts, per-process address
@@ -692,7 +719,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
 
     # 2b. the program stored on the disk and run by execve(). Same layout,
     #     same base: it never coexists with the image above because it runs
-    #     in a space of its own. Its flat image carries 320 KiB of filler so
+    #     in a space of its own. Its flat image carries 192 KiB of filler so
     #     the file is larger than one old page-cache slot; the BSS segment
     #     goes just past the code, computed here so the tool and the linker
     #     agree on where the code ends.
@@ -769,8 +796,9 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
     # 4. a fresh FAT12 volume for the disk filesystem test. The kernel
     #    creates /TMP and writes NOTE.TXT during the run, so the seed files
     #    are rebuilt every time rather than reused.
+    busybox64 = shell_busybox64(busybox64_path)
     build_x64_fs(py, fs_img, exec_elf, x64_module_image, x64_romfs_image,
-                 init64_elf)
+                 init64_elf, busybox64)
 
     # 5. boot it when asked. qemu-system-i386 refuses long mode without a
     #    64-bit CPU model, so every x64 boot uses the x86_64 binary;
@@ -896,6 +924,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode):
                 "HAKU64-COW-OK",
                 "HAKU64-DUP-OK", "HAKU64-EXEC-OK", "HAKU64-EXEC-ARGS",
                 "HAKU64-EXEC-LARGE",
+                "HAKU64-BUSYBOX-OK",
                 "HAKU64-THREAD-OK", "HAKU64-PORT-OK",
                 "HAKU64-MODULE-OK", "HAKU64-MODULE-LIB-OK",
                 "HAKU64-MODULE-LOAD-OK", "HAKU64-MODULE-REJECT-OK",
@@ -1020,6 +1049,7 @@ def main():
     smp_cpus = 2
     smp_explicit = False
     busybox_path = None
+    busybox64_path = None
     boot_command = None
     boot_check = False
     for flag in raw_args:
@@ -1030,6 +1060,9 @@ def main():
             continue
         if flag.startswith("--busybox="):
             busybox_path = flag.split("=", 1)[1]
+            continue
+        if flag.startswith("--busybox64="):
+            busybox64_path = flag.split("=", 1)[1]
             continue
         if flag.startswith("--cmd="):
             boot_command = flag.split("=", 1)[1]
@@ -1069,7 +1102,7 @@ def main():
         if flag.startswith("-"):
             sys.exit(f"unknown flag: {flag} (use --arch=x64|i386, --fresh, "
                      "--memory=MB, --smp=N, --init=PATH, --expect=MARKER, "
-                     "--busybox=PATH, --cmd=TEXT, --check)")
+                     "--busybox=PATH, --busybox64=PATH, --cmd=TEXT, --check)")
     fresh = "--fresh" in raw_args
     if len(positionals) > 1:
         sys.exit(f"unexpected argument: {positionals[1]}")
@@ -1097,7 +1130,7 @@ def main():
         sys.exit("--check only applies to `shell` and `rootfs`")
 
     if mode == "x64":
-        build_x64(nasm, py, memory_mb, smp_cpus, "headless")
+        build_x64(nasm, py, memory_mb, smp_cpus, "headless", busybox64_path)
         return
 
     if mode in ("probe", "shell", "rootfs"):
@@ -1106,7 +1139,7 @@ def main():
                      "use --arch=i386")
         arch = "i386"
     if mode in ("build", "run", "headless") and arch == "x64":
-        build_x64(nasm, py, memory_mb, smp_cpus, mode)
+        build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path)
         return
     if smp_explicit and arch == "i386" and smp_cpus > 4:
         sys.exit("--smp=N takes 1..4 for the 32-bit image: its task table "

@@ -33,6 +33,7 @@
 #define PAGE_PWT      0x008ull   /* write-through (MMIO) */
 #define PAGE_PCD      0x010ull   /* cache disable (MMIO) */
 #define PAGE_LARGE    0x080ull   /* PS: 2 MiB page in a page directory */
+#define PAGE_GLOBAL   0x100ull   /* G: keep kernel leaves across CR3 swaps */
 /* Bits 9 and 10 are ignored by the walker, so they carry the fork state:
  * PAGE_COW marks a frame two spaces share, and PAGE_COW_RW remembers that
  * the mapping is logically writable, so the break can restore the write bit
@@ -223,12 +224,48 @@ static void space_changed(u64 space) {
 }
 
 static int user_address(u64 virt) {
-    return virt >= K64_USER_BASE && virt < K64_USER_END;
+    return (virt >= K64_USER_BASE && virt < K64_USER_END) ||
+           (virt >= K64_LEGACY_IMAGE_MIN && virt < K64_LEGACY_IMAGE_MAX);
+}
+
+/* Copy the kernel's slot-0 tables into this space. The entries still map
+ * the kernel's code and data at supervisor privileges, but the PD is now
+ * private: the legacy image window can be split into 4 KiB user pages
+ * without editing a table every other CR3 shares. */
+static int copy_low_slot(u64 *root) {
+    u64 *boot = (u64 *)phys_to_virt64(PML4_PHYS);
+    u64 *boot_pdpt = (u64 *)phys_to_virt64(boot[0] & K64_PHYS_MASK);
+    u64 *pdpt = space_table();
+
+    if (!pdpt) return 0;
+    memcpy(pdpt, boot_pdpt, K64_PAGE_SIZE);
+    for (u32 i = 0; i < 512; i++) {
+        u64 *boot_pd, *pd;
+
+        if (!(pdpt[i] & PAGE_PRESENT)) continue;
+        boot_pd = (u64 *)phys_to_virt64(pdpt[i] & K64_PHYS_MASK);
+        pd = space_table();
+        if (!pd) {
+            for (u32 j = 0; j < i; j++)
+                if (pdpt[j] & PAGE_PRESENT)
+                    frame64_free(pdpt[j] & K64_PHYS_MASK);
+            frame64_free(table_phys(pdpt));
+            return 0;
+        }
+        memcpy(pd, boot_pd, K64_PAGE_SIZE);
+        /* USER must be set at every level for a ring-3 access. The leaves
+         * copied from the kernel map stay supervisor-only, so this does not
+         * expose kernel pages: a leaf with U/S=0 still denies user access. */
+        pdpt[i] = (pdpt[i] & ~K64_PHYS_MASK) | PAGE_USER | table_phys(pd);
+    }
+    root[0] = (boot[0] & ~K64_PHYS_MASK) | PAGE_USER | table_phys(pdpt);
+    return 1;
 }
 
 /* A new PML4 that borrows the kernel's identity map and physmap. Slot 1
  * (the user half) starts empty; the k-th process gets its own copy of the
- * remaining two entries, so all processes share kernel code and data. */
+ * remaining two entries, so all processes share kernel code and data. Slot 0
+ * is copied too, so an ET_EXEC linked at 0x400000 can be mapped there. */
 u64 paging64_create_space(void) {
     u64 space = frame64_alloc();
     u64 *root;
@@ -238,7 +275,10 @@ u64 paging64_create_space(void) {
     root = (u64 *)phys_to_virt64(space);
     memset(root, 0, K64_PAGE_SIZE);
     boot = (u64 *)PML4_PHYS;
-    root[0] = boot[0];                         /* identity map, slot 0 */
+    if (!copy_low_slot(root)) {
+        frame64_free(space);
+        return 0;
+    }
     root[PML4_INDEX(K64_PHYS_MAP_BASE)] = boot[PML4_INDEX(K64_PHYS_MAP_BASE)];
     /* The local APIC is reachable from a user space too: an interrupt that
      * arrives while a process runs acknowledges through the unit, and the
@@ -276,7 +316,22 @@ static u64 *space_leaf_create(u64 space, u64 virt) {
     }
     pd = (u64 *)phys_to_virt64(pdpt[PDPT_INDEX(virt)] & K64_PHYS_MASK);
 
-    if (pd[PD_INDEX(virt)] & PAGE_LARGE) return 0;
+    /* The kernel's low identity map uses 2 MiB leaves. In a private slot 0
+     * that leaf can be split into 4 KiB entries: the kernel keeps its own
+     * supervisor mappings, and an image can add user pages in the same
+     * 2 MiB region without touching another CR3's tables. */
+    if (pd[PD_INDEX(virt)] & PAGE_LARGE) {
+        u64 base = pd[PD_INDEX(virt)] & K64_PHYS_MASK &
+                   ~((K64_PAGE_SIZE << 9) - 1ull);
+        u64 *pt = space_table();
+
+        if (!pt) return 0;
+        for (u32 k = 0; k < 512; k++)
+            pt[k] = base + ((u64)k << 12) | PAGE_PRESENT | PAGE_WRITABLE |
+                    PAGE_GLOBAL | PAGE_NX;
+        pd[PD_INDEX(virt)] = table_phys(pt) | PAGE_PRESENT | PAGE_WRITABLE |
+                             PAGE_USER;
+    }
     if (!(pd[PD_INDEX(virt)] & PAGE_PRESENT)) {
         pt = space_table();
         if (!pt) return 0;
@@ -426,12 +481,30 @@ void paging64_destroy_space(u64 space) {
         }
         frame64_free(table_phys(pdpt));
     }
+
+    /* Slot 0 is private to this space: free its copied PDPT and PDs and any
+     * PT a legacy image split out of a 2 MiB identity leaf. */
+    if (pml4[0] & PAGE_PRESENT) {
+        pdpt = (u64 *)phys_to_virt64(pml4[0] & K64_PHYS_MASK);
+        for (i = 0; i < 512; i++) {
+            if (!(pdpt[i] & PAGE_PRESENT)) continue;
+            pd = (u64 *)phys_to_virt64(pdpt[i] & K64_PHYS_MASK);
+            for (j = 0; j < 512; j++) {
+                if (!(pd[j] & PAGE_PRESENT) || (pd[j] & PAGE_LARGE)) continue;
+                pt = (u64 *)phys_to_virt64(pd[j] & K64_PHYS_MASK);
+                frame64_free(table_phys(pt));
+            }
+            frame64_free(table_phys(pd));
+        }
+        frame64_free(table_phys(pdpt));
+    }
     frame64_free(space);
 }
 
-/* Visit every present 4 KiB leaf in the user half. Slots below the user
- * base are the kernel's own and are never reported. The callback returns 0
- * to stop the walk, which clone uses to bail out on the first failure. */
+/* Visit every present 4 KiB user leaf. Slot 0 is included now that static
+ * Linux images can live there, but its kernel identity leaves carry no
+ * PAGE_USER bit and are skipped. The callback returns 0 to stop the walk,
+ * which clone uses to bail out on the first failure. */
 static int walk_user_pages(u64 space,
                            int (*visit)(u64 virt, u64 phys, u64 flags,
                                         void *ctx),
@@ -441,7 +514,7 @@ static int walk_user_pages(u64 space,
 
     if (!space) return 0;
     pml4 = (u64 *)phys_to_virt64(space);
-    for (slot = PML4_INDEX(K64_USER_BASE);
+    for (slot = 0;
          slot <= PML4_INDEX(K64_USER_END - 1); slot++) {
         if (!(pml4[slot] & PAGE_PRESENT)) continue;
         pdpt = (u64 *)phys_to_virt64(pml4[slot] & K64_PHYS_MASK);
@@ -454,6 +527,7 @@ static int walk_user_pages(u64 space,
                 for (k = 0; k < 512; k++) {
                     u64 virt;
                     if (!(pt[k] & PAGE_PRESENT)) continue;
+                    if (slot == 0 && !(pt[k] & PAGE_USER)) continue;
                     virt = ((u64)slot << 39) | ((u64)i << 30) |
                            ((u64)j << 21) | ((u64)k << 12);
                     if (!visit(virt, pt[k] & K64_PHYS_MASK, pt[k], ctx))
