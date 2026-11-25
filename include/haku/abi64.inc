@@ -85,6 +85,7 @@
 %define HAKU64_SYS_PIPE2         293
 %define HAKU64_SYS_GETRANDOM     318
 %define HAKU64_SYS_STATX         332
+%define HAKU64_SYS_GETCPU        309
 
 ; arch_prctl(2) subcommands and the auxv keys the startup stub reads.
 %define HAKU64_ARCH_SET_GS 0x1001

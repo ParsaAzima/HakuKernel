@@ -399,9 +399,16 @@ static void release_reaped_slots(void) {
  * Every CPU's housekeeping runs there on purpose: klog.c has no lock of its
  * own and only one CPU edits user page tables, so the diagnostic line and
  * the address-space teardown stay single-threaded. */
+/* The boot handshake reads the AP probe's exit status from its slot. Keep
+ * that one task out of the reaper until the handshake has seen it, otherwise
+ * a tick on the bootstrap processor clears the slot before the caller can
+ * tell a clean exit from a signal. */
+static uint32_t boot_ap_pid;
+
 static void reap_completed_tasks(void) {
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
         task_t *task = &tasks[i];
+        if (boot_ap_pid && task->pid == boot_ap_pid) continue;
         if ((task->state != TASK_ZOMBIE &&
              task->state != TASK_REAP_PENDING) ||
             task_is_running_anywhere(i))
@@ -736,11 +743,14 @@ regs_t *scheduler_preempt(regs_t *frame) {
         }
 
         reap_completed_tasks();
-        wake_expired_sleepers();
         /* The timer is the clock for a parked poll(2)/select(2): it re-scans
          * readiness and checks its deadline once per tick. */
         wait_queue_wake_all(&scheduler_activity);
     }
+    /* Sleepers can be pinned to any CPU, so every timer must expire its own
+     * sleeping tasks. A task parked by nanosleep on an AP would otherwise
+     * wait forever for the bootstrap processor's next tick. */
+    wake_expired_sleepers();
     if (cpu->current == SCHEDULER_IDLE_INDEX) {
         idle_task.frame = frame;
     } else if (cpu->current >= 0 &&
@@ -1083,7 +1093,11 @@ static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status) {
     int next;
     task_t *exiting;
     uint32_t status;
-    if (!scheduler_started || current_task < 0 ||
+    /* Application processors are already scheduling their own tasks before
+     * the bootstrap processor calls scheduler_start(), so only the BSP waits
+     * for that flag. The boot AP probe exits while the BSP is still in
+     * kernel_main. */
+    if ((!scheduler_started && percpu_self()->index == 0) || current_task < 0 ||
         current_task >= SCHEDULER_IDLE_INDEX)
         return frame;
 
@@ -1928,6 +1942,117 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
     klog_dec(child->pid);
     klog_write("\n");
     return (int32_t)child->pid;
+}
+
+/* Place a preloaded ELF image on an application processor before PID 1 has
+ * entered ring 3. spawn() deliberately inherits from a current task, which
+ * does not exist yet at that point; this boot path gives the new process its
+ * own group and standard descriptors instead. The slot stays STARTING until
+ * the user stack and VFS context are complete, so no AP can run a half-built
+ * task even though interrupts are already on. */
+int32_t scheduler_user_on(uint32_t cpu, loaded_elf_t *program) {
+    irqflags_t flags;
+    task_t *child = 0;
+    uint32_t slot;
+    uint32_t pid;
+
+    if (!program || !program->address_space.directory_phys ||
+        !program->entry || !program->user_stack || cpu == 0 ||
+        cpu >= SMP_MAX_CPUS)
+        return -(int32_t)HAKU_EINVAL;
+    if (idle_tasks[cpu].state != TASK_RUNNABLE)
+        return -(int32_t)HAKU_EINVAL;
+
+    flags = spin_lock_irqsave(&sched_lock);
+    release_reaped_slots();
+    for (slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
+        if (tasks[slot].state == TASK_UNUSED) {
+            child = &tasks[slot];
+            break;
+        }
+    }
+    if (!child) {
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return -(int32_t)HAKU_EAGAIN;
+    }
+    memset(child, 0, sizeof(*child));
+    pid = slot + 1u;
+    child->pid = pid;
+    /* PID 1 is the only task alive at this point. Keeping it as the parent
+     * leaves the AP task a zombie with its exit status intact after exit,
+     * which is exactly what the boot handshake reads. */
+    child->parent_pid = 1u;
+    child->tgid = pid;
+    child->pgrp = pid;
+    child->sid = pid;
+    child->space_owner = pid;
+    child->space_users = 1u;
+    child->cpu = cpu;
+    child->state = TASK_STARTING;
+    init_task_identity(child);
+    spin_unlock_irqrestore(&sched_lock, flags);
+
+    child->program = *program;
+    if (!initialize_stack(child, 1)) {
+        paging_destroy_user_space(&child->program.address_space);
+        flags = spin_lock_irqsave(&sched_lock);
+        memset(child, 0, sizeof(*child));
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return -(int32_t)HAKU_ENOMEM;
+    }
+    program->address_space.directory_phys = 0;
+
+    if (vfs_open_stdio(pid) != 1) {
+        vfs_close_all(pid);
+        frame_free_pages((void *)child->kernel_stack,
+                         TASK_KERNEL_STACK_PAGES);
+        paging_destroy_user_space(&child->program.address_space);
+        flags = spin_lock_irqsave(&sched_lock);
+        memset(child, 0, sizeof(*child));
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return -(int32_t)HAKU_EMFILE;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    child->state = TASK_RUNNABLE;
+    boot_ap_pid = pid;
+    spin_unlock_irqrestore(&sched_lock, flags);
+
+    /* The AP is parked in its idle loop with interrupts enabled; without
+     * this IPI it would not notice a runnable task until its next tick. */
+    smp_resched_cpu(cpu);
+    klog_prefix();
+    klog_write("sched: SPAWN-AP-OK pid=");
+    klog_dec(pid);
+    klog_write(" cpu=");
+    klog_dec(cpu);
+    klog_write("\n");
+    return (int32_t)pid;
+}
+
+int scheduler_task_finished(uint32_t pid, uint32_t *exit_status) {
+    task_t *task = task_by_pid(pid);
+
+    if (!task) return 0;
+    if (task->state != TASK_ZOMBIE && task->state != TASK_REAP_PENDING)
+        return 0;
+    if (exit_status) *exit_status = task->exit_status;
+    /* The boot AP probe is parented to PID 1 only so it keeps its status.
+     * Once the handshake has that status, free the slot completely: a zombie
+     * left behind would look like PID 1's child to the very first waitpid,
+     * and a plain reap() keeps a TASK_ZOMBIE slot intact. The probe has
+     * already switched its AP to the idle task, so no CPU stands on its
+     * kernel stack here. */
+    if (task->pid == boot_ap_pid) {
+        irqflags_t flags;
+
+        boot_ap_pid = 0;
+        flags = spin_lock_irqsave(&sched_lock);
+        release_task_resources(task);
+        memset(task, 0, sizeof(*task));
+        spin_unlock_irqrestore(&sched_lock, flags);
+    }
+    return 1;
 }
 
 /* Build the child's kernel stack and register frame for a fork: the frame

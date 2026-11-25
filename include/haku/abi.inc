@@ -125,6 +125,7 @@
 %define HAKU_SYS_PIPE2     331
 %define HAKU_SYS_PRLIMIT64 340
 %define HAKU_SYS_GETRANDOM 355
+%define HAKU_SYS_GETCPU     323
 %define HAKU_SYS_RSEQ      386
 
 %define HAKU_E2BIG         7

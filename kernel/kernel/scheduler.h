@@ -5,7 +5,7 @@
 #include "haku/abi.h"
 #include "idt.h"
 
-#define SCHEDULER_MAX_PROCESSES 4u
+#define SCHEDULER_MAX_PROCESSES 8u
 /* Signals: Haku implements the standard range 1..31, so a mask fits in a
  * single word with bit (sig - 1) set. */
 #define SCHEDULER_NSIG 31u
@@ -70,6 +70,13 @@ regs_t *scheduler_preempt(regs_t *frame);
 regs_t *scheduler_exit_current(regs_t *frame);
 int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame);
 int32_t scheduler_spawn(loaded_elf_t *program);
+/* Boot-time user task pinned to an application processor. Unlike spawn this
+ * does not require a running current task: the kernel calls it after the APs
+ * are up and before PID 1 enters ring 3. It takes ownership of `program` on
+ * success. Returns the task's pid or a negative -errno. */
+int32_t scheduler_user_on(uint32_t cpu, loaded_elf_t *program);
+/* 1 when `pid` has finished; `exit_status` receives its raw wait status. */
+int scheduler_task_finished(uint32_t pid, uint32_t *exit_status);
 /* fork(2)/clone(2): the child gets its own address space that shares the
  * parent's pages copy-on-write, and inherits its descriptors; the child
  * returns 0 from the call and the parent gets the new pid. */

@@ -306,6 +306,7 @@ typedef signed long long s64;
 #define K64_SYS_RENAMEAT2     316u
 #define K64_SYS_GETRANDOM     318u
 #define K64_SYS_STATX         332u
+#define K64_SYS_GETCPU        309u
 #define K64_SYS_FACCESSAT2    439u
 
 /* *at flags. Haku has no symbolic links, so NOFOLLOW is accepted and
@@ -1072,6 +1073,10 @@ int sched64_prepare_ap(u32 cpu);
 /* Enter `cpu`'s idle task; runs on the AP and does not return. */
 void sched64_start_ap(u32 cpu);
 int task64_create_user(u64 entry, u64 user_stack_top, u64 space);
+/* Ring-3 counterpart of task64_create_kernel_on(): build the user frame in
+ * an unused slot, pin it to an online AP and kick that CPU's scheduler. The
+ * ordinary wrapper still pins to the calling CPU. Returns the slot or -1. */
+int task64_create_user_on(u32 cpu, u64 entry, u64 user_stack_top, u64 space);
 regs64_t *sched64_tick(regs64_t *frame);
 regs64_t *sched64_exit(regs64_t *frame);
 /* end every task of the caller's thread group, then the caller */

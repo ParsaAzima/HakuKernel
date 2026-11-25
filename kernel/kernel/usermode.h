@@ -26,6 +26,10 @@
 #define USER_MMAP_LIMIT 0x70000000u
 
 int usermode_init(void);
+/* Boot-time probe: run /AP.ELF as a ring-3 task pinned to CPU 1 and wait for
+ * its exit on the bootstrap processor. Returns 1 when it exited cleanly or
+ * when only one CPU is online (then it logs AP-SKIP). */
+int usermode_ap_probe(void);
 void usermode_run(void);
 regs_t *user_syscall(regs_t *r);
 

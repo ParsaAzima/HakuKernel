@@ -55,6 +55,9 @@ int personality(unsigned int persona);
 #define PER_LINUX HAKU_PER_LINUX
 #define PER_QUERY HAKU_PER_QUERY
 int getpid(void);
+/* getcpu(2): report the CPU running the caller. `cpu` and `node` are optional
+ * u32 out pointers; Haku has one NUMA node, so node is 0. */
+int getcpu(unsigned *cpu, unsigned *node, void *unused);
 /* gettid(2): the calling thread's id. A process's first thread has the same
  * id as the process; a created thread gets its own. */
 int gettid(void);

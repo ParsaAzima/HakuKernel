@@ -162,6 +162,7 @@
 #define HAKU_SYS_PIPE2     331u
 #define HAKU_SYS_PRLIMIT64 340u
 #define HAKU_SYS_GETRANDOM 355u
+#define HAKU_SYS_GETCPU     323u
 #define HAKU_SYS_RSEQ      386u
 
 /* Process-creation flags (Linux). clone(2) supports the fork-like case and

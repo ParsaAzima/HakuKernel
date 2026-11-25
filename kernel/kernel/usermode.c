@@ -1,4 +1,5 @@
 #include "usermode.h"
+#include "percpu.h"
 #include "devfs.h"
 #include "fat12_vfs.h"
 #include "initramfs.h"
@@ -8,6 +9,7 @@
 #include "procfs.h"
 #include "ramfs.h"
 #include "scheduler.h"
+#include "smp.h"
 #include "sync.h"
 #include "terminal.h"
 #include "fat12.h"
@@ -369,6 +371,39 @@ static uint32_t build_initial_stack(const char *argv0, loaded_elf_t *program) {
     return build_exec_stack(program, &arguments);
 }
 
+/* The AP probe is loaded while pid 1's VFS context is still live, before
+ * scheduler_init clears the current task: after the scheduler starts there
+ * is no current pid to resolve a path through until ring 3 is running. */
+static loaded_elf_t ap_boot_program;
+static int ap_boot_ready;
+
+static void load_ap_program(void) {
+    vfs_stat_t ap_stat;
+    uint8_t *ap_image;
+    uint32_t ap_size = 0;
+    int result;
+
+    result = vfs_stat(1, "AP.ELF", &ap_stat);
+    if (result != 1 || ap_stat.st_size == 0 ||
+        ap_stat.st_size > USER_ELF_MAX_SIZE)
+        return;
+    ap_image = (uint8_t *)kmalloc((uint32_t)ap_stat.st_size);
+    if (!ap_image) return;
+    result = read_vfs_file("AP.ELF", ap_image, (uint32_t)ap_stat.st_size,
+                           &ap_size);
+    if (result != 1 ||
+        !elf_load_executable(ap_image, ap_size, &ap_boot_program)) {
+        kfree(ap_image);
+        return;
+    }
+    kfree(ap_image);
+    if (build_initial_stack("AP.ELF", &ap_boot_program)) {
+        paging_destroy_user_space(&ap_boot_program.address_space);
+        return;
+    }
+    ap_boot_ready = 1;
+}
+
 int usermode_init(void) {
     uint32_t loaded = 0;
     uint32_t image_size = 0;
@@ -460,10 +495,17 @@ int usermode_init(void) {
     klog_write("USERMODE-READY: user stack=");
     klog_hex(initial_program.user_stack);
     klog_write("\n");
+    /* SMP is initialised after usermode_init, so load the probe regardless
+     * of the CPU count; the caller skips (and frees) it on a uniprocessor. */
+    load_ap_program();
     if (!scheduler_init(&initial_program)) {
         klog_log(KLOG_ERROR,
                  "SCHED-INIT-FAIL: could not start initial process\n");
         paging_destroy_user_space(&initial_program.address_space);
+        if (ap_boot_ready) {
+            paging_destroy_user_space(&ap_boot_program.address_space);
+            ap_boot_ready = 0;
+        }
         return 0;
     }
     return 1;
@@ -477,6 +519,58 @@ void usermode_run(void) {
      * display mirror back on for a fatal error. */
     klog_mirror_display(0);
     scheduler_start();
+}
+
+/* /AP.ELF is the C library linked into a tiny ring-3 probe. The kernel puts
+ * it on CPU 1 before PID 1 enters ring 3; every syscall it makes therefore
+ * resolves its current task, user page directory and FS base on that AP.
+ * The bootstrap processor only waits for the exit status. */
+int usermode_ap_probe(void) {
+    uint32_t status = 0xFFFFFFFFu;
+    uint32_t deadline;
+    int32_t pid;
+    int finished;
+
+    if (smp_cpu_count() < 2) {
+        if (ap_boot_ready) {
+            paging_destroy_user_space(&ap_boot_program.address_space);
+            ap_boot_ready = 0;
+        }
+        klog_log(KLOG_INFO, "AP-SKIP: one CPU online\n");
+        return 1;
+    }
+    if (!ap_boot_ready) {
+        /* The probe is a headless self-test. The shell and rootfs images boot
+         * a smaller file set and do not seed AP.ELF, so their run must simply
+         * skip it rather than panic; the headless gate still requires every
+         * AP marker when the image is present. */
+        klog_log(KLOG_INFO, "AP-SKIP: /AP.ELF not seeded on this disk\n");
+        return 1;
+    }
+    pid = scheduler_user_on(1u, &ap_boot_program);
+    if (pid < 0) {
+        klog_log(KLOG_ERROR, "AP-FAIL: scheduler_user_on\n");
+        return 0;
+    }
+    deadline = pit_ticks() + 500u;
+    finished = 0;
+    while (!(finished = scheduler_task_finished((uint32_t)pid, &status)) &&
+           pit_ticks() < deadline)
+        cpu_pause();
+    if (!finished || status != 0u) {
+        klog_prefix();
+        klog_write("AP-FAIL: pid=");
+        klog_dec((uint32_t)pid);
+        klog_write(" status=");
+        klog_hex(status);
+        klog_write("\n");
+        return 0;
+    }
+    klog_prefix();
+    klog_write("AP-RUN-OK: cpu=1 pid=");
+    klog_dec((uint32_t)pid);
+    klog_write(" exit=0\n");
+    return 1;
 }
 
 static uint32_t copy_from_user_error(uint32_t error) {
@@ -2698,6 +2792,27 @@ regs_t *user_syscall(regs_t *r) {
     case HAKU_SYS_STATX:
         r->eax = sys_statx(r->ebx, r->ecx, r->edx, r->esi, r->edi);
         return r;
+    case HAKU_SYS_GETCPU: {
+        uint32_t cpu = percpu_self_index();
+        uint32_t node = 0;
+
+        if (r->ebx) {
+            if (!paging_user_range_valid(r->ebx, sizeof(cpu), 1) ||
+                !copy_to_user(r->ebx, &cpu, sizeof(cpu))) {
+                r->eax = copy_from_user_error(HAKU_EFAULT);
+                return r;
+            }
+        }
+        if (r->ecx) {
+            if (!paging_user_range_valid(r->ecx, sizeof(node), 1) ||
+                !copy_to_user(r->ecx, &node, sizeof(node))) {
+                r->eax = copy_from_user_error(HAKU_EFAULT);
+                return r;
+            }
+        }
+        r->eax = 0;
+        return r;
+    }
     case HAKU_SYS_GETPID:
         /* A thread reports its process, not its own tid. */
         r->eax = scheduler_current_tgid();

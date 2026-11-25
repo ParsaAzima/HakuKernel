@@ -181,6 +181,11 @@ void kernel_main(void) {
         panic("SMP-FAIL: per-CPU scheduling self-test failed");
     }
 
+    /* A ring-3 task on an AP, before PID 1 takes the screen: this is the
+     * first time the syscall layer's bookkeeping runs on more than the BSP. */
+    if (!usermode_ap_probe())
+        panic("AP-FAIL: ring-3 task on an application processor");
+
     klog_log(KLOG_INFO, "input: press one key for the read() test...\n");
     usermode_run();
     panic("scheduler returned unexpectedly");

@@ -1436,6 +1436,76 @@ static int test_module_fs_release(void) {
     return 1;
 }
 
+/* /AP64.ELF is the same user library linked into a tiny ring-3 probe. The
+ * kernel places it on CPU 1 before /INIT.ELF runs, then waits here on the
+ * bootstrap processor. Everything the probe prints and every syscall it
+ * makes therefore goes through CPU 1's current task, TSS, FS base and APIC
+ * timer; the marker below only closes the handshake once the task is gone. */
+static int test_ap_user64(void) {
+    static const char path[] = "/AP64.ELF";
+    u64 size;
+    u64 deadline;
+    u8 *image;
+    int file, id;
+    loaded_elf64_t loaded;
+
+    if (smp64_cpu_count() < 2 || !cpus64[1].online) {
+        k64_puts("HAKU64-AP-SKIP: one CPU online\r\n");
+        return 1;
+    }
+
+    file = fs64_lookup(path);
+    if (file < 0) return 0;
+    size = fs64_size(file);
+    if (size == 0 || size > (u64)FS64_PAGE_MAX * K64_PAGE_SIZE) return 0;
+    image = (u8 *)kmalloc64(size);
+    if (!image) return 0;
+    if (fs64_read(file, 0, image, size) != size) {
+        kfree64(image);
+        return 0;
+    }
+    if (!elf64_load(image, size, &loaded)) {
+        k64_puts("HAKU64-AP-FAIL: ");
+        k64_puts(elf64_last_error());
+        k64_puts("\r\n");
+        kfree64(image);
+        return 0;
+    }
+    kfree64(image);
+    if (sys64_build_init_stack(&loaded, path)) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    id = task64_create_user_on(1, loaded.entry, loaded.stack_top, loaded.space);
+    if (id < 0) {
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    deadline = timer64_ticks() + 500;
+    while (task64_state(id) != K64_TASK_DONE && timer64_ticks() < deadline)
+        cpu_pause64();
+    if (task64_state(id) != K64_TASK_DONE ||
+        task64_exit_status(id) != 0) {
+        k64_puts("HAKU64-AP-FAIL: task=");
+        k64_dec(id);
+        k64_puts(" state=");
+        k64_dec(task64_state(id));
+        k64_puts(" exit=");
+        k64_dec(task64_exit_status(id));
+        k64_puts("\r\n");
+        elf64_unload(&loaded);
+        return 0;
+    }
+
+    k64_puts("HAKU64-AP-RUN-OK: cpu=1 task=");
+    k64_dec(id);
+    k64_puts(" exit=0\r\n");
+    elf64_unload(&loaded);
+    return 1;
+}
+
 /* /INIT.ELF is the C program built against user/lib64. The kernel reads it
  * from the FAT12 volume, loads it through the ELF64 loader, builds the same
  * argc/argv/envp/auxv stack execve would and starts it at ring 3. Everything
@@ -1763,6 +1833,7 @@ void kernel64_main(void) {
     if (!test_elf64()) k64_fail("ELF64 loader self-test");
     if (!test_module_fs()) k64_fail("module filesystem self-test");
     if (!test_libc64()) k64_fail("x86-64 user library self-test");
+    if (!test_ap_user64()) k64_fail("ring-3 task on an AP self-test");
     if (!test_module_fs_release())
         k64_fail("module filesystem unload self-test");
     if (!test_disk_note()) k64_fail("FAT12 disk write self-test");

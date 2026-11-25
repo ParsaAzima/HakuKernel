@@ -175,6 +175,12 @@ int arch_prctl(int code, unsigned long long address) {
         haku64_syscall2(HAKU64_SYS_ARCH_PRCTL, code, (long long)address));
 }
 
+int getcpu(unsigned *cpu, unsigned *node, void *unused) {
+    return (int)haku64_errno_check(
+        haku64_syscall3(HAKU64_SYS_GETCPU, (long long)cpu, (long long)node,
+                        (long long)unused));
+}
+
 /* fork(2): the child returns 0 into the same instruction fault frame, so a
  * negative result means the call was refused and becomes errno. The child
  * keeps the parent's TEB by copy-on-write but has a task id of its own, so

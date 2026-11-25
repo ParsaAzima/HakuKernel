@@ -70,6 +70,11 @@ int getpid(void) {
     return haku_syscall0(HAKU_SYS_GETPID);
 }
 
+int getcpu(unsigned *cpu, unsigned *node, void *unused) {
+    return haku_errno_check(
+        haku_syscall3(HAKU_SYS_GETCPU, (int)cpu, (int)node, (int)unused));
+}
+
 int gettid(void) {
     return haku_syscall0(HAKU_SYS_GETTID);
 }

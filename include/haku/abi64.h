@@ -121,6 +121,7 @@ typedef long long time_t;
 #define HAKU64_SYS_PIPE2         293
 #define HAKU64_SYS_GETRANDOM     318
 #define HAKU64_SYS_STATX         332
+#define HAKU64_SYS_GETCPU        309
 
 /* Offsets inside the thread control block (the TEB) this library builds. The
  * +0x30 self pointer and +0x58 TlsSlots pointer are the Windows definitions
@@ -644,6 +645,9 @@ int get_robust_list(int pid, haku64_robust_list_t **head, size_t *length);
 /* Set or read the user FS/GS base. `address` is a pointer for GET_* and the
  * new base for SET_*; returns 0 or -1 with errno. */
 int arch_prctl(int code, unsigned long long address);
+/* getcpu(2): report the CPU running the caller. `cpu` and `node` are
+ * optional u32 out pointers; Haku has one NUMA node, so node is 0. */
+int getcpu(unsigned *cpu, unsigned *node, void *unused);
 /* crt64.asm calls this before main(); exported so a custom entry point can
  * do the same. Returns 0 on success (or when the image has no TLS). */
 int haku64_tls_init(const unsigned long long *auxv);

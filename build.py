@@ -522,14 +522,16 @@ def build_rootfs_image(py, init_elf, busybox, command):
 
 
 def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf,
-                 busybox64):
+                 busybox64, ap64_elf):
     """Seed the x86-64 disk: a FAT12 volume with the boot archive on it.
 
     The kernel mounts FAT12 at /disk, reads /disk/INITRD, and unpacks it into
     the RAM filesystem that becomes /. The archive therefore carries what the
     boot tests open by absolute path: HELLO.TXT with the 16-byte marker,
     PATTERN.BIN with three pages of a byte pattern, INIT.ELF (the C program
-    built against user/lib64 that the kernel starts first), X64MOD.HKM (the
+    built against user/lib64 that the kernel starts first), AP64.ELF (the
+    same library linked into a tiny probe the kernel pins to an AP),
+    X64MOD.HKM (the
     packed module the loader reads and relocates), ROMFS.HKM (the read-only
     filesystem module the capability test mounts at /rom), and
     etc/banner.txt for the ring-3 initramfs check. USER.ELF stays on the
@@ -565,7 +567,7 @@ def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf,
     run([py, os.path.join(ROOT, "tools", "mkcpio.py"), archive,
          "--dir=tmp", "--dir=dev", "--dir=disk",
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
-         f"INIT.ELF={init_elf}",
+         f"INIT.ELF={init_elf}", f"AP64.ELF={ap64_elf}",
          f"X64MOD.HKM={module_image}", f"ROMFS.HKM={romfs_image}",
          f"etc/banner.txt={banner_path}"])
     if os.path.getsize(archive) > 32 * 4096:
@@ -574,8 +576,9 @@ def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf,
     run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
          f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
          f"INITRD={archive}", f"USER.ELF={exec_elf}",
-         f"INIT.ELF={init_elf}", f"X64MOD.HKM={module_image}",
-         f"BUSYBOX={busybox64}", f"ROMFS.HKM={romfs_image}"])
+         f"INIT.ELF={init_elf}", f"AP64.ELF={ap64_elf}",
+         f"X64MOD.HKM={module_image}", f"BUSYBOX={busybox64}",
+         f"ROMFS.HKM={romfs_image}"])
     log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes, "
         f"initramfs {os.path.getsize(archive)} bytes)")
 
@@ -738,8 +741,11 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
     lib64_dir = os.path.join(ROOT, "user", "lib64")
     lib64_sources = sorted(glob.glob(os.path.join(lib64_dir, "*.c")))
     init64_source = os.path.join(ROOT, "user", "tests", "init64.c")
+    ap64_source = os.path.join(ROOT, "user", "tests", "ap_probe.c")
     init64_pe = os.path.join(BUILD, "init64.exe")
     init64_elf = os.path.join(BUILD, "INIT.ELF")
+    ap64_pe = os.path.join(BUILD, "ap_probe64.exe")
+    ap64_elf = os.path.join(BUILD, "AP64.ELF")
     lib64_objects = []
     for source in sorted(glob.glob(os.path.join(lib64_dir, "*.asm"))):
         obj = os.path.join(BUILD, "u64asm_" +
@@ -747,20 +753,28 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
         run([nasm, "-I" + os.path.join(ROOT, "include"), "-f", "win64",
              source, "-o", obj])
         lib64_objects.append(obj)
-    for source in lib64_sources + [init64_source]:
+    for source in lib64_sources:
         obj = os.path.join(BUILD, "u64lib_" +
                            os.path.splitext(os.path.basename(source))[0] + ".obj")
         run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Os", "/W3",
                   "/I" + os.path.join(ROOT, "include"), "/Fo" + obj, source])
         lib64_objects.append(obj)
-    run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:CONSOLE",
-                  "/ENTRY:_start", f"/BASE:{user_base:#x}", "/FIXED",
-                  "/DYNAMICBASE:NO", "/NXCOMPAT:NO", "/ALIGN:4096",
-                  "/FILEALIGN:512", "/NODEFAULTLIB", "/OUT:" + init64_pe]
-        + lib64_objects)
-    run([py, os.path.join(ROOT, "tools", "pe2elf64.py"),
-         init64_pe, init64_elf])
-    log("x86-64 user libc built, /INIT.ELF packed as ELF64")
+
+    user64_link = ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:CONSOLE",
+                   "/ENTRY:_start", f"/BASE:{user_base:#x}", "/FIXED",
+                   "/DYNAMICBASE:NO", "/NXCOMPAT:NO", "/ALIGN:4096",
+                   "/FILEALIGN:512", "/NODEFAULTLIB"]
+    for source, pe_path, elf_path, tag in (
+            (init64_source, init64_pe, init64_elf, "init64"),
+            (ap64_source, ap64_pe, ap64_elf, "ap_probe64")):
+        obj = os.path.join(BUILD, "u64main_" + tag + ".obj")
+        run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Os", "/W3",
+                  "/I" + os.path.join(ROOT, "include"), "/Fo" + obj, source])
+        run(linker + user64_link + ["/OUT:" + pe_path]
+            + lib64_objects + [obj])
+        run([py, os.path.join(ROOT, "tools", "pe2elf64.py"),
+             pe_path, elf_path])
+    log("x86-64 user libc built, /INIT.ELF and /AP64.ELF packed as ELF64")
 
     # The kernel links libhakumod's runtime half too: elf64_load() keeps its
     # frame vector on the stack (384 pages = 3 KiB), so the compiler emits a
@@ -798,7 +812,7 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
     #    are rebuilt every time rather than reused.
     busybox64 = shell_busybox64(busybox64_path)
     build_x64_fs(py, fs_img, exec_elf, x64_module_image, x64_romfs_image,
-                 init64_elf, busybox64)
+                 init64_elf, busybox64, ap64_elf)
 
     # 5. boot it when asked. qemu-system-i386 refuses long mode without a
     #    64-bit CPU model, so every x64 boot uses the x86_64 binary;
@@ -933,6 +947,14 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
                 "HAKU64-USER-MODULE-OK",
                 "HAKU64-MODULE-UNLOAD-OK", "HAKU64-LIBC-OK",
                 "HAKU64-SELFTEST-OK"]
+    ap64_markers = ["HAKU64-AP-CPU: running on 1",
+                    "HAKU64-AP-TLS-OK", "HAKU64-AP-SIGNAL-OK",
+                    "HAKU64-AP-SCHED-OK", "HAKU64-AP-EXIT-OK",
+                    "HAKU64-AP-RUN-OK: cpu=1"]
+    if smp_cpus >= 2:
+        required += ap64_markers
+    else:
+        required.append("HAKU64-AP-SKIP: one CPU online")
     if smp_cpus == 1:
         # A uniprocessor run reports the two SMP scheduling tests as skipped,
         # and the AP markers cannot appear at all.
@@ -1142,8 +1164,8 @@ def main():
         build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path)
         return
     if smp_explicit and arch == "i386" and smp_cpus > 4:
-        sys.exit("--smp=N takes 1..4 for the 32-bit image: its task table "
-                 "has four slots and the boot test needs one per AP")
+        sys.exit("--smp=N takes 1..4 for the 32-bit image: the boot test "
+                 "needs one task slot per AP")
 
     cc, linker, toolchain = detect_toolchain()
     qemu = find_tool("qemu-system-i386",
@@ -1224,10 +1246,13 @@ def main():
     user_lib_dir = os.path.join(ROOT, "user", "lib")
     user_lib_sources = sorted(glob.glob(os.path.join(user_lib_dir, "*.c")))
     user_test_source = os.path.join(ROOT, "user", "tests", "libtest.c")
+    ap_test_source = os.path.join(ROOT, "user", "tests", "ap_probe.c")
     user_start_asm = os.path.join(user_lib_dir, "crt0.asm")
     user_syscall_asm = os.path.join(user_lib_dir, "syscall.asm")
     libtest_pe = os.path.join(BUILD, "libtest.exe")
     libtest_elf = os.path.join(BUILD, "lib.elf")
+    ap_test_pe = os.path.join(BUILD, "ap_probe.exe")
+    ap_test_elf = os.path.join(BUILD, "AP.ELF")
     pe2elf_script = os.path.join(ROOT, "tools", "pe2elf.py")
     filesystem_image = os.path.join(BUILD, "haku_fs.img")
     spare_image = os.path.join(BUILD, "ata_spare.img")
@@ -1322,6 +1347,19 @@ def main():
                   "/ALIGN:4096", "/FILEALIGN:512", "/NODEFAULTLIB",
                   "/OUT:" + libtest_pe] + library_objects + [user_test_obj])
     run([py, pe2elf_script, libtest_pe, libtest_elf])
+    # The AP probe is the same library linked into a tiny program the kernel
+    # pins to CPU 1 before PID 1 starts. It exercises getcpu, TLS, signals and
+    # syscalls on an application processor.
+    ap_test_obj = os.path.join(BUILD, "ulib_ap_probe.obj")
+    run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Od", "/Oi-", "/W3"]
+        + no_sse + ["/I" + include_dir, "/Fo" + ap_test_obj, ap_test_source])
+    run(linker + ["/nologo", "/MACHINE:X86", "/SUBSYSTEM:CONSOLE",
+                  "/ENTRY:start", "/BASE:0x40000000", "/FIXED",
+                  "/DYNAMICBASE:NO", "/NXCOMPAT:NO", "/SAFESEH:NO",
+                  "/ALIGN:4096", "/FILEALIGN:512", "/NODEFAULTLIB",
+                  "/OUT:" + ap_test_pe] + library_objects + [ap_test_obj])
+    run([py, pe2elf_script, ap_test_pe, ap_test_elf])
+    log("AP probe built and packed as ELF32")
 
     # The shell and rootfs targets boot their own data disks. Both are
     # generated on every run (unlike haku_fs.img, which is user data) and
@@ -1360,7 +1398,7 @@ def main():
          f"init={init_override or user_elf}", f"HAKU.ELF={user_elf}",
          f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
          f"VFORK.ELF={vfork_elf}", f"FAULT.ELF={fault_elf}",
-         f"LIB.ELF={libtest_elf}", *module_archives,
+         f"LIB.ELF={libtest_elf}", f"AP.ELF={ap_test_elf}", *module_archives,
          "--dir=dev", "--dir=proc", "--dir=disk"])
 
     if mode in ("shell", "rootfs"):
@@ -1374,7 +1412,8 @@ def main():
         run([py, fat12_script, user_elf, filesystem_image,
              f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
              f"FAULT.ELF={fault_elf}", f"LIB.ELF={libtest_elf}",
-             f"VFORK.ELF={vfork_elf}", f"INITRD={initramfs_image}",
+             f"AP.ELF={ap_test_elf}", f"VFORK.ELF={vfork_elf}",
+             f"INITRD={initramfs_image}",
              *module_archives])
         log(f"FAT12 program disk ready "
             f"({os.path.getsize(filesystem_image)} bytes)")
@@ -1588,10 +1627,16 @@ def main():
                             "SMP-LOCK-OK",      # one lock across CPUs
                             "SMP-AP-GDT-OK",    # AP loaded its own TSS/IDT
                             "SMP-SCHED-OK",     # an AP ran its own task
-                            "SMP-TLB-OK"]       # shootdown reached every CPU
+                            "SMP-TLB-OK",       # shootdown reached every CPU
+                            # A ring-3 task pinned to CPU 1: getcpu, TLS,
+                            # signal delivery and its exit all run there.
+                            "AP-CPU: running on 1", "AP-TLS-OK",
+                            "AP-SIGNAL-OK", "AP-SCHED-OK", "AP-EXIT-OK",
+                            "AP-RUN-OK: cpu=1"]
         else:
             smp_markers += ["SMP-OK cpus=1", "SMP-LOCK-OK",
-                            "SMP-SCHED-SKIP", "SMP-TLB-SKIP"]
+                            "SMP-SCHED-SKIP", "SMP-TLB-SKIP",
+                            "AP-SKIP: one CPU online"]
         headless_expected = [
             "HAKU-BOOT-OK",  # kernel_main reached
             "IDT-OK",        # 48 IDT gates loaded

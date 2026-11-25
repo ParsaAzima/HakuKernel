@@ -353,14 +353,15 @@ int task64_create_kernel(void (*entry)(void)) {
     return task64_create_kernel_on(k64_cpu_index(), entry);
 }
 
-int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
+int task64_create_user_on(u32 cpu, u64 entry, u64 user_stack_top, u64 space) {
     int id;
     u8 *stack;
     u64 top;
     regs64_t *frame;
     u64 flags;
 
-    if (!enabled || !space) return -1;
+    if (!enabled || !space || cpu >= K64_SMP_MAX_CPUS) return -1;
+    if (!cpus64[cpu].online) return -1;
 
     flags = spin64_lock(&sched_lock);
     id = find_free();
@@ -388,11 +389,12 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     tasks[id].id = (u32)id;
     tasks[id].parent = -1;
     tasks[id].tgid = (u32)id;
-    /* User tasks stay on the CPU that created them. The syscall layer's
-     * global state (the descriptor table, the filesystem) is not locked yet,
-     * so letting a user process float between CPUs would race it; pinning is
-     * the honest alternative to pretending it is safe. */
-    tasks[id].cpu = k64_cpu_index();
+    /* A user task never migrates. The ordinary creator pins it to the CPU
+     * that built it; the explicit form lets the boot test place one on an
+     * AP while the bootstrap processor keeps its own user task. The syscall
+     * tables are indexed by slot and the frame/TLS state is per CPU, so an
+     * explicit affinity exercises the whole ring-3 path on that AP. */
+    tasks[id].cpu = cpu;
     tasks[id].space = space;
     tasks[id].stack_base = (u64)stack;
     tasks[id].stack_top = top;
@@ -422,7 +424,14 @@ int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
     prepare_sse(id);
     tasks[id].state = K64_TASK_READY;
     spin64_unlock(&sched_lock, flags);
+    /* An AP parked in its idle loop needs an IPI; waiting for its next timer
+     * tick would only make the boot test slower. */
+    if (cpu != k64_cpu_index()) smp64_resched_cpu(cpu);
     return id;
+}
+
+int task64_create_user(u64 entry, u64 user_stack_top, u64 space) {
+    return task64_create_user_on(k64_cpu_index(), entry, user_stack_top, space);
 }
 
 /* Round-robin on one CPU. The cursor is per CPU, so two CPUs scanning the
@@ -2202,5 +2211,9 @@ void sched64_start_ap(u32 cpu_index) {
     spin64_unlock(&sched_lock, 0);
 
     timer64_lapic_start_local();
+    /* STAR/LSTAR/SFMASK are MSRs, hence per CPU: without this an AP has no
+     * SYSCALL entry point and the first ring-3 call from a task pinned here
+     * jumps to LSTAR=0 instead of sys64_dispatch. */
+    syscall64_init();
     isr64_resume64(tasks[idle].frame);
 }

@@ -2399,6 +2399,23 @@ static u64 sys64_arch_prctl(u64 code, u64 address) {
     return 0;
 }
 
+/* getcpu(309): report the CPU executing the caller. The answer comes from
+ * GS[4], not from the task record, so it is correct even while a task is
+ * being preempted or has just been migrated. Optional out pointers follow
+ * Linux; Haku has one NUMA node. */
+static u64 sys64_getcpu(u64 cpu_ptr, u64 node_ptr, u64 unused) {
+    u32 cpu = k64_cpu_index();
+    u32 node = 0;
+
+    (void)unused;
+    if (cpu_ptr && !copy_to_user64(current_space(), cpu_ptr, &cpu, sizeof(cpu)))
+        return (u64)0 - SYS64_EFAULT;
+    if (node_ptr &&
+        !copy_to_user64(current_space(), node_ptr, &node, sizeof(node)))
+        return (u64)0 - SYS64_EFAULT;
+    return 0;
+}
+
 /* --------------------------------------------------------- memory mapping
  */
 
@@ -3583,6 +3600,10 @@ regs64_t *sys64_dispatch(regs64_t *frame) {
 
     case K64_SYS_ARCH_PRCTL:
         result = sys64_arch_prctl(frame->rdi, frame->rsi);
+        break;
+
+    case K64_SYS_GETCPU:
+        result = sys64_getcpu(frame->rdi, frame->rsi, frame->rdx);
         break;
 
     case K64_SYS_GETRANDOM:
