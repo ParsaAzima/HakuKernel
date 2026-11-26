@@ -201,24 +201,37 @@ After QEMU exits, `tools/lsfat12.py --check` verifies the volume the guest
 just wrote, and `--cat NOTE.TXT` re-reads the bytes the kernel wrote to
 `/disk/NOTE.TXT`, so the disk write is proven from the host's view and not
 just from the kernel's cache. The 32-bit `haku.img` is still built with
-`--arch=i386`, and it remains the only image with the shell and capability
-modules.
+`--arch=i386`, and the original shell and capability-module image remain
+available there for comparison.
 
-`python build.py shell` boots something else entirely: a real static
-`busybox` (musl, i386) as PID 1, so the guest comes up in `ash` instead of
-Haku's own test userland. The image is a separate FAT12 volume
-(`build/haku_shell.img`) holding `BUSYBOX` and, for the scripted run, a
-one-line `INIT.CMD`; the kernel prefers `disk/BUSYBOX` over the initramfs
-when it is there and hands it `sh -c "…"`. busybox is 1 MiB and belongs to
-someone else, so it is cached under `build/` and never committed —
-`tools/getbusybox.py` fetches the Alpine `busybox-static` build on first use
-and `--busybox=PATH` points the build at a local copy instead (offline
-machines, CI). `--cmd=TEXT` replaces the boot command line, and
-`shell --check` runs the fixed script
-(`mkdir -p /bin`, `--install -s /bin`, `export PATH=/bin`, then `uname`,
-`ls /bin | wc -l`, `ls /`, `cat /proc/version`) and asserts
-`SHELL-BOOT`, `SHELL-OK`, `UNAME:haku`, `APPS:<count ≥ 100>`, `HakuKernel`,
-and `SHELL-DONE`. Today it reports 306 applets resolved through `$PATH`.
+`python build.py shell` now boots the 64-bit image into `ash`. A static musl
+busybox is seeded on the x64 FAT12 volume as `BUSYBOX`, together with a
+one-line `INIT.CMD` holding PID 1's command line. The kernel reads that file
+before its headless self-tests, loads busybox as a normal ring-3 task and
+hands it the console (`HAKU64-INIT-OK`); there is no keyboard injection in
+this mode. The 64-bit RAM filesystem has no symlinks, so the setup uses
+`PATH=/disk` and invokes the multiplexer by its lowercase applet name
+(`busybox <applet>`) instead of `--install -s /bin`. `shell --check` asserts
+`HAKU64-INIT-OK`, the prompt, a PATH lookup, `cat /HELLO.TXT`, `ls /`, `ps`,
+a `sh -i` job-control marker and a forked pipeline, then prints
+`X64 SHELL CHECK PASSED`. `run` leaves the same shell on the framebuffer with
+the PS/2 keyboard. `--cmd=TEXT` replaces the boot command line, and
+`HAKU_SHELL_TIMEOUT` (default 300 s) bounds the run.
+
+busybox belongs to someone else, so it is cached under `build/` and never
+committed: `tools/getbusybox64.py` fetches Alpine's static x86-64 build on
+first use and `--busybox64=PATH` points the build at a local copy for offline
+machines and CI. `--arch=i386` keeps the older 32-bit shell: there PID 1 is
+`disk/busybox`, `INIT.CMD` is read by the kernel into its exec stack, and the
+check asserts `SHELL-BOOT`, `SHELL-OK`, `UNAME:haku`, `APPS:<count ≥ 100>`,
+`HakuKernel` and `SHELL-DONE` with `--install -s /bin` resolving a full PATH.
+
+`python build.py probe --init=ELF --expect=MARKER` also defaults to x64: the
+external ELF is seeded as `/INIT.ELF` and its markers are checked alongside
+the boot markers, with `X64 PROBE CHECK PASSED` on success. `--arch=i386`
+keeps the original ELF32 probe flow. Both probes require a clean exit.
+
+`python build.py rootfs` remains a 32-bit target.
 
 `python build.py rootfs` boots a small Linux-style root filesystem instead:
 the data volume itself is the root. `build/haku_rootfs.img` is a 1.44 MB

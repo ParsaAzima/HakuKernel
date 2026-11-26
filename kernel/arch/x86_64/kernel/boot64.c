@@ -1672,6 +1672,92 @@ static int test_elf64(void) {
     return 1;
 }
 
+/* A shell image carries /disk/INIT.CMD. Instead of running the headless
+ * self-tests and halting, give PID 1 to static busybox with the command line
+ * from that file, the same contract the 32-bit image uses. The shell is a
+ * normal user task: it goes through the syscall layer, the FAT12 backend and
+ * the console line discipline exactly like /INIT.ELF does. */
+static void shell_boot64(void) {
+    static const char cmd_path[] = "/disk/INIT.CMD";
+    static const char image_path[] = "/disk/BUSYBOX";
+    static const char *envp[] = {"PATH=/disk", "HOME=/", "TERM=linux"};
+    char line[512];
+    const char *argv[8];
+    u32 argc = 0;
+    u32 at = 0;
+    u8 *cmd = 0;
+    u8 *image = 0;
+    s64 cmd_size;
+    s64 image_size;
+    loaded_elf64_t loaded;
+    int id;
+
+    cmd_size = fs64_load_image(cmd_path, &cmd, sizeof(line) - 1u);
+    if (cmd_size <= 0 || !cmd) k64_fail("shell boot command");
+    memcpy(line, cmd, (u64)cmd_size);
+    line[cmd_size] = 0;
+    kfree64(cmd);
+
+    /* One line, space separated, single or double quotes grouping a word that
+     * contains spaces. No escapes: this is a boot command, not a shell. */
+    while (at < (u64)cmd_size && argc < 8) {
+        char quote = 0;
+        char delimiter;
+        u32 start;
+        u32 out;
+
+        while (line[at] == ' ' || line[at] == '\t' ||
+               line[at] == '\r' || line[at] == '\n') at++;
+        if (!line[at]) break;
+        start = at;
+        out = at;
+        while (line[at]) {
+            char c = line[at];
+
+            if (quote) {
+                if (c == quote) {
+                    quote = 0;
+                    at++;
+                    continue;
+                }
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+                at++;
+                continue;
+            } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                break;
+            }
+            line[out++] = c;
+            at++;
+        }
+        /* Remember the separator before the terminator overwrites it, or
+         * the outer loop sees end-of-string after the first word. */
+        delimiter = line[at];
+        line[out] = 0;
+        argv[argc++] = line + start;
+        if (delimiter) at++;
+    }
+    if (argc == 0) k64_fail("empty shell boot command");
+
+    image_size = fs64_load_image(image_path, &image, K64_ELF64_MAX_BYTES);
+    if (image_size <= 0 || !image) k64_fail("shell boot image");
+    if (!elf64_load(image, (u64)image_size, &loaded)) {
+        kfree64(image);
+        k64_fail("shell boot ELF");
+    }
+    kfree64(image);
+    if (sys64_build_command_stack(&loaded, argv, argc, envp, 3))
+        k64_fail("shell boot stack");
+    /* The headless path starts the scheduler inside test_tasks(); a shell
+     * boot skips that self-test, so initialise it here instead. */
+    sched64_init();
+    id = task64_create_user(loaded.entry, loaded.stack_top, loaded.space);
+    if (id < 0) k64_fail("shell boot task");
+    k64_puts("HAKU64-INIT-OK: /disk/BUSYBOX is pid 1\r\n");
+    console64_handover();
+    for (;;) cpu_halt64();
+}
+
 void kernel64_main(void) {
     u64 top;
     u64 highest;
@@ -1784,6 +1870,10 @@ void kernel64_main(void) {
      * processor keeps the 8259 timer it just programmed. */
     smp64_init();
     sti64();
+
+    /* A shell image is an interactive session: hand the console to busybox
+     * before the headless self-tests and never come back. */
+    if (path_size64("/disk/INIT.CMD") > 0) shell_boot64();
 
     if (!test_percpu()) k64_fail("per-CPU block self-test");
     if (!test_exceptions()) k64_fail("exception dispatch self-test");

@@ -32,7 +32,7 @@ that needs new kernel work is 2.
 | Storage           | ATA PIO + FAT12 at `/disk` behind a page cache, RAM initramfs root, procfs, devfs (including module devices), read-only module filesystems (`/rom`), file writes                                                                                                                                                                                               | ATA PIO + FAT12 + VFS with ramfs, devfs, procfs, initramfs                     |
 | Display and input | shared VBE renderer (`drivers/fbcon.c`) drawing Terminus 8x16 as plain full-screen text with a 128-row scrollback ring, VGA text fallback, PS/2 keyboard with `0xE0` arrow/Home/End/Page keys, canonical line discipline (`tty64.c`) with 32-entry history and in-line editing, kernel-log display latch                                                       | the same renderer and font, plus the terminal line discipline and CSI handling |
 | Modules           | version 2 loader: log, ticks, heap, device and filesystem registration; a module filesystem is mounted at its own prefix and read through the VFS                                                                                                                                                                                                              | version 1 loader with device and filesystem registration                       |
-| Userland          | `user/lib64` C library and `/INIT.ELF` from the FAT12 volume; no shell, no console device                                                                                                                                                                                                                                                                      | freestanding user C library, `busybox ash`, the FAT12 rootfs image, probes     |
+| Userland          | `user/lib64` C library, `/INIT.ELF` from the FAT12 volume and `busybox ash` as PID 1 on the shell image                                                                                                                                                                                                                                                       | freestanding user C library, `busybox ash`, the FAT12 rootfs image, probes     |
 
 CI runs the two headless gates at one and four CPUs on every push; the shell  
 and rootfs checks are local gates:
@@ -40,7 +40,8 @@ and rootfs checks are local gates:
 ```cmd
 python build.py headless                  :: x64: prints "X64 CHECK PASSED"
 python build.py headless --arch=i386      :: 32-bit: "HEADLESS CHECK PASSED"
-python build.py shell --check             :: 32-bit busybox shell markers
+python build.py shell --check             :: x64 busybox shell markers
+python build.py shell --arch=i386 --check :: 32-bit busybox shell markers
 python build.py rootfs --check            :: 32-bit rootfs (init + busybox) markers
 ```
 
@@ -316,14 +317,23 @@ with the 32-bit image available as a fallback.
   `ET_EXEC` at 0x400000 with no relocations, each user space now owns a copy  
   of slot 0's page tables and the loader accepts a 4-8 MiB legacy window, so  
   the absolute immediates stay valid (`HAKU64-BUSYBOX-OK`).
-- [ ] Make `shell`, `shell --check` and `probe` default to x86-64; `--arch=i386`  
-  keeps the old image for comparison. Delete the "these modes force i386"  
-  special case from `build.py`.
-- [ ] Re-verify the shell markers on the 64-bit image: prompt, `ls`, `cat`,  
-  `ps`, a forked pipeline and a PATH lookup.
+- [x] Make `shell`, `shell --check` and `probe` default to x86-64; `--arch=i386`  
+  keeps the old image for comparison. The force-i386 special case is gone:
+  both ports now read a one-line `/disk/INIT.CMD`, but the 64-bit kernel
+  launches static busybox itself before the headless self-tests and hands it
+  the console. `probe` seeds `--init` as `/INIT.ELF` and asserts the caller's
+  expectations on top of the boot markers.
+- [x] Re-verify the shell markers on the 64-bit image: the prompt, PATH lookup
+  of the busybox multiplexer, `cat /HELLO.TXT`, `ls /`, `ps`, a forked
+  foreground pipeline and job control are all asserted from the serial log.
+  `run` starts the same shell on the framebuffer console with the PS/2
+  keyboard; the i386 suite stays green. The 64-bit image has no symlinks, so
+  `PATH=/disk` and the lowercase `busybox` applet name replace the i386
+  `--install -s /bin` setup.
 
-**Acceptance.** `X64 SHELL CHECK PASSED` and `HAKU64-INIT-OK`; `run` starts a  
-usable interactive shell without serial; the i386 suite stays green.
+**Acceptance.** `X64 SHELL CHECK PASSED`, `HAKU64-INIT-OK` and
+`X64 PROBE CHECK PASSED`; `run` starts a usable interactive shell without
+serial; the i386 suite stays green.
 
 ## 5. True SMP scheduling
 

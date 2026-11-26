@@ -128,6 +128,33 @@ ROOTFS_EXPECTED = ["ROOTFS-MOUNT-OK",   # the kernel chose the FAT12 volume
                    "HakuKernel",        # /proc/version was read
                    "ROOTFS-DONE"]
 
+# The 64-bit shell has no symlinks, so busybox's `--install -s /bin` cannot
+# populate a PATH directory. PATH=/disk names the multiplexer itself: the
+# shell finds BUSYBOX through PATH and argv[0] selects the applet. That still
+# exercises a real PATH lookup, and it keeps the 1.44 MB FAT12 volume from
+# holding a hundred copies of a 1 MB binary.
+X64_SHELL_SETUP = "export PATH=/disk; "
+X64_SHELL_INTERACTIVE_SCRIPT = (
+    'sh -c "' + X64_SHELL_SETUP +
+    'echo Haku x86-64 shell: busybox ash, type help or exit; exec busybox sh"')
+X64_SHELL_CHECK_SCRIPT = (
+    'sh -c "' + X64_SHELL_SETUP +
+    'echo X64-SHELL-OK; '
+    # A bare lowercase `busybox` is found through PATH and its argv[0]
+    # selects the applet; uppercase would be a different applet name.
+    'busybox echo X64-PATH-OK; '
+    'busybox cat /HELLO.TXT; '
+    'busybox ls /; '
+    'busybox ps; echo X64-PS-RAN; '
+    "busybox sh -i -c 'echo X64-SHELL-JOBCTL-OK; "
+    "echo X64-PIPE-OUT | busybox cat; "
+    "echo X64-PIPE-DONE'; "
+    'echo X64-SHELL-DONE; exec busybox sh"')
+X64_SHELL_EXPECTED = ["HAKU64-INIT-OK", "X64-SHELL-OK", "X64-PATH-OK",
+                      "HAKU64-FILE-OK", "X64-PS-RAN",
+                      "X64-SHELL-JOBCTL-OK", "X64-PIPE-OUT",
+                      "X64-PIPE-DONE", "X64-SHELL-DONE"]
+
 
 def log(msg):
     print(msg, flush=True)
@@ -522,7 +549,7 @@ def build_rootfs_image(py, init_elf, busybox, command):
 
 
 def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf,
-                 busybox64, ap64_elf):
+                 busybox64, ap64_elf, shell_command=None):
     """Seed the x86-64 disk: a FAT12 volume with the boot archive on it.
 
     The kernel mounts FAT12 at /disk, reads /disk/INITRD, and unpacks it into
@@ -573,17 +600,27 @@ def build_x64_fs(py, image, exec_elf, module_image, romfs_image, init_elf,
     if os.path.getsize(archive) > 32 * 4096:
         raise SystemExit("x64 initramfs exceeds the 128 KiB cached-file limit")
 
-    run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image,
-         f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
-         f"INITRD={archive}", f"USER.ELF={exec_elf}",
-         f"INIT.ELF={init_elf}", f"AP64.ELF={ap64_elf}",
-         f"X64MOD.HKM={module_image}", f"BUSYBOX={busybox64}",
-         f"ROMFS.HKM={romfs_image}"])
+    seed = [f"HELLO.TXT={hello_path}", f"PATTERN.BIN={pattern_path}",
+            f"INITRD={archive}", f"USER.ELF={exec_elf}",
+            f"INIT.ELF={init_elf}", f"AP64.ELF={ap64_elf}",
+            f"X64MOD.HKM={module_image}", f"BUSYBOX={busybox64}",
+            f"ROMFS.HKM={romfs_image}"]
+    if shell_command is not None:
+        # The kernel reads this one-line command and makes it PID 1's argv,
+        # exactly as the 32-bit shell image does.
+        cmd_path = os.path.join(BUILD, "init64.cmd")
+        with open(cmd_path, "w", encoding="ascii", newline="\n") as f:
+            f.write(shell_command + "\n")
+        seed.append(f"INIT.CMD={cmd_path}")
+    run([py, os.path.join(ROOT, "tools", "mkfat12.py"), "--empty", image]
+        + seed)
     log(f"x64 FAT12 seed disk ready ({os.path.getsize(image)} bytes, "
         f"initramfs {os.path.getsize(archive)} bytes)")
 
 
-def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
+def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None,
+              boot_command=None, boot_check=False, probe_init=None,
+              expectations=None):
     """Build haku64.img, then boot it when `mode` asks for a run.
 
     The entry path, memory subsystem, interrupts, per-process address
@@ -592,8 +629,11 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
     32-bit kernel uses, behind a small compatibility layer), the module
     loader and its device/filesystem capabilities (the ROMFS module mounts a
     read-only filesystem at /rom) are all 64-bit. `mode` is "build" (compile
-    and lay out the images), "run" (boot with a QEMU window) or "headless"
-    (boot, capture the serial log and assert the marker list).
+    and lay out the images), "run" (boot with a QEMU window), "headless"
+    (boot, capture the serial log and assert the marker list), "shell"
+    (boot into busybox, with `boot_command` as PID 1's command line) or
+    "probe" (run `probe_init` instead of the library self-test as /INIT.ELF
+    and assert `expectations` on top of the x64 boot markers).
     """
     cc, linker, label = find_x64_toolchain()
     log(f"x64 toolchain: {label}")
@@ -812,7 +852,8 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
     #    are rebuilt every time rather than reused.
     busybox64 = shell_busybox64(busybox64_path)
     build_x64_fs(py, fs_img, exec_elf, x64_module_image, x64_romfs_image,
-                 init64_elf, busybox64, ap64_elf)
+                 probe_init or init64_elf, busybox64, ap64_elf,
+                 shell_command=boot_command if mode == "shell" else None)
 
     # 5. boot it when asked. qemu-system-i386 refuses long mode without a
     #    64-bit CPU model, so every x64 boot uses the x86_64 binary;
@@ -832,6 +873,36 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
     if mode == "run":
         log("Booting Haku x86-64 in QEMU (close the window to return)...")
         subprocess.run(base)
+        return
+
+    if mode == "shell":
+        if os.path.exists(serial):
+            os.remove(serial)
+        proc = subprocess.Popen(base + ["-display", "none",
+                                        "-serial", f"file:{serial}"])
+        reached = True
+        if boot_check:
+            timeout = float(os.environ.get("HAKU_SHELL_TIMEOUT", "300"))
+            reached = wait_for_serial(serial, "X64-SHELL-DONE", timeout)
+        else:
+            # Interactive runs are driven by the person at the QEMU window;
+            # give the shell a moment to reach the prompt before returning.
+            time.sleep(2)
+        proc.kill()
+        proc.wait()
+        with open(serial, errors="replace") as f:
+            content = f.read()
+        log("--- serial log (x64 shell) ---")
+        log(content)
+        missing = [m for m in X64_SHELL_EXPECTED if m not in content]
+        forbidden = [m for m in ("PANIC", "FAIL", "can't access tty",
+                                 "job control turned off",
+                                 "can't set tty process group")
+                     if m in content]
+        if not reached or missing or forbidden:
+            sys.exit("X64 SHELL CHECK FAILED: "
+                     f"done={reached} missing={missing} forbidden={forbidden}")
+        log("X64 SHELL CHECK PASSED: " + ", ".join(X64_SHELL_EXPECTED))
         return
 
     if os.path.exists(serial):
@@ -959,6 +1030,19 @@ def build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path=None):
         # A uniprocessor run reports the two SMP scheduling tests as skipped,
         # and the AP markers cannot appear at all.
         required = [m for m in required if not m.startswith("HAKU64-SMP")]
+    if mode == "probe":
+        # The probe replaces the library self-test as /INIT.ELF; only the boot
+        # markers, its clean exit and the caller's expectations matter. The
+        # disk-write and screendump checks belong to the full headless run.
+        required = ["HAKU64-BOOT-OK", "HAKU64-INITRAMFS-OK",
+                    "HAKU64-USER-OK", "HAKU64-LIBC-RUN-OK"]
+        required += expectations or []
+        missing = [m for m in required if m not in content]
+        if "HAKU64-FAIL" in content or missing or not reached:
+            sys.exit("X64 PROBE CHECK FAILED: "
+                     f"done={reached} missing={', '.join(missing)}")
+        log("X64 PROBE CHECK PASSED: " + ", ".join(required))
+        return
     missing = [marker for marker in required if marker not in content]
     if "HAKU64-FAIL" in content:
         for line in content.splitlines():
@@ -1048,10 +1132,9 @@ def main():
     positionals = [a for a in raw_args if not a.startswith("-")]
     mode = positionals[0] if positionals else "build"
 
-    # x86-64 is the primary image. --arch=i386 selects the original
-    # 32-bit pipeline, which still owns the shell, the user C library and the
-    # probes; those modes force it because their userland does not exist on
-    # the 64-bit side yet.
+    # x86-64 is the primary image and now owns the shell. --arch=i386 selects
+    # the original 32-bit pipeline for comparison; rootfs and probe still run
+    # there until their 64-bit counterparts land.
     arch = "x64"
     arch_explicit = False
 
@@ -1155,10 +1238,26 @@ def main():
         build_x64(nasm, py, memory_mb, smp_cpus, "headless", busybox64_path)
         return
 
+    # x86-64 is the primary image and now owns the shell. --arch=i386 keeps
+    # the original 32-bit image for comparison; rootfs stays 32-bit for now.
+    if mode == "shell" and arch == "x64":
+        # The 32-bit scripts rely on symlinks and /proc/version, which this
+        # port does not have. Use the multiplexer-driven equivalents unless
+        # the caller supplied --cmd explicitly.
+        if boot_command == SHELL_CHECK_SCRIPT:
+            boot_command = X64_SHELL_CHECK_SCRIPT
+        elif boot_command == SHELL_INTERACTIVE_SCRIPT:
+            boot_command = X64_SHELL_INTERACTIVE_SCRIPT
+        build_x64(nasm, py, memory_mb, smp_cpus, "shell", busybox64_path,
+                  boot_command=boot_command, boot_check=boot_check)
+        return
+
+    if mode == "probe" and arch == "x64":
+        build_x64(nasm, py, memory_mb, smp_cpus, "probe", busybox64_path,
+                  probe_init=init_override, expectations=expectations)
+        return
+
     if mode in ("probe", "shell", "rootfs"):
-        if arch_explicit and arch != "i386":
-            sys.exit("`probe`, `shell` and `rootfs` run the 32-bit kernel; "
-                     "use --arch=i386")
         arch = "i386"
     if mode in ("build", "run", "headless") and arch == "x64":
         build_x64(nasm, py, memory_mb, smp_cpus, mode, busybox64_path)

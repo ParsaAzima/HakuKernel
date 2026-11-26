@@ -400,15 +400,18 @@ detached worker, the two robust-mutex outcomes, and per-thread `errno`.
 - **No floating point in `printf`.** `%f`, `%e` and `%g` are not implemented;
   the kernel has no FPU context switch for user tasks beyond FXSAVE/FXRSTOR of
   the SSE state.
-- **Signals have dispositions and a stop state, but no terminal-generated job
+- **Signals have dispositions, a stop state and terminal-generated job
   control.** `sigaction`, `sigprocmask`, `sigaltstack`, `signal` and `raise`
   work, a handler needs the restorer `sigaction` supplies, and `SIGSTOP`/
-  `SIGCONT` park and resume a task with `wait4` reporting both events. There is
-  no `sigqueue`, no real-time range, no `SIGHUP`/`SIGTTIN`/`SIGTTOU` from the
-  keyboard, and a hardware fault is never turned into a signal. `pipe`/`pipe2`
-  and `poll` exist; a write with no reader fails with `EPIPE` and raises
-  `SIGPIPE`, whose default action ends the process. `fcntl` is reached through
-  the raw `haku64_syscall3` wrapper because the library does not wrap it yet.
+  `SIGCONT` park and resume a task with `wait4` reporting both events. A
+  background console read raises `SIGTTIN` for its group and returns `-EINTR`
+  (or `-EIO` when blocked or ignored), and a session leader's exit raises
+  `SIGHUP` for the console's foreground group. There is no `sigqueue`, no
+  real-time range, no `TOSTOP`-driven `SIGTTOU`, and a hardware fault is
+  never turned into a signal. `pipe`/`pipe2` and `poll` exist; a write with no
+  reader fails with `EPIPE` and raises `SIGPIPE`, whose default action ends the
+  process. `fcntl` is reached through the raw `haku64_syscall3` wrapper because
+  the library does not wrap it yet.
 - **`haku64_thread_create` is detached, not joinable.** Its thread frees its
   own stack and TLS block on return, so there is no status to collect; use
   `haku64_thread_spawn`/`haku64_thread_join` or `pthread_create` when the

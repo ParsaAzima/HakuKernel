@@ -53,7 +53,9 @@ typedef signed long long s64;
  * faults instead of overwriting code. */
 #define K64_USER_IMAGE_MIN   (K64_USER_BASE + 0x10000ull)
 #define K64_USER_STACK_TOP   (K64_USER_END - K64_PAGE_SIZE)
-#define K64_USER_STACK_PAGES 4u
+/* musl's ash probes a 64 KiB stack frame at start-up before it reads argv,
+ * so the boot shell needs more than the four pages a small ELF needs. */
+#define K64_USER_STACK_PAGES 20u
 #define K64_USER_STACK_BOTTOM \
     (K64_USER_STACK_TOP - (u64)K64_USER_STACK_PAGES * K64_PAGE_SIZE)
 
@@ -1364,6 +1366,11 @@ u64 sys64_count(void);
 /* Build the same argc/argv/envp/auxv stack image execve produces for a
  * kernel-launched image. `path` becomes argv[0] and AT_EXECFN. */
 int sys64_build_init_stack(loaded_elf64_t *loaded, const char *path);
+/* Boot a kernel-launched image with an explicit argv/envp (the shell reads
+ * its command line from /disk/INIT.CMD, so argv[0] is not just the path). */
+int sys64_build_command_stack(loaded_elf64_t *loaded,
+                              const char *const *argv, u32 argc,
+                              const char *const *envp, u32 envc);
 
 /* idt64.c: gate table plus the C exception/IRQ dispatcher */
 void idt64_init(void);

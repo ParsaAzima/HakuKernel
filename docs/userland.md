@@ -188,18 +188,34 @@ usable shell":
   `T+<n>s` line or ring-3 fault report scrolls away (those still reach
   `build/serial.log`).
 
-Interactive use is the same image without `INIT.CMD`: `python build.py shell`
-drops into `ash` on the serial console. `ls` (sorted columns, 300+ entries),
-`cat`, `head`, `grep`, `seq`, `sort`, `wc`, `uname`, `echo`, `mkdir`, `ln`,
-`rm`, `cp`, `mv`, and `--install` all behave, `cat /proc/meminfo` and
-`/proc/uptime` return live values, and `seq 1 20000 | wc -l` prints 20000. It
-is a shell on top of the kernel's own VFS, not a Linux emulation layer, so
-the tools that need a fuller `/proc` are shallow: `ps` prints only its header
-(there is no `/proc/<pid>`), `df`/`mount` look for `/proc/mounts` and report
-it missing, and `free` prints zeros because there is no `sysinfo` syscall.
-There is also no `/etc`, no line discipline beyond what the console
-provides, and `--install -s /bin` only fills the FAT12 image, which is
-regenerated on every build.
+Interactive use is the same image without `INIT.CMD`: `python build.py shell
+--arch=i386` drops into `ash` on the serial console. `ls` (sorted columns,
+300+ entries), `cat`, `head`, `grep`, `seq`, `sort`, `wc`, `uname`, `echo`,
+`mkdir`, `ln`, `rm`, `cp`, `mv`, and `--install` all behave, `cat /proc/meminfo`
+and `/proc/uptime` return live values, and `seq 1 20000 | wc -l` prints
+20000. It is a shell on top of the kernel's own VFS, not a Linux emulation
+layer, so the tools that need a fuller `/proc` are shallow: `ps` prints only
+its header (there is no `/proc/<pid>`), `df`/`mount` look for `/proc/mounts`
+and report it missing, and `free` prints zeros because there is no `sysinfo`
+syscall. There is also no `/etc`, and `--install -s /bin` only fills the FAT12
+image, which is regenerated on every build.
+
+`python build.py shell` now boots the 64-bit image instead. The kernel reads
+`/disk/INIT.CMD` before its self-tests and starts static musl busybox as PID
+1 with a 20-page user stack, which is what musl's `ash` needs for its 64 KiB
+startup probe. The same console line discipline and PS/2 keyboard driver are
+live, so `sh -i` gets a controlling terminal, a foreground process group and
+a working `|` pipeline. Because the x64 RAM filesystem has no symlinks, the
+shell sets `PATH=/disk` and calls applets as `busybox <applet>`; the check
+covers the PATH lookup, `cat`, `ls`, `ps`, job control and the pipeline, and
+prints `X64 SHELL CHECK PASSED`. The `uname` applet and a full `/proc` listing
+are not asserted on this port: `uname` returns the x64 boot banner but the
+musl applet prints nothing here, and `ps` reports a bad address for its
+`/proc` scan. Those gaps are limitations of the port, not of the shell.
+
+`python build.py probe --init=ELF --expect=MARKER` likewise defaults to the
+64-bit image, seeding the external ELF as `/INIT.ELF`; `--arch=i386` keeps
+both older flows.
 
 ## A Linux-style rootfs
 

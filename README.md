@@ -115,9 +115,9 @@ volume itself as `/`.
   The disk is `/disk`, a cpio initramfs is the RAM root, `/proc` generates
   `meminfo`/`uptime`/`self/cmdline`, and `/dev` provides `null`, `zero`,
   `console` and devices a module registers; a module filesystem such as `/rom`
-  joins the same namespace and is read and listed at ring 3. There is no shell
-  and no signal handlers yet, but `pipe`/`pipe2` and a blocking
-  `poll` connect a forked parent and child.
+  joins the same namespace and is read and listed at ring 3. The shell image
+  replaces `/INIT.ELF` with static busybox, and signal handlers, stop/continue
+  and `pipe`/`pipe2` with a blocking `poll` connect forked processes.
 
 ## Quick start
 
@@ -130,20 +130,23 @@ Ubuntu.
 python build.py                 :: build haku64.img only (x86-64)
 python build.py run             :: build + boot in a QEMU window
 python build.py headless        :: build + boot headless, verify
-python build.py shell           :: boot a busybox ash shell (32-bit image)
+python build.py shell           :: boot a busybox ash shell (64-bit image)
 python build.py shell --check   :: scripted shell run, assert its markers
 python build.py rootfs          :: boot a Linux-style rootfs (32-bit image)
 python build.py rootfs --check  :: scripted rootfs boot, assert its markers
-python build.py probe --init=X  :: boot an external ELF32 as /init (32-bit)
+python build.py probe --init=X  :: boot an external ELF64 as /INIT.ELF (64-bit)
+python build.py shell --arch=i386 --check :: the original 32-bit shell
 python build.py headless --arch=i386   :: the full 32-bit headless suite
 ```
 
 `headless` prints `X64 CHECK PASSED` after the serial log shows the boot,
 storage, process, syscall, memory and module self-test markers.
 `headless --arch=i386` prints `HEADLESS CHECK PASSED` for the 32-bit suite.
-`shell --check` prints `SHELL CHECK PASSED` after a forked foreground pipeline
-and a PATH lookup run inside `sh -i -c`. `rootfs --check` prints
-`ROOTFS CHECK PASSED` after `/INIT` mounts the FAT12 volume as `/`, reads
+`shell --check` prints `X64 SHELL CHECK PASSED` after busybox is launched as
+PID 1, a PATH lookup, `cat`/`ls`/`ps` and a forked foreground pipeline run;
+the 32-bit form prints `SHELL CHECK PASSED`. `probe` prints
+`X64 PROBE CHECK PASSED` once the external ELF exits cleanly. `rootfs --check`
+prints `ROOTFS CHECK PASSED` after `/INIT` mounts the FAT12 volume as `/`, reads
 `/etc/motd` and `/etc/rc`, and runs busybox applets. All exit nonzero on a
 missing marker, an unexpected `*-FAIL`, or `KERNEL PANIC`.
 
@@ -151,8 +154,9 @@ missing marker, an unexpected `*-FAIL`, or `KERNEL PANIC`.
 32-bit image is user data: it is reused untouched unless you pass `--fresh`,
 and `python build.py inspect --check` verifies its BPB, FAT mirrors, and
 cluster chains without modifying it. Report a damaged image rather than
-deleting it out of hand. The x64 seed disk is rebuilt on every run. `shell`
-and `rootfs` boot their own generated volumes, `build/haku_shell.img` and
+deleting it out of hand. The x64 seed disk is rebuilt on every run; `shell`
+seeds that same `build/haku64_fs.img` with `INIT.CMD` and busybox, while the
+32-bit shell uses its own generated `build/haku_shell.img`. `rootfs` boots
 `build/haku_rootfs.img` (plus `build/haku_rootfs.tar` for a host).
 
 ## Documentation
@@ -205,12 +209,12 @@ Tasks are pinned to the CPU that created them, and there is no load balancing
 or migration. A libc-linked ring-3 probe now runs on an application processor
 on both ports: it prints its getcpu, TLS, signal, syscall, sleep and exit
 markers there, while the bootstrap processor collects its status. The x86-64
-kernel has scrollback and runs a static musl busybox applet via `execve`, but
-has no shell and no namespace beyond its boot mounts and the filesystems
-modules mount themselves: its userland is a C library (`user/lib64`), the
-`/INIT.ELF` self-test and the busybox probe rather than a shell; its console
-has a canonical line discipline and PS/2 keyboard so a program can read a
-whole line of keys. FAT12 has 8.3 names, no timestamps, and no permission
+kernel has scrollback, a canonical line discipline and a PS/2 keyboard, and
+`shell` boots static musl busybox as PID 1 into `ash` with job control and
+pipelines; its namespace is still limited to the boot mounts and the
+filesystems modules mount themselves, and there are no symlinks, so applets
+are reached as `busybox <applet>` through `PATH=/disk` rather than installed
+as individual `/bin` links. FAT12 has 8.3 names, no timestamps, and no permission
 bits. Haku's
 filesystem cache holds eight paths of at most 128 KiB each; `execve` streams an
 image of up to 1.5 MiB instead of caching it. Everything

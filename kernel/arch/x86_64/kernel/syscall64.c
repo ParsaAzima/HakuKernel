@@ -1520,7 +1520,7 @@ static u64 sys64_pipe(u64 user_fds, u64 flags) {
  * copied into kernel buffers before the address space is replaced; the caps
  * keep the copy off the kernel stack's deep end and are reported as E2BIG. */
 #define SYS64_EXEC_VEC_MAX   8u
-#define SYS64_EXEC_ARG_MAX   128u
+#define SYS64_EXEC_ARG_MAX   512u
 #define SYS64_EXEC_BYTES_MAX 768u
 #define SYS64_EXEC_WORDS_MAX 64u
 
@@ -1730,6 +1730,46 @@ int sys64_build_init_stack(loaded_elf64_t *loaded, const char *path) {
     argv.lengths[0] = length + 1;
     memcpy(argv.strings, path, length + 1);
     return build_exec_stack64(loaded, &argv, &envp);
+}
+
+/* Copy an already-kernel-resident vector into the fixed exec buffers. Used by
+ * the boot shell, which reads its command line from a file instead of user
+ * memory. Returns 0 on success, 1 when a string does not fit. */
+static int fill_kernel_vector64(exec_vector64_t *out,
+                                const char *const *strings, u32 count) {
+    for (u32 i = 0; i < count; i++) {
+        u32 length = 0;
+
+        if (!strings[i] || i >= SYS64_EXEC_VEC_MAX) return 1;
+        while (strings[i][length]) {
+            if (length + 1u >= SYS64_EXEC_ARG_MAX ||
+                out->length + length + 2u > SYS64_EXEC_BYTES_MAX)
+                return 1;
+            length++;
+        }
+        out->offsets[out->count] = out->length;
+        out->lengths[out->count] = length + 1u;
+        memcpy(out->strings + out->length, strings[i], length + 1u);
+        out->length += length + 1u;
+        out->count++;
+    }
+    return 0;
+}
+
+int sys64_build_command_stack(loaded_elf64_t *loaded,
+                              const char *const *argv, u32 argc,
+                              const char *const *envp, u32 envc) {
+    exec_vector64_t args, envs;
+
+    if (!loaded || !argv || argc == 0 || argc > SYS64_EXEC_VEC_MAX ||
+        envc > SYS64_EXEC_VEC_MAX)
+        return SYS64_EINVAL;
+    memset(&args, 0, sizeof(args));
+    memset(&envs, 0, sizeof(envs));
+    if (fill_kernel_vector64(&args, argv, argc) ||
+        (envc && fill_kernel_vector64(&envs, envp, envc)))
+        return SYS64_E2BIG;
+    return build_exec_stack64(loaded, &args, &envs);
 }
 
 /* execve(path, argv, envp): replace the caller's image with an ELF64 file

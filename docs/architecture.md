@@ -590,8 +590,15 @@ it. The test forks once more and execs `/disk/BUSYBOX` with
 even though FAT12 uppercases the file name, because busybox dispatches
 applets from the basename of `argv[0]`. The marker is printed by the real
 musl runtime from ring 3, which proves the startup syscall sweep, the legacy
-image window and the 1 MiB FAT12 read all work together. It next maps a
-two-page thread stack, `clone`s a thread with
+image window and the 1 MiB FAT12 read all work together. The `shell` image
+takes the same executable but starts it from the kernel instead: a one-line
+`/disk/INIT.CMD` is tokenised into `sh -c "…"`, `fs64_load_image()` streams
+busybox into the heap, `elf64_load()` maps it at `0x400000`, and
+`sys64_build_command_stack()` gives it the same argv/envp/auxv image
+`execve()` would build. Its 20-page stack covers the 64 KiB probe musl's
+`ash` makes at start-up. `HAKU64-INIT-OK` marks the handover, and from there
+the shell is an ordinary ring-3 task on the console. The library test next
+maps a two-page thread stack, `clone`s a thread with
 `CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD`, sleeps in
 `futex(FUTEX_WAIT)` on a word in the shared BSS, and requires the thread to
 have bumped that word with `lock inc`, stored its `gettid` and `getpid`
